@@ -1,0 +1,57 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Veynode actual desktop H.264 decode check</title>
+<style>body{background:#17202b;color:#e5edf5;font:16px system-ui;max-width:960px;margin:30px auto}video{width:100%;background:black}pre{white-space:pre-wrap}</style>
+<h1>Actual desktop H.264 decode check</h1>
+<p>This checks a recorded Guest desktop sample in this browser. It does not test WebRTC, internet latency, E2EE or correct Guest graphics.</p>
+<video id="video" autoplay muted playsinline controls src="/sample.mp4"></video>
+<pre id="result">Waiting for decoded video frames…</pre>
+<script>
+const video=document.querySelector('#video');
+const output=document.querySelector('#result');
+const canvas=document.createElement('canvas');
+const context=canvas.getContext('2d',{willReadFrequently:true});
+const hashes=new Set();
+let frames=0,nonblackFrames=0,reported=false,lastTime=-1;
+async function report(error){
+  if(reported)return;
+  reported=true;
+  const quality=video.getVideoPlaybackQuality?.();
+  const result={passed:!error&&frames>=2&&nonblackFrames>=2&&hashes.size>=2,
+    limitation:'Recorded sample only. No WebRTC, network, E2EE, 60fps, quality or latency acceptance.',
+    user_agent:navigator.userAgent,codec_support:video.canPlayType('video/mp4; codecs="avc1.640028"'),
+    video_width:video.videoWidth,video_height:video.videoHeight,duration_seconds:video.duration,
+    pixel_samples:frames,nonblack_pixel_samples:nonblackFrames,distinct_sampled_rgb_hashes:hashes.size,
+    total_video_frames:quality?.totalVideoFrames,dropped_video_frames:quality?.droppedVideoFrames,
+    error:error??null};
+  output.textContent=JSON.stringify(result,null,2);
+  try{
+    const response=await fetch('/result',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(result)});
+    if(!response.ok)throw new Error('Evidence server rejected result');
+  }catch(e){output.textContent+='\nEvidence not saved: '+e.message;}
+}
+function sample(frameTime=video.currentTime){
+  if(!video.videoWidth||frameTime===lastTime)return;
+  lastTime=frameTime;
+  canvas.width=160;canvas.height=100;
+  context.drawImage(video,0,0,canvas.width,canvas.height);
+  const pixels=context.getImageData(0,0,canvas.width,canvas.height).data;
+  let nonblack=0,hash=2166136261;
+  for(let i=0;i<pixels.length;i+=4){
+    if(pixels[i]+pixels[i+1]+pixels[i+2]>12)nonblack++;
+    for(let c=0;c<3;c++)hash=Math.imul(hash^pixels[i+c],16777619);
+  }
+  frames++;if(nonblack>100)nonblackFrames++;hashes.add(hash>>>0);
+}
+function decoded(now,metadata){
+  if(reported)return;
+  sample(metadata.mediaTime);
+  if('requestVideoFrameCallback'in video)video.requestVideoFrameCallback(decoded);
+}
+if('requestVideoFrameCallback'in video)video.requestVideoFrameCallback(decoded);
+else video.addEventListener('timeupdate',()=>sample());
+video.addEventListener('ended',()=>{if(!('requestVideoFrameCallback'in video))sample();report();});
+video.addEventListener('error',()=>report('Media decode error '+video.error?.code));
+setTimeout(()=>report('Playback did not reach end within 45 seconds'),45000);
+video.play().catch(error=>report('Playback start failed: '+error.message));
+</script>

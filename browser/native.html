@@ -1,0 +1,20 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Veynode native WebRTC receiver</title><link rel="stylesheet" href="probe.css"></head><body><main>
+<h1>Native VM → WebRTC browser receiver</h1>
+<p>This localhost diagnostic receives the native VM console encoded by the host. Hardware capabilities come from the local encoder probe; no browser fixture checkboxes. The optional signed-session mode validates paired keys on this local path. It does not validate Internet connectivity, TURN, trusted remote browser-code delivery or complete end-to-end security.</p>
+<section id="pairing" hidden>
+<h2>Local test device pairing</h2>
+<p>Copy the host public key from the local administrator command through your trusted channel. The capability response is not a trust anchor. Only observation is requested.</p>
+<label>Trusted host public key <input id="host-pin" type="text" size="70" autocomplete="off"></label>
+<button id="prepare-pairing">Prepare pairing request</button>
+<pre id="pairing-request"></pre>
+<label>Locally approved signed grant <textarea id="signed-grant" rows="4" cols="80" autocomplete="off"></textarea></label>
+<button id="accept-grant" disabled>Verify approved grant</button>
+<p id="pairing-status" role="status">Pairing required before connection.</p>
+</section>
+<label>Codec preference <select id="codec-preference"><option value="auto">Automatic: prefer hardware H.265, fallback H.264</option><option value="h264">H.264 only (compatibility check)</option></select></label>
+<div class="actions"><button id="connect" disabled>Connect native console</button><button id="disconnect" disabled>Disconnect</button><button id="retry-cleanup" hidden disabled>Retry cleanup</button><button id="download">Download JSON evidence</button></div>
+<p id="status" role="status">Reading live native hardware capabilities…</p>
+<video id="received" autoplay muted playsinline></video><canvas id="last-frame" width="640" height="360" hidden></canvas>
+<p>At most two attempts: H.265 preferred when supported, then H.264. Each attempt has a 12-second deadline. A passed gate requires 5 decoded and presented frames. Pixel changes are reported separately; a static desktop is valid. The live diagnostic closes after 120 seconds.</p>
+<pre id="result" aria-label="Native receiver JSON result"></pre>
+</main><script type="module" src="dist/native.js"></script></body></html>

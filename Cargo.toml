@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/control", "crates/media-local", "crates/session-auth"]
+resolver = "2"

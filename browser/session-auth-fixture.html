@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Veynode session-auth interoperability fixture</title></head>
+<body>
+<h1>Session authentication fixture</h1>
+<p>This test uses synthetic SDP only. It does not start a VM, connect WebRTC, pair a real host, or contact an external service.</p>
+<p>Run creates/reopens a non-extractable P-256 identity only in this origin's <code>veynode-session-auth-fixture-v1</code> IndexedDB database. Reload this page and run again to check persistence. No private key is exported or stored in localStorage.</p>
+<button id="run">Run cryptography and persistence checks</button>
+<button id="unpair" disabled>Unpair only this fixture identity</button>
+<button id="download" disabled>Download public test report</button>
+<p id="status">Ready; no identity opened yet.</p>
+<pre id="result"></pre>
+<script type="module" src="/dist/session-auth-fixture.js"></script>
+</body></html>

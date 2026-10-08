@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Veynode WebRTC codec probe</title><link rel="stylesheet" href="probe.css"></head>
+<body><main><h1>WebRTC codec negotiation probe</h1>
+<p>Local animated canvas → real RTP connection → browser decoder. This tests WebRTC codec negotiation, <strong>not VM streaming or native host hardware encoding</strong>. No external ICE servers, camera, microphone, or experimental browser flags.</p>
+<fieldset><legend>Explicit host capability fixture</legend><p>These inputs simulate a host capability report for this protocol probe only. Production must use the trusted native encoder’s verified hardware result.</p>
+<label><input id="h264" type="checkbox" checked> Host verified hardware H.264 (required fallback)</label>
+<label><input id="h265" type="checkbox" checked> Host verified hardware H.265 (prefer when browser supports)</label>
+</fieldset>
+<label>Explicit fault injection <select id="fault"><option value="none">None — actual browser behavior</option><option value="h265-negotiation">Reject first H.265 attempt</option><option value="h265-first-frame">Suppress H.265 first-frame evidence until timeout</option></select></label>
+<div class="actions"><button id="run">Run WebRTC probe</button><button id="stop" disabled>Cancel probe</button><button id="download">Download JSON evidence</button></div>
+<p id="status" role="status">Ready. Each attempt has a 12-second deadline; at most two attempts.</p>
+<div class="media"><figure><canvas id="source" width="640" height="360"></canvas><figcaption>Canvas source (640×360, requested 30fps)</figcaption></figure><figure><video id="received" autoplay muted playsinline></video><canvas id="last-frame" width="640" height="360" hidden></canvas><figcaption>Last received WebRTC frame; transport closes after 5 dynamic frames</figcaption></figure></div>
+<h2>Capabilities and result</h2><pre id="result" aria-label="Probe JSON result"></pre>
+</main><script type="module" src="dist/probe.js"></script></body></html>

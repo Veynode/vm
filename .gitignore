@@ -1,0 +1,7 @@
+.DS_Store
+.local/
+target/
+.build/
+node_modules/
+__pycache__/
+*.pyc
