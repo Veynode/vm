@@ -6,16 +6,24 @@ import struct
 import sys
 import time
 
+if sys.argv[1:] == ["--probe-capabilities"]:
+    print(json.dumps({"native_window_protocol":1,"native_window":True,
+                      "display_only":True,"input_enabled":False}))
+    raise SystemExit(0)
+
 if sys.argv[1:] == ["--probe-codecs"]:
-    print(json.dumps({"h264": "verified-hardware", "h265": "unavailable",
-                      "source": "TEST-ONLY PROTOCOL FIXTURE; NOT HARDWARE EVIDENCE"}))
+    print(json.dumps({"h264": "unavailable" if os.environ.get("CONSOLE_TEST_MODE") == "window-only" else "verified-hardware", "h265": "unavailable",
+                      "rate_control_version":1,"rate_min_bps":250000,"rate_max_bps":40000000,"source": "TEST-ONLY PROTOCOL FIXTURE; NOT HARDWARE EVIDENCE"}))
     raise SystemExit(0)
 
 mode = os.environ.get("CONSOLE_TEST_MODE", "normal")
 log_path = os.environ["CONSOLE_TEST_LOG"]
 active = None
+window_open = False
 previous = 0
 starts = 0
+rate_sequence=0
+rate_target=8000000
 
 def log(value):
     with open(log_path, "a") as file:
@@ -36,12 +44,19 @@ for line in sys.stdin:
     log(request)
     ident, method = request["id"], request["method"]
     epoch = request.get("epoch", 0)
-    if method == "start":
+    if method in {"show_window", "close_window", "window_status"}:
+        assert set(request) == {"id", "method"}
+        if method == "show_window": window_open = True
+        if method == "close_window": window_open = False
+        os.write(1, record(1, 0, {"id":ident,"result":{"native_window_protocol":1,"native_window":True,"display_only":True,"input_enabled":False,"window_open":window_open}}))
+    elif method == "start":
         starts += 1
         if active is not None:
             os.write(1, record(1, epoch, {"id": ident, "error": "encoding_busy"}))
             continue
         active = epoch
+        rate_sequence=0
+        rate_target=8000000
         ack = record(1, epoch, {"id": ident, "result": {"state": "encoding", "epoch": epoch}})
         if mode == "truncated-au":
             os.write(1, ack + au(epoch)[:6])
@@ -80,6 +95,18 @@ for line in sys.stdin:
         else:
             active = None
             os.write(1, record(1, epoch, {"id": ident, "result": {"state": "stopped"}}))
+    elif method in {"rate_status","set_bitrate"}:
+        instance=format(active or 0,'032x')
+        error=None
+        if method=="set_bitrate":
+            if request['encoder_instance']!=instance: error='stale_encoder'
+            elif request['sequence']!=rate_sequence+1: error='stale_sequence'
+            else: rate_sequence+=1;rate_target=request['target_bps']
+        if error: os.write(1,record(1,epoch,{"id":ident,"error":{"code":error}}))
+        else:
+            result={"encoder_instance":instance,"epoch":epoch,"sequence":rate_sequence,"target_bps":rate_target,"readback_bps":rate_target,"submitted_frames":2,"hardware_verified":True}
+            if mode=='stale-rate-receipt' and method=='set_bitrate': result['sequence']-=1
+            os.write(1,record(1,epoch,{"id":ident,"result":result}))
     elif method == "keyframe":
         if active != epoch:
             os.write(1, record(1, epoch, {"id": ident, "error": "stale_or_inactive_epoch"}))

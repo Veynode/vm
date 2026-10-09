@@ -158,7 +158,9 @@ def run_case(out,mode,codec='h264'):
         return report
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('--output',type=pathlib.Path,default=ROOT/'.local/evidence/guest-video-synthetic');args=parser.parse_args()
+    global ENCODER
+    parser=argparse.ArgumentParser();parser.add_argument('--encoder',type=pathlib.Path,default=ENCODER);parser.add_argument('--output',type=pathlib.Path,default=ROOT/'.local/evidence/guest-video-synthetic');args=parser.parse_args()
+    ENCODER=args.encoder.resolve(strict=True)
     args.output.mkdir(parents=True,exist_ok=False);(ROOT/'.local/run').mkdir(exist_ok=True)
     reports=[]
     try:

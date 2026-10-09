@@ -16,6 +16,27 @@ pub struct Registry {
 pub struct Store {
     dir: PathBuf,
     _lock: File,
+    owner_pid: libc::pid_t,
+}
+impl Drop for Store {
+    fn drop(&mut self) {
+        // Closing only our FD does not release flock if an unrelated fork/spawn
+        // still holds the inherited open-file description before CLOEXEC. End
+        // this process's transaction explicitly. A fork copy must not unlock a
+        // parent transaction, and cannot use its inherited handle for I/O.
+        if self.owner_pid == unsafe { libc::getpid() } {
+            loop {
+                let result = unsafe {
+                    libc::flock(std::os::fd::AsRawFd::as_raw_fd(&self._lock), libc::LOCK_UN)
+                };
+                if result == 0
+                    || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+                {
+                    break;
+                }
+            }
+        }
+    }
 }
 fn private(file: &File, dir: bool) -> Result<()> {
     let m = file.metadata()?;
@@ -50,6 +71,8 @@ impl Store {
             .custom_flags(libc::O_NOFOLLOW)
             .open(path.join("lock"))?;
         private(&lock, false)?;
+        // No fallible operation after taking the lock until Store owns its drop.
+        let dir = path.canonicalize()?;
         ensure!(
             unsafe {
                 libc::flock(
@@ -60,11 +83,20 @@ impl Store {
             "registry busy"
         );
         Ok(Self {
-            dir: path.canonicalize()?,
+            dir,
             _lock: lock,
+            owner_pid: unsafe { libc::getpid() },
         })
     }
+    fn require_owner(&self) -> Result<()> {
+        ensure!(
+            self.owner_pid == unsafe { libc::getpid() },
+            "registry handle belongs to another process"
+        );
+        Ok(())
+    }
     pub fn load(&self) -> Result<Registry> {
+        self.require_owner()?;
         let path = self.dir.join("grants.json");
         if let Err(e) = fs::symlink_metadata(&path) {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -88,6 +120,7 @@ impl Store {
         Ok(registry)
     }
     pub fn save(&self, registry: &Registry) -> Result<()> {
+        self.require_owner()?;
         registry.validate()?;
         let data = serde_json::to_vec_pretty(registry)?;
         ensure!(data.len() <= 1024 * 1024, "registry too large");
@@ -198,5 +231,107 @@ impl Registry {
         ensure!(version <= MAX_SAFE_INTEGER, "version exhausted");
         self.versions.insert(key, version);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lock_lifetime_tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn inherited_handle_cannot_unlock_or_access_parent_transaction() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("registry");
+        let parent = Store::open(&path).unwrap();
+        // Model the fork copy's mismatched process identity using a real dup of
+        // the same open-file description; no allocator calls in a fork child.
+        let inherited = Store {
+            dir: parent.dir.clone(),
+            _lock: parent._lock.try_clone().unwrap(),
+            owner_pid: parent.owner_pid.checked_add(1).unwrap(),
+        };
+        assert!(inherited
+            .load()
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("another process"));
+        assert!(inherited
+            .save(&Registry::default())
+            .unwrap_err()
+            .to_string()
+            .contains("another process"));
+        drop(inherited);
+        assert!(
+            Store::open(&path).is_err(),
+            "fork-copy drop unlocked the parent"
+        );
+        drop(parent);
+        let independent = Store::open(&path).unwrap();
+        assert!(
+            Store::open(&path).is_err(),
+            "external transaction must still fail closed"
+        );
+        drop(independent);
+        Store::open(&path).unwrap();
+    }
+
+    // The child executes only async-signal-safe libc calls and never touches
+    // Rust locks/allocators. It retains the parent's descriptor before exec.
+    #[test]
+    fn parent_drop_releases_lock_while_fork_child_still_holds_description() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("registry");
+        let store = Store::open(&path).unwrap();
+        let fd = store._lock.as_raw_fd();
+        assert_ne!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        let mut pipe = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe {
+                libc::close(pipe[1]);
+                libc::alarm(3); // Bounded even if another simultaneous fork inherits the pipe.
+                let mut byte = 0_u8;
+                loop {
+                    let n = libc::read(pipe[0], (&mut byte as *mut u8).cast(), 1);
+                    if n >= 0 {
+                        break;
+                    }
+                }
+                libc::_exit(0);
+            }
+        }
+        unsafe {
+            libc::close(pipe[0]);
+        }
+        drop(store);
+        let reopened = Store::open(&path);
+        // Always unblock/reap our still-owned exact child before asserting.
+        unsafe {
+            libc::close(pipe[1]);
+        }
+        let mut status = 0;
+        loop {
+            let result = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if result == pid {
+                break;
+            }
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EINTR)
+            );
+        }
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        assert!(
+            reopened.is_ok(),
+            "parent lock remained inherited before exec: {:?}",
+            reopened.err()
+        );
     }
 }

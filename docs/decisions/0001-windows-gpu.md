@@ -127,3 +127,16 @@ An independent official **English International / English (United Kingdom)** dow
 The second official Safari artifact completed at8,543,594,496bytes. Its full SHA256 is `500bcb6f272b7c455156470ea06816f558f13b885723f84ee9eab7534c7dee61`, not the independently recorded English International pin `23d5d42e8cd37fe1bacc37920eaa1ab0bb044aae0d41eeeb6a77e82a8ca9a483`. The current official table associates the observed hash with Dutch64-bit, while read-only `lang.ini` and WIM metadata identify en-GB. This second artifact was **never booted**. Its own mount was successfully detached. The scripts retain distinct strict en-US/en-GB profiles; neither failed artifact is allowed through another language's row.
 
 See [en-GB identity evidence](../evidence/windows-media-en-gb-identity.json). Do not continue downloading languages looking for a hash that passes. Windows installation is now blocked on an independently verifiable matching official artifact or authoritative publisher correction of this provenance conflict, followed by applicable test entitlement/acceptance. The rest of product development continues; this does not make the entire project externally blocked.
+
+### 2026-10-09 independent official-media recheck
+
+The retail English language/hash conflict remains unchanged. The public ordinary
+Enterprise evaluation link checked is x64 despite an overview mentioning ARM64.
+A distinct IoT LTSC2024 ARM64 en-US candidate has an official5,042,194,432-byte
+HEAD response and an independent Microsoft PDF assigning SHA256
+`ccec358a760c3c581249f091ed42d04f37b2b99c347b7a58257c3cc272d7982c`.
+It has **not been downloaded or booted**. Required registration, evaluation-scope
+and agreement acceptance are unresolved; fixed-function IoT evaluation must not
+silently replace general Windows desktop acceptance. No strict pin was changed.
+Individual PE/catalog signatures and WIM metadata do not resolve whole-media
+identity. See the [bounded review and primary sources](../evidence/windows-media-review-20261009/README.md).

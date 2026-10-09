@@ -1,11 +1,13 @@
 /** Physical-console control v1. Canonical bytes match Rust session-auth/control.rs.
  * Signatures authenticate requests; they do not encrypt HTTP, prove Guest input
  * delivery, or bind an RTP frame to a screenshot UUID. */
+import { fileActionFields, validateFileResult, type FileAction } from './session-files.js';
 import { DeviceIdentity, SessionAuthError, answerBytes, sha256, unhex, verifySignature, identityId, type AnswerTranscript } from './session-auth.js';
 
 export interface FrameAnchor { frame_id: string; source_generation: number; width: number; height: number }
 type Button = 'left' | 'middle' | 'right';
 export type ControlAction =
+  | { kind: 'file'; operation: FileAction }
   | { kind: 'acquire' }
   | { kind: 'release'; epoch: number }
   | { kind: 'observe_frame' }
@@ -45,6 +47,7 @@ function point(frame: FrameAnchor, x: unknown, y: unknown) { integer(x, 0, frame
 function actionFields(action: ControlAction, c: Canon) {
   ensure(action !== null && typeof action === 'object', 'Invalid control action');
   const kind = action.kind;
+  if (kind === 'file') { exact(action, ['kind', 'operation']); c.text(kind); fileActionFields(action.operation, c); return; }
   if (kind === 'acquire' || kind === 'observe_frame') { exact(action, ['kind']); c.text(kind); return; }
   if (kind === 'release') { exact(action, ['kind', 'epoch']); integer(action.epoch, 1); c.text(kind); c.int(action.epoch); return; }
   const common = ['kind', 'epoch', 'frame'];
@@ -63,7 +66,7 @@ function actionFields(action: ControlAction, c: Canon) {
   if (action.kind === 'scroll') { ensure(['up', 'down', 'left', 'right'].includes(action.direction), 'Invalid scroll direction'); integer(action.ticks, 1, 20); c.text(action.direction); c.int(action.ticks); }
   else { ensure(['left', 'middle', 'right'].includes(action.button), 'Invalid mouse button'); c.text(action.button); }
 }
-export function requiredControlScope(action: ControlAction): 'observe' | 'input' { return action.kind === 'observe_frame' ? 'observe' : 'input'; }
+export function requiredControlScope(action: ControlAction): 'observe' | 'input' | 'files' { return action.kind === 'file' ? 'files' : action.kind === 'observe_frame' ? 'observe' : 'input'; }
 export function controlBytes(request: ControlRequest): Uint8Array<ArrayBuffer> {
   exact(request, ['session_id', 'transcript_sha256', 'sequence', 'expires_at', 'action']);
   text(request.session_id, /^[A-Za-z0-9_.-]{1,128}$/, 'Invalid control session ID'); unhex(request.transcript_sha256, 32);
@@ -94,6 +97,7 @@ export async function verifyControl(signed: SignedControl, transcript: AnswerTra
 /** Extract only the server-issued screenshot anchor. The caller must actually
  * display that image for coordinate input; an RTP video frame has no such ID. */
 export function screenshotAnchor(result: Record<string, unknown>): FrameAnchor {
+  ensure(result.input_anchor_available === undefined || result.input_anchor_available === true, 'Screenshot has no usable input anchor');
   const frame = { frame_id: result.frame_id, source_generation: result.source_generation, width: result.width, height: result.height } as FrameAnchor;
   validateFrame(frame); return frame;
 }
@@ -101,14 +105,37 @@ export function validateControlResponse(value: unknown, sequence: number, action
   exact(value, ['sequence', 'result']); integer(value.sequence, 1); ensure(value.sequence === sequence, 'Control response sequence substituted');
   ensure(value.result !== null && typeof value.result === 'object' && !Array.isArray(value.result), 'Invalid control result');
   const result = value.result as Record<string, unknown>;
-  if (action.kind === 'observe_frame') {
-    screenshotAnchor(result); integer(result.byte_length, 1, SCREENSHOT_MAX_BYTES);
-    ensure(typeof result.data_base64 === 'string' && result.data_base64.length <= Math.ceil(SCREENSHOT_MAX_BYTES / 3) * 4, 'Screenshot exceeds limit');
-    text(result.data_base64, /^[A-Za-z0-9+/]*={0,2}$/, 'Invalid screenshot base64');
-    const decoded = atob(result.data_base64); ensure(decoded.length === result.byte_length && btoa(decoded) === result.data_base64, 'Screenshot size/base64 mismatch');
-    ensure(result.mime_type === 'image/png' && decoded.startsWith('\x89PNG\r\n\x1a\n'), 'Expected PNG screenshot');
+  if (action.kind === 'file') { validateFileResult(result, action.operation); } else if (action.kind === 'observe_frame') {
+    screenshotAnchor(result); screenshotBytes(result);
   } else if (action.kind === 'acquire') { integer(result.epoch, 1); ensure(result.expires_in_seconds === 60, 'Invalid lease lifetime'); }
   else if (action.kind === 'release') { ensure(result.released === true, 'Control release not acknowledged'); }
   else { ensure(result.dispatched === true && result.guest_delivery_confirmed === false, 'Input dispatch not acknowledged'); }
   return { sequence, result };
+}
+
+/** Structural validation only; image decoder acceptance and declared dimensions
+ * are checked by the page before the image can become an input anchor. */
+function screenshotBytes(result: Record<string, unknown>): Uint8Array<ArrayBuffer> {
+  integer(result.byte_length, 1, SCREENSHOT_MAX_BYTES);
+  ensure(result.mime_type === 'image/png' || result.mime_type === 'image/jpeg', 'Unsupported screenshot MIME type');
+  ensure(typeof result.data_base64 === 'string' && result.data_base64.length <= Math.ceil(SCREENSHOT_MAX_BYTES / 3) * 4, 'Screenshot exceeds limit');
+  text(result.data_base64, /^[A-Za-z0-9+/]*={0,2}$/, 'Invalid screenshot base64');
+  let decoded: string;
+  try { decoded = atob(result.data_base64); } catch { throw new SessionAuthError('Invalid screenshot base64'); }
+  ensure(decoded.length === result.byte_length && btoa(decoded) === result.data_base64, 'Screenshot size/base64 mismatch');
+  if (result.mime_type === 'image/png') ensure(decoded.startsWith('\x89PNG\r\n\x1a\n'), 'Invalid PNG screenshot signature');
+  else ensure(decoded.length >= 4 && decoded.startsWith('\xff\xd8') && decoded.endsWith('\xff\xd9'), 'Invalid JPEG screenshot boundaries');
+  // macOS JPEG responses always carry this hash. Legacy QEMU PNG remains
+  // compatible without it; a supplied hash is never silently ignored.
+  if (result.mime_type === 'image/jpeg' || result.sha256 !== undefined) text(result.sha256, /^[0-9a-f]{64}$/, 'Invalid screenshot SHA-256');
+  return Uint8Array.from(decoded, c => c.charCodeAt(0));
+}
+/** Snapshot before awaiting WebCrypto so mutation cannot replace the verified
+ * payload with different bytes. A valid hash is integrity, not decoder success. */
+export async function verifiedScreenshotSource(result: Record<string, unknown>): Promise<string> {
+  const copy = { ...result };
+  screenshotAnchor(copy);
+  const bytes = screenshotBytes(copy);
+  if (copy.sha256 !== undefined) ensure(await sha256(bytes) === copy.sha256, 'Screenshot SHA-256 mismatch');
+  return `data:${copy.mime_type as string};base64,${copy.data_base64 as string}`;
 }

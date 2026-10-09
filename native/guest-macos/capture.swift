@@ -31,13 +31,18 @@ private final class CaptureResult {
     func finish(_ reply:[String:Any]) {lock.lock();guard value==nil else{lock.unlock();return};value=reply;lock.unlock();screenshotGate.signal();ready.signal()}
     func get() -> [String:Any]? {lock.lock();defer{lock.unlock()};return value}
 }
-func screenshotReply(_ id:String,enabled:Bool) -> [String:Any] {
+func screenshotReply(_ id:String,enabled:Bool,registerInput:Bool=false) -> [String:Any] {
     guard enabled else{return errorReply(id,"forbidden","observation disabled; launch Guest service with --allow-observe")}
     guard systemString("hw.model").hasPrefix("VirtualMac"),getuid() != 0 else{return errorReply(id,"virtual_guest_required","capture is restricted to the signed-in non-root VirtualMac Guest user")}
     guard CGPreflightScreenCaptureAccess() else{return errorReply(id,"screen_recording_permission_required","Approve Screen Recording for the responsible Guest application, then restart if required; service never requests permission automatically")}
+    let console:GuestConsoleIdentityV1
+    do {console=try requireConsoleIdentity(GuestConsoleIdentityReader.observe())}
+    catch let error as CaptureFailure {guestInput.invalidate();return errorReply(id,error.code,error.message)}
+    catch {guestInput.invalidate();return errorReply(id,"console_identity_unavailable","Console identity is unavailable")}
     guard screenshotGate.wait(timeout:.now()) == .success else{return errorReply(id,"busy","one capture is already outstanding")}
     let result=CaptureResult(),deadline=DispatchTime.now() + .seconds(8)
-    let selected=CGMainDisplayID()
+    let inputCaptureToken=registerInput ? guestInput.captureToken():nil
+    let selected=console.displayID
     func fail(_ code:String,_ message:String){result.finish(errorReply(id,code,message))}
     SCShareableContent.getExcludingDesktopWindows(false,onScreenWindowsOnly:true) {content,error in
         guard DispatchTime.now()<deadline else{fail("capture_timeout","capture deadline expired");return}
@@ -48,6 +53,9 @@ func screenshotReply(_ id:String,enabled:Bool) -> [String:Any] {
         let w=Double(bounds.width)*scale,h=Double(bounds.height)*scale
         guard scale.isFinite,scale>0,w.isFinite,h.isFinite,w>=1,h>=1,w<=4096,h<=4096,w*h<=8_388_608 else{fail("unsupported_geometry","capture requires <=4096 pixels per axis and <=8388608 pixels; no resizing performed");return}
         let width=Int(w.rounded()),height=Int(h.rounded())
+        do {try validateCaptureConsole(console,observation:GuestConsoleIdentityReader.observe(),display:selected,width:width,height:height,bounds:display.frame)}
+        catch let error as CaptureFailure {guestInput.invalidate();fail(error.code,error.message);return}
+        catch {guestInput.invalidate();fail("console_identity_unavailable","Console identity is unavailable");return}
         let config=SCStreamConfiguration();config.width=width;config.height=height;config.showsCursor=true;config.scalesToFit=false
         if #available(macOS 15.0,*){config.captureDynamicRange = .SDR}
         let requested=Date(),start=DispatchTime.now().uptimeNanoseconds
@@ -58,9 +66,24 @@ func screenshotReply(_ id:String,enabled:Bool) -> [String:Any] {
             guard image.width==width,image.height==height else{fail("geometry_mismatch","captured image does not match requested physical pixel dimensions");return}
             do {
                 let encoded=try encodeScreenshotJPEG(image),jpeg=encoded.data
-                let metadata:[String:Any]=["frame_id":UUID().uuidString.lowercased(),"mime_type":"image/jpeg","data_base64":jpeg.base64EncodedString(),"byte_length":jpeg.count,"sha256":SHA256.hash(data:jpeg).map{String(format:"%02x",$0)}.joined(),"width":image.width,"height":image.height,"source_width":width,"source_height":height,"image_width":image.width,"image_height":image.height,"display_id":selected,"coordinate_space":"guest-display-physical-pixels","desktop_bounds_points":["x":display.frame.origin.x,"y":display.frame.origin.y,"width":display.frame.width,"height":display.frame.height],"content_rect_points":["x":bounds.origin.x,"y":bounds.origin.y,"width":bounds.width,"height":bounds.height],"guest_ui_scale":scale,"point_pixel_scale":scale,"capture_requested_at_us":Int64(requested.timeIntervalSince1970*1_000_000),"captured_at_us":Int64(completed.timeIntervalSince1970*1_000_000),"captured_monotonic_us":end/1000,"capture_time_basis":"Guest API completion; exact presentation timestamp unavailable","capture_duration_ms":Double(end-start)/1_000_000,"jpeg_quality":encoded.quality,"jpeg_quality_ladder":[0.8,0.65,0.5,0.35],"resized":false,"includes_cursor":true]
+                // Re-read after encoding: an image from a prior user/session or
+                // geometry must never become a fresh input anchor or leave Guest.
+                try validateCaptureConsole(console,observation:GuestConsoleIdentityReader.observe(),display:selected,width:image.width,height:image.height,bounds:display.frame)
+                var metadata:[String:Any]=["frame_id":UUID().uuidString.lowercased(),"mime_type":"image/jpeg","data_base64":jpeg.base64EncodedString(),"byte_length":jpeg.count,"sha256":SHA256.hash(data:jpeg).map{String(format:"%02x",$0)}.joined(),"width":image.width,"height":image.height,"source_width":width,"source_height":height,"image_width":image.width,"image_height":image.height,"display_id":selected,"coordinate_space":"guest-display-physical-pixels","desktop_bounds_points":["x":display.frame.origin.x,"y":display.frame.origin.y,"width":display.frame.width,"height":display.frame.height],"content_rect_points":["x":bounds.origin.x,"y":bounds.origin.y,"width":bounds.width,"height":bounds.height],"guest_ui_scale":scale,"point_pixel_scale":scale,"capture_requested_at_us":Int64(requested.timeIntervalSince1970*1_000_000),"captured_at_us":Int64(completed.timeIntervalSince1970*1_000_000),"captured_monotonic_us":end/1000,"capture_time_basis":"Guest API completion; exact presentation timestamp unavailable","capture_duration_ms":Double(end-start)/1_000_000,"jpeg_quality":encoded.quality,"jpeg_quality_ladder":[0.8,0.65,0.5,0.35],"resized":false,"includes_cursor":true]
+                metadata["console_identity"]=console.wire
+                metadata["console_identity_verified_at"]="capture_pre_enumeration_and_post_encode"
+                if registerInput {
+                    do {metadata["source_generation"]=try guestInput.record(metadata,captureToken:inputCaptureToken);metadata["input_anchor_available"]=true}
+                    catch let error as GuestInputFailure {
+                        if error.code=="input_console_identity_changed" || error.code=="input_console_geometry_mismatch" || error.code=="input_geometry_changed" {
+                            throw CaptureFailure(code:"console_identity_changed",message:"Console identity changed before anchor publication; image discarded")
+                        }
+                        metadata["input_anchor_available"]=false;metadata["input_anchor_error"]=error.code;metadata["input_anchor_error_detail"]=error.message
+                    }
+                    catch {metadata["input_anchor_available"]=false;metadata["input_anchor_error"]="input_registration_failed"}
+                }
                 result.finish(["id":id,"result":metadata])
-            } catch let error as CaptureFailure {fail(error.code,error.message)} catch {fail("encoding_failed","could not encode screenshot")}
+            } catch let error as CaptureFailure {if error.code.hasPrefix("console_"){guestInput.invalidate()};fail(error.code,error.message)} catch {fail("encoding_failed","could not encode screenshot")}
         }
     }
     guard result.ready.wait(timeout:deadline) == .success,let reply=result.get() else {

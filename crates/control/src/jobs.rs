@@ -44,6 +44,19 @@ pub(crate) fn make_room<T>(
     }
     true
 }
+// TTL is a result-retention policy, never evidence that an unobserved job ended.
+// Keep the same rule in the daemon and the MCP original-epoch cache.
+pub(crate) fn prune_terminal<T>(
+    entries: &mut BTreeMap<(String, String), T>,
+    now: Instant,
+    state: impl Fn(&T) -> (Instant, bool),
+) {
+    entries.retain(|_, value| {
+        let (created, terminal_confirmed) = state(value);
+        !terminal_confirmed || now.saturating_duration_since(created) < Duration::from_secs(330)
+    });
+}
+
 pub fn validate_job_id(id: &str) -> Result<()> {
     if id.len() != 32
         || !id
@@ -56,8 +69,7 @@ pub fn validate_job_id(id: &str) -> Result<()> {
 }
 impl Jobs {
     fn prune(&mut self, now: Instant) {
-        self.entries
-            .retain(|_, job| now.saturating_duration_since(job.created) < Duration::from_secs(330));
+        prune_terminal(&mut self.entries, now, |job| (job.created, job.finished));
     }
     pub fn reserve(table: &Arc<Mutex<Self>>, now: Instant) -> Result<Reservation> {
         let mut jobs = table.lock().unwrap();
@@ -66,7 +78,7 @@ impl Jobs {
         if !make_room(&mut jobs.entries, reservations, |job| {
             (job.created, job.finished)
         }) {
-            bail!("host job ownership capacity reached; wait for jobs to expire")
+            bail!("host job ownership capacity reached; unresolved jobs require terminal proof or VM shutdown/restart")
         }
         jobs.reservations += 1;
         Ok(Reservation {
@@ -179,9 +191,12 @@ mod tests {
         assert!(table.owned("other-vm", &id, "owner", 4, now).is_err());
         assert!(table.owned("vm", &id, "other-owner", 4, now).is_err());
         assert!(table.owned("vm", &id, "owner", 5, now).is_err());
-        assert!(table
-            .owned("vm", &id, "owner", 4, now + Duration::from_secs(331))
-            .is_err());
+        assert!(
+            table
+                .owned("vm", &id, "owner", 4, now + Duration::from_secs(331))
+                .is_ok(),
+            "elapsed time cannot erase an unresolved cleanup obligation"
+        );
     }
     #[test]
     fn finished_jobs_are_not_cancelled_by_takeover() {
@@ -268,5 +283,80 @@ mod tests {
         entries.insert(("vm".into(), "new".into()), (now, false));
         assert!(!make_room(&mut entries, 0, |entry| *entry));
         assert_eq!(entries.len(), 256);
+    }
+    #[test]
+    fn unresolved_jobs_survive_ttl_for_owner_and_vm_cleanup_until_terminal_proof() {
+        let jobs = Arc::new(Mutex::new(Jobs::default()));
+        let now = Instant::now();
+        for (id, owner, epoch) in [
+            ("a".repeat(32), "owner-a", 1),
+            ("b".repeat(32), "owner-b", 9),
+        ] {
+            Jobs::reserve(&jobs, now)
+                .unwrap()
+                .register("vm", &id, owner, epoch, now)
+                .unwrap();
+        }
+        let later = now + Duration::from_secs(86400);
+        let mut table = jobs.lock().unwrap();
+        assert_eq!(table.running("vm", later).len(), 2);
+        let old = table.owned_running("owner-a", None, later);
+        assert_eq!(old.len(), 1);
+        assert_eq!(old[0].epoch, 1);
+        assert!(table
+            .owned("vm", &"a".repeat(32), "owner-b", 9, later)
+            .is_err());
+        table.finish("vm", &"a".repeat(32));
+        assert!(table.owned_running("owner-a", None, later).is_empty());
+        assert_eq!(table.owned_running("owner-b", None, later).len(), 1);
+        assert!(table
+            .owned("vm", &"a".repeat(32), "owner-a", 1, later)
+            .is_err());
+    }
+    #[test]
+    fn capacity_never_discards_expired_unresolved_jobs_or_original_epochs() {
+        let jobs = Arc::new(Mutex::new(Jobs::default()));
+        let now = Instant::now();
+        for i in 0..256 {
+            Jobs::reserve(&jobs, now)
+                .unwrap()
+                .register("vm", &format!("{i:032x}"), "owner", i + 1, now)
+                .unwrap();
+        }
+        let later = now + Duration::from_secs(86400);
+        assert!(Jobs::reserve(&jobs, later).is_err());
+        {
+            let mut table = jobs.lock().unwrap();
+            assert_eq!(table.owned_running("owner", None, later).len(), 256);
+            for i in 0..256 {
+                assert_eq!(
+                    table
+                        .owned("vm", &format!("{i:032x}"), "owner", i + 1, later)
+                        .unwrap()
+                        .epoch,
+                    i + 1
+                )
+            }
+            table.finish("vm", &format!("{:032x}", 17));
+        }
+        let reservation = Jobs::reserve(&jobs, later).unwrap();
+        assert_eq!(jobs.lock().unwrap().entries.len(), 255);
+        assert!(Jobs::reserve(&jobs, later).is_err());
+        drop(reservation);
+    }
+    #[test]
+    fn mcp_epoch_cache_retains_unknown_but_expires_confirmed_terminal() {
+        let now = Instant::now();
+        let mut entries = BTreeMap::from([
+            (("vm".into(), "unknown".into()), (5u64, now, false)),
+            (("vm".into(), "finished".into()), (7u64, now, true)),
+        ]);
+        prune_terminal(
+            &mut entries,
+            now + Duration::from_secs(331),
+            |(_, created, terminal)| (*created, *terminal),
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[&("vm".into(), "unknown".into())].0, 5);
     }
 }

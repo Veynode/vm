@@ -5,6 +5,8 @@ This package implements receiver codec selection and bounded H.265 → H.264 fal
 ## Reproduce
 
 ```sh
+# Rust/WebCrypto interoperability tests require the real verification CLI.
+cargo build --locked -p vm-session-auth --bin vm-pair
 cd browser
 npm ci --ignore-scripts
 npm test
@@ -59,3 +61,9 @@ The browser filters original advertised capability objects before its offer and 
 
 
 Verified on 2026-10-08: actual native VM → WebRTC → Chromium154 H.265 and Constrained Baseline H.264, plus Safari26.4 Automatic correctly falling back to H.264 because its HEVC level93 is below this encoder's required120. These current runs also recovered after deliberately dropping the first complete keyframe, with actual PLI/FIR forwarded to the native encoder, and confirmed explicit closes. See [native evidence](../docs/evidence/native-webrtc.md). Earlier successful decodes with mismatched profiles are retained there as superseded evidence, not accepted conformance. This does not certify every browser/device, Internet security or target frame rate. The standalone canvas probe retains its separate [loopback evidence](../docs/evidence/browser-codec-policy.md).
+
+## Authenticated console control
+
+The optional paired receiver creates one reliable ordered `veynode-control-v1` DataChannel before the signed offer. Its exact SDP (including the application section) and DTLS fingerprints are bound to the approved identities. After signed confirmation, screenshot and input envelopes use this channel exclusively; `/auth/control` is removed, with no HTTP fallback. Input remains an independently approved scope plus an explicit daemon lease and fresh screenshot anchor. See [actual browser/Guest evidence](../docs/evidence/browser-control-channel/README.md).
+
+Browser transport bounds: one request, no queue/retry;16KiB binary fragments,17byte header,1MiB total JSON,64KiB browser send-buffer cap,2second send/open deadline,5second partial-response deadline and25second total operation deadline. Signatures, sequence and expiry remain checked inside DTLS. The native page reports channel counters and DTLS/ICE state without SDP, candidate addresses or input bodies. This localhost test does not certify Internet routing, TURN, trusted remote code delivery or all-data E2EE.

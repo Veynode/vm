@@ -1,0 +1,160 @@
+{
+  "scope": "Read-only local artifact/source/license inspection; no VM execution or distribution permission conclusion.",
+  "inventories": {
+    "utm-5-0-5": {
+      "tree_sha256": "1414edb421021f84d9b748decad05160989a08904df2c8079da15cdb3cdf62e3",
+      "regular_files": 552,
+      "symlinks": 243,
+      "bytes": 1387657335,
+      "problems": []
+    },
+    "spice-reconnect": {
+      "tree_sha256": "ede167b4c4b33963b129cd7f47157a909c1e71ef3c61495899c189584d01f11b",
+      "regular_files": 4,
+      "symlinks": 3,
+      "bytes": 3558574,
+      "problems": [
+        "nonportable_or_external_symlink:UTM.app",
+        "nonportable_or_external_symlink:alpine-minirootfs-3.23.6-aarch64.tar.gz",
+        "nonportable_or_external_symlink:spice-capture"
+      ]
+    }
+  },
+  "evidence_files": {
+    "scripts/windows-fetch-utm.sh": {
+      "bytes": 1189,
+      "sha256": "675b87ccb54d04d3d39e79af1b9227217d0a5ccc314f9cd342ed3ef21465d874"
+    },
+    ".local/windows-gpu/UTM-5.0.5/LICENSE": {
+      "bytes": 11358,
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    ".local/windows-gpu/UTM-5.0.5/Renderer/LICENSE.txt": {
+      "bytes": 1055,
+      "sha256": "85bb2db51c99fe47c7466378aacff03b771c20a2271b7ad58f9c47b0bd9e0de0"
+    },
+    ".local/windows-gpu/UTM-5.0.5/patches/sources": {
+      "bytes": 3988,
+      "sha256": "adac6e4b89af52dbf721989e282605e8a53638462959f33abfdd9f0e75b07cae"
+    },
+    ".local/windows-gpu/UTM-5.0.5/patches/spice-0.14.3.patch": {
+      "bytes": 21344,
+      "sha256": "f4ab372d6bfcfcf80e46944bb9371bfd2b064d319f02272523743a14f81136d0"
+    },
+    ".local/windows-gpu/UTM.app/Contents/Frameworks/D3DMetal.framework/Versions/A/Resources/LICENSE": {
+      "bytes": 1389,
+      "sha256": "553d0035773ddd1590045f8fdc3a4c6ead31e36336721aeca8421e88ed1c9f80"
+    },
+    ".local/windows-gpu/UTM.app/Contents/Resources/qemu/edk2-licenses.txt": {
+      "bytes": 42903,
+      "sha256": "1ddeaed2e7d2e9ecb960bdfc1b8ee45387aff70d056d985d145949af3951657c"
+    },
+    ".local/spice-reconnect-build/spice-0.14.3/COPYING": {
+      "bytes": 26530,
+      "sha256": "dc626520dcd53a22f727af3ee42c770e56c97a64fe3adb063799d8ab032fe551"
+    },
+    ".local/spice-reconnect-build/spice-0.14.3/server/reds.c": {
+      "bytes": 159352,
+      "sha256": "4125c9b434d1096d12734105cb4745905565f1893100d816c208a01345e83797"
+    },
+    ".local/spice-reconnect-build/sources.json": {
+      "bytes": 1859,
+      "sha256": "144b108ce0cc0c2b991c77d5cfc2d85d83c887f61330bef967c3a90dc561ed58"
+    },
+    "scripts/prepare-spice-reconnect-build.py": {
+      "bytes": 3724,
+      "sha256": "29ea06beacb6acffed2cf1cbf493fe052e3c5e578ff97464c6447ec89c5c0caa"
+    },
+    "scripts/configure-spice-reconnect-build.py": {
+      "bytes": 2226,
+      "sha256": "eada0a0778fb401f5ad5b6087622eb3cc006f40aa5dcdbf42106ffe91adef704"
+    },
+    "scripts/build-spice-reconnect-server.py": {
+      "bytes": 4731,
+      "sha256": "4b28419298e2d0ca53679396d99b240426fe09985496fc0d264e671f4424a57a"
+    },
+    "scripts/apply-spice-reconnect-fix.py": {
+      "bytes": 6579,
+      "sha256": "acf862f7264b43aa80f200d0a2987af1ba8a6d5d3438d12618e920f97522008d"
+    },
+    "scripts/apply-spice-retired-publication-fix.py": {
+      "bytes": 1727,
+      "sha256": "fce9eabb1e8f30c30355bc8174324623ef99e16a3cdf6144c33e41181c070008"
+    },
+    "native/tools/spice-scanout-generation.c": {
+      "bytes": 3422,
+      "sha256": "e953fb7bac2291769c54cbd5b71d33a53a3c9f51cea0be2ec308572da9dcbe2a"
+    },
+    "native/tools/spice-scanout-generation.h": {
+      "bytes": 843,
+      "sha256": "65e928c3ce576861479d66e134c8e4aba08114dce4411aeaf07d482a27623566"
+    }
+  },
+  "source_archives": [
+    {
+      "file": "glib-2.83.0.tar.xz",
+      "url": "https://download.gnome.org/sources/glib/2.83/glib-2.83.0.tar.xz",
+      "bytes": 5595320,
+      "sha256": "a07d9e1a57a4279c5ece71c26dc44eea12bd518ea9ff695d53e722997032b614"
+    },
+    {
+      "file": "pixman-0.38.0.tar.gz",
+      "url": "https://www.cairographics.org/releases/pixman-0.38.0.tar.gz",
+      "bytes": 891291,
+      "sha256": "a7592bef0156d7c27545487a52245669b00cf7e70054505381cff2136d890ca8"
+    },
+    {
+      "file": "libjpeg-turbo-1.5.3.tar.gz",
+      "url": "https://ftp.osuosl.org/pub/blfs/conglomeration/libjpeg-turbo/libjpeg-turbo-1.5.3.tar.gz",
+      "bytes": 1658672,
+      "sha256": "b24890e2bb46e12e72a79f7e965f409f4e16466d00e1dd15d93d73ee6b592523"
+    },
+    {
+      "file": "openssl-1.1.1b.tar.gz",
+      "url": "https://github.com/openssl/openssl/releases/download/OpenSSL_1_1_1b/openssl-1.1.1b.tar.gz",
+      "bytes": 8213737,
+      "sha256": "5c557b023230413dfb0756f3137a13e6d726838ccd1430888ad15bfb2b43ea4b"
+    },
+    {
+      "file": "spice-protocol-0.14.4.tar.xz",
+      "url": "https://www.spice-space.org/download/releases/spice-protocol-0.14.4.tar.xz",
+      "bytes": 23540,
+      "sha256": "04ffba610d9fd441cfc47dfaa135d70096e60b1046d2119d8db2f8ea0d17d912"
+    },
+    {
+      "file": "spice-0.14.3.tar.bz2",
+      "url": "https://www.spice-space.org/download/releases/spice-server/spice-0.14.3.tar.bz2",
+      "bytes": 1504304,
+      "sha256": "551d4be4a07667cf0543f3c895beb6da8a93ef5a9829f2ae47817be5e616a114"
+    }
+  ],
+  "utm_dmg": {
+    "bytes": 302621893,
+    "sha256": "713afe73c711f01344b8766654be531cd391ed2e30931206f43b5159f143764f"
+  },
+  "modified_spice_dylib": {
+    "bytes": 1753936,
+    "sha256": "689882d91be47e37b5b6c5fdf571b96bdcc718696572f7a167a46054582f3b0a",
+    "dynamic_dependencies": [
+      "\t@rpath/spice-server.1.framework/Versions/A/spice-server.1 (compatibility version 1.0.0, current version 1.0.0)",
+      "\t@rpath/glib-2.0.0.framework/glib-2.0.0 (compatibility version 8301.0.0, current version 8301.0.0)",
+      "\t@rpath/gio-2.0.0.framework/gio-2.0.0 (compatibility version 8301.0.0, current version 8301.0.0)",
+      "\t@rpath/gobject-2.0.0.framework/gobject-2.0.0 (compatibility version 8301.0.0, current version 8301.0.0)",
+      "\t@rpath/pixman-1.0.framework/pixman-1.0 (compatibility version 39.0.0, current version 39.0.0)",
+      "\t@rpath/ssl.1.1.framework/ssl.1.1 (compatibility version 1.1.0, current version 1.1.0)",
+      "\t@rpath/crypto.1.1.framework/crypto.1.1 (compatibility version 1.1.0, current version 1.1.0)",
+      "\t/System/Library/Frameworks/IOSurface.framework/Versions/A/IOSurface (compatibility version 1.0.0, current version 1.0.0)",
+      "\t/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation (compatibility version 150.0.0, current version 4424.1.255)",
+      "\t@rpath/jpeg.62.framework/jpeg.62 (compatibility version 65.0.0, current version 65.0.0)",
+      "\t/usr/lib/libz.1.dylib (compatibility version 1.0.0, current version 1.2.12)",
+      "\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1356.0.0)"
+    ]
+  },
+  "literal_license_filename_scan": {
+    "scope": "regular paths named license/copying/notice/acknowledgement in extracted UTM.app; embedded notices not assessed",
+    "found": [
+      "Contents/Resources/qemu/edk2-licenses.txt",
+      "Contents/Frameworks/D3DMetal.framework/Versions/A/Resources/LICENSE"
+    ]
+  }
+}

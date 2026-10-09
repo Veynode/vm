@@ -88,6 +88,9 @@ func stopBridge(_ bridge: GuestStreamBridge) throws {
             } catch { completion(.failure(error)) }
         })
         bridge.start()
+        let proof=try bridge.binding(vmID:"fixture",workerInstance:String(repeating:"a",count:64),bridgeInstance:String(repeating:"b",count:64))
+        try check(proof["vm_id"] as? String == "fixture" && proof["worker_pid"] as? Int32 == getpid(), "binding VM and worker")
+        try check(proof["input_authorized"] as? Bool == false && proof["scope"] as? String == "host-worker-listener-only", "binding does not grant input or Guest identity")
         let mode = try FileManager.default.attributesOfItem(atPath: path("stream"))[.posixPermissions] as! NSNumber
         try check(mode.intValue == 0o600, "socket mode0600")
         let client = try connectLocal(path("stream"))
@@ -124,6 +127,17 @@ func stopBridge(_ bridge: GuestStreamBridge) throws {
         try check(read(third, &byte, 1) == 0, "stop closes active client")
         try check(read(guests[2], &byte, 1) == 0, "stop closes active Guest endpoint")
         close(third); close(guests[2])
+        do {_ = try bridge.binding(vmID:"fixture",workerInstance:String(repeating:"a",count:64),bridgeInstance:String(repeating:"b",count:64)); throw TestFailure(message:"stopped bridge provided provenance")}
+        catch is GuestStreamBridgeError {}
+        let replaced=try GuestStreamBridge(path:path("replaced"),connector:{_ in})
+        replaced.start()
+        try FileManager.default.removeItem(atPath:path("replaced"))
+        try Data("replacement-preserved".utf8).write(to:URL(fileURLWithPath:path("replaced")))
+        do {_ = try replaced.binding(vmID:"fixture",workerInstance:String(repeating:"a",count:64),bridgeInstance:String(repeating:"c",count:64)); throw TestFailure(message:"replaced socket provided provenance")}
+        catch is GuestStreamBridgeError {}
+        var replacementStopped=false; replaced.stop {replacementStopped=true}; try waitMain {replacementStopped}
+        try check(try String(contentsOfFile:path("replaced"),encoding:.utf8)=="replacement-preserved","stop must preserve replaced path")
+        print("PASS listener provenance, stopped/replaced socket rejection and replacement preservation")
         print("PASS exact duplex 4MiB, HUP drain, single-client rejection, reconnect and active stop")
 
         // A consumer that never reads cannot retain an unbounded pending frame.

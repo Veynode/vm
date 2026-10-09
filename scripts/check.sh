@@ -4,12 +4,14 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 export PATH="/opt/homebrew/bin:$PATH"
 ./scripts/build-native.sh
+./scripts/check-manager.sh
 cargo fmt --check
 cargo build --locked --bins
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 go -C guest/veynode-agent test -race ./...
 python3 -m unittest discover -s tests -v
+npm --prefix browser test
 if [[ "${1:-}" == "--real" ]]; then
   python3 scripts/prepare-linux.py
   python3 scripts/build-linux-fixture.py

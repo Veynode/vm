@@ -523,3 +523,187 @@ fn session_end_with_mismatched_body_epoch_cannot_authorize_cleanup() {
     }
     broker.assert_failed_exit_and_native_reaped();
 }
+
+#[test]
+fn display_only_window_close_preserves_capture_and_encoder_owner() {
+    let broker = Broker::start("normal");
+    let mut media = broker.connect();
+    let epoch = media.start("owner");
+    let mut window = broker.connect();
+    for (method, open) in [
+        ("show_window", true),
+        ("window_status", true),
+        ("close_window", false),
+        ("window_status", false),
+    ] {
+        window.send(method, method);
+        let record = read_record(&mut window.reader).unwrap();
+        assert_eq!(record.epoch, 0);
+        let reply = record.value().unwrap();
+        assert_eq!(reply["request_id"], method);
+        assert_eq!(reply["result"]["window_open"], open);
+        assert_eq!(reply["result"]["input_enabled"], false);
+        assert_eq!(reply["result"]["display_only"], true);
+    }
+    assert!(!broker.log().iter().any(|v| v["method"] == "stop"));
+    media.send("key-after-close", "keyframe");
+    assert_eq!(
+        media.response("key-after-close")["result"]["requested"],
+        true
+    );
+    assert!(broker
+        .log()
+        .iter()
+        .any(|v| v["method"] == "keyframe" && v["epoch"] == epoch));
+    window.send("status", "status");
+    assert_eq!(
+        window.response("status")["result"]["capture_connected"],
+        true
+    );
+    media.send("finish", "stop");
+    assert_eq!(media.response("finish")["result"]["state"], "stopped");
+}
+
+#[test]
+fn display_only_broker_does_not_require_hardware_h264() {
+    let broker = Broker::start("window-only");
+    let mut client = broker.connect();
+    client.send("caps", "capabilities");
+    let caps = client.response("caps")["result"].clone();
+    assert_eq!(caps["h264"], "unavailable");
+    assert_eq!(caps["native_window"], true);
+    assert_eq!(caps["broker_window_protocol"], 1);
+    client.send("show", "show_window");
+    assert_eq!(client.response("show")["result"]["window_open"], true);
+    client.send("close", "close_window");
+    assert_eq!(client.response("close")["result"]["window_open"], false);
+    assert!(!broker.log().iter().any(|v| v["method"] == "start"));
+}
+
+#[test]
+fn broker_rejects_unimplemented_requested_fps_before_native_start() {
+    let broker = Broker::start("normal");
+    let mut client = broker.connect();
+    client.send("caps", "capabilities");
+    let caps = client.response("caps")["result"].clone();
+    assert_eq!(caps["encoder_fps_request_supported"], false);
+    writeln!(
+        client.stream,
+        "{}",
+        json!({"request_id":"unsupported-fps","method":"start","codec":"h264","fps":60})
+    )
+    .unwrap();
+    assert!(read_record(&mut client.reader).is_err());
+    assert!(!broker.log().iter().any(|v| v["method"] == "start"));
+    // Invalid requests cannot reserve the encoder or break another client.
+    let mut valid = broker.connect();
+    assert!(valid.start("valid-default") > 0);
+    valid.send("finish", "stop");
+    assert_eq!(valid.response("finish")["result"]["state"], "stopped");
+}
+
+#[test]
+fn rate_updates_require_encoder_owner_and_reject_old_receipts() {
+    for mode in ["normal", "stale-rate-receipt"] {
+        let broker = Broker::start(mode);
+        let mut owner = broker.connect();
+        let epoch = owner.start("rate-owner");
+        let mut other = broker.connect();
+        let status = json!({"version":1,"request_id":"rate-status","method":"rate_status"});
+        writeln!(other.stream, "{status}").unwrap();
+        assert!(other.response("rate-status")["error"].is_string());
+        writeln!(owner.stream, "{status}").unwrap();
+        let result = owner.response("rate-status")["result"].clone();
+        assert_eq!(result["sequence"], 0);
+        let mut set = json!({"version":1,"request_id":"rate-update","method":"set_bitrate","encoder_instance":result["encoder_instance"],"epoch":epoch,"sequence":1,"target_bps":2_000_000});
+        writeln!(owner.stream, "{set}").unwrap();
+        let answer = owner.response("rate-update");
+        if mode == "normal" {
+            assert_eq!(answer["result"]["target_bps"], 2_000_000);
+            writeln!(owner.stream, "{set}").unwrap();
+            assert!(owner.response("rate-update")["error"].is_string());
+        } else {
+            assert!(
+                answer["error"].is_string(),
+                "stale native receipt must not succeed"
+            )
+        }
+        let mut foreign = set.clone();
+        foreign["encoder_instance"] = json!("f".repeat(32));
+        foreign["sequence"] = json!(2);
+        writeln!(owner.stream, "{foreign}").unwrap();
+        assert!(owner.response("rate-update")["error"].is_string());
+        set["epoch"] = json!(epoch + 1);
+        writeln!(owner.stream, "{set}").unwrap();
+        assert!(owner.response("rate-update")["error"].is_string());
+        owner.send("rate-stop", "stop");
+        assert_eq!(owner.response("rate-stop")["result"]["state"], "stopped");
+        writeln!(owner.stream, "{status}").unwrap();
+        assert!(owner.response("rate-status")["error"].is_string());
+        assert_eq!(
+            broker
+                .log()
+                .iter()
+                .filter(|v| v["method"] == "start")
+                .count(),
+            1,
+            "rate changes never restart encoder"
+        );
+    }
+}
+
+#[test]
+fn actual_stream_shim_private_fd_correlates_rate_and_preserves_stop_ack() {
+    use std::os::{fd::AsRawFd, unix::process::CommandExt};
+    let broker = Broker::start("normal");
+    let (mut parent, child) = UnixStream::pair().unwrap();
+    parent
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let fd = child.as_raw_fd();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_vm-console-stream"));
+    command
+        .arg(broker.directory.join("console.sock"))
+        .args(["--codec", "h264", "--rate-control-fd", &fd.to_string()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut shim = Shim(command.spawn().unwrap());
+    drop(child);
+    writeln!(
+        parent,
+        "{}",
+        json!({"version":1,"request_id":"query","method":"rate_status"})
+    )
+    .unwrap();
+    let mut line = String::new();
+    BufReader::new(&mut parent).read_line(&mut line).unwrap();
+    let reply: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(reply["request_id"], "query");
+    let result = &reply["result"];
+    assert_eq!(result["sequence"], 0);
+    writeln!(parent,"{}",json!({"version":1,"request_id":"lower","method":"set_bitrate","encoder_instance":result["encoder_instance"],"epoch":result["epoch"],"sequence":1,"target_bps":1_000_000})).unwrap();
+    line.clear();
+    BufReader::new(&mut parent).read_line(&mut line).unwrap();
+    let reply: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(reply["result"]["readback_bps"], 1_000_000);
+    let (status, stderr) = shim.stop_line_then_eof();
+    assert!(status.success(), "{stderr}");
+    let mut media = Vec::new();
+    shim.0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut media)
+        .unwrap();
+    assert!(!media.is_empty());
+    assert!(!media.windows(10).any(|w| w == b"request_id"));
+}

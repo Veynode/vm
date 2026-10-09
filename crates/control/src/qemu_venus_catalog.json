@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "profile_revision": "owned-group-v1",
+  "roles": {
+    "loader": "2533628fb78ec7eed058c63ecb1deca406ec73c1614c3411fda5174350e827d6",
+    "host_library": "471cffbff498c5048d54246ee1efd106455a8c1a5d0613bd391f195cb0abc1b3",
+    "render_server": "a2a48a0fa033853b338161616c21ce667f91066b822ed75b3628b1a7f92f3a71",
+    "qemu_library": "b815ecc84f47c2c13d4368089207f09124cc4c36eee2ea705f08ccacc7965b24",
+    "spice_library": "689882d91be47e37b5b6c5fdf571b96bdcc718696572f7a167a46054582f3b0a",
+    "icd": "c266d6b7e729aa35e6f548b6a1dac74c71b9e2e8eab3f5d769352f599198f349",
+    "firmware": "ee769c4bf42a5350d33345fc1b16d00156fe0c25fb3c68debd003bd844e4e3fa"
+  },
+  "frameworks": {
+    "EGL.framework/Versions/A/EGL": "4d8b66b78acae288983fbffc46f2ecb37506de3c9a30fc505a96b29a08f32e9b",
+    "GLESv2.framework/Versions/A/GLESv2": "031211c898c383f188fcd8e91368ab6dcad08de628f6a089ab7ab597ed74b031",
+    "MoltenVK.framework/Versions/A/MoltenVK": "b96a76813884c04ebe7f13ddf4c4b305234224117a0688a56b81a398fc1641dd",
+    "crypto.1.1.framework/Versions/A/crypto.1.1": "a388f94a339864a2c92fbeb41e062dd54c995f0baff463ccc86cd0a57485df2f",
+    "epoxy.0.framework/Versions/A/epoxy.0": "935573bab19780b7beb442bceb57b6ef2e2268b7f47ee366a8dbf6822b46fd03",
+    "ffi.8.framework/Versions/A/ffi.8": "dbbb8e0ad00bc0638e3a48d3526c7a06ab7292dec7e276d5c95238ea68af4d4a",
+    "gio-2.0.0.framework/Versions/A/gio-2.0.0": "261a85ed59c76eb536072c8cd847611cd1c58605a8619f99e5054b6f93392c55",
+    "glib-2.0.0.framework/Versions/A/glib-2.0.0": "8d2f04ff62144427de2731516886e9e5b24cf965a5e6a2726ee3dd72e9add0be",
+    "gmodule-2.0.0.framework/Versions/A/gmodule-2.0.0": "8b4647d03a467a9e0fe1f942be26a16583ae775d6e3c4027ca11aef065414483",
+    "gobject-2.0.0.framework/Versions/A/gobject-2.0.0": "a6eda0512b537f3bc5007d73760906043d6cec1071aba206cd4378d010aa82d5",
+    "gstapp-1.0.0.framework/Versions/A/gstapp-1.0.0": "a096f025657704962b6a11e9bbf8ec757f3da5caea837fbfb660b59dac311c86",
+    "gstbase-1.0.0.framework/Versions/A/gstbase-1.0.0": "149ca9a9715e7884e3dd6e368af84347b9c19535556743cab22af0ea63ef928d",
+    "gstreamer-1.0.0.framework/Versions/A/gstreamer-1.0.0": "e7a69f783caaa7ec3dc4b22033a8b9801bc996b0ce78b2d917c4b9d2d9da3ead",
+    "iconv.2.framework/Versions/A/iconv.2": "f529bdc4a86abaeb6d683e1eb39c507bed6c753edf9d2786ce61609dbb6a8c29",
+    "intl.8.framework/Versions/A/intl.8": "5d2bf67e86743531b4045d1cdeff6af5f2ca147e6b23bf679d235c59eff4406d",
+    "jpeg.62.framework/Versions/A/jpeg.62": "1da1d1e86cfde64af70e6f6ec1bd0f23f771945cf5213f8f16cb8ffea8a9c334",
+    "opus.0.framework/Versions/A/opus.0": "0e2f1628cdafefc3a57a1e3199c1e002e0483f4180e1815d6d440d84eab9a213",
+    "pixman-1.0.framework/Versions/A/pixman-1.0": "1b0f50db530e71c85e6627a1d61e6de9edb6d6414d54f5d034b078fc9413f20c",
+    "qemu-aarch64-softmmu.framework/Versions/A/qemu-aarch64-softmmu": "b815ecc84f47c2c13d4368089207f09124cc4c36eee2ea705f08ccacc7965b24",
+    "slirp.0.framework/Versions/A/slirp.0": "a1f2d84564d712e9486fc87598aaf51ef2987aef5782cca083b698b8cac77e62",
+    "spice-server.1.framework/Versions/A/spice-server.1": "67e9a98f86b3f8b13768f0cb325110a56f95bd4afcb942fcb952967ec11ca5b5",
+    "ssl.1.1.framework/Versions/A/ssl.1.1": "95dffa7e24934dc9944203bda7b9d679383fed38f5b5761413d122de14aa09a5",
+    "usb-1.0.0.framework/Versions/A/usb-1.0.0": "9cdaa050910450459845ab8d4b861d18d9c22af87381927b04273deae219d2cd",
+    "usbredirparser.1.framework/Versions/A/usbredirparser.1": "902348c07878a73b57e2a4f9b353d48d87e8926dea92ea7ed807b66327407e60",
+    "virglrenderer.1.framework/Versions/A/virglrenderer.1": "cdbe4531e7c4c4befb4316ed5a8e3a33dd27383d2f8e94c4a6a4cad4192c81c3",
+    "vulkan.1.framework/Versions/A/vulkan.1": "8bc36ef7302ef74ccba2b7a5eab49b0c1b8fe09c52a825ccf808971103cbdb4e",
+    "zstd.1.framework/Versions/A/zstd.1": "293c1805d40f3ed49c7873cf57bcca81e84ebfa2b4ae67e41ef5a4bd32a50825"
+  }
+}

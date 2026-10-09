@@ -20,8 +20,12 @@ adapter defaults to observe only. `--allow-lifecycle` adds start, shutdown,
 force-stop, console visibility and local configuration registration.
 `--allow-execute` separately adds commands and control leases.
 Desktop input is separately enabled with `--allow-input` on QEMU persistent capture; accessibility remains unsupported. `vm_screenshot` requires registered QEMU capture or an opted-in macOS Guest observation service with existing Guest Screen Recording permission; Apple Linux returns unsupported. Independent
-`--allow-files` enables bounded transfer tools only when Linux Guest files integration
-is explicitly configured; execute permission does not imply files permission.
+`--allow-files` enables bounded transfer tools only when Guest files integration
+is explicitly configured. Linux uses a dedicated files account; macOS requires
+Guest `--allow-files --files-root /absolute/private/directory` and uses the service
+UID. Execute permission does not imply files permission. Query `vm_guest_info`
+for the running Guest's `capabilities.files` and `file_policy`; the OS name alone
+does not establish availability.
 
 `vm_create` registers an existing direct-boot Linux configuration or installed
 macOS configuration. It does not install the OS or allocate a guest disk.
@@ -256,8 +260,9 @@ Observe still grants guest information and authorized VM resource metadata. Exec
 explicitly grants command access inside the allowlisted guest; guest-visible
 shared files remain within that command-access boundary. Independent `files` scope grants the bounded file-transfer tools; `execute` and
 `lifecycle` do not. Each token is bound to this MCP session owner and VM. These
-file tools access only the explicitly configured Linux files directory, not
-arbitrary Guest paths.
+file tools access only the explicitly configured Linux or macOS Guest files
+directory, not arbitrary Guest paths. macOS uses the service UID; its private
+directory is not isolated from other programs running under that same UID.
 
 The endpoint checks allowed browser Origin, MIME types, Accept and negotiated
 version. Sessions are random, principal-bound, limited to 32 total / 4 per principal,
@@ -313,9 +318,11 @@ review remain required before public distribution.
 
 Local stdio adds file tools only with `--allow-files`; verified HTTPS principals
 must explicitly include `files` alongside `observe`. Neither execute nor lifecycle
-implies files. The native worker only transports these requests to a Linux Guest
-with opt-in dedicated non-root files integration. Other Guest systems fail with
-an explicit unsupported error; no host file read or command-execution fallback.
+implies files. The native worker transports these requests to an explicitly enabled
+Linux or macOS Guest files service. Disabled or unavailable Guest integration
+returns an error; the controller does not infer availability from the OS. QEMU
+Guest integration remains unsupported. There is no host file read or
+command-execution fallback.
 
 The six tools are `vm_file_upload_begin`, `vm_file_upload_write`,
 `vm_file_upload_commit`, `vm_file_download_begin`, `vm_file_download_read`, and
@@ -327,11 +334,15 @@ SHA256, no-overwrite publication and bounded lifetime. Closing the MCP session
 requests file cleanup; Guest deadlines cover unconfirmed cleanup or abrupt host
 failure. Sensitive file bodies are never logged.
 
-This is single-filename transfer into an explicit directory owned by a separate
-Guest files account. The ordinary execute account cannot use these uploaded
-files. Directory traversal, arbitrary Guest file access, overwrite, directory
-creation and upload-then-execute authorization are future work, not implied by
-this implementation. See [Guest protocol and boundary](../../guest/veynode-agent/README.md).
+This is single-filename transfer into an explicit Guest directory. Linux uses a
+separate files account; the ordinary execute account cannot use those uploaded
+files. macOS requires a fixed owner-private directory and a dedicated worker
+running under the Guest service UID. That is **not isolation from other programs
+with the same UID**. The files permission does not authorize command execution,
+and MCP macOS command execution remains unsupported. Neither backend grants
+directory traversal, arbitrary Guest file access, overwrite or directory creation.
+The controller routing tests use pipe fixtures and do not establish actual macOS
+Guest transfer acceptance. See [Linux Guest boundary](../../guest/veynode-agent/README.md).
 
 
 ## Opt-in QEMU/HVF console backend
@@ -387,11 +398,19 @@ controller. The explicit test script saves diagnostics and screenshots.
 `vm_screenshot` is observation-only and returns MCP image content plus UUID,
 timestamps, physical Guest pixel dimensions and unknown Guest UI scale. Internal
 SPICE scanout IDs are removed. One asynchronous capture per VM is allowed; another
-returns busy. Helper output is <=1MiB, PNG <=700KiB, worker deadline 15s, control
+returns busy. Screenshot responses are <=3MiB, PNG <=2MiB, worker deadline 15s, control
 wait bound 17s. Shutdown/stop can be processed while capture is pending. Capture
 currently starts a short-lived SPICE consumer: a completely static desktop that
 sends no new draw can fail explicitly. Use the persistent console broker below to
 keep the capture connection from VM startup. Input uses separate current control authorization plus a recent frame observation token; a screenshot alone grants no input permission.
+The larger response bound applies only to an outstanding screenshot request;
+ordinary replies and all incoming requests remain <=1MiB. Persistent native/broker
+records remain <=4MiB. The full-resolution lossless PNG is never resized to fit;
+images above 2MiB fail explicitly, so not every 1440p/4K scene is guaranteed to fit.
+Screenshot JSON avoids optional slash escaping to keep worst-case base64 within
+its response budget. The macOS Guest JPEG producer and 700KiB validation remain
+unchanged. Fixed native error diagnostics report the stage and encoded byte count,
+never pixels or file paths.
 
 Reproduce the actual RAM-only test (requires the pinned media and local runtimes):
 
@@ -534,3 +553,85 @@ holding every scope. They require a running Apple macOS worker. The native worke
 validates private socket ownership/modes and fixes the Guest endpoint to vsock5001;
 start acknowledges only a listening Unix socket, not successful capture or Guest
 connection. The controller waits at most8s for each bridge management response.
+
+### Guest bridge listener provenance (local only)
+
+A new controller supplies per-worker and per-start random256-bit instance nonces to
+`start_guest_stream_bridge`. A matching new Apple worker returns `binding` with
+version1, VM ID, both instances, worker PID, socket path/device/inode and fixed
+Guest port5001. The scope is `host-worker-listener-only`; `input_authorized:false`
+is mandatory. Listening does not prove Guest connection, capture identity, or a
+frame belonging to the same desktop as a later screenshot.
+
+To revalidate an obtained binding without connecting to or consuming the stream:
+
+```sh
+vm-control call --state-dir PRIVATE_STATE guest_stream_bridge_binding \
+  '{"id":"VM_ID","worker_instance":"64_LOWERCASE_HEX_FROM_START","bridge_instance":"64_LOWERCASE_HEX_FROM_START"}'
+```
+
+The local RPC accepts exactly those three arguments. It is not an MCP tool or a remote HTTP method. The call
+requires a live current worker, repeats the native listener check, and compares
+VM/worker/bridge identity and owner-only mode0600 socket under mode0700 parent.
+Stopping invalidates the binding before waiting for cleanup. Restarting a worker
+or bridge invalidates previous nonces even when the same pathname is reused.
+A late start reply cannot republish a stopped or superseded attempt.
+
+Old native callers without nonces retain the diagnostic start/stop behavior but
+receive no provenance. New controllers fail explicitly with old workers; stop a
+failed/unsupported start before retrying, since an unknown worker may have opened
+a listener. A failed start never grants provenance. The source binding is valid
+only when freshly rechecked; there is no claim of atomicity across a later socket
+connect or input RPC. Host user/worker/controller remain trusted.
+
+macOS browser input remains disabled. Guest service/console identity must still
+be checked against capture and screenshot metadata before a future media/control
+integration can authorize it. Do not use this listener proof as that identity.
+
+### Local experimental Venus profile
+
+The default QEMU Linux profile remains `virgl`, with the original graphics and
+HVF arguments. A VM can explicitly select
+`"qemu_graphics_profile":"venus-moltenvk-experimental"`. This value is rejected
+for other backends/Guests. VM config and MCP cannot supply runtime paths or
+renderer environment overrides. The existing stdio MCP lifecycle `vm_create`
+accepts only the two profile enum values; `qemu_guest_exec` remains local-only.
+Remote HTTPS continues to hide and reject `vm_create` entirely.
+
+The local daemon operator must also pass `--qemu-venus-runtime ABS_JSON`. Its
+strict schema 1 contains `profile_revision:"owned-group-v1"`, canonical
+`frameworks_dir`, and `loader`, `host_library`, `render_server`, `qemu_library`,
+`spice_library`, `icd`, `firmware`, each exactly `{path,sha256}`. The registration
+is a private regular file (0600, <=64 KiB); referenced regular files are bounded,
+non-symlink canonical paths in locally trusted directories. FIFO/device files,
+unknown fields, changed identities and hashes fail closed. The compiled
+`qemu_venus_catalog.json` admits only the reviewed matching loader, host virgl
+with inherited process-group ownership, standalone server, and pinned runtime
+closure. A manifest cannot bless a different binary by declaring its own hash.
+The 27 pinned framework files cover the selected transitive `@rpath` closure plus
+EGL/GLES/MoltenVK; this is a local integrity catalog, not redistribution approval.
+
+Registration requires Apple Silicon macOS 26+ and a successful public Hypervisor
+**configuration object** 4 KiB set/readback; this probe creates no VM. Venus uses
+`-machine virt -accel hvf,ipa-granule-size=4096` and a named GPU with `blob=on`,
+`hostmem=256M`, `venus=on`. Before `cont`, the worker checks actual QMP GPU
+properties and a paused/prelaunch state, after existing disk/witness FD checks.
+This does not claim a QMP readback of the running Hypervisor IPA granule. The
+pinned QEMU must initialize with the requested option; startup errors stay errors.
+The 256 MiB hostmem aperture is not a measured RAM allocation.
+
+Both profiles clear inherited Vulkan/Metal-driver/ANGLE/renderer/`DYLD_*`
+injection variables, then restore only explicit registered SPICE and fixed
+ANGLE Metal. Venus additionally selects the registered host library/server/ICD;
+there is no software-renderer or legacy-runtime fallback. Same-UID trusted
+operators can still alter host files; registration rechecks before launch do not
+provide protection from arbitrary malicious code running as that operator.
+
+`runtime.graphics_profile` and per-VM capabilities distinguish the configured
+profile, successful host admission, and `guest_verified:false`. Actual Guest
+Vulkan driver identity and application pixels must be independently measured;
+SPICE connectivity, QOM configuration, and host API support do not verify Guest
+Vulkan, native desktop scanout, conformance or performance. Existing disk locks,
+execution witness/guardian supervision, input authority and normal/forced cleanup
+are retained. New production-path runtime acceptance remains separate from
+component tests and earlier standalone renderer lifecycle tests.

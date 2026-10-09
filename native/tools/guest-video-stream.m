@@ -1,6 +1,7 @@
 // Guest raw NV12 -> required-hardware host VideoToolbox -> framed Annex B.
 // No host capture API, software fallback, recording or public network listener.
 #include "hevc-profile.h"
+#include "../shared/encoder-rate.h"
 #import <Foundation/Foundation.h>
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreVideo/CoreVideo.h>
@@ -16,7 +17,11 @@
 static VTCompressionSessionRef encoder;
 static NSLock *lock;
 static NSString *failure,*codecName,*actualH264Profile;
-static NSDictionary *actualHEVCProfile;
+static NSDictionary *actualHEVCProfile,*expectedConsoleIdentity;
+static BOOL consoleIdentityMatched;
+static int receiptFD=-1,receiptParentFD=-1;
+static NSString *receiptName,*receiptService,*receiptCapture;
+static BOOL receiptRequested,registrationSeen,registrationPersisted;
 static BOOL useHEVC,hardwareVerified,hardwareProbe,probeOutput;
 static NSUInteger width,height,encoded,keyframes;
 static const NSUInteger maxAU=4*1024*1024;
@@ -35,7 +40,7 @@ static BOOL writeRecord(NSData *payload,uint64_t pts,BOOL key){
   fail(@"stdout closed, errored or stalled; partial record must be discarded");return NO;
  }}return YES;
 }
-static void compressed(void *context,void *source,OSStatus status,VTEncodeInfoFlags flags,CMSampleBufferRef sample){@autoreleasepool{
+static void compressed(void *context,void *source,OSStatus status,VTEncodeInfoFlags flags,CMSampleBufferRef sample){(void)context;(void)source;@autoreleasepool{
  if(status!=noErr||!sample||!CMSampleBufferDataIsReady(sample)||(flags&kVTEncodeInfo_FrameDropped)){fail([NSString stringWithFormat:@"Encode callback failed status=%d flags=%u",(int)status,(unsigned)flags]);return;}
  CMFormatDescriptionRef format=CMSampleBufferGetFormatDescription(sample);
  if(CMFormatDescriptionGetMediaSubType(format)!=(useHEVC?kCMVideoCodecType_HEVC:kCMVideoCodecType_H264)){fail(@"Unexpected output codec");return;}
@@ -89,7 +94,7 @@ static BOOL createEncoder(CVPixelBufferRef pixel){
     hardwareVerified=result==noErr&&usingHardware&&CFGetTypeID(usingHardware)==CFBooleanGetTypeID()&&CFBooleanGetValue(usingHardware);
     if(usingHardware)CFRelease(usingHardware);
     if(!hardwareVerified){fail(@"Encoder did not confirm hardware acceleration; software fallback rejected");return NO;}
-    return YES;
+    rateReset();return YES;
 }
 static int probeCodecs(void){
  hardwareProbe=YES;width=height=64;NSMutableDictionary *result=[NSMutableDictionary new];
@@ -102,10 +107,10 @@ static int probeCodecs(void){
   if(encoder){VTCompressionSessionInvalidate(encoder);CFRelease(encoder);encoder=NULL;}
  }
  CVPixelBufferRelease(pixel);result[@"source"]=@"VideoToolbox required-hardware session property";
- result[@"protocol"]=@"veynode-guest-video-stream-v1";result[@"cleanup_contract_version"]=@1;result[@"cleanup_confirmed_failure_exit"]=@78;
+ result[@"protocol"]=@"veynode-guest-video-stream-v1";result[@"cleanup_contract_version"]=@1;result[@"cleanup_confirmed_failure_exit"]=@78;result[@"console_identity_binding_version"]=@1;result[@"cleanup_receipt_version"]=@1;result[@"rate_control_version"]=@1;result[@"rate_min_bps"]=@(rateMinimum);result[@"rate_max_bps"]=@(rateMaximum);
  NSData *json=[NSJSONSerialization dataWithJSONObject:result options:NSJSONWritingSortedKeys error:NULL];fwrite(json.bytes,1,json.length,stdout);fputc('\n',stdout);return 0;
 }
-static BOOL stopping,forceKeyframe,started,stopped;
+static BOOL stopping,forceKeyframe,started,stopped,streamAnnounced;
 static BOOL terminalReceived,cleanCaptureFailure;
 // Exit78 is opt-in via the exact capabilities contract. It remains a failed
 // media outcome: only a matched Guest error+terminal+EOF attests cleanup.
@@ -145,23 +150,109 @@ static void encodeCached(BOOL idle){
  lastSubmit=now;lastPTS=pts;submitted++;if(idle)idleFrames++;
 }
 static BOOL unsignedNumber(id value,uint64_t expected){return [value isKindOfClass:[NSNumber class]]&&CFGetTypeID((__bridge CFTypeRef)value)!=CFBooleanGetTypeID()&&[value doubleValue]==(double)expected;}
+// Must match GuestConsoleIdentityV1; this is identity, not lock/input authorization.
+static BOOL identityUInt(id value,uint64_t minimum,uint64_t maximum){
+ if(![value isKindOfClass:[NSNumber class]]||CFGetTypeID((__bridge CFTypeRef)value)==CFBooleanGetTypeID())return NO;
+ double n=[value doubleValue];return isfinite(n)&&n>=minimum&&n<=maximum&&floor(n)==n;
+}
+static BOOL validConsoleIdentity(id value){
+ if(![value isKindOfClass:[NSDictionary class]])return NO;
+ NSSet *keys=[NSSet setWithArray:@[@"version",@"security_session_id",@"uid",@"console_set",@"display_id",@"physical_width",@"physical_height",@"display_geometry_sha256"]];
+ if(![[NSSet setWithArray:[value allKeys]] isEqual:keys]||!identityUInt(value[@"version"],1,1)||!identityUInt(value[@"security_session_id"],1,UINT32_MAX-2)||!identityUInt(value[@"uid"],1,UINT32_MAX-1)||!identityUInt(value[@"display_id"],1,UINT32_MAX)||!identityUInt(value[@"physical_width"],1,16384)||!identityUInt(value[@"physical_height"],1,16384))return NO;
+ if(value[@"console_set"]!=[NSNull null]&&!identityUInt(value[@"console_set"],0,UINT32_MAX))return NO;
+ NSString *hash=value[@"display_geometry_sha256"];if(![hash isKindOfClass:[NSString class]]||[hash length]!=64)return NO;
+ return [hash rangeOfCharacterFromSet:[[NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdef"] invertedSet]].location==NSNotFound;
+}
+static NSDictionary *readExpectedIdentity(const char *path){
+ int fd=open(path,O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);if(fd<0)return nil;
+ struct stat before,after;uint8_t bytes[2049];size_t count=0;BOOL valid=fstat(fd,&before)==0&&S_ISREG(before.st_mode)&&before.st_uid==getuid()&&(before.st_mode&0777)==0600&&before.st_nlink==1&&before.st_size>0&&before.st_size<=2048;
+ while(valid&&count<sizeof(bytes)){ssize_t n=read(fd,bytes+count,sizeof(bytes)-count);if(n<0&&errno==EINTR)continue;if(n<0){valid=NO;break;}if(n==0)break;count+=(size_t)n;}
+ valid=valid&&count>0&&count<=2048&&fstat(fd,&after)==0&&before.st_size==after.st_size&&before.st_mtimespec.tv_sec==after.st_mtimespec.tv_sec&&before.st_mtimespec.tv_nsec==after.st_mtimespec.tv_nsec&&before.st_ctimespec.tv_sec==after.st_ctimespec.tv_sec&&before.st_ctimespec.tv_nsec==after.st_ctimespec.tv_nsec;
+ close(fd);if(!valid)return nil;
+ id value=[NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:bytes length:count] options:0 error:NULL];return validConsoleIdentity(value)?value:nil;
+}
+static BOOL instanceID(id value){
+ return [value isKindOfClass:[NSString class]]&&[value length]==32&&[value rangeOfCharacterFromSet:[[NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdef"] invertedSet]].location==NSNotFound;
+}
+static BOOL cleanupBasisAllowed(id value){return [@[@"no_stream_created",@"stop_capture_completed",@"delegate_reported_stopped"] containsObject:value?:[NSNull null]];}
+static BOOL reserveReceipt(const char *path){
+ NSString *name=[NSString stringWithUTF8String:path];
+ if(!name||![name isAbsolutePath]||![name isEqual:name.stringByStandardizingPath])return NO;
+ NSArray *parts=name.pathComponents;if(parts.count<3)return NO;
+ int parent=open("/",O_RDONLY|O_DIRECTORY|O_CLOEXEC);if(parent<0)return NO;
+ for(NSUInteger i=1;i+1<parts.count;i++){
+  NSString *part=parts[i];int next=openat(parent,part.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);close(parent);if(next<0)return NO;parent=next;
+ }
+ struct stat directory;if(fstat(parent,&directory)||!S_ISDIR(directory.st_mode)||directory.st_uid!=getuid()||(directory.st_mode&0777)!=0700){close(parent);return NO;}
+ NSString *leaf=parts.lastObject;int fd=openat(parent,leaf.fileSystemRepresentation,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC,0600);
+ if(fd<0){close(parent);return NO;}struct stat file;
+ if(fstat(fd,&file)||!S_ISREG(file.st_mode)||file.st_uid!=getuid()||(file.st_mode&0777)!=0600||file.st_nlink!=1){close(fd);close(parent);return NO;}
+ receiptFD=fd;receiptParentFD=parent;receiptName=leaf;receiptRequested=YES;return YES;
+}
+static BOOL matchingReceipt(NSDictionary *value){
+ return registrationPersisted&&[value[@"service_instance"] isEqual:receiptService]&&[value[@"capture_instance"] isEqual:receiptCapture]&&unsignedNumber(value[@"cleanup_protocol_version"],1)&&unsignedNumber(value[@"cleanup_retention_ms"],120000);
+}
+static BOOL persistRegistration(NSDictionary *value){
+ if(![value[@"id"] isEqual:@"host-start"]||!instanceID(value[@"service_instance"])||!instanceID(value[@"capture_instance"])||!unsignedNumber(value[@"cleanup_protocol_version"],1)||!unsignedNumber(value[@"cleanup_retention_ms"],120000))return NO;
+ NSDictionary *receipt=@{@"version":@1,@"service_instance":value[@"service_instance"],@"capture_instance":value[@"capture_instance"],@"cleanup_retention_ms":@120000};
+ NSData *bytes=[NSJSONSerialization dataWithJSONObject:receipt options:NSJSONWritingSortedKeys error:NULL];if(!bytes||bytes.length>2048)return NO;
+ size_t sent=0;while(sent<bytes.length){ssize_t n=write(receiptFD,(const uint8_t *)bytes.bytes+sent,bytes.length-sent);if(n<0&&errno==EINTR)continue;if(n<=0)return NO;sent+=(size_t)n;}
+ struct stat fd,path;
+ if(fsync(receiptFD)||fsync(receiptParentFD)||fstat(receiptFD,&fd)||fstatat(receiptParentFD,receiptName.fileSystemRepresentation,&path,AT_SYMLINK_NOFOLLOW)||fd.st_dev!=path.st_dev||fd.st_ino!=path.st_ino||!S_ISREG(fd.st_mode)||fd.st_uid!=getuid()||(fd.st_mode&0777)!=0600||fd.st_nlink!=1||fd.st_size!=(off_t)bytes.length)return NO;
+ receiptService=value[@"service_instance"];receiptCapture=value[@"capture_instance"];registrationPersisted=YES;return YES;
+}
+// Optional host-local timing metadata; never cleanup or identity attestation.
+static NSDictionary *safeIdentityDiagnostic(id value){
+ if(![value isKindOfClass:[NSDictionary class]])return nil;
+ NSArray *numbers=@[@"authority_read_max_us",@"identity_publish_lock_wait_max_us",@"sample_copy_max_us",@"sample_lock_wait_max_us",@"identity_timer_lateness_max_us",@"sample_generation"];
+ NSMutableSet *keys=[NSMutableSet setWithArray:numbers];[keys addObjectsFromArray:@[@"stale_site",@"verification_age_us"]];
+ if(![[NSSet setWithArray:[value allKeys]] isEqual:keys])return nil;
+ id site=value[@"stale_site"];
+ if(site!=[NSNull null]&&![@[@"authority_read",@"authority_publish",@"timer_read",@"sample_admission",@"sample_publish",@"writer_admission"] containsObject:site])return nil;
+ for(NSString *key in [numbers arrayByAddingObject:@"verification_age_us"]){
+  id n=value[key];if([key isEqual:@"verification_age_us"]&&n==[NSNull null])continue;
+  if(![n isKindOfClass:[NSNumber class]]||CFGetTypeID((__bridge CFTypeRef)n)==CFBooleanGetTypeID()||[n doubleValue]<0||[n doubleValue]>9007199254740991.0||[n doubleValue]!=(double)[n unsignedLongLongValue])return nil;
+ }
+ return [value copy];
+}
 static void record(NSData *body,BOOL draining){
  const uint8_t *p=body.bytes;if(!body.length){fail(@"Empty Guest record");return;}
  if(p[0]==1){
   if(body.length>65536){fail(@"Guest JSON event exceeds limit");return;}
   id value=[NSJSONSerialization JSONObjectWithData:[body subdataWithRange:NSMakeRange(1,body.length-1)] options:0 error:NULL];
   if(![value isKindOfClass:[NSDictionary class]]){fail(@"Invalid Guest event");return;}NSString *event=value[@"event"];
-  if([event isEqual:@"started"]&&!started&&!draining&&[value[@"id"] isEqual:@"host-start"]&&unsignedNumber(value[@"width"],width)&&unsignedNumber(value[@"height"],height)&&[value[@"pixel_format"] isEqual:@"nv12-video-range"]&&[value[@"color_matrix"] isEqual:@"ITU-R BT.709"]&&[value[@"color_space"] isEqual:@"ITU-R BT.709"]&&[value[@"capture_dynamic_range"] isEqual:@"SDR"]){started=YES;diagnostic(@{@"event":@"guest-started",@"geometry":value});}
+  if(receiptRequested){
+   if([event isEqual:@"capture_registered"]){
+    if(registrationSeen||started||streamAnnounced||draining){fail(@"Unexpected or duplicate capture registration");return;}
+    registrationSeen=YES;
+    if(!persistRegistration(value)){fail(@"Capture registration invalid or receipt persistence failed");return;}
+    diagnostic(@{@"event":@"capture-receipt-persisted",@"cleanup_receipt_version":@1});return;
+   }
+   // A rejected start before registration creates no receipt and proves nothing
+   // about any previous capture. It remains an unconfirmed failed attempt.
+   BOOL unregisteredError=!registrationSeen&&[event isEqual:@"error"]&&!value[@"service_instance"]&&!value[@"capture_instance"]&&!value[@"cleanup_protocol_version"]&&!value[@"cleanup_retention_ms"];
+   if(!unregisteredError&&!matchingReceipt(value)){fail(@"Guest event cleanup receipt identity mismatch or registration missing");return;}
+  }
+  if([event isEqual:@"started"]&&!started&&!draining&&[value[@"id"] isEqual:@"host-start"]&&unsignedNumber(value[@"width"],width)&&unsignedNumber(value[@"height"],height)&&[value[@"pixel_format"] isEqual:@"nv12-video-range"]&&[value[@"color_matrix"] isEqual:@"ITU-R BT.709"]&&[value[@"color_space"] isEqual:@"ITU-R BT.709"]&&[value[@"capture_dynamic_range"] isEqual:@"SDR"]){
+   streamAnnounced=YES; // Existence evidence for draining only; not permission to encode.
+   if(expectedConsoleIdentity){
+    if(!validConsoleIdentity(value[@"console_identity"])||![expectedConsoleIdentity isEqual:value[@"console_identity"]]||![value[@"console_binding_mode"] isEqual:@"expected_identity_matched"]||![value[@"frame_console_identity_scope"] isEqual:@"this_capture_connection"]){fail(@"Guest console identity missing, invalid or mismatched");return;}
+    consoleIdentityMatched=YES;
+   }
+   started=YES;diagnostic(@{@"event":@"guest-started",@"geometry":value,@"expected_console_identity_matched":consoleIdentityMatched?@YES:@NO});
+  }
   else if([event isEqual:@"stopped"]&&draining&&[value[@"id"] isEqual:@"host-stop"]){stopped=YES;}
   else if([event isEqual:@"error"]&&[value[@"id"] isEqual:@"host-start"]&&[value[@"code"] isKindOfClass:[NSString class]]&&[value[@"code"] length]>0&&[value[@"code"] length]<=64&&!guestError&&!terminalReceived){
    NSMutableDictionary *safe=[@{@"code":value[@"code"]} mutableCopy];
    if([value[@"error_domain"] isKindOfClass:[NSString class]]&&[value[@"error_domain"] length]<=128)safe[@"error_domain"]=value[@"error_domain"];
    if([value[@"error_code"] isKindOfClass:[NSNumber class]])safe[@"error_code"]=value[@"error_code"];
    for(NSString *key in @[@"main_display_active",@"main_display_asleep"])if(value[key]&&CFGetTypeID((__bridge CFTypeRef)value[key])==CFBooleanGetTypeID())safe[key]=value[key];
+   NSDictionary *identityDiagnostic=safeIdentityDiagnostic(value[@"console_identity_diagnostic"]);
+   if(identityDiagnostic)safe[@"console_identity_diagnostic"]=identityDiagnostic;
    guestError=safe;if(!draining)fail(@"Guest capture failed; waiting for independent cleanup attestation");
   }
   else if([event isEqual:@"terminated"]&&draining&&guestError&&!terminalReceived&&[value[@"id"] isEqual:@"host-start"]&&[value[@"reason"] isEqual:@"capture_failed"]&&value[@"cleanup_confirmed"]&&CFGetTypeID((__bridge CFTypeRef)value[@"cleanup_confirmed"])==CFBooleanGetTypeID()&&[value[@"cleanup_confirmed"] boolValue]&&([value[@"cleanup_basis"] isEqual:@"no_stream_created"]||[value[@"cleanup_basis"] isEqual:@"stop_capture_completed"]||[value[@"cleanup_basis"] isEqual:@"delegate_reported_stopped"])){
-   if(started&&[value[@"cleanup_basis"] isEqual:@"no_stream_created"]){fail(@"Guest cleanup basis contradicts started stream");return;}
+   if(streamAnnounced&&[value[@"cleanup_basis"] isEqual:@"no_stream_created"]){fail(@"Guest cleanup basis contradicts started stream");return;}
    if([value[@"cleanup_basis"] isEqual:@"delegate_reported_stopped"]){
     id code=guestError[@"error_code"];
     if(![guestError[@"code"] isEqual:@"capture_stopped_with_error"]||![guestError[@"error_domain"] isEqual:@"com.apple.ScreenCaptureKit.SCStreamErrorDomain"]||![code isKindOfClass:[NSNumber class]]||CFGetTypeID((__bridge CFTypeRef)code)==CFBooleanGetTypeID()||[code doubleValue]!=[code longLongValue]){fail(@"Guest delegate cleanup lacks ScreenCaptureKit stop error evidence");return;}
@@ -172,7 +263,7 @@ static void record(NSData *body,BOOL draining){
   }
   else{fail(@"Guest error, unexpected event or start/stop contract mismatch");}return;
  }
- if(p[0]!=2||!started||body.length<29){fail(@"Unexpected Guest frame");return;}
+ if(p[0]!=2||(!started&&!(draining&&streamAnnounced))||(!draining&&expectedConsoleIdentity&&!consoleIdentityMatched)||body.length<29){fail(@"Unexpected Guest frame");return;}
  uint64_t seq=read64(p+1),pts=read64(p+9);uint32_t w=read32(p+17),h=read32(p+21),y=read32(p+25);
  // Header is kind + two u64 + four u32 = 33 bytes (including UV size).
  if(body.length<33){fail(@"Truncated Guest frame header");return;}uint32_t uv=read32(p+29);
@@ -214,18 +305,64 @@ static int connectPrivate(const char *path){
  if(connect(fd,(struct sockaddr *)&addr,sizeof(addr))<0){if(errno!=EINPROGRESS){close(fd);fail(@"Guest bridge connect failed");return -1;}struct pollfd f={fd,POLLOUT,0};int error=0;socklen_t length=sizeof(error);if(poll(&f,1,3000)<=0||getsockopt(fd,SOL_SOCKET,SO_ERROR,&error,&length)||error){close(fd);fail(@"Guest bridge connect deadline/error");return -1;}}
  uid_t uid;gid_t gid;if(getpeereid(fd,&uid,&gid)||uid!=getuid()){close(fd);fail(@"Guest bridge peer UID mismatch");return -1;}return fd;
 }
+static int printQueryResult(NSDictionary *value,int result){
+ NSData *json=[NSJSONSerialization dataWithJSONObject:value options:NSJSONWritingSortedKeys error:NULL];NSMutableData *bytes=[json mutableCopy];[bytes appendBytes:"\n" length:1];
+ int flags=fcntl(STDOUT_FILENO,F_GETFL);if(!bytes||bytes.length>2048||flags<0||fcntl(STDOUT_FILENO,F_SETFL,flags|O_NONBLOCK)<0)return 1;
+ const uint8_t *p=bytes.bytes;size_t sent=0;int64_t end=nowUs()+500000;
+ while(sent<bytes.length){if(nowUs()>=end)return 1;ssize_t n=write(STDOUT_FILENO,p+sent,bytes.length-sent);if(n>0){sent+=(size_t)n;continue;}if(n<0&&errno==EINTR)continue;if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK)){struct pollfd fd={STDOUT_FILENO,POLLOUT,0};if(poll(&fd,1,20)>=0)continue;}return 1;}
+ return result;
+}
+static int queryCleanup(const char *socket,NSString *service,NSString *capture){
+ NSMutableDictionary *output=[@{@"version":@1,@"status":@"invalid_response",@"cleanup_confirmed":@NO,@"proof":@NO} mutableCopy];
+ if(!instanceID(service)||!instanceID(capture)){output[@"status"]=@"invalid_request";return printQueryResult(output,2);}
+ output[@"service_instance"]=service;output[@"capture_instance"]=capture;
+ int64_t end=nowUs()+4000000;signal(SIGPIPE,SIG_IGN);sourceFD=connectPrivate(socket);
+ if(sourceFD<0){output[@"status"]=@"unavailable";return printQueryResult(output,1);}
+ BOOL sent=sendCommand(@{@"id":@"host-cleanup-query",@"method":@"cleanup_status",@"service_instance":service,@"capture_instance":capture});
+ NSMutableData *bytes=[NSMutableData new];BOOL eof=NO,invalid=NO;
+ while(sent&&nowUs()<end){
+  uint8_t buffer[2054];ssize_t n=read(sourceFD,buffer,sizeof(buffer));
+  if(n>0){[bytes appendBytes:buffer length:(NSUInteger)n];if(bytes.length>2053||(bytes.length>=4&&(read32(bytes.bytes)<2||read32(bytes.bytes)>2049))){invalid=YES;break;}continue;}
+  if(n==0){eof=YES;break;}if(errno==EINTR)continue;
+  if(errno!=EAGAIN&&errno!=EWOULDBLOCK){invalid=YES;break;}
+  struct pollfd fd={sourceFD,POLLIN,0};int timeout=(int)MAX(1,MIN(50,(end-nowUs())/1000));if(poll(&fd,1,timeout)<0&&errno!=EINTR){invalid=YES;break;}
+ }
+ close(sourceFD);sourceFD=-1;
+ if(!eof&&!invalid){output[@"status"]=sent?@"timeout":@"unavailable";return printQueryResult(output,1);}
+ if(invalid||bytes.length<5||read32(bytes.bytes)+4!=bytes.length||((const uint8_t *)bytes.bytes)[4]!=1)return printQueryResult(output,1);
+ id value=[NSJSONSerialization JSONObjectWithData:[bytes subdataWithRange:NSMakeRange(5,bytes.length-5)] options:0 error:NULL];
+ if(![value isKindOfClass:[NSDictionary class]])return printQueryResult(output,1);
+ NSMutableSet *keys=[NSMutableSet setWithArray:@[@"event",@"id",@"protocol_version",@"service_instance",@"capture_instance",@"status",@"cleanup_confirmed",@"retention_ms"]];if(value[@"cleanup_basis"])[keys addObject:@"cleanup_basis"];
+ NSString *status=value[@"status"];id confirmed=value[@"cleanup_confirmed"];
+ if(![[NSSet setWithArray:[value allKeys]] isEqual:keys]||![value[@"event"] isEqual:@"cleanup_status"]||![value[@"id"] isEqual:@"host-cleanup-query"]||!unsignedNumber(value[@"protocol_version"],1)||!unsignedNumber(value[@"retention_ms"],120000)||!instanceID(value[@"service_instance"])||![value[@"capture_instance"] isEqual:capture]||![@[@"active",@"clean",@"failed",@"unknown",@"service_mismatch"] containsObject:status?:[NSNull null]]||!confirmed||CFGetTypeID((__bridge CFTypeRef)confirmed)!=CFBooleanGetTypeID())return printQueryResult(output,1);
+ BOOL sameService=[value[@"service_instance"] isEqual:service],clean=[status isEqual:@"clean"];
+ if(([status isEqual:@"service_mismatch"]?sameService:!sameService)||(clean?(![confirmed boolValue]||!cleanupBasisAllowed(value[@"cleanup_basis"])):([confirmed boolValue]||value[@"cleanup_basis"])))return printQueryResult(output,1);
+ output[@"status"]=status;output[@"service_instance"]=value[@"service_instance"];output[@"cleanup_confirmed"]=clean?@YES:@NO;output[@"proof"]=clean?@YES:@NO;
+ if(clean)output[@"cleanup_basis"]=value[@"cleanup_basis"];
+ return printQueryResult(output,clean?0:1);
+}
 int main(int argc,char **argv){@autoreleasepool{
- lock=[NSLock new];if(argc==2&&!strcmp(argv[1],"--probe-codecs"))return probeCodecs();
- if(argc==2&&!strcmp(argv[1],"--capabilities")){puts("{\"protocol\":\"veynode-guest-video-stream-v1\",\"cleanup_contract_version\":1,\"cleanup_confirmed_failure_exit\":78}");return 0;}
- if(argc!=4||strcmp(argv[2],"--codec")||((strcmp(argv[3],"h264")!=0)&&(strcmp(argv[3],"hevc")!=0))){fprintf(stderr,"Usage: guest-video-stream PRIVATE_UNIX_SOCKET --codec h264|hevc\n");return 2;}
+ lock=[NSLock new];
+ if(argc>1&&!strcmp(argv[1],"--query-cleanup")){if(argc!=7||strcmp(argv[3],"--service-instance")||strcmp(argv[5],"--capture-instance"))return printQueryResult(@{@"version":@1,@"status":@"invalid_request",@"cleanup_confirmed":@NO,@"proof":@NO},2);return queryCleanup(argv[2],[NSString stringWithUTF8String:argv[4]],[NSString stringWithUTF8String:argv[6]]);}
+ if(argc==2&&!strcmp(argv[1],"--probe-codecs"))return probeCodecs();
+ if(argc==2&&!strcmp(argv[1],"--capabilities")){puts("{\"protocol\":\"veynode-guest-video-stream-v1\",\"cleanup_contract_version\":1,\"cleanup_confirmed_failure_exit\":78,\"console_identity_binding_version\":1,\"cleanup_receipt_version\":1,\"rate_control_version\":1,\"rate_min_bps\":250000,\"rate_max_bps\":40000000}");return 0;}
+ if(argc<4||argc>10||argc%2||strcmp(argv[2],"--codec")||((strcmp(argv[3],"h264")!=0)&&(strcmp(argv[3],"hevc")!=0))){fprintf(stderr,"Usage: guest-video-stream PRIVATE_UNIX_SOCKET --codec h264|hevc [--expected-console-identity PRIVATE_JSON] [--cleanup-receipt PRIVATE_NEW_JSON]\n");return 2;}
+ const char *identityPath=NULL,*receiptPath=NULL;int rateFD=-1;NSMutableData *rateBuffer=[NSMutableData new];int64_t rateBegan=0;
+ for(int i=4;i<argc;i+=2){if(!strcmp(argv[i],"--expected-console-identity")&&!identityPath)identityPath=argv[i+1];else if(!strcmp(argv[i],"--cleanup-receipt")&&!receiptPath)receiptPath=argv[i+1];else if(!strcmp(argv[i],"--rate-control-fd")&&rateFD<0){char *end=NULL;long fd=strtol(argv[i+1],&end,10);if(!end||*end||fd<=2||fd>INT_MAX||!rateConfigureFD((int)fd))return 2;rateFD=(int)fd;}else return 2;}
+ if(identityPath){expectedConsoleIdentity=readExpectedIdentity(identityPath);if(!expectedConsoleIdentity){diagnostic(@{@"event":@"error",@"error":@"Expected console identity must be strict v1 JSON in an owner-only0600 regular file, max2048bytes",@"guest_cleanup_confirmed":@NO});return 2;}}
+ if(receiptPath&&!reserveReceipt(receiptPath)){diagnostic(@{@"event":@"error",@"error":@"Cleanup receipt requires a new exclusive0600 file below a private owner0700 directory without symlinks",@"guest_cleanup_confirmed":@NO});return 2;}
  codecName=[NSString stringWithUTF8String:argv[3]];useHEVC=[codecName isEqual:@"hevc"];width=useHEVC?1920:1280;height=useHEVC?1080:720;
  signal(SIGPIPE,SIG_IGN);int outputFlags=fcntl(STDOUT_FILENO,F_GETFL),inputFlags=fcntl(STDIN_FILENO,F_GETFL);if(outputFlags<0||inputFlags<0||fcntl(STDOUT_FILENO,F_SETFL,outputFlags|O_NONBLOCK)<0||fcntl(STDIN_FILENO,F_SETFL,inputFlags|O_NONBLOCK)<0){diagnostic(@{@"event":@"error",@"error":@"Cannot configure bounded nonblocking standard pipes",@"guest_cleanup_confirmed":@NO});return 1;}
  commands=[NSMutableData new];incoming=[NSMutableData new];sourceFD=connectPrivate(argv[1]);
- if(sourceFD>=0&&!failure&&sendCommand(@{@"id":@"host-start",@"method":@"start",@"width":@(width),@"height":@(height),@"fps":@30})){
+ NSMutableDictionary *startRequest=[@{@"id":@"host-start",@"method":@"start",@"width":@(width),@"height":@(height),@"fps":@30} mutableCopy];
+ if(expectedConsoleIdentity)startRequest[@"expected_console_identity"]=expectedConsoleIdentity;
+ if(receiptRequested)startRequest[@"cleanup_receipt"]=@YES;
+ if(sourceFD>=0&&!failure&&sendCommand(startRequest)){
   int64_t begin=nowUs();while(!failure&&!stopping){
    struct pollfd f[2]={{sourceFD,POLLIN,0},{STDIN_FILENO,POLLIN,0}};int ready=poll(f,2,50);if(ready<0&&errno!=EINTR){fail(@"poll failed");break;}
    if(f[1].revents&(POLLIN|POLLHUP|POLLERR))readCommands();if(stopping)break;
    if(f[0].revents&(POLLIN|POLLHUP|POLLERR)){if(!readSource(NO))break;}
+   if(!rateServiceFD(rateFD,rateBuffer,&rateBegan,encoder,hardwareVerified,1,submitted)){fail(@"Private rate control disconnected or invalid");break;}
    if(!submitted&&nowUs()-begin>10000000){fail(@"Guest first frame timeout");break;}
    if(cachedPixel&&(forceKeyframe||nowUs()-lastSubmit>=1000000))encodeCached(YES);
   }
@@ -236,7 +373,7 @@ int main(int argc,char **argv){@autoreleasepool{
   }
   if(!stopped&&!failure)fail(@"Guest stop acknowledgement exceeded 1500ms");if(original)failure=original;else if(guestError)fail(@"Guest capture failed");
  }
- if(encoder){VTCompressionSessionInvalidate(encoder);CFRelease(encoder);}if(cachedPixel)CVPixelBufferRelease(cachedPixel);if(sourceFD>=0)close(sourceFD);
- diagnostic(@{@"event":failure?@"error":@"stopped",@"error":failure?:[NSNull null],@"guest_error":guestError?:[NSNull null],@"secondary_stop_error":secondaryStopError?:[NSNull null],@"cleanup_basis":cleanupBasis?:[NSNull null],@"guest_cleanup_confirmed":stopped?@YES:@NO,@"hardware_verified":hardwareVerified?@YES:@NO,@"codec":codecName,@"width":@(width),@"height":@(height),@"source_sequence":@(sourceSequence),@"source_pts_ns":@(sourcePTS),@"submitted":@(submitted),@"encoded":@(encoded),@"keyframes":@(keyframes),@"host_cpu_plane_copies":@(cpuCopies),@"idle_refresh_frames":@(idleFrames)});
+ if(rateFD>=0)close(rateFD);if(encoder){VTCompressionSessionInvalidate(encoder);CFRelease(encoder);}if(cachedPixel)CVPixelBufferRelease(cachedPixel);if(sourceFD>=0)close(sourceFD);if(receiptFD>=0)close(receiptFD);if(receiptParentFD>=0)close(receiptParentFD);
+ diagnostic(@{@"event":failure?@"error":@"stopped",@"error":failure?:[NSNull null],@"guest_error":guestError?:[NSNull null],@"secondary_stop_error":secondaryStopError?:[NSNull null],@"cleanup_basis":cleanupBasis?:[NSNull null],@"guest_cleanup_confirmed":stopped?@YES:@NO,@"cleanup_receipt_requested":receiptRequested?@YES:@NO,@"cleanup_receipt_persisted":registrationPersisted?@YES:@NO,@"console_identity_binding_requested":expectedConsoleIdentity?@YES:@NO,@"expected_console_identity_matched":consoleIdentityMatched?@YES:@NO,@"hardware_verified":hardwareVerified?@YES:@NO,@"codec":codecName,@"width":@(width),@"height":@(height),@"source_sequence":@(sourceSequence),@"source_pts_ns":@(sourcePTS),@"submitted":@(submitted),@"encoded":@(encoded),@"keyframes":@(keyframes),@"host_cpu_plane_copies":@(cpuCopies),@"idle_refresh_frames":@(idleFrames)});
  return cleanCaptureFailure&&failure?78:(failure||!stopped?1:0);
 }}

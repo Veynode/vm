@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "scope": "Host synthetic CVPixelBuffer, controlled queues and actual Unix socket only. No SCK capture, Guest run, UI or permission API. Does not prove the cause of the observed Guest750ms expiry or a live performance fix.",
+  "build_command": "bash native/tools/build-macos-capture-stream.sh --output \"$PWD/.local/guest-share/macos-capture-stream-console-stage5\"",
+  "binary_path": ".local/guest-share/macos-capture-stream-console-stage5",
+  "binary_sha256": "3ca1bdb483c790172f412704e88720b404342a09a558e3471bdc439ffdc2a5f0",
+  "sources": [
+    {
+      "path": "native/tools/macos-capture-stream.swift",
+      "sha256": "440c621d078a4613f54dc6e43099386235fce432bb277dbc2de2af1923158e1f"
+    },
+    {
+      "path": "native/tools/macos-capture-lock-tests.swift",
+      "sha256": "74a51a0e477cb6949190d1934f7209fe6749a97b532b223586d5487a000a71a4"
+    },
+    {
+      "path": "native/tools/build-macos-capture-stream.sh",
+      "sha256": "3893d5b7d60c0a115f362b123c781540f14426dca94b67808b78472809c50807"
+    },
+    {
+      "path": "native/guest-macos/console-binding.swift",
+      "sha256": "790615d8f1ce2dd8654681a448794b72fe8354f21e7b83ecd59b90df920e8d53"
+    }
+  ],
+  "before_original_source_sha256": "aeefecdb3de5c25a0b1e7dc9408aa59a6f9515ad060a03b4756b670892b6e458",
+  "before_test_source_sha256": "71870b4d86601e3bc7d87c4f8f3f866e8b3e1a41f892abc17dce306d77d76522",
+  "results": [
+    {
+      "argument": "--copy-lock-test",
+      "exit_code": 0,
+      "stdout_sha256": "888be040771797d1185382e811c09a1479f8c022e9852da26f4d38bec221915f",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "argument": "--self-test",
+      "exit_code": 0,
+      "stdout_sha256": "a3a74b3271fd33c94bc62c8bb16b5e1b1eb057fc266fcc538d0de8ec11e4b0ad",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "compiler_note": "Existing weak variable released never mutated warning in prior self-test retained; compile completed successfully."
+}

@@ -183,3 +183,42 @@ python3 scripts/windows-probe-glamor.py --analyze-only --output .local/windows-g
 Acceptance requires exactly the original15uniquecases, precisely the original two baseline failures, all15fixed cases passing, actual31point/state traces for both variants, and both selected module paths in the real process maps. The ordinary desktop fixture retains its default180s readiness bound; this explicit source-build experiment uses a bounded600s setup allowance. This is not a relaxation of a rendering assertion.
 
 This provides a reproducible **Xorg core-glyph workaround on the tested stack**. It has not yet been packaged into an installed Guest integration service, validated across other font/layout/rendering paths, or tested with game/CAD workloads. The independent composite GLES diagnostic still contains unexplained failures; the workaround does not fix them. A lower-layer fix, full graphics regression matrix, color management, measured performance, supported guest packaging and redistribution audit remain necessary before treating this backend as release-ready. No upstream message or publication was sent.
+
+## Actual upstream glmark2 GLES workload (2026-10-09)
+
+The bounded next step beyond the15pixel diagnostic now passes in a real independent
+1536MiB/2-vCPU QEMU/HVF RAM Guest with the same fixed SPICE/glamor path. Unmodified
+upstream glmark2 2023.01 was built inside the actual Alpine3.23.6 userspace with
+Meson, only `x11-glesv2` and two compiler jobs. The source archive SHA256 is
+`8fece3fc323b643644a525be163dc4931a4189971eda1de8ad4c1712c5db3d67`;
+actual Guest binary SHA256 is
+`9319c38cfa78cc3f3e607123c4acaf4579cf20df45dae3e24e99234da29d8acd`.
+Package versions, build/runtime/source hashes, filtered logs and images are saved
+in [the actual-run record](../evidence/linux-glmark2/README.md).
+
+All six unchanged upstream pixel validations pass: client-array and VBO model
+submission, mipmapped texture sampling, Phong lighting, normal-map bump and
+height-map bump. The parser requires the actual `Validation: Success` records
+because upstream may exit0 even on pixel Failure/Unknown. Each validation process
+reports `virgl` and GLES3.0/Mesa25.2.7, independently of the accelerated virgl
+`glxinfo` guard. No software renderer fallback or assertion relaxation was used.
+
+Three more complex public GLES window scenes—terrain, shadow and refract—complete
+their requested2seconds and exit0. A subsequent live terrain window produces
+actual Guest XWD plus two changing nonblack SPICE frames; the owned QEMU quits
+normally with exit0. Both inspected1280×800 console images show the800×600 terrain
+window with visible relief, texture and lighting and black unused background.
+They are captured at different animation times and are not a pixel-match oracle.
+The separate QMP CPU screendump remains black and does not count as display success.
+
+This expands actual functional coverage to a public multi-scene GLES workload,
+not a game/CAD application certification. The complex scenes have no asserted
+full-frame reference here; color fidelity and native presentation remain unaccepted.
+No native viewer was opened, and raw glmark2 FPS is not a presentation/frame-time
+measurement or a comparison with Parallels. This single run does not resolve the
+other exploratory GLES failures, installed-Guest packaging, redistribution, broad
+compatibility, or performance gates documented above.
+
+```sh
+python3 scripts/test-linux-glmark2.py --output-dir .local/evidence/linux-glmark2-next
+```

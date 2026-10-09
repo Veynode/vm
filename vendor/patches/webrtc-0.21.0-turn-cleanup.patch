@@ -1,0 +1,473 @@
+--- a/src/peer_connection/mod.rs
++++ b/src/peer_connection/mod.rs
+@@ -758,6 +758,8 @@
+     /// that closes the reactor-thread leak window; the `Close` event is only the
+     /// fast wake.
+     pub(crate) closing: AtomicBool,
++    // 0 pending,1 authenticated allocation cleanup,2 unconfirmed. Sticky across close retries.
++    pub(crate) turn_cleanup: std::sync::atomic::AtomicU8,
+     /// Per-channel data-channel send-buffer limit in bytes (`usize::MAX` = unbounded,
+     /// the default). When a limit is configured, [`DataChannel::send`]/[`send_text`](DataChannel::send_text)
+     /// block until a channel's `outstanding_bytes` drops below it, and
+@@ -971,6 +973,7 @@
+                 write_pending: AtomicBool::new(false),
+                 write_backpressure: std::sync::atomic::AtomicUsize::new(0),
+                 closing: AtomicBool::new(false),
++                turn_cleanup: std::sync::atomic::AtomicU8::new(0),
+                 data_channel_send_buffer_limit,
+                 data_channel_backpressure: crate::runtime::Notify::new(),
+                 data_channel_delivery_blocked: AtomicBool::new(false),
+@@ -1015,6 +1018,7 @@
+             // Mark closing and wake any sender parked in send back-pressure, so a blocking
+             // send() cannot hang waiting for a drain that will never come — the driver no
+             // longer drains outstanding_bytes. Idempotent when close()/Drop already set it.
++            let _ = driver.shutdown_turn().await;
+             driver.signal_stopped();
+         };
+ 
+@@ -1083,48 +1087,23 @@
+         // and returns `ErrDataChannelClosed` at once, rather than waiting out its 50 ms
+         // liveness backstop — the driver has stopped draining `outstanding_bytes`.
+         self.inner.data_channel_backpressure.notify_waiters();
+-        // Best-effort wake. A send failure here is benign, not an error:
+-        // `closing` already guarantees the driver terminates, and it may already
+-        // have observed the flag and dropped the receiver via its independent
+-        // top-of-loop exit path — in which case the channel is closed. Treating
+-        // that as an error would make a perfectly clean shutdown return `Err`.
+-        // overflow: awaited — `close()` is called by the application, so blocking it is
+-        // correct. (The result is discarded for an unrelated reason, explained above.)
++        // closing is authoritative: never block cleanup on a full callback queue.
+         let _ = self
+             .inner
+             .driver_event_tx
+-            .send(PeerConnectionDriverEvent::Close)
+-            .await;
+-
+-        let driver_handle = self.driver_handle.lock().await.take();
+-        if let Some(driver_handle) = driver_handle {
+-            if self.dedicated_reactor {
+-                // The reactor driver is a task pinned to a shared pool thread.
+-                // First wait (bounded) for its event loop to return on its own, so
+-                // it flushes the SCTP shutdown and releases its socket by the time
+-                // `close()` resolves — it exits promptly once it observes the
+-                // shutdown signalled above. Then abort the task unconditionally to
+-                // free the pool thread of it (a no-op once it has finished; the
+-                // fallback that reclaims a driver still wedged at the bound).
+-                //
+-                // Note: if `close()` is called *from within an event-handler
+-                // callback* (which, for a dedicated reactor, runs on this very
+-                // task), the loop cannot make progress until the handler returns,
+-                // so this wait runs out its full bound before aborting. Handlers
+-                // must not block (see `with_dedicated_reactor_thread`).
+-                let step = std::time::Duration::from_millis(1);
+-                let max = std::time::Duration::from_secs(2);
+-                let mut waited = std::time::Duration::ZERO;
+-                while !driver_handle.is_finished() && waited < max {
+-                    self.inner.runtime.sleep(step).await;
+-                    waited += step;
+-                }
+-                driver_handle.abort();
+-            } else {
+-                driver_handle.abort();
++            .try_send(PeerConnectionDriverEvent::Close);
++        let mut handle = self.driver_handle.lock().await;
++        if let Some(driver) = handle.take() {
++            let max = if self.dedicated_reactor { 1500 } else { 1250 };
++            let deadline = self.inner.runtime.now() + Duration::from_millis(max);
++            while !driver.is_finished() && self.inner.runtime.now() < deadline {
++                self.inner.runtime.sleep(Duration::from_millis(1)).await;
+             }
+-        }
+-
++            driver.abort();
++        }
++        if self.inner.turn_cleanup.load(Ordering::Acquire) != 1 {
++            return Err(Error::Other("TURN allocation cleanup unconfirmed".into()));
++        }
+         Ok(())
+     }
+ 
+@@ -1556,6 +1535,7 @@
+             write_pending: AtomicBool::new(false),
+             write_backpressure: AtomicUsize::new(0),
+             closing: AtomicBool::new(false),
++            turn_cleanup: std::sync::atomic::AtomicU8::new(0),
+             data_channel_send_buffer_limit: usize::MAX,
+             data_channel_backpressure: crate::runtime::Notify::new(),
+             data_channel_delivery_blocked: AtomicBool::new(false),
+--- a/src/peer_connection/driver.rs
++++ b/src/peer_connection/driver.rs
+@@ -637,9 +637,6 @@
+             // momentarily full channel), this check still guarantees the loop —
+             // and thus a dedicated reactor thread — terminates instead of leaking.
+             if self.inner.closing.load(Ordering::Acquire) {
+-                if let Err(err) = self.turn_relayer.close() {
+-                    error!("Failed to close turn_relayer: {}", err);
+-                }
+                 return Ok(());
+             }
+ 
+@@ -1529,9 +1526,6 @@
+                 self.tcp_transport.register_stream(four_tuple, stream);
+             }
+             PeerConnectionDriverEvent::Close => {
+-                if let Err(err) = self.turn_relayer.close() {
+-                    error!("Failed to close turn_relayer: {}", err);
+-                }
+                 return true;
+             }
+         }
+@@ -1713,6 +1707,47 @@
+         messages
+     }
+ 
++    /// Veynode: after event_loop's receive futures are dropped, keep the same
++    /// UDP sockets alive for at most750ms to send and authenticate Refresh(0).
++    pub(crate) async fn shutdown_turn(&mut self) -> bool {
++        let runtime = self.inner.runtime.clone();
++        let expires = runtime.now() + Duration::from_millis(750);
++        let deadline = runtime.sleep(Duration::from_millis(750)).fuse();
++        let cleanup=async {
++            loop {
++                if runtime.now()>=expires {return Err(Error::Other("TURN cleanup deadline".into()))}
++                if self.turn_relayer.prepare_deallocation()? { return Ok::<(),Error>(()) }
++                while let Some(packet)=self.turn_relayer.poll_write() {
++                    let socket=self.udp_sockets.get(&packet.transport.local_addr).ok_or_else(||Error::Other("TURN cleanup socket missing".into()))?;
++                    let sent=socket.send_to(&packet.message,packet.transport.peer_addr).await?;
++                    if sent!=packet.message.len(){return Err(Error::Other("partial TURN cleanup send".into()))}
++                }
++                let mut reads=FuturesUnordered::new();
++                for (local,socket) in &self.udp_sockets {
++                    let (local,socket)=(*local,socket.clone());
++                    reads.push(async move {let mut bytes=vec![0u8;4096];let result=socket.recv_from(&mut bytes).await; (local,bytes,result)});
++                }
++                let tick=runtime.sleep(Duration::from_millis(20)).fuse();
++                futures::pin_mut!(tick);
++                futures::select! {
++                    packet=reads.next().fuse()=>{
++                        let Some((local,bytes,result))=packet else {return Err(Error::Other("TURN cleanup sockets unavailable".into()))};
++                        if let Ok((len,peer))=result {
++                            self.turn_relayer.handle_deallocation_read(TaggedBytesMut{now:runtime.now(),transport:TransportContext{local_addr:local,peer_addr:peer,ecn:None,transport_protocol:TransportProtocol::UDP},message:BytesMut::from(&bytes[..len])})?;
++                        }
++                    },
++                    _=tick=>{self.turn_relayer.handle_timeout(runtime.now())?;}
++                }
++            }
++        }.fuse();
++        futures::pin_mut!(deadline, cleanup);
++        let released = futures::select! {result=cleanup=>result.is_ok(),_=deadline=>false};
++        self.inner
++            .turn_cleanup
++            .store(if released { 1 } else { 2 }, Ordering::Release);
++        released
++    }
++
+     async fn poll_writes(&mut self) -> Result<()> {
+         // 1.a stun_gatherer poll_write()
+         while let Some(msg) = self.stun_gatherer.poll_write() {
+--- a/src/peer_connection/transport/turn_relayer.rs
++++ b/src/peer_connection/transport/turn_relayer.rs
+@@ -44,7 +44,15 @@
+     peer_addr: SocketAddr,
+ }
+ 
++struct ReleaseProof {
++    transaction: TransactionId,
++    integrity: Vec<u8>,
++    confirmed: bool,
++}
++
+ struct ManagedTurnClient {
++    password: String,
++    release: Option<ReleaseProof>,
+     client: TurnClient,
+     url: String,
+     allocate_tid: rtc::stun::message::TransactionId,
+@@ -65,6 +73,7 @@
+     crypto_provider: Arc<dyn RTCCryptoProvider>,
+     allocation_refresh_interval_cap: Option<Duration>,
+     clients: HashMap<FourTuple, ManagedTurnClient>,
++    cleanup_unknown: bool,
+     relay_addrs: HashMap<SocketAddr, FourTuple>,
+     pending_permissions: HashMap<rtc::stun::message::TransactionId, PendingPermission>,
+     pending_permission_pairs: HashMap<(SocketAddr, SocketAddr), rtc::stun::message::TransactionId>,
+@@ -92,6 +101,7 @@
+             crypto_provider,
+             allocation_refresh_interval_cap,
+             clients: HashMap::new(),
++            cleanup_unknown: false,
+             relay_addrs: HashMap::new(),
+             pending_permissions: HashMap::new(),
+             pending_permission_pairs: HashMap::new(),
+@@ -216,6 +226,7 @@
+             let _ = managed
+                 .client
+                 .update_credentials(username.clone(), password.clone());
++            managed.password = password.clone();
+ 
+             if let Err(err) = managed.client.refresh_allocations(self.runtime.now()) {
+                 warn!(
+@@ -329,6 +340,8 @@
+                         four_tuple,
+                         ManagedTurnClient {
+                             client,
++                            password: url.password.clone(),
++                            release: None,
+                             url: url.to_string(),
+                             allocate_tid,
+                             local_addr: *local_addr,
+@@ -507,8 +520,139 @@
+         }
+     }
+ 
++    /// Veynode: queue authenticated Refresh(0), retaining transactions until a
++    /// matching authenticated server acknowledgement. Called only after normal
++    /// media/event processing has stopped; late Allocate replies are still drained.
++    pub(crate) fn prepare_deallocation(&mut self) -> Result<bool> {
++        for managed in self.clients.values_mut() {
++            if let Some(addr) = managed.relay_addr {
++                if managed.release.is_none() {
++                    managed.client.close()?;
++                    while managed.client.poll_write().is_some() {}
++                    managed.client.relay(addr)?.close(self.runtime.now())?;
++                    let packet = managed
++                        .client
++                        .poll_write()
++                        .ok_or_else(|| Error::Other("TURN deallocation request missing".into()))?;
++                    let mut request = StunMessage::new();
++                    request.raw = packet.message.to_vec();
++                    request.decode()?;
++                    let username =
++                        String::from_utf8(request.get(rtc::stun::attributes::ATTR_USERNAME)?)
++                            .map_err(|_| Error::Other("TURN username encoding".into()))?;
++                    let realm = String::from_utf8(request.get(rtc::stun::attributes::ATTR_REALM)?)
++                        .map_err(|_| Error::Other("TURN realm encoding".into()))?;
++                    let integrity =
++                        rtc::stun::integrity::MessageIntegrity::long_term_integrity_key(
++                            username,
++                            realm,
++                            managed.password.clone(),
++                            self.crypto_provider.crypto(),
++                        )?;
++                    managed.release = Some(ReleaseProof {
++                        transaction: request.transaction_id,
++                        integrity,
++                        confirmed: false,
++                    });
++                    self.wouts.push_back(packet);
++                }
++            }
++        }
++        Ok(!self.cleanup_unknown
++            && self.clients.values().all(|client| {
++                client.gather_finished
++                    && match &client.release {
++                        Some(proof) => proof.confirmed,
++                        None => client.relay_addr.is_none(),
++                    }
++            }))
++    }
++
++    /// A random transaction ID alone is not a resource-release proof. Require
++    /// the exact server socket, REFRESH success, zero lifetime and its HMAC.
++    pub(crate) fn handle_deallocation_read(&mut self, message: TaggedBytesMut) -> Result<()> {
++        let key = FourTuple::from(&message.transport);
++        let Some(client) = self.clients.get_mut(&key) else {
++            return Ok(());
++        };
++        if let Some(proof) = client.release.as_mut() {
++            let mut reply = StunMessage::new();
++            reply.raw = message.message.to_vec();
++            if reply.decode().is_err()
++                || reply.transaction_id != proof.transaction
++                || reply.typ.method != rtc::stun::message::METHOD_REFRESH
++                || reply.typ.class != CLASS_SUCCESS_RESPONSE
++            {
++                return Ok(());
++            }
++            // MESSAGE-INTEGRITY authenticates only preceding attributes. Never
++            // accept an appended/repeated lifetime outside the authenticated span.
++            let mut offset = 20;
++            let mut lifetime_count = 0;
++            let mut integrity_count = 0;
++            let mut attributes_valid = true;
++            while offset + 4 <= reply.raw.len() {
++                let typ = u16::from_be_bytes([reply.raw[offset], reply.raw[offset + 1]]);
++                let len =
++                    u16::from_be_bytes([reply.raw[offset + 2], reply.raw[offset + 3]]) as usize;
++                if offset + 4 + len > reply.raw.len() {
++                    attributes_valid = false;
++                    break;
++                }
++                if typ == 0x000d {
++                    lifetime_count += 1;
++                    if integrity_count != 0 {
++                        attributes_valid = false;
++                    }
++                }
++                if typ == 0x0008 {
++                    integrity_count += 1;
++                }
++                offset += 4 + ((len + 3) & !3);
++            }
++            if !attributes_valid
++                || offset != reply.raw.len()
++                || lifetime_count != 1
++                || integrity_count != 1
++            {
++                return Ok(());
++            }
++            if reply
++                .get(rtc::stun::attributes::ATTR_LIFETIME)
++                .ok()
++                .as_deref()
++                != Some(&[0, 0, 0, 0])
++            {
++                return Ok(());
++            }
++            if rtc::stun::integrity::MessageIntegrity::check(
++                &mut reply,
++                &proof.integrity,
++                self.crypto_provider.crypto(),
++            )
++            .is_err()
++            {
++                return Ok(());
++            }
++            proof.confirmed = true;
++            client.client.close()?;
++            Ok(())
++        } else {
++            // Allocation might have completed on the server while close raced its
++            // reply. Preserve it, learn its address, then delete it on the next pass.
++            self.handle_read(message)?;
++            while self.poll_event().is_some() {}
++            Ok(())
++        }
++    }
++
+     fn remove_client(&mut self, four_tuple: FourTuple) {
+         if let Some(mut managed_client) = self.clients.remove(&four_tuple) {
++            // A socket failure or configuration change must not erase a known
++            // allocation and let subsequent close claim authenticated release.
++            if managed_client.relay_addr.is_some() || !managed_client.gather_finished {
++                self.cleanup_unknown = true;
++            }
+             if let Some(relay_addr) = managed_client.relay_addr.take() {
+                 self.relay_addrs.remove(&relay_addr);
+                 self.pending_packets
+@@ -734,6 +878,7 @@
+                                     .remove(&(pending.relay_addr, pending.peer_addr));
+                                 pending_drop.push((pending.relay_addr, pending.peer_addr));
+                             } else if tid == managed_client.allocate_tid {
++                                self.cleanup_unknown = true;
+                                 managed_client.gather_finished = true;
+                                 gathered_complete = true;
+                             }
+@@ -1077,4 +1222,106 @@
+             );
+         });
+     }
++    #[test]
++    fn deallocation_ack_requires_hmac_transaction_type_source_and_zero_lifetime() {
++        futures::executor::block_on(async {
++            use rtc::stun::integrity::MessageIntegrity;
++            use rtc::stun::message::{METHOD_ALLOCATE, METHOD_REFRESH};
++            use rtc::turn::proto::lifetime::Lifetime;
++            let local: SocketAddr = "127.0.0.1:54000".parse().unwrap();
++            let server: SocketAddr = "127.0.0.1:3478".parse().unwrap();
++            let provider = rtc::crypto::default_provider().unwrap();
++            let mut relayer = RTCTurnRelayer::new(
++                vec![local],
++                vec![RTCIceServer {
++                    urls: vec![format!("turn:{server}?transport=udp")],
++                    username: "fixture".into(),
++                    credential: "private-test-value".into(),
++                }],
++                RTCIceTransportPolicy::Relay,
++                None,
++                crate::runtime::default_runtime().unwrap(),
++                provider.clone(),
++            );
++            relayer.gather().await.unwrap();
++            let key = FourTuple {
++                local_addr: local,
++                peer_addr: server,
++            };
++            let tid = TransactionId::new();
++            let integrity = vec![0x11; 16];
++            relayer.clients.get_mut(&key).unwrap().release = Some(ReleaseProof {
++                transaction: tid,
++                integrity: integrity.clone(),
++                confirmed: false,
++            });
++            for variant in 0..8 {
++                let mut response = StunMessage::new();
++                response
++                    .build(&[
++                        Box::new(if variant == 0 {
++                            TransactionId::new()
++                        } else {
++                            tid
++                        }),
++                        Box::new(MessageType::new(
++                            if variant == 1 {
++                                METHOD_ALLOCATE
++                            } else {
++                                METHOD_REFRESH
++                            },
++                            CLASS_SUCCESS_RESPONSE,
++                        )),
++                        Box::new(Lifetime(if variant == 2 {
++                            Duration::from_secs(1)
++                        } else {
++                            Duration::ZERO
++                        })),
++                        Box::new(MessageIntegrity::new_raw_integrity_with_provider(
++                            if variant == 3 {
++                                vec![0x22; 16]
++                            } else {
++                                integrity.clone()
++                            },
++                            provider.crypto(),
++                        )),
++                    ])
++                    .unwrap();
++                if variant == 5 {
++                    // Strip the integrity attribute; an unsigned success is not proof.
++                    response.raw.truncate(response.raw.len() - 24);
++                    let length = (response.raw.len() - 20) as u16;
++                    response.raw[2..4].copy_from_slice(&length.to_be_bytes());
++                }
++                if variant == 6 {
++                    // Appended duplicate LIFETIME is outside the HMAC span.
++                    response.raw.extend_from_slice(&[0, 13, 0, 4, 0, 0, 0, 0]);
++                    let length = (response.raw.len() - 20) as u16;
++                    response.raw[2..4].copy_from_slice(&length.to_be_bytes());
++                }
++                let from = if variant == 4 {
++                    "127.0.0.1:3479".parse().unwrap()
++                } else {
++                    server
++                };
++                relayer
++                    .handle_deallocation_read(tagged(local, from, &response.raw))
++                    .unwrap();
++                assert_eq!(
++                    relayer.clients[&key].release.as_ref().unwrap().confirmed,
++                    variant == 7,
++                    "variant{variant}"
++                );
++            }
++            let client = relayer.clients.get_mut(&key).unwrap();
++            client.gather_finished = true;
++            client.relay_addr = Some("127.0.0.1:56000".parse().unwrap());
++            assert!(relayer.prepare_deallocation().unwrap());
++            // A later socket/configuration discard without a release proof is
++            // sticky uncertainty, not an empty-map success.
++            relayer.clients.get_mut(&key).unwrap().release = None;
++            relayer.remove_client(key);
++            assert!(!relayer.prepare_deallocation().unwrap());
++        });
++    }
+ }

@@ -1,5 +1,7 @@
 //! Typed pairing/session authentication. No network listener and no media transport.
 //! Callers must stop active transports returned by `replace_grants` and enforce expiry.
+pub mod ice;
+pub mod rejection;
 use anyhow::{ensure, Context, Result};
 use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use rand_core::{OsRng, RngCore};
@@ -10,6 +12,7 @@ use std::sync::Mutex;
 
 pub mod cli;
 pub mod control;
+pub mod files;
 #[cfg(target_os = "macos")]
 pub mod keychain;
 pub mod store;

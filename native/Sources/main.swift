@@ -4,10 +4,18 @@ import Foundation
 
 let outputLock = NSLock()
 func emit(_ object: [String: Any]) {
-    guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
+    guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes]),
           let line = String(data: data, encoding: .utf8) else { return }
     outputLock.lock(); defer { outputLock.unlock() }
     FileHandle.standardOutput.write(Data((line + "\n").utf8))
+}
+// Compact standard JSON preserves the full 32 KiB binary chunk contract without
+// spending the 64 KiB line budget on optional escaping of base64 slash bytes.
+func guestRequestData(_ request: [String: Any]) -> Data? {
+    guard var data = try? JSONSerialization.data(withJSONObject: request, options: [.withoutEscapingSlashes]),
+          data.count < 65536 else { return nil }
+    data.append(10)
+    return data
 }
 func fail(_ message: String) -> Never { emit(["event":"state","state":"error","message":message]); exit(1) }
 struct Config: Decodable {
@@ -63,6 +71,7 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
     var installing = false
     var guestRequests = Set<UUID>()
     var guestStreamBridge: GuestStreamBridge?
+    var guestStreamBinding:(worker:String,bridge:String)?
     var diskLock: Int32?
     init(_ config: Config) { self.config = config }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
@@ -243,7 +252,7 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
     }
     func reportState() { emit(["event":"state","state":stateName(vm.state),"vm_id":config.id]) }
     func showWindow() {
-        if let window { window.makeKeyAndOrderFront(nil); return }
+        if let window { focusWindow(window); return }
         let view = VZVirtualMachineView()
         view.virtualMachine = vm
         view.capturesSystemKeys = true
@@ -254,13 +263,20 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
         window.isReleasedWhenClosed = false
         window.delegate = self
         self.window = window
-        NSApplication.shared.setActivationPolicy(.regular)
         window.center()
-        window.makeKeyAndOrderFront(nil)
+        focusWindow(window)
+    }
+    func focusWindow(_ window: NSWindow) {
+        NSApplication.shared.setActivationPolicy(.regular)
         NSApplication.shared.activate(ignoringOtherApps:true)
+        window.makeKeyAndOrderFront(nil)
+        if let view = window.contentView as? VZVirtualMachineView {
+            window.makeFirstResponder(view)
+        }
     }
     func windowWillClose(_ notification: Notification) { window = nil; emit(["event":"window_closed","vm_id":config.id]) }
     func stopGuestStreamBridge(_ completion: @escaping () -> Void) {
+        guestStreamBinding = nil
         guard let bridge = guestStreamBridge else { completion(); return }
         // Retain the bridge while its own serial queue closes owned descriptors.
         // No descriptor is closed from the main/UI queue.
@@ -318,8 +334,7 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
         guard vm.state == .running, let socket = vm.socketDevices.first as? VZVirtioSocketDevice else { reject("invalid_state","VM must be running with a virtio socket"); return }
         guard guestRequests.count < 16 else { reject("busy","Too many concurrent guest requests"); return }
         guard let request = object["request"] as? [String:Any], let requestID = request["id"], request["method"] is String,
-              var data = try? JSONSerialization.data(withJSONObject:request), data.count < 65536 else { reject("invalid_request","Expected guest request with id/method within a 64 KiB line including newline"); return }
-        data.append(10)
+              let data = guestRequestData(request) else { reject("invalid_request","Expected guest request with id/method within a 64 KiB line including newline"); return }
         let key = UUID()
         guestRequests.insert(key)
         let deadline = DispatchTime.now() + .seconds(35)
@@ -399,9 +414,13 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
         switch object["method"] as? String {
         case "guest_request": guestRequest(object)
         case "start_guest_stream_bridge":
-            guard Set(object.keys).isSubset(of:["id","method","socket_path"]), let path = object["socket_path"] as? String else {
+            guard Set(object.keys).isSubset(of:["id","method","socket_path","worker_instance","bridge_instance"]), let path = object["socket_path"] as? String else {
                 error("invalid_request","Expected only id, method and absolute socket_path"); return
             }
+            let workerNonce=object["worker_instance"] as? String,bridgeNonce=object["bridge_instance"] as? String
+            func nonce(_ v:String?)->Bool {guard let v else{return false};return v.utf8.count==64 && v.utf8.allSatisfy{(48...57).contains($0)||(97...102).contains($0)}}
+            let hasBinding=object["worker_instance"] != nil || object["bridge_instance"] != nil
+            guard !hasBinding || (nonce(workerNonce) && nonce(bridgeNonce)) else {error("invalid_request","Paired lowercase256-bit binding nonces required");return}
             guard !installing, vm.state == .running, vm.socketDevices.first is VZVirtioSocketDevice else {
                 error("invalid_state","VM must be running with a virtio socket"); return
             }
@@ -430,8 +449,20 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
                     }
                 }, event:{ reason in emit(["event":"guest_stream_bridge_connection_closed","reason":reason]) })
                 guestStreamBridge = bridge; bridge.start()
-                ok(["listening":true,"guest_connected":false,"socket_path":path,"guest_port":5001,"scope":"trusted-local-diagnostic"])
+                var response:[String:Any]=["listening":true,"guest_connected":false,"socket_path":path,"guest_port":5001,"scope":"trusted-local-diagnostic"]
+                if let workerNonce,let bridgeNonce {
+                    guestStreamBinding=(workerNonce,bridgeNonce)
+                    response["binding"]=try bridge.binding(vmID:config.id,workerInstance:workerNonce,bridgeInstance:bridgeNonce)
+                }
+                ok(response)
             } catch let failure { error("bridge_error",failure.localizedDescription) }
+        case "guest_stream_bridge_binding":
+            guard Set(object.keys).isSubset(of:["id","method","worker_instance","bridge_instance"]),
+                  let identity=guestStreamBinding, let bridge=guestStreamBridge,
+                  object["worker_instance"] as? String==identity.worker,object["bridge_instance"] as? String==identity.bridge,
+                  vm.state == .running else {error("binding_unavailable","No matching live bound bridge");return}
+            do {ok(["binding":try bridge.binding(vmID:config.id,workerInstance:identity.worker,bridgeInstance:identity.bridge)])}
+            catch _ {error("binding_unavailable","Bridge socket incarnation unavailable")}
         case "stop_guest_stream_bridge":
             guard Set(object.keys).isSubset(of:["id","method"]) else { error("invalid_request","Expected only id and method"); return }
             stopGuestStreamBridge { ok(["stopped":true]) }
@@ -480,6 +511,9 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
 let args = CommandLine.arguments
 if args.count < 2 { fail("Usage: vm-apple probe | latest-restore | run --config FILE | install --config FILE") }
 switch args[1] {
+#if JSON_FRAMING_TESTS
+case "framing-test": jsonFramingSelfTest()
+#endif
 case "probe":
     emit(["backend":"apple-virtualization","protocol_version":1,"architecture":"arm64","virtualization_supported":VZVirtualMachine.isSupported,"host_os":ProcessInfo.processInfo.operatingSystemVersionString,"memory_bytes":ProcessInfo.processInfo.physicalMemory,"logical_cpus":ProcessInfo.processInfo.processorCount,"limits":["min_cpus":VZVirtualMachineConfiguration.minimumAllowedCPUCount,"max_cpus":VZVirtualMachineConfiguration.maximumAllowedCPUCount,"min_memory_bytes":VZVirtualMachineConfiguration.minimumAllowedMemorySize,"max_memory_bytes":VZVirtualMachineConfiguration.maximumAllowedMemorySize],"guests":["linux":["boot":"direct-kernel","display":"VZVirtioGraphicsDevice + VZVirtualMachineView","gpu_3d":"unverified; virtio scanout is not a 3D claim","headless_lifecycle":true],"macos":["boot":"VZMacOSBootLoader","install":"VZMacOSInstaller","display":"VZMacGraphicsDevice + VZVirtualMachineView","gpu_3d":"unverified in guest","headless_lifecycle":true],"windows":["supported":false]],"remote_capture":false,"snapshot_restore":"unverified","native_display":true,"guest_transport":"virtio-vsock","entitlement_required":"com.apple.security.virtualization"])
 case "latest-restore":

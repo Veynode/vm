@@ -11,6 +11,9 @@ export interface Challenge { host_id: string; device_id: string; vm_id: string; 
 export interface SdpBinding { sha256: string; fingerprint_sha256: string }
 export interface OfferIntent { challenge: Challenge; request_id: string; codec: 'h264' | 'h265'; offer: SdpBinding }
 export interface SignedOffer { intent: OfferIntent; signature: string }
+export const OFFER_REJECTION_CODES = ['guest_capture_unavailable', 'guest_display_inactive', 'guest_display_asleep'] as const;
+export interface OfferRejection { intent: OfferIntent; code: typeof OFFER_REJECTION_CODES[number]; outcome: 'not_admitted'; version: 1 }
+export interface SignedOfferRejection { rejection: OfferRejection; signature: string }
 export interface AnswerTranscript { intent: OfferIntent; session_id: string; answer: SdpBinding }
 export interface SignedAnswer { transcript: AnswerTranscript; signature: string }
 export interface Confirmation { transcript_sha256: string; signature: string }
@@ -92,6 +95,19 @@ function intentFields(value: OfferIntent, c: Canon) {
   exact(value, ['challenge', 'request_id', 'codec', 'offer']); challengeFields(value.challenge, c); identifier(value.request_id); requireCondition(value.codec === 'h264' || value.codec === 'h265', 'Invalid codec'); c.text(value.request_id); c.text(value.codec); bindingFields(value.offer, c);
 }
 export function offerBytes(value: OfferIntent): Uint8Array<ArrayBuffer> { const c = new Canon('offer'); intentFields(value, c); return c.bytes(); }
+export function offerRejectionBytes(value: OfferRejection): Uint8Array<ArrayBuffer> {
+  exact(value, ['intent', 'code', 'outcome', 'version']);
+  requireCondition(value.version === 1 && value.outcome === 'not_admitted' && OFFER_REJECTION_CODES.includes(value.code), 'Invalid offer rejection');
+  const c = new Canon('offer-rejection'); c.int(value.version); intentFields(value.intent, c); c.text(value.code); c.text(value.outcome); return c.bytes();
+}
+/** This terminal receipt proves only non-admission of the exact current offer.
+ * It grants no session authority, and may arrive after that challenge expires. */
+export async function verifyOfferRejection(signed: SignedOfferRejection, pinnedHostPublic: string, expectedIntent: OfferIntent): Promise<OfferRejection> {
+  const value = structuredClone(signed); exact(value, ['rejection', 'signature']); const bytes = offerRejectionBytes(value.rejection);
+  requireCondition(sameBytes(offerBytes(expectedIntent), offerBytes(value.rejection.intent)), 'Offer rejection intent substituted');
+  requireCondition(value.rejection.intent.challenge.host_id === await identityId(pinnedHostPublic), 'Pinned host mismatch');
+  await verifySignature(pinnedHostPublic, bytes, value.signature); return value.rejection;
+}
 export function answerBytes(value: AnswerTranscript): Uint8Array<ArrayBuffer> { exact(value, ['intent', 'session_id', 'answer']); const c = new Canon('answer'); intentFields(value.intent, c); identifier(value.session_id); c.text(value.session_id); bindingFields(value.answer, c); return c.bytes(); }
 export function confirmationBytes(digest: string): Uint8Array<ArrayBuffer> { unhex(digest, 32); const c = new Canon('confirm'); c.text(digest); return c.bytes(); }
 export function closeBytes(sessionId: string, digest: string): Uint8Array<ArrayBuffer> { identifier(sessionId); unhex(digest, 32); const c = new Canon('close'); c.text(sessionId); c.text(digest); return c.bytes(); }

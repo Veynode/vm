@@ -12,6 +12,16 @@ use std::{
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Verification {
+    IceRequest {
+        device_public_key: String,
+        signed: ice::SignedIceRequest,
+    },
+    IceConfig {
+        host_public_key: String,
+        expected_request: ice::IceRequest,
+        signed: ice::SignedIceConfig,
+        now: u64,
+    },
     Control {
         device_public_key: String,
         transcript: AnswerTranscript,
@@ -25,6 +35,11 @@ enum Verification {
         device_public_key: String,
         signed: SignedOffer,
         exact_sdp: String,
+    },
+    OfferRejection {
+        host_public_key: String,
+        expected_intent: OfferIntent,
+        signed: rejection::SignedOfferRejection,
     },
     Answer {
         host_public_key: String,
@@ -54,6 +69,26 @@ pub fn run_cli(a: &[String]) -> Result<()> {
     if command == "verify" {
         ensure!(a.len() == 1, "unexpected arguments");
         match read::<Verification>()? {
+            Verification::IceRequest {
+                device_public_key,
+                signed,
+            } => {
+                ensure!(
+                    identity_id(&device_public_key)? == signed.request.challenge.device_id,
+                    "device mismatch"
+                );
+                verify(
+                    &device_public_key,
+                    &signed.request.canonical()?,
+                    &signed.signature,
+                )?;
+            }
+            Verification::IceConfig {
+                host_public_key,
+                expected_request,
+                signed,
+                now,
+            } => signed.verify(&host_public_key, &expected_request, now)?,
             Verification::Control {
                 device_public_key,
                 transcript,
@@ -106,6 +141,11 @@ pub fn run_cli(a: &[String]) -> Result<()> {
                     &signed.signature,
                 )?
             }
+            Verification::OfferRejection {
+                host_public_key,
+                expected_intent,
+                signed,
+            } => signed.verify(&host_public_key, &expected_intent)?,
             Verification::Answer {
                 host_public_key,
                 expected_intent,

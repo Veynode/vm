@@ -1,0 +1,8 @@
+#!/sbin/openrc-run
+name="ONE-SHOT diagnostic Guest service crash injector"
+command="/opt/veynode-crash/watcher"
+command_background="yes"
+pidfile="/run/veynode-crash-watcher.pid"
+output_log="/dev/console"
+error_log="/dev/console"
+depend() { need veynode-agent; }

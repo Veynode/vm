@@ -127,17 +127,45 @@ func command(_ argv:[String],timeoutMS:Int) throws -> [String:Any] {
     let exitCode=(processStatus & 0x7f)==0 ? Int((processStatus>>8)&0xff):-1
     return ["exit_code":exitCode,"stdout":String(decoding:outputs[0],as:UTF8.self),"stderr":String(decoding:outputs[1],as:UTF8.self),"stdout_truncated":truncated[0],"stderr_truncated":truncated[1],"timed_out":timedOut,"duration_ms":Int((DispatchTime.now().uptimeNanoseconds-start)/1_000_000)]
 }
-func handle(_ request:[String:Any],allowExec:Bool,allowObserve:Bool=false) -> [String:Any] {
+func handle(_ request:[String:Any],allowExec:Bool,allowObserve:Bool=false,allowInput:Bool=false,
+            consoleRead:()->ConsoleIdentityObservation={GuestConsoleIdentityReader.observe()},
+            graphicsRead:()->[String:Any]={readGuestGraphicsFields()}) -> [String:Any] {
     let id=request["id"] as? String ?? ""
     guard !id.isEmpty,id.utf8.count<=128,let method=request["method"] as? String else {return errorReply(id,"invalid_request","id must be 1..128 bytes and method must be string")}
-    guard Set(request.keys).isSubset(of:["id","method","argv","timeout_ms"]) else {return errorReply(id,"invalid_request","unknown request fields")}
+    if guestFileMethods.contains(method) {
+        guard let files=guestFiles else{return errorReply(id,"unsupported","file integration disabled at service launch")}
+        return files.call(request)
+    }
+    guard Set(request.keys).isSubset(of:["id","method","argv","timeout_ms","arguments"]) else {return errorReply(id,"invalid_request","unknown request fields")}
     switch method {
     case "info":
-        let observation=observationPolicy(allowObserve)
-        return ["id":id,"result":["protocol_version":1,"os":"darwin","arch":"arm64","os_release":ProcessInfo.processInfo.operatingSystemVersionString,"kernel":systemString("kern.osrelease"),"machine":systemString("hw.model"),"metal_device":MTLCreateSystemDefaultDevice()?.name ?? "none","uid":getuid(),"username":NSUserName(),"transport":"vsock-host-only","capabilities":["exec":allowExec,"async_exec":false,"shutdown":false,"desktop":false,"screenshot":observation["screenshot_available"] as! Bool,"files":false],"observation":observation,"max_output_bytes_per_stream":maxOutput,"max_timeout_ms":30000]]
+        let console=consoleRead()
+        if !console.identityEligible {guestInput.invalidate()}
+        let fields=consoleInfoFields(console,observation:observationPolicy(allowObserve),input:inputPolicy(allowInput))
+        let observation=fields["observation"] as! [String:Any],input=fields["input_policy"] as! [String:Any]
+        var info:[String:Any]=["protocol_version":1,"os":"darwin","arch":"arm64","os_release":ProcessInfo.processInfo.operatingSystemVersionString,"kernel":systemString("kern.osrelease"),"machine":systemString("hw.model"),"uid":getuid(),"username":NSUserName(),"transport":"vsock-host-only","capabilities":["exec":allowExec,"async_exec":false,"shutdown":false,"desktop":input["available"] as! Bool,"input":input["available"] as! Bool,"screenshot":observation["screenshot_available"] as! Bool,"files":false],"max_output_bytes_per_stream":maxOutput,"max_timeout_ms":30000]
+        info.merge(graphicsRead()){_,new in new}
+        let windows=windowObservationPolicy(allowObserve,console:console)
+        info["window_policy"]=windows
+        var observationCapabilities=info["capabilities"] as! [String:Bool]
+        observationCapabilities["windows"]=windows["windows_available"] as? Bool ?? false
+        info["capabilities"]=observationCapabilities
+        if let files=guestFiles {
+            let policy=files.call(["id":"files-info","method":"file_worker_info"])
+            info["file_policy"]=policy["result"] ?? ["error":policy["error"] ?? [:]]
+            var capabilities=info["capabilities"] as! [String:Bool];capabilities["files"]=policy["result"] != nil;info["capabilities"]=capabilities
+        }
+        info.merge(fields){_,new in new}
+        return ["id":id,"result":info]
     case "screenshot":
         guard Set(request.keys)==Set(["id","method"]) else{return errorReply(id,"invalid_request","screenshot accepts only id and method")}
-        return screenshotReply(id,enabled:allowObserve)
+        return screenshotReply(id,enabled:allowObserve,registerInput:allowInput)
+    case "windows":
+        guard Set(request.keys)==Set(["id","method"]) else{return errorReply(id,"invalid_request","windows accepts only id and method")}
+        return windowsReply(id,enabled:allowObserve)
+    case "input_step","input_cleanup","input_revoke":
+        guard Set(request.keys)==Set(["id","method","arguments"]),let args=request["arguments"] as? [String:Any] else {return errorReply(id,"invalid_request","input requires id, method, arguments")}
+        return inputReply(id,method:method,args:args,enabled:allowInput)
     case "exec":
         guard allowExec else {return errorReply(id,"forbidden","command execution disabled at guest service launch")}
         guard let argv=request["argv"] as? [String],!argv.isEmpty,argv.count<=128,!argv[0].isEmpty,
@@ -148,7 +176,7 @@ func handle(_ request:[String:Any],allowExec:Bool,allowObserve:Bool=false) -> [S
     default:return errorReply(id,"unsupported","unsupported guest method")
     }
 }
-func serve(_ fd:Int32,allowExec:Bool,allowObserve:Bool) {
+func serve(_ fd:Int32,allowExec:Bool,allowObserve:Bool,allowInput:Bool) {
     defer {close(fd)}
     _ = fcntl(fd,F_SETFL,fcntl(fd,F_GETFL)|O_NONBLOCK)
     var noSignal:Int32=1;_ = setsockopt(fd,SOL_SOCKET,SO_NOSIGPIPE,&noSignal,socklen_t(MemoryLayout<Int32>.size))
@@ -168,9 +196,15 @@ func serve(_ fd:Int32,allowExec:Bool,allowObserve:Bool) {
         }
     }
     let reply:[String:Any]
-    if complete,let value=try? JSONSerialization.jsonObject(with:data) as? [String:Any] {reply=handle(value,allowExec:allowExec,allowObserve:allowObserve)}
+    var failedWriteCleanup:[String:Any]?
+    if complete,let value=try? JSONSerialization.jsonObject(with:data) as? [String:Any] {
+        reply=handle(value,allowExec:allowExec,allowObserve:allowObserve,allowInput:allowInput)
+        if value["method"] as? String=="input_step" {failedWriteCleanup=value["arguments"] as? [String:Any]}
+    }
     else {reply=errorReply("","invalid_request","expected newline JSON within 64 KiB")}
-    guard var output=try? JSONSerialization.data(withJSONObject:reply,options:.sortedKeys) else {return}
+    var written=false
+    defer {if !written,let args=failedWriteCleanup {_ = try? guestInput.cleanup(args)}}
+    guard var output=try? JSONSerialization.data(withJSONObject:reply,options:[.sortedKeys,.withoutEscapingSlashes]) else {return}
     if output.count>=1024*1024 {output=try! JSONSerialization.data(withJSONObject:errorReply(reply["id"] as? String ?? "","response_too_large","response exceeds 1 MiB limit"))}
     output.append(10)
     let writeDeadline=DispatchTime.now().uptimeNanoseconds+2_000_000_000
@@ -184,9 +218,10 @@ func serve(_ fd:Int32,allowExec:Bool,allowObserve:Bool) {
             if count<=0 {break}
             offset+=count
         }
+        written = offset==bytes.count
     }
 }
-func run(allowExec:Bool,allowObserve:Bool) throws {
+func run(allowExec:Bool,allowObserve:Bool,allowInput:Bool) throws {
     guard getuid() != 0 else {throw AgentError(message:"Run this service as the intended Guest user, not root")}
     let listener=socket(AF_VSOCK,SOCK_STREAM,0)
     guard listener>=0 else {throw AgentError(message:"AF_VSOCK unavailable: \(String(cString:strerror(errno)))")}
@@ -203,7 +238,7 @@ func run(allowExec:Bool,allowObserve:Bool) throws {
         if fd<0 {if errno==EINTR{continue};throw AgentError(message:"VSOCK accept failed")}
         _ = fcntl(fd,F_SETFD,FD_CLOEXEC)
         guard length==MemoryLayout<sockaddr_vm>.size,peer.svm_family==AF_VSOCK,peer.svm_cid==2,capacity.wait(timeout:.now()) == .success else {close(fd);continue}
-        DispatchQueue.global(qos:.userInitiated).async {serve(fd,allowExec:allowExec,allowObserve:allowObserve);capacity.signal()}
+        DispatchQueue.global(qos:.userInitiated).async {serve(fd,allowExec:allowExec,allowObserve:allowObserve,allowInput:allowInput);capacity.signal()}
     }
 }
 func selfTest() {
@@ -237,11 +272,28 @@ func selfTest() {
     precondition((unknown["error"] as? [String:String])?["code"]=="invalid_request")
     print("PASS: macOS Guest handler forbidden, Unicode/nonzero exit, pinned process-group timeout/natural-exit cleanup,32 short-lived groups, bounded output, strict timeout type. Host-only handler tests; vsock Guest acceptance separate.")
 }
-let arguments=Set(CommandLine.arguments.dropFirst())
-if arguments==["--self-test"] {selfTest();captureSelfTest();exit(0)}
-guard arguments.isSubset(of:["--allow-execute","--allow-observe"]) else {fputs("Usage: macos-guest-agent [--allow-execute] [--allow-observe] | --self-test\n",stderr);exit(2)}
+var rawArguments=Array(CommandLine.arguments.dropFirst())
+if rawArguments.count==3,rawArguments[0]=="--file-worker",rawArguments[1]=="--files-root" {exit(runGuestFileWorker(rawArguments[2]))}
+var filesRoot:String?
+if let index=rawArguments.firstIndex(of:"--files-root"),index+1<rawArguments.count {filesRoot=rawArguments[index+1];rawArguments.removeSubrange(index...index+1)}
+let arguments=Set(rawArguments)
+if arguments==["--graphics-self-test"] {graphicsSelfTest();exit(0)}
+if arguments==["--windows-self-test"] {windowsSelfTest();exit(0)}
+if arguments==["--files-self-test"] {filesSelfTest();exit(0)}
+if arguments==["--self-test"] {selfTest();captureSelfTest();inputSelfTest();consoleIntegrationSelfTest();graphicsSelfTest();windowsSelfTest();filesSelfTest();exit(0)}
+guard rawArguments.count==arguments.count, arguments.contains("--allow-files")==((filesRoot) != nil),arguments.isSubset(of:["--allow-execute","--allow-observe","--allow-input","--allow-files"]), !arguments.contains("--allow-input") || arguments.contains("--allow-observe") else {fputs("Usage: macos-guest-agent [--allow-execute] [--allow-observe [--allow-input]] [--allow-files --files-root ABSOLUTE_PRIVATE_DIRECTORY] | --self-test\n",stderr);exit(2)}
+signal(SIGPIPE,SIG_IGN)
+if let root=filesRoot {
+    do {guestFiles=try GuestFileBridge(binary:URL(fileURLWithPath:CommandLine.arguments[0]).standardizedFileURL.path,root:root)}
+    catch {fputs("File integration startup failed; verify non-root private directory and worker availability\n",stderr);exit(1)}
+}
+if arguments.contains("--allow-input") && !registerGuestInputDisplayNotifications() {fputs("Input requires a non-root VirtualMac Guest and display reconfiguration notifications\n",stderr);exit(1)}
+let inputTimer=DispatchSource.makeTimerSource(queue:.global(qos:.userInitiated))
+if arguments.contains("--allow-input") {inputTimer.schedule(deadline:.now(),repeating:.milliseconds(100));inputTimer.setEventHandler{guestInput.tick()};inputTimer.resume()}
+var terminationSources:[DispatchSourceSignal]=[]
+for number in [SIGINT,SIGTERM] {signal(number,SIG_IGN);let source=DispatchSource.makeSignalSource(signal:number,queue:.global(qos:.userInitiated));source.setEventHandler{let inputClean=guestInput.shutdown();let filesClean=guestFiles?.stop() ?? true;exit(inputClean && filesClean ? 0:1)};source.resume();terminationSources.append(source)}
 DispatchQueue.global(qos:.userInitiated).async {
-    do {try run(allowExec:arguments.contains("--allow-execute"),allowObserve:arguments.contains("--allow-observe"))}
-    catch {fputs(error.localizedDescription+"\n",stderr);exit(1)}
+    do {try run(allowExec:arguments.contains("--allow-execute"),allowObserve:arguments.contains("--allow-observe"),allowInput:arguments.contains("--allow-input"))}
+    catch {_ = guestInput.shutdown();_ = guestFiles?.stop();fputs(error.localizedDescription+"\n",stderr);exit(1)}
 }
 dispatchMain()

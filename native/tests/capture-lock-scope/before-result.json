@@ -1,0 +1,6 @@
+{
+  "exit_code": 1,
+  "binary_sha256": "809b0fc289178ce26090201d0ba7f8968f2cd9d9638d760591a48f828856bf17",
+  "source_sha256": "47749fe469590f2623ecde8e7486c9e19065cc11728c948aef33dce9488a1748",
+  "scope": "Actual sample receive/copy function; injected blocking copy; no SCK/permission/Guest. Test seam/extraction preserve old lock scope."
+}

@@ -1,3 +1,8 @@
 [workspace]
 members = ["crates/control", "crates/media-local", "crates/session-auth"]
 resolver = "2"
+exclude = ["vendor/webrtc-0.21.0", "vendor/rtc-0.21.0"]
+
+[patch.crates-io]
+webrtc = { path = "vendor/webrtc-0.21.0" }
+rtc = { path = "vendor/rtc-0.21.0" }

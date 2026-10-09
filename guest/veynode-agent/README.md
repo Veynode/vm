@@ -197,3 +197,36 @@ python3 scripts/test-control-files.py --config .local/vms/NEW-UNUSED-NAME/config
 
 The fixture also installs clearly named symlink/hardlink/FIFO/wrong-owner negative
 samples in its newly created files root. It does not modify existing VM disks.
+
+### Private QEMU rootless execution transport v2
+
+`--virtio-serial-exec --allow-execute --exec-user=veynode` is a separate opt-in
+mode, never an upgrade of the default `--virtio-serial` observer. It requires a
+root service, a fixed non-root command identity, verified cgroup v2 / clone3
+placement and `cgroup.kill`. Files, shutdown, synchronous exec and legacy
+process-group fallback are rejected. The service opens only the fixed private
+`org.veynode.agent.0` port, once. Startup drains previous private job cgroups
+before emitting a fresh challenge. Do not configure automatic transport reconnect.
+
+The [v2 contract](../../docs/decisions/0015-qemu-serial-execution-v2.md) binds every
+request to both incarnation nonces. Commands also carry owner/epoch scope.
+Scope revocation seals admission before cancelling, and succeeds only after
+pending starts and real descendant cleanup finish. A lost start response cannot
+hide its scope's work. Up to 1024 scope records persist for the entire service
+lifetime; expiry of a finished job never removes a revocation fence. A failed
+boundary cleanup fences all execution, including asynchronous failure with no
+subsequent client poll. Already executed effects are not rolled back.
+
+The independent reader, writer and 2-second Guest heartbeat watchdog do not wait
+for a 30-second command. One ordinary operation, one revoke and eight queued
+responses bound transport work. The host sends heartbeats every 500ms. A Guest
+scope cleanup has a 3-second budget. These Guest clocks **freeze during a QEMU
+pause**; therefore this mode must only run behind the host's independently owned
+QEMU guardian, which terminates the original incarnation on worker/transport
+failure. Closing and reopening virtio-serial is not a revocation boundary.
+
+`go test -race ./...` includes real Unix framing, real host subprocess cancellation,
+blocked-start retirement, cross-scope rejection, lifetime capacity, sticky cleanup
+errors, watchdog cleanup and strict schema/CLI negatives. Host tests inject the
+containment policy tag at a private test seam while using host process groups;
+these are explicitly **not** Linux cgroup or real QEMU acceptance.

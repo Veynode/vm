@@ -21,14 +21,17 @@ use std::{
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::{Mutex, Semaphore},
+    sync::{Mutex, Notify, OnceCell, Semaphore},
     time::timeout,
 };
 
@@ -65,19 +68,27 @@ struct Session {
     created: Instant,
     touched: Instant,
     io: Arc<Mutex<Bridge>>,
-    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    lifecycle: Arc<Lifecycle>,
+}
+struct Lifecycle {
+    child: Mutex<Child>,
+    stdout: Mutex<BufReader<ChildStdout>>,
+    stdin: Mutex<Option<ChildStdin>>,
+    retired: AtomicBool,
+    outcome: OnceCell<bool>,
 }
 struct Bridge {
-    child: Child,
-    stdin: Arc<Mutex<Option<ChildStdin>>>,
-    stdout: BufReader<ChildStdout>,
+    lifecycle: Arc<Lifecycle>,
 }
 impl Bridge {
     async fn exchange(&mut self, request: &Value) -> Result<Option<Value>> {
         let mut bytes = serde_json::to_vec(request)?;
         bytes.push(b'\n');
         {
-            let mut stdin = self.stdin.lock().await;
+            let mut stdin = self.lifecycle.stdin.lock().await;
+            if self.lifecycle.retired.load(Ordering::Acquire) {
+                bail!("session is retired")
+            }
             let stdin = stdin.as_mut().context("session is closed")?;
             stdin.write_all(&bytes).await?;
             stdin.flush().await?;
@@ -85,12 +96,14 @@ impl Bridge {
         if request.get("id").is_none() {
             return Ok(None);
         }
+        let limit = vm_control::mcp_response_limit(request);
         let mut line = Vec::new();
-        let read = (&mut self.stdout)
-            .take((vm_control::MAX_MESSAGE + 1) as u64)
+        let mut stdout = self.lifecycle.stdout.lock().await;
+        let read = (&mut *stdout)
+            .take((limit + 1) as u64)
             .read_until(b'\n', &mut line)
             .await?;
-        if read == 0 || read > vm_control::MAX_MESSAGE || line.last() != Some(&b'\n') {
+        if read == 0 || read > limit || line.last() != Some(&b'\n') {
             bail!("invalid stdio bridge response")
         }
         let response: Value = serde_json::from_slice(&line)?;
@@ -99,22 +112,117 @@ impl Bridge {
         }
         Ok(Some(response))
     }
-    async fn close(&mut self) {
-        self.stdin.lock().await.take();
-        if timeout(Duration::from_secs(3), self.child.wait())
+}
+impl Lifecycle {
+    async fn close(&self) -> bool {
+        *self
+            .outcome
+            .get_or_init(|| async {
+                // Close stdin without waiting behind stdout/tool processing. The MCP
+                // disconnect monitor retires authority and retains its first outcome.
+                let eof = timeout(Duration::from_secs(1), async {
+                    self.stdin.lock().await.take();
+                })
+                .await
+                .is_ok();
+                let mut child = self.child.lock().await;
+                // Once the in-flight reader yields, drain responses that no HTTP
+                // caller consumes. Do not let a bounded response fill the pipe and
+                // prevent the MCP child from reaching its EOF cleanup.
+                let drain = async {
+                    let mut stdout = self.stdout.lock().await;
+                    let _ = tokio::io::copy(&mut *stdout, &mut tokio::io::sink()).await;
+                };
+                let result = {
+                    let wait = timeout(Duration::from_secs(42), child.wait());
+                    tokio::pin!(wait);
+                    tokio::select! { result = &mut wait => result, _ = drain => wait.await }
+                };
+                match result {
+                    Ok(Ok(status)) => eof && status.success(),
+                    _ => {
+                        // SIGKILL/reaping is resource cleanup, never Guest cleanup proof.
+                        let _ = child.start_kill();
+                        let _ = timeout(Duration::from_secs(1), child.wait()).await;
+                        false
+                    }
+                }
+            })
             .await
-            .is_err()
-        {
-            let _ = self.child.kill().await;
-        }
     }
 }
+
 struct App {
     config: Config,
     state_dir: PathBuf,
     control_bin: PathBuf,
     sessions: Mutex<BTreeMap<String, Session>>,
     requests: Semaphore,
+    closing: AtomicBool,
+    cleanup_failed: AtomicBool,
+    changed: Notify,
+}
+impl App {
+    // Spawned once, tracked in sessions until completion. Request cancellation,
+    // DELETE timeout and TTL expiry cannot drop the last cleanup owner.
+    fn retire(self: &Arc<Self>, id: String, lifecycle: Arc<Lifecycle>) {
+        if lifecycle.retired.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let app = self.clone();
+        tokio::spawn(async move {
+            if !lifecycle.close().await {
+                app.cleanup_failed.store(true, Ordering::Release);
+            }
+            let mut sessions = app.sessions.lock().await;
+            if sessions
+                .get(&id)
+                .is_some_and(|s| Arc::ptr_eq(&s.lifecycle, &lifecycle))
+            {
+                sessions.remove(&id);
+            }
+            app.changed.notify_waiters();
+        });
+    }
+    async fn shutdown(self: &Arc<Self>) -> Result<()> {
+        self.closing.store(true, Ordering::Release);
+        {
+            let sessions = self.sessions.lock().await;
+            for (id, session) in sessions.iter() {
+                self.retire(id.clone(), session.lifecycle.clone());
+            }
+        }
+        let settled = timeout(Duration::from_secs(45), async {
+            loop {
+                let changed = self.changed.notified();
+                if self.sessions.lock().await.is_empty() {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .is_ok();
+        if !settled || self.cleanup_failed.load(Ordering::Acquire) {
+            bail!("MCP session cleanup unconfirmed; authority/Guest cleanup requests or child reaping failed")
+        }
+        Ok(())
+    }
+}
+// Cancelling an HTTP future after writing a command must retire its session.
+// Cleanup ownership transfers to a tracked task, not to the cancelled request.
+struct ExchangeGuard {
+    app: Arc<App>,
+    id: String,
+    lifecycle: Arc<Lifecycle>,
+    armed: bool,
+}
+impl Drop for ExchangeGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.app.retire(self.id.clone(), self.lifecycle.clone());
+        }
+    }
 }
 fn private_file(path: &Path) -> Result<()> {
     let m = fs::symlink_metadata(path)?;
@@ -244,6 +352,9 @@ fn filter_reply(principal: &Principal, request: &Value, mut reply: Value) -> Val
     reply
 }
 async fn admission(State(app): State<Arc<App>>, request: Request, next: Next) -> Response {
+    if app.closing.load(Ordering::Acquire) {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "Server is shutting down");
+    }
     let _permit = match app.requests.try_acquire() {
         Ok(p) => p,
         Err(_) => {
@@ -393,6 +504,9 @@ async fn dispatch(
             return error(StatusCode::BAD_REQUEST, "Initialize requires request id");
         }
         let mut sessions = app.sessions.lock().await;
+        if app.closing.load(Ordering::Acquire) {
+            return error(StatusCode::SERVICE_UNAVAILABLE, "Server is shutting down");
+        }
         if sessions.len() >= 32
             || sessions
                 .values()
@@ -431,32 +545,61 @@ async fn dispatch(
             Ok(c) => c,
             Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "Cannot start MCP session"),
         };
-        let mut bridge = Bridge {
-            stdin: Arc::new(Mutex::new(child.stdin.take())),
-            stdout: BufReader::new(child.stdout.take().unwrap()),
-            child,
-        };
-        let reply = match timeout(Duration::from_secs(5), bridge.exchange(&request)).await {
-            Ok(Ok(Some(value))) => value,
-            _ => {
-                bridge.close().await;
-                return error(StatusCode::BAD_GATEWAY, "MCP initialization failed");
-            }
-        };
-        if reply.get("error").is_some() {
-            bridge.close().await;
-            return Json(reply).into_response();
-        }
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let lifecycle = Arc::new(Lifecycle {
+            stdout: Mutex::new(stdout),
+            stdin: Mutex::new(child.stdin.take()),
+            retired: AtomicBool::new(false),
+            outcome: OnceCell::new(),
+            child: Mutex::new(child),
+        });
+        let bridge = Arc::new(Mutex::new(Bridge {
+            lifecycle: lifecycle.clone(),
+        }));
+        // Register before any asynchronous handshake, so signal shutdown owns even
+        // initializing sessions. Quotas count retiring sessions until child reap.
         sessions.insert(
             session_id.clone(),
             Session {
                 principal: principal.name.clone(),
                 created: Instant::now(),
                 touched: Instant::now(),
-                stdin: bridge.stdin.clone(),
-                io: Arc::new(Mutex::new(bridge)),
+                lifecycle: lifecycle.clone(),
+                io: bridge.clone(),
             },
         );
+        drop(sessions);
+        let mut guard = ExchangeGuard {
+            app: app.clone(),
+            id: session_id.clone(),
+            lifecycle: lifecycle.clone(),
+            armed: true,
+        };
+        let reply = match timeout(Duration::from_secs(5), async {
+            bridge.lock().await.exchange(&request).await
+        })
+        .await
+        {
+            Ok(Ok(Some(value)))
+                if !app.closing.load(Ordering::Acquire)
+                    && !lifecycle.retired.load(Ordering::Acquire) =>
+            {
+                value
+            }
+            _ => {
+                app.retire(session_id, lifecycle.clone());
+                let _ = lifecycle.close().await;
+                return error(StatusCode::BAD_GATEWAY, "MCP initialization failed");
+            }
+        };
+        if reply.get("error").is_some() {
+            app.retire(session_id, lifecycle.clone());
+            if !lifecycle.close().await {
+                return error(StatusCode::BAD_GATEWAY, "MCP cleanup unconfirmed");
+            }
+            return Json(reply).into_response();
+        }
+        guard.armed = false;
         let mut r = Json(reply).into_response();
         r.headers_mut().insert(
             "mcp-session-id",
@@ -470,30 +613,38 @@ async fn dispatch(
     };
     let mut sessions = app.sessions.lock().await;
     let session = match sessions.get_mut(session_id) {
-        Some(s) if s.principal == principal.name => s,
+        Some(s)
+            if s.principal == principal.name
+                && !s.lifecycle.retired.load(Ordering::Acquire)
+                && !app.closing.load(Ordering::Acquire) =>
+        {
+            s
+        }
         _ => return error(StatusCode::NOT_FOUND, "Session not found"),
     };
     if session.touched.elapsed() > Duration::from_secs(app.config.session_idle_seconds)
         || session.created.elapsed() > Duration::from_secs(28800)
     {
-        let session = sessions.remove(session_id).unwrap();
+        let lifecycle = session.lifecycle.clone();
+        app.retire(session_id.into(), lifecycle.clone());
         drop(sessions);
-        session.stdin.lock().await.take();
-        session.io.lock().await.close().await;
+        if !lifecycle.close().await {
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "Expired session cleanup unconfirmed",
+            );
+        }
         return error(StatusCode::NOT_FOUND, "Session expired");
     }
     session.touched = Instant::now();
     let bridge = session.io.clone();
-    let stdin = session.stdin.clone();
+    let lifecycle = session.lifecycle.clone();
     if *method == Method::DELETE {
-        sessions.remove(session_id);
+        app.retire(session_id.into(), lifecycle.clone());
         drop(sessions);
-        // Do not wait behind a long tool response to revoke this session's transport.
-        stdin.lock().await.take();
-        let _ = timeout(Duration::from_secs(40), async {
-            bridge.lock().await.close().await
-        })
-        .await;
+        if !lifecycle.close().await {
+            return error(StatusCode::BAD_GATEWAY, "MCP cleanup unconfirmed");
+        }
         return StatusCode::NO_CONTENT.into_response();
     }
     drop(sessions);
@@ -517,12 +668,22 @@ async fn dispatch(
             )
         }
     };
-    match timeout(Duration::from_secs(40), io.exchange(&request)).await {
+    let mut guard = ExchangeGuard {
+        app: app.clone(),
+        id: session_id.into(),
+        lifecycle: lifecycle.clone(),
+        armed: true,
+    };
+    let exchange = timeout(Duration::from_secs(40), io.exchange(&request)).await;
+    if matches!(exchange, Ok(Ok(_))) {
+        guard.armed = false;
+    }
+    match exchange {
         Ok(Ok(Some(reply))) => Json(filter_reply(principal, &request, reply)).into_response(),
         Ok(Ok(None)) => StatusCode::ACCEPTED.into_response(),
         _ => {
-            io.close().await;
-            app.sessions.lock().await.remove(session_id);
+            app.retire(session_id.into(), lifecycle.clone());
+            let _ = lifecycle.close().await;
             error(
                 StatusCode::BAD_GATEWAY,
                 "MCP session failed; initialize a new session",
@@ -612,32 +773,26 @@ async fn run() -> Result<()> {
         control_bin,
         sessions: Mutex::new(BTreeMap::new()),
         requests: Semaphore::new(64),
+        closing: AtomicBool::new(false),
+        cleanup_failed: AtomicBool::new(false),
+        changed: Notify::new(),
     });
+    let shutdown_signal = install_shutdown_signal()?;
     let cleaner = app.clone();
-    tokio::spawn(async move {
+    let cleaner_task = tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            let expired = {
-                let mut sessions = cleaner.sessions.lock().await;
-                let ids = sessions
-                    .iter()
-                    .filter(|(_, s)| {
-                        s.touched.elapsed()
-                            > Duration::from_secs(cleaner.config.session_idle_seconds)
-                            || s.created.elapsed() > Duration::from_secs(28800)
-                    })
-                    .map(|(id, _)| id.clone())
-                    .collect::<Vec<_>>();
-                ids.into_iter()
-                    .filter_map(|id| sessions.remove(&id))
-                    .collect::<Vec<_>>()
-            };
-            for session in expired {
-                session.stdin.lock().await.take();
-                let _ = timeout(Duration::from_secs(40), async {
-                    session.io.lock().await.close().await
-                })
-                .await;
+            if cleaner.closing.load(Ordering::Acquire) {
+                break;
+            }
+            let sessions = cleaner.sessions.lock().await;
+            for (id, session) in sessions.iter() {
+                if session.touched.elapsed()
+                    > Duration::from_secs(cleaner.config.session_idle_seconds)
+                    || session.created.elapsed() > Duration::from_secs(28800)
+                {
+                    cleaner.retire(id.clone(), session.lifecycle.clone());
+                }
             }
         }
     });
@@ -649,12 +804,46 @@ async fn run() -> Result<()> {
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(45),
         ))
-        .with_state(app);
+        .with_state(app.clone());
     eprintln!("MCP HTTPS listening on {bind}; TLS terminates on this host; provisioned bearer authentication");
-    axum_server::bind_rustls(bind, tls)
-        .serve(router.into_make_service())
-        .await?;
+    let handle = axum_server::Handle::new();
+    let server = axum_server::bind_rustls(bind, tls)
+        .handle(handle.clone())
+        .serve(router.into_make_service());
+    tokio::pin!(server);
+    let (server_result, signal_result) = tokio::select! {
+        signal = shutdown_signal => (None, signal),
+        result = &mut server => (Some(result), Ok(())),
+    };
+    app.closing.store(true, Ordering::Release);
+    handle.graceful_shutdown(Some(Duration::from_secs(45)));
+    cleaner_task.abort();
+    let cleanup = app.shutdown();
+    let transport = async {
+        if let Some(result) = server_result {
+            result.map_err(anyhow::Error::from)
+        } else {
+            timeout(Duration::from_secs(46), &mut server)
+                .await
+                .context("HTTP shutdown timed out")?
+                .map_err(anyhow::Error::from)
+        }
+    };
+    let (cleanup, transport) = tokio::join!(cleanup, transport);
+    cleanup?;
+    transport?;
+    signal_result?;
     Ok(())
+}
+fn install_shutdown_signal(
+) -> std::io::Result<impl std::future::Future<Output = std::io::Result<()>>> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    Ok(async move {
+        tokio::select! { value = interrupt.recv() => value, value = terminate.recv() => value }
+            .ok_or_else(|| std::io::Error::other("shutdown signal stream closed"))
+    })
 }
 
 #[cfg(test)]
@@ -685,6 +874,29 @@ mod tests {
         ));
     }
     #[test]
+    fn graphics_profile_does_not_enable_remote_create() {
+        let p = principal();
+        for profile in ["virgl", "venus-moltenvk-experimental", "unknown"] {
+            let request = json!({"method":"tools/call","params":{"name":"vm_create","arguments":{"id":"allowed","backend":"qemu-hvf","qemu_graphics_profile":profile}}});
+            assert!(!remote_authorized(&p, &request));
+        }
+        let reply = filter_reply(&p, &json!({"method":"tools/list"}), json!({"result":{"tools":[{"name":"vm_create","inputSchema":{"properties":{"qemu_graphics_profile":{"enum":["virgl","venus-moltenvk-experimental"]}}}},{"name":"vm_status"}]}}));
+        assert_eq!(reply["result"]["tools"], json!([{"name":"vm_status"}]));
+    }
+    #[test]
+    fn window_observation_is_still_vm_allowlisted() {
+        let mut p = principal();
+        p.scopes = vec!["observe".into()];
+        assert!(remote_authorized(
+            &p,
+            &json!({"method":"tools/call","params":{"name":"vm_windows","arguments":{"id":"allowed"}}})
+        ));
+        assert!(!remote_authorized(
+            &p,
+            &json!({"method":"tools/call","params":{"name":"vm_windows","arguments":{"id":"other"}}})
+        ));
+    }
+    #[test]
     fn observations_filter_vm_ids_and_host_diagnostics() {
         let vm = json!({"config":{"id":"allowed","kernel":"/host/private-kernel","command_line":"token=secret","shared_dir":"/host/private","memory_mib":1024},"pid":42,"runtime":{"state":"error","error":"cannot open /host/private"}});
         let request = json!({"method":"tools/call","params":{"name":"vm_list"}});
@@ -702,3 +914,7 @@ mod tests {
         assert_eq!(values[0]["runtime"]["state"], "error");
     }
 }
+
+#[cfg(test)]
+#[path = "vm_mcp_http_tests/mod.rs"]
+mod shutdown_tests;

@@ -1,0 +1,2 @@
+PASS synthetic NV12 padded rows/header, strict legacy/bound start/identity, source geometry, freshness deadline, stale-frame real socket suppression/terminal cleanup and bounded backpressure. No capture or permission API invoked.
+PASS cleanup ledger exact identities/grammar, TTL/eviction/restart, immutable failed quarantine, duplicate stop/start/drain phases, disconnected proof retention and active management JSONL/framed response/EOF. No actual SCK stop was simulated as Guest acceptance.

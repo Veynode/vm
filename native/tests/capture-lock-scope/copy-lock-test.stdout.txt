@@ -1,0 +1,2 @@
+PASS authority condition remains available while actual frame copy is blocked; no SCK capture invoked
+PASS blocked-copy renewal/stop/generation/PTS/late-error; authority completion is not renewed by metrics lock; expired publication emits zero frames on real socket. Synthetic, not SCK acceptance.

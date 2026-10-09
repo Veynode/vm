@@ -18,7 +18,7 @@ def packet(value):
     return struct.pack('>I', len(data)) + data
 
 
-def run(binary, mode, delegate_supported=True):
+def run(binary, mode, delegate_supported=True, identity_diagnostic=None):
     with tempfile.TemporaryDirectory(prefix='gc-', dir=ROOT / '.local/run') as temp:
         path = pathlib.Path(temp) / 'socket'
         listener = socket.socket(socket.AF_UNIX)
@@ -40,6 +40,8 @@ def run(binary, mode, delegate_supported=True):
                        'color_space': 'ITU-R BT.709', 'capture_dynamic_range': 'SDR'}
             error = {'event': 'error', 'id': 'host-start', 'code': 'main_display_unavailable',
                      'main_display_active': False, 'main_display_asleep': True}
+            if identity_diagnostic is not None:
+                error['console_identity_diagnostic'] = identity_diagnostic
             terminal = {'event': 'terminated', 'id': 'host-start', 'reason': 'capture_failed',
                         'cleanup_confirmed': True, 'cleanup_basis': 'no_stream_created'}
             if mode.startswith('delegate-'):
@@ -127,8 +129,10 @@ def run(binary, mode, delegate_supported=True):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--binary', type=pathlib.Path, default=ROOT / '.local/bin/guest-video-stream-stage4')
+    parser.add_argument('--binary', type=pathlib.Path, default=ROOT / '.local/bin/guest-video-stream-stage6')
     parser.add_argument('--legacy-binary', type=pathlib.Path)
+    parser.add_argument('--rate-control-version', type=int, choices=[1],
+                        help='Explicit current encoder contract; omission retains the older exact contract')
     parser.add_argument('--output', type=pathlib.Path, required=True)
     args = parser.parse_args()
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -136,7 +140,10 @@ def main():
     with args.output.open('x') as output:
         try:
             capability = json.loads(subprocess.check_output([str(args.binary), '--capabilities']))
-            assert capability == {'protocol': 'veynode-guest-video-stream-v1', 'cleanup_contract_version': 1, 'cleanup_confirmed_failure_exit': 78}
+            expected = {'protocol': 'veynode-guest-video-stream-v1', 'cleanup_contract_version': 1, 'cleanup_confirmed_failure_exit': 78, 'console_identity_binding_version': 1, 'cleanup_receipt_version': 1}
+            if args.rate_control_version == 1:
+                expected.update(rate_control_version=1, rate_min_bps=250000, rate_max_bps=40000000)
+            assert capability == expected
             report['capabilities'] = capability
             for mode in ['normal-stop', 'early-clean', 'fragmented-clean', 'after-start-clean', 'missing-terminal',
                          'wrong-id', 'false-confirmed', 'numeric-confirmed', 'invalid-basis', 'wrong-reason',

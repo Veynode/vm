@@ -15,6 +15,29 @@ export interface PolicyResult { selected: VideoCodec; fallbackReason: string | n
 export class CodecError extends Error {
   constructor(public readonly code: string, message: string) { super(message); this.name = 'CodecError'; }
 }
+const sourceMessages = {
+  guest_display_asleep: 'The Guest display is asleep. Wake it in the Guest and reconnect explicitly.',
+  guest_display_inactive: 'The Guest display is inactive. Restore the Guest display and reconnect explicitly.',
+  guest_screen_permission_required: 'Guest screen recording permission is required. Review permission in the Guest before reconnecting.',
+  guest_capture_unavailable: 'The Guest screen capture source is unavailable. Check the Guest display and capture service.',
+  guest_capture_stopped: 'The Guest screen capture service reported that capture stopped.',
+  guest_capture_no_frames: 'The Guest capture source provided no frames. The cause is not established; check the Guest display and capture service.',
+  guest_capture_failed: 'The Guest screen capture source failed. Check the Guest display and capture service.',
+} as const;
+export type MediaFailureCode = keyof typeof sourceMessages;
+export interface MediaFailure { code: MediaFailureCode }
+/** Diagnostic only. The close caller must separately require closed:true. */
+export function mediaFailureFromReceipt(receipt: unknown): MediaFailure | null {
+  if (receipt === null || typeof receipt !== 'object' || Array.isArray(receipt)) throw new CodecError('invalid_close_receipt', 'Invalid close receipt.');
+  const value = (receipt as Record<string, unknown>).media_failure;
+  if (value === undefined) return null;
+  if (value === null || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 1 || typeof (value as Record<string, unknown>).code !== 'string') throw new CodecError('invalid_media_failure', 'Invalid capture failure diagnostic.');
+  const code = (value as { code: string }).code;
+  return { code: Object.hasOwn(sourceMessages, code) ? code as MediaFailureCode : 'guest_capture_failed' };
+}
+export class SourceFailureError extends CodecError {
+  constructor(failure: MediaFailure) { super(failure.code, sourceMessages[failure.code]); }
+}
 export class NegotiationError extends CodecError {
   constructor(code: string, message: string, public readonly attempts: AttemptRecord[]) { super(code, message); }
 }
@@ -69,6 +92,7 @@ export async function negotiateCodec(plan: CodecPlan, attempt: CodecAttempt, sig
       const reason = error instanceof CodecError ? error.code : 'negotiation_failed';
       attempts.push({ preferred, outcome: 'failed', reason });
       if (signal?.aborted || reason === 'cancelled') throw new NegotiationError('cancelled', 'Negotiation cancelled.', attempts);
+      if (error instanceof SourceFailureError || reason === 'cleanup_unconfirmed') throw new NegotiationError(reason, error instanceof Error ? error.message : 'Session cleanup is unconfirmed.', attempts);
       fallbackReason = reason;
       if (preferred === 'h264') throw new NegotiationError('no_working_hardware_codec', error instanceof Error ? error.message : String(error), attempts);
     } finally {
@@ -140,4 +164,38 @@ export function createNativeCodecPlan(host: HostCapabilities, receiverCodecs: re
   const plan = createCodecPlan(host, compatible);
   if (host.h265 === 'verified-hardware' && plan.preferred === 'h264' && supports(receiverCodecs, 'h265')) plan.reason = 'browser_h265_profile_unavailable';
   return plan;
+}
+
+/** Connection establishment has its own finite budget. The first decoded and
+ * presented frame budget starts only after transport connection and the signed
+ * confirmation ACK. negotiateCodec still owns the stricter overall deadline. */
+export class ReceptionDeadline {
+  private timer: ReturnType<typeof setTimeout> | undefined;
+  private state: 'connection' | 'first-frame' | 'closed' = 'connection';
+  constructor(private readonly options: {
+    connected: () => boolean;
+    confirmed: () => boolean;
+    onTimeout: (code: 'connection_timeout' | 'first_frame_timeout') => void;
+    onPhase?: (phase: 'connection-deadline-started' | 'first-frame-deadline-started') => void;
+  }) {
+    options.onPhase?.('connection-deadline-started');
+    this.timer = setTimeout(() => this.expire('connection_timeout'), 12000);
+    this.update();
+  }
+  update(): void {
+    if (this.state !== 'connection' || !this.options.connected() || !this.options.confirmed()) return;
+    clearTimeout(this.timer); this.state = 'first-frame';
+    this.options.onPhase?.('first-frame-deadline-started');
+    this.timer = setTimeout(() => this.expire('first_frame_timeout'), 6000);
+  }
+  firstFrame(): boolean {
+    this.update();
+    if (this.state !== 'first-frame') return false;
+    this.close(); return true;
+  }
+  close(): void { clearTimeout(this.timer); this.timer = undefined; this.state = 'closed'; }
+  private expire(code: 'connection_timeout' | 'first_frame_timeout') {
+    if (this.state === 'closed') return;
+    this.close(); this.options.onTimeout(code);
+  }
 }

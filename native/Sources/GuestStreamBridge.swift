@@ -113,6 +113,21 @@ final class GuestStreamBridge {
         connectTimeout = connectTimeoutMilliseconds * 1_000_000
     }
 
+    // Listener provenance only. It does not identify or authorize a Guest desktop.
+    func binding(vmID:String,workerInstance:String,bridgeInstance:String) throws -> [String:Any] {
+        lock.lock();defer{lock.unlock()}
+        guard !stopping && !stopped else {throw GuestStreamBridgeError(message:"Bridge stopped or stopping")}
+        var current=stat()
+        guard fstatat(directoryFD,socketName,&current,AT_SYMLINK_NOFOLLOW)==0,
+              current.st_dev==socketDevice,current.st_ino==socketInode,
+              current.st_mode & mode_t(S_IFMT)==mode_t(S_IFSOCK),current.st_uid==getuid(),current.st_mode & 0o777==0o600 else {
+            throw GuestStreamBridgeError(message:"Bridge socket incarnation changed")
+        }
+        return ["version":1,"vm_id":vmID,"worker_instance":workerInstance,"bridge_instance":bridgeInstance,
+                "worker_pid":getpid(),"socket_path":socketPath,"socket_device":UInt64(socketDevice),"socket_inode":UInt64(socketInode),
+                "guest_port":5001,"scope":"host-worker-listener-only","input_authorized":false]
+    }
+
     private static func configure(_ fd: Int32) throws {
         let flags = fcntl(fd, F_GETFL)
         var noSignal: Int32 = 1

@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { DeviceIdentity, hex, grantBytes, answerBytes, sdpBinding, verifyOffer, verifyConfirmation, verifyClose } from '../dist/session-auth.js';
-import { controlBytes, signControl, verifyControl, validateControlResponse, screenshotAnchor, SCREENSHOT_MAX_BYTES, CONTROL_MAX_RESPONSE_BYTES } from '../dist/session-control.js';
+import { controlBytes, signControl, verifyControl, validateControlResponse, screenshotAnchor, verifiedScreenshotSource, SCREENSHOT_MAX_BYTES } from '../dist/session-control.js';
 import { AuthenticatedReceiver } from '../dist/native-auth.js';
 
 const pairBinary = process.env.VEYNODE_PAIR_BIN ?? new URL('../../target/debug/vm-pair', import.meta.url).pathname;
@@ -32,21 +33,22 @@ async function fixture(scopes = ['input', 'observe']) {
     }
     if (path === '/auth/confirm') { await verifyConfirmation(body.confirmation, state.transcript, device.publicKey, now); return Response.json({ confirmed: state.confirm }); }
     if (path === '/auth/close') { await verifyClose(body, state.transcript, device.publicKey); return Response.json({ closed: state.close }); }
-    if (path === '/auth/control') {
-      await verifyControl(body, state.transcript, device.publicKey, Math.floor(Date.now() / 1000)); state.controls.push(body);
-      if (state.controlReply) return state.controlReply(body);
-      const action = body.request.action;
-      const result = action.kind === 'acquire' ? { epoch: 1, expires_in_seconds: 60 } : action.kind === 'release' ? { released: true, note: 'synthetic' } : action.kind === 'observe_frame' ? png : { dispatched: true, guest_delivery_confirmed: false };
-      return Response.json({ sequence: body.request.sequence, result });
-    }
+    if (path === '/auth/control') throw new Error('Plaintext HTTP control is forbidden');
     throw new Error('Unexpected endpoint');
   };
+  receiver.bindControlTransport(async body => {
+      await verifyControl(body, state.transcript, device.publicKey, Math.floor(Date.now() / 1000)); state.controls.push(body);
+      if (state.controlReply) return (await state.controlReply(body)).json();
+      const action = body.request.action;
+      const result = action.kind === 'acquire' ? { epoch: 1, expires_in_seconds: 60 } : action.kind === 'release' ? { released: true, note: 'synthetic' } : action.kind === 'observe_frame' ? png : { dispatched: true, guest_delivery_confirmed: false };
+      return { sequence: body.request.sequence, result };
+  });
   return { host, device, receiver, state, calls, fetcher };
 }
 async function withSession(callback, scopes) {
   const f = await fixture(scopes), previous = globalThis.fetch; globalThis.fetch = f.fetcher;
   try { await f.receiver.offer(sdp('AA'), 'control-request', 'h264'); await callback(f); }
-  finally { f.state.close = true; await f.receiver.close(); f.receiver.dispose(); globalThis.fetch = previous; }
+  finally { assert.equal(f.calls.includes('/auth/control'), false); f.state.close = true; await f.receiver.close(); f.receiver.dispose(); globalThis.fetch = previous; }
 }
 
 test('Rust golden canonical bytes and P256 signatures match every browser control variant', async () => {
@@ -129,19 +131,18 @@ test('uncertain control consumes sequence without retry; failed close permanentl
     await f.receiver.confirm();
     f.state.controlReply = () => { throw new TypeError('response lost after dispatch'); };
     await assert.rejects(f.receiver.control(click()), /lost/); assert.equal(f.state.controls.length, 1);
-    f.state.controlReply = undefined; await f.receiver.control(click()); assert.deepEqual(f.state.controls.map(s => s.request.sequence), [1, 2]);
+    f.state.controlReply = undefined; await assert.rejects(f.receiver.control(click()), /confirmed/); assert.deepEqual(f.state.controls.map(s => s.request.sequence), [1]);
     f.state.close = false; await assert.rejects(f.receiver.close(), /not acknowledged/);
     await assert.rejects(f.receiver.control(click()), /confirmed/); await assert.rejects(f.receiver.confirm(), /No verified/);
-    assert.equal(f.state.controls.length, 2);
+    assert.equal(f.state.controls.length, 1);
   });
 });
-test('control HTTP response has a1MiB streaming bound and matching sequence is mandatory', async () => {
+test('bound transport is mandatory, cannot be rebound during a session, and wrong sequence fences control', async () => {
   await withSession(async f => {
-    await f.receiver.confirm(); let cancelled = false;
-    f.state.controlReply = () => new Response(new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(CONTROL_MAX_RESPONSE_BYTES + 1)); }, cancel() { cancelled = true; } }));
-    await assert.rejects(f.receiver.control({ kind: 'observe_frame' }), /too large/); assert.equal(cancelled, true);
+    await f.receiver.confirm(); assert.throws(() => f.receiver.bindControlTransport(async () => ({})), /before offering/);
     f.state.controlReply = body => Response.json({ sequence: body.request.sequence + 1, result: png });
     await assert.rejects(f.receiver.control({ kind: 'observe_frame' }), /sequence/);
+    await assert.rejects(f.receiver.control({ kind: 'observe_frame' }), /confirmed/);
   });
 });
 test('screenshot bounds/base64/type and dispatch/lease/release outcomes fail closed', () => {
@@ -168,3 +169,74 @@ test('configuration scopes and returned pairing objects cannot expand fixed auth
   const first = await receiver.pairingRequest(); first.pairing.scopes.unshift('input');
   assert.deepEqual((await receiver.pairingRequest()).pairing.scopes, ['observe']); receiver.dispose();
 });
+
+test('unbound confirmed session rejects control without HTTP; only genuinely unopened transports can clear', async () => {
+  const f = await fixture(), previous = globalThis.fetch; globalThis.fetch = f.fetcher;
+  try {
+    f.receiver.clearUnopenedControlTransport();
+    let closed = 0;
+    f.receiver.bindControlTransport(async () => { throw Error('unused'); }, () => { closed++; });
+    assert.throws(() => f.receiver.bindControlTransport(async () => ({})), /once before/);
+    f.receiver.clearUnopenedControlTransport(); assert.equal(closed, 1);
+    await f.receiver.offer(sdp('AA'), 'unbound-request', 'h264'); await f.receiver.confirm();
+    await assert.rejects(f.receiver.control({ kind: 'observe_frame' }), /Encrypted control channel required; HTTP control is disabled/);
+    assert.throws(() => f.receiver.clearUnopenedControlTransport(), /admission/);
+    assert.throws(() => f.receiver.bindControlTransport(async () => ({})), /before offering/);
+    assert.equal(f.calls.includes('/auth/control'), false); await f.receiver.close();
+  } finally { await f.receiver.close(); f.receiver.dispose(); globalThis.fetch = previous; }
+});
+test('failed offer cannot discard its transport or bind another while admission is uncertain', async () => {
+  // The old fixture threw during challenge, which is provably pre-transmission.
+  // This negative case must reach /auth/offer before losing the answer.
+  const f = await fixture(), previous = globalThis.fetch; globalThis.fetch = async (path, options) => {
+    if (path === '/auth/offer') { await f.fetcher(path, options); throw Error('response lost'); }
+    return f.fetcher(path, options);
+  };
+  try {
+    await assert.rejects(f.receiver.offer(sdp('AA'), 'uncertain-request', 'h264'), /response lost/);
+    assert.throws(() => f.receiver.clearUnopenedControlTransport(), /admission/);
+    assert.throws(() => f.receiver.bindControlTransport(async () => ({})), /before offering/);
+    assert.equal(f.calls.includes('/auth/control'), false);
+  } finally { assert.throws(() => f.receiver.dispose(), /Close the session/); globalThis.fetch = previous; }
+});
+
+test('JPEG and PNG screenshot sources verify bytes and hashes without inventing anchors', async () => {
+  const bytes = await readFile(new URL('./fixtures/screenshot-1000x500.jpg', import.meta.url));
+  const jpeg = { ...frame, width: 1000, height: 500, input_anchor_available: true, mime_type: 'image/jpeg', byte_length: bytes.length, data_base64: bytes.toString('base64'), sha256: createHash('sha256').update(bytes).digest('hex') };
+  const check = result => validateControlResponse({ sequence: 1, result }, 1, { kind: 'observe_frame' });
+  check(jpeg); check(png);
+  assert.equal(await verifiedScreenshotSource(jpeg), `data:image/jpeg;base64,${jpeg.data_base64}`);
+  assert.equal(await verifiedScreenshotSource(png), `data:image/png;base64,${png.data_base64}`);
+  const hashedPNG = { ...png, sha256: createHash('sha256').update(Buffer.from(png.data_base64, 'base64')).digest('hex') };
+  await verifiedScreenshotSource(hashedPNG);
+  for (const mutate of [
+    r => r.mime_type = 'image/jpg', r => r.mime_type = 'image/png', r => delete r.sha256,
+    r => r.sha256 = r.sha256.toUpperCase(), r => r.sha256 = 42,
+    r => r.byte_length++, r => r.byte_length = SCREENSHOT_MAX_BYTES + 1,
+    r => delete r.source_generation, r => r.input_anchor_available = false,
+    r => r.input_anchor_available = 'true', r => r.data_base64 = 'a',
+  ]) {
+    const changed = structuredClone(jpeg); mutate(changed);
+    assert.throws(() => check(changed)); await assert.rejects(verifiedScreenshotSource(changed));
+  }
+  for (const changedBytes of [bytes.subarray(1), bytes.subarray(0, -1), Buffer.concat([bytes, Buffer.from([0])])]) {
+    const changed = { ...jpeg, byte_length: changedBytes.length, data_base64: changedBytes.toString('base64') };
+    assert.throws(() => check(changed), /boundaries/);
+  }
+  for (const original of [jpeg, hashedPNG]) await assert.rejects(verifiedScreenshotSource({ ...original, sha256: '00'.repeat(32) }), /SHA-256 mismatch/);
+  const mutable = structuredClone(jpeg), verifying = verifiedScreenshotSource(mutable);
+  mutable.data_base64 = png.data_base64; mutable.mime_type = 'text/html';
+  assert.equal(await verifying, `data:image/jpeg;base64,${jpeg.data_base64}`, 'Awaiting digest cannot swap the checked payload');
+  assert.throws(() => screenshotAnchor({ ...jpeg, input_anchor_available: false }), /no usable input anchor/);
+});
+test('files-only signatures verify in Rust and semantic file refusal leaves the session usable',async()=>withSession(async f=>{
+ const action={kind:'file',operation:{kind:'upload_begin',path:'澳洲.bin',size:3,sha256:createHash('sha256').update('abc').digest('hex')}};
+ const signed=await signControl(f.device,f.state.transcript,action,{sequence:1,now:Math.floor(Date.now()/1000)});
+ const request={kind:'control',device_public_key:f.device.publicKey,transcript:f.state.transcript,signed};
+ const result=spawnSync(pairBinary,['verify'],{input:JSON.stringify(request),encoding:'utf8',timeout:5000});assert.equal(result.status,0,result.stderr);
+ request.signed.request.action.operation.path='substituted';assert.notEqual(spawnSync(pairBinary,['verify'],{input:JSON.stringify(request),encoding:'utf8',timeout:5000}).status,0);
+ await assert.rejects(signControl(f.device,f.state.transcript,click(),{sequence:2,now:Math.floor(Date.now()/1000)}),/scope/);
+ await f.receiver.confirm();f.state.controlReply=body=>Response.json({sequence:body.request.sequence,result:{ok:false,error:{code:'forbidden'}}});
+ assert.equal((await f.receiver.control({kind:'file',operation:{kind:'download_begin',path:'private'}})).result.ok,false);assert.equal(f.receiver.controlConfirmed,true);
+ assert.equal((await f.receiver.control({kind:'file',operation:{kind:'download_begin',path:'private'}})).result.ok,false);
+},['files','observe']));

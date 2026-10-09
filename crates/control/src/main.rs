@@ -35,7 +35,8 @@ fn run() -> Result<()> {
             | "--qemu-spice-library"
             | "--qemu-screenshot-helper"
             | "--qemu-console-broker"
-            | "--qemu-console-helper" => {
+            | "--qemu-console-helper"
+            | "--qemu-venus-runtime" => {
                 let path = PathBuf::from(args.next().context("missing QEMU runtime path")?)
                     .canonicalize()
                     .context("QEMU runtime path not found")?;
@@ -96,6 +97,7 @@ fn run() -> Result<()> {
                     screenshot_helper: qemu_options.remove("--qemu-screenshot-helper"),
                     console_broker: qemu_options.remove("--qemu-console-broker"),
                     console_helper: qemu_options.remove("--qemu-console-helper"),
+                    venus_runtime: qemu_options.remove("--qemu-venus-runtime"),
                 })
             };
             vm_control::serve_with_qemu(dir, backend, memory_budget_mib, qemu)

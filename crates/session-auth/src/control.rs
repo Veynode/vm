@@ -1,4 +1,4 @@
-//! Domain-separated physical-console requests. No text injection, file paths or VM selection.
+//! Domain-separated console and independently authorized bounded file requests.
 use super::{identifier, unhex, Canon, MAX_SAFE_INTEGER};
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
@@ -40,6 +40,9 @@ impl FrameAnchor {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ControlAction {
+    File {
+        operation: super::files::FileAction,
+    },
     Acquire,
     Release {
         epoch: u64,
@@ -77,7 +80,9 @@ pub enum ControlAction {
 }
 impl ControlAction {
     pub fn required_scope(&self) -> &'static str {
-        if matches!(self, Self::ObserveFrame) {
+        if matches!(self, Self::File { .. }) {
+            "files"
+        } else if matches!(self, Self::ObserveFrame) {
             "observe"
         } else {
             "input"
@@ -110,6 +115,10 @@ impl ControlAction {
             )
         };
         match self {
+            Self::File { operation } => {
+                c.text("file");
+                operation.fields(c)?;
+            }
             Self::Acquire => c.text("acquire"),
             Self::ObserveFrame => c.text("observe_frame"),
             Self::Release { epoch } => {

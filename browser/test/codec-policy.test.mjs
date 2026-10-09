@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createCodecPlan, codecPreferences, negotiateCodec, CodecError } from '../dist/codec-policy.js';
+import { createCodecPlan, codecPreferences, negotiateCodec, CodecError, SourceFailureError, mediaFailureFromReceipt } from '../dist/codec-policy.js';
 import { sdpCodecs } from '../dist/loopback.js';
 const h264 = { mimeType: 'video/H264', clockRate: 90000, sdpFmtpLine: 'packetization-mode=1;profile-level-id=42e01f' };
 const high264 = { ...h264, sdpFmtpLine: 'packetization-mode=1;profile-level-id=640c1f' };
@@ -120,4 +120,19 @@ test('native HEVC filters Main10, tier1, other transmission modes and too-low le
     const filteredPlan = createNativeCodecPlan(host, [capability, h264]);
     assert.equal(filteredPlan.preferred, 'h264'); assert.equal(filteredPlan.reason, 'browser_h265_profile_unavailable');
   }
+});
+
+test('source failure after acknowledged cleanup stops codec fallback; cleanup uncertainty takes precedence', async () => {
+  for (const failure of [new SourceFailureError({ code: 'guest_display_asleep' }), new SourceFailureError({ code: 'guest_capture_no_frames' }), new CodecError('cleanup_unconfirmed', 'Cleanup not confirmed')]) {
+    const calls = [];
+    await assert.rejects(negotiateCodec(plan(), async codec => { calls.push(codec); throw failure; }), error => error.code === failure.code && error.attempts.length === 1);
+    assert.deepEqual(calls, ['h265']);
+  }
+});
+test('source diagnostics have only fixed messages and never infer lock from unknown code', () => {
+  assert.equal(mediaFailureFromReceipt({ closed: true }), null);
+  assert.deepEqual(mediaFailureFromReceipt({ closed: true, media_failure: { code: 'guest_display_asleep' } }), { code: 'guest_display_asleep' });
+  const generic = mediaFailureFromReceipt({ closed: true, media_failure: { code: '/private/SECRET' } });
+  assert.equal(generic.code, 'guest_capture_failed'); assert.doesNotMatch(new SourceFailureError(generic).message, /SECRET|asleep|lock/);
+  for (const media_failure of [null, [], {}, { code: 1 }, { code: 'guest_display_asleep', extra: 'SECRET' }]) assert.throws(() => mediaFailureFromReceipt({ closed: true, media_failure }));
 });

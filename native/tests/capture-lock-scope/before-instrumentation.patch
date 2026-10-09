@@ -1,0 +1,40 @@
+--- a/macos-capture-stream.swift
++++ b/macos-capture-stream.swift
+@@ -175,6 +175,7 @@
+     var captureIdentity:GuestConsoleIdentityV1?,identityVerifiedAt:UInt64?
+     var identityTimer:DispatchSourceTimer?,workspaceObservers:[NSObjectProtocol]=[]
+     var identityReads:UInt64=0,identityReadMaxNS:UInt64=0
++    var copyFrame:(CVPixelBuffer,UInt64,UInt64,Int,Int)throws->Data = { try frameBody($0,sequence:$1,pts:$2,width:$3,height:$4) }
+     var captureInstance:String?,stopPending=false,callbacksDraining=false
+     init(fd:Int32,ledger:CleanupLedger=cleanupLedger) {self.fd=fd;self.ledger=ledger;super.init()}
+     func receiptFields()->[String:Any] {
+@@ -490,15 +491,17 @@
+               let pixel=CMSampleBufferGetImageBuffer(sample) else{return}
+         let timestamp=CMTimeConvertScale(CMSampleBufferGetPresentationTimeStamp(sample),timescale:1_000_000_000,method:.default)
+         guard timestamp.isValid,timestamp.isNumeric,timestamp.value>=0 else {fail("invalid_sample_timestamp");return}
++        receivePixel(pixel,pts:UInt64(timestamp.value))
++    }
++    func receivePixel(_ pixel:CVPixelBuffer,pts:UInt64) {
+         condition.lock()
+         guard accepting,let config=settings else {condition.unlock();return}
+         guard identityFresh(verifiedAt:identityVerifiedAt,at:now()) else {condition.unlock();fail("console_identity_verification_stale");return}
+-        let pts=UInt64(timestamp.value)
+         if let lastPTS,pts<=lastPTS {condition.unlock();return}
+         if latest != nil {replaced+=1;latest=nil}
+         do {
+             sequence+=1
+-            latest=try frameBody(pixel,sequence:sequence,pts:pts,width:config.width,height:config.height)
++            latest=try copyFrame(pixel,sequence,pts,config.width,config.height)
+             lastPTS=pts
+             condition.signal();condition.unlock()
+         } catch {condition.unlock();fail((error as? Failure)?.code ?? "frame_copy_failed")}
+@@ -721,7 +724,8 @@
+ static func main() {
+ let args=Array(CommandLine.arguments.dropFirst())
+ do {
+-    if args==["--self-test"] {try selfTest()}
++    if args==["--copy-lock-test"] {try copyLockTest()}
++    else if args==["--self-test"] {try selfTest()}
+     else if args==["--serve"] {
+         DispatchQueue.global(qos:.userInitiated).async {
+             do {try serve()} catch {log((error as? Failure)?.code ?? "unexpected_failure");exit(1)}

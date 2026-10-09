@@ -24,7 +24,7 @@ static id<MTLDevice> device;
 static id<MTLCommandQueue> queue;
 static NSString *failure;
 static NSDictionary *result;
-static const NSUInteger maxPixels = 8388608, maxPNG = 700 * 1024;
+static const NSUInteger maxPixels = 8388608, maxPNG = 2 * 1024 * 1024;
 
 static void fail(NSString *message) {
     if (!failure) failure = message;
@@ -106,7 +106,7 @@ static void draw(SpiceDisplayChannel *channel, guint32 x, guint32 y,
                         if (image) CGImageRelease(image);
                         CGColorSpaceRelease(color); CGDataProviderRelease(provider);
                         if (!encoded) fail(@"png_encoding_failed");
-                        else if (png.length > maxPNG) fail(@"screenshot_exceeds_700KiB_limit");
+                        else if (png.length > maxPNG) fail(@"screenshot_exceeds_2MiB_limit");
                         else if (!generationLive()) fail(@"source_invalidated_before_publication");
                         else {
                             NSISO8601DateFormatter *formatter = [NSISO8601DateFormatter new];
@@ -176,7 +176,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     clearSurface(); g_main_loop_unref(loop); loop=NULL;
     NSDictionary *output = failure ? @{@"error":failure} : result;
     if (!output) output = @{@"error":@"no_screenshot"};
-    NSMutableData *json = [[NSJSONSerialization dataWithJSONObject:output options:NSJSONWritingSortedKeys error:nil] mutableCopy];
+    NSMutableData *json = [[NSJSONSerialization dataWithJSONObject:output options:NSJSONWritingSortedKeys|NSJSONWritingWithoutEscapingSlashes error:nil] mutableCopy];
     [json appendBytes:"\n" length:1];
     if (!writeBounded(json)) return 1;
     return failure || !result ? 1 : 0;

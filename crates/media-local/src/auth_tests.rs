@@ -69,12 +69,17 @@ impl Fixture {
             .save(&registry)
             .unwrap();
         let auth = Arc::new(Auth {
+            ice_config: None,
+            test_identity: None,
+            registry_read: std::sync::Mutex::new(()),
             host_public_key: host_public_key.clone(),
             vm_id: grant.grant.vm_id.clone(),
             gate: protocol::SessionGate::new(&host_public_key, std::slice::from_ref(&grant))
                 .unwrap(),
             state,
             namespace: "not-used-no-keychain".into(),
+            control_state: None,
+            files_enabled: false,
             close_proofs: std::sync::Mutex::new(BTreeMap::new()),
         });
         let app = App {
@@ -84,11 +89,14 @@ impl Fixture {
             socket: PathBuf::new(),
             web: PathBuf::new(),
             capabilities: json!({"h265":"verified-hardware","h264":"verified-hardware"}),
+            fault_au_egress_hold: false,
             fault_drop_first_keyframe: false,
             fault_suppress_hevc_frames: false,
             active: Arc::new(Mutex::new(SessionBook::default())),
             auth: Some(auth),
             cleanup_failure_exit: None,
+            guest_binding: None,
+            encoder_rate: None,
         };
         Self {
             _directory: directory,
@@ -208,6 +216,8 @@ impl Fixture {
             cancel,
             finished,
             confirmed,
+            input: None,
+            files: None,
         });
         (cancelled, confirmation, done)
     }
@@ -463,7 +473,177 @@ async fn signed_close_never_turns_missing_cleanup_attestation_into_success() {
 }
 
 #[tokio::test]
-async fn wrong_confirmation_cannot_start_encoder_watch_and_valid_confirmation_is_single_use() {
+async fn expired_close_proof_can_retry_only_exact_unresolved_cleanup_after_revocation() {
+    let f = Fixture::new();
+    let answer = f.pending();
+    let signed = f.signed_close(&answer);
+    f.complete(&answer, false).await;
+    f.auth()
+        .close_proofs
+        .lock()
+        .unwrap()
+        .get_mut(&signed.session_id)
+        .unwrap()
+        .issued = Instant::now() - Duration::from_secs(3600);
+    f.revoke_registry();
+    f.auth().reload().unwrap();
+    for _ in 0..2 {
+        let (status, body) = f
+            .post(
+                "/auth/close",
+                serde_json::to_value(&signed).unwrap(),
+                Some(&f.app.origin),
+            )
+            .await;
+        // Authorization reaches cleanup rather than failing at proof expiry,
+        // but no Guest proof exists in this fixture, so it cannot claim success.
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert!(!String::from_utf8_lossy(&body).contains("\"closed\":true"));
+        assert!(f
+            .app
+            .active
+            .lock()
+            .await
+            .cancelled
+            .contains_key(&answer.transcript.intent.request_id));
+        assert!(f
+            .auth()
+            .gate
+            .authorize_session(&signed.session_id, "observe")
+            .is_err());
+        assert!(f
+            .auth()
+            .gate
+            .authorize_session(&signed.session_id, "input")
+            .is_err());
+    }
+}
+
+#[tokio::test]
+async fn unresolved_cleanup_does_not_waive_signature_or_exact_expired_proof_binding() {
+    for variant in [
+        "request",
+        "session",
+        "missing",
+        "clean",
+        "digest",
+        "signature",
+    ] {
+        let f = Fixture::new();
+        let answer = f.pending();
+        let mut signed = f.signed_close(&answer);
+        f.complete(&answer, false).await;
+        f.auth()
+            .close_proofs
+            .lock()
+            .unwrap()
+            .get_mut(&signed.session_id)
+            .unwrap()
+            .issued = Instant::now() - Duration::from_secs(3600);
+        {
+            let mut book = f.app.active.lock().await;
+            let request = &answer.transcript.intent.request_id;
+            match variant {
+                "request" => {
+                    let entry = book.completed.remove(request).unwrap();
+                    book.completed
+                        .insert(uuid::Uuid::new_v4().to_string(), entry);
+                }
+                "session" => {
+                    book.completed.get_mut(request).unwrap().2 = uuid::Uuid::new_v4().to_string()
+                }
+                "missing" => book.completed.clear(),
+                "clean" => book.completed.get_mut(request).unwrap().1 = true,
+                "digest" => signed.transcript_sha256 = "00".repeat(32),
+                "signature" => {
+                    signed.signature = TestIdentity::new(3)
+                        .sign(
+                            &protocol::close_bytes(&signed.session_id, &signed.transcript_sha256)
+                                .unwrap(),
+                        )
+                        .unwrap()
+                }
+                _ => unreachable!(),
+            }
+        }
+        let (status, body) = f
+            .post(
+                "/auth/close",
+                serde_json::to_value(&signed).unwrap(),
+                Some(&f.app.origin),
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "variant {variant}");
+        assert!(!String::from_utf8_lossy(&body).contains("\"closed\":true"));
+        assert!(
+            f.app.active.lock().await.cancelled.is_empty(),
+            "invalid proof reached cleanup: {variant}"
+        );
+        assert!(
+            f.auth()
+                .close_proofs
+                .lock()
+                .unwrap()
+                .get(&answer.transcript.session_id)
+                .unwrap()
+                .issued
+                .elapsed()
+                >= Duration::from_secs(3600),
+            "invalid proof renewed receipt: {variant}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn recovered_close_receipt_is_retryable_when_recovery_acknowledgement_is_lost() {
+    let f = Fixture::new();
+    let answer = f.pending();
+    let signed = f.signed_close(&answer);
+    f.complete(&answer, false).await;
+    f.auth()
+        .close_proofs
+        .lock()
+        .unwrap()
+        .get_mut(&signed.session_id)
+        .unwrap()
+        .issued = Instant::now() - Duration::from_secs(3600);
+    f.revoke_registry();
+    f.auth().reload().unwrap();
+    let payload = serde_json::to_value(&signed).unwrap();
+    assert_eq!(
+        f.post("/auth/close", payload.clone(), Some(&f.app.origin))
+            .await
+            .0,
+        StatusCode::GATEWAY_TIMEOUT
+    );
+    // This test supplies only the state-machine's positive cleanup result;
+    // it does not simulate or claim a Guest recovery proof. The caller loses
+    // the first successful acknowledgement and retries the exact same signature.
+    f.complete(&answer, true).await;
+    let discarded_reply = f
+        .post("/auth/close", payload.clone(), Some(&f.app.origin))
+        .await;
+    assert_eq!(discarded_reply.0, StatusCode::OK);
+    let (status, body) = f.post("/auth/close", payload, Some(&f.app.origin)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!({"closed":true})
+    );
+    assert!(f
+        .auth()
+        .gate
+        .authorize_session(&signed.session_id, "observe")
+        .is_err());
+    assert!(f
+        .auth()
+        .gate
+        .authorize_session(&signed.session_id, "input")
+        .is_err());
+}
+
+#[tokio::test]
+async fn wrong_confirmation_cannot_start_encoder_watch_and_valid_retry_is_idempotent() {
     let f = Fixture::new();
     let answer = f.pending();
     let (_, confirmed, _done) = f.install_session(&answer).await;
@@ -507,7 +687,7 @@ async fn wrong_confirmation_cannot_start_encoder_watch_and_valid_confirmation_is
         f.post("/auth/confirm", body(valid), Some(&f.app.origin))
             .await
             .0,
-        StatusCode::FORBIDDEN
+        StatusCode::OK
     );
 }
 
@@ -557,6 +737,8 @@ fn duplicate_and_partial_auth_cli_config_fail_before_keychain_access() {
         vec!["--auth-state", "one", "--auth-state", "two"],
         vec!["--auth-namespace", "one", "--auth-namespace", "two"],
         vec!["--vm", "one", "--vm", "two"],
+        vec!["--ice-config", "/missing"],
+        vec!["--ice-config", "one", "--ice-config", "two"],
         vec!["--unknown"],
     ] {
         assert!(
@@ -618,11 +800,21 @@ async fn old_signed_close_cannot_borrow_new_sessions_cleanup_after_request_id_re
         StatusCode::GATEWAY_TIMEOUT
     );
 
-    // Completion receipts expire at 60s while signed close proofs live for 240s.
-    // Simulate only that elapsed clock boundary, preserving the old valid proof.
+    // Unresolved cleanup must survive the old 60s pruning boundary. Only a
+    // later positive cleanup result makes this request eligible for expiry.
     {
         let mut book = f.app.active.lock().await;
         book.completed.get_mut(&request_id).unwrap().0 = Instant::now() - Duration::from_secs(61);
+        book.prune();
+        assert!(!book.completed.get(&request_id).unwrap().1);
+    }
+    f.complete(&old, true).await;
+    // Clean receipts expire at 60s while signed close proofs live for 240s.
+    // Simulate both elapsed receipt/tombstone clocks, preserving the valid proof.
+    {
+        let mut book = f.app.active.lock().await;
+        book.completed.get_mut(&request_id).unwrap().0 = Instant::now() - Duration::from_secs(61);
+        *book.cancelled.get_mut(&request_id).unwrap() = Instant::now() - Duration::from_secs(61);
         book.prune();
         assert!(!book.completed.contains_key(&request_id));
         assert!(!book.cancelled.contains_key(&request_id));
@@ -672,7 +864,6 @@ async fn old_signed_close_cannot_borrow_new_sessions_cleanup_after_request_id_re
     );
 }
 
-
 #[tokio::test]
 async fn shutdown_fences_fresh_signed_offer_after_previous_session_releases_slot() {
     let f = Fixture::new();
@@ -687,7 +878,11 @@ async fn shutdown_fences_fresh_signed_offer_after_previous_session_releases_slot
     f.complete(&old, true).await;
     done.send(Some(true)).unwrap();
     let (receipt, wait) = tokio::join!(
-        f.post("/auth/offer", json!({"signed_offer":fresh,"sdp":sdp("11")}), Some(&f.app.origin)),
+        f.post(
+            "/auth/offer",
+            json!({"signed_offer":fresh,"sdp":sdp("11")}),
+            Some(&f.app.origin)
+        ),
         crate::await_shutdown_cleanup(finished, Duration::from_millis(50))
     );
     wait.unwrap();
@@ -696,5 +891,894 @@ async fn shutdown_fences_fresh_signed_offer_after_previous_session_releases_slot
     assert!(f.app.active.lock().await.active.is_none());
     // Authentication succeeded/consumed the one-use challenge before admission
     // refused it; this does not create a replayable token or pending session.
-    assert!(f.auth().gate.accept_offer(&fresh, &sdp("11"), now().unwrap()).is_err());
+    assert!(f
+        .auth()
+        .gate
+        .accept_offer(&fresh, &sdp("11"), now().unwrap())
+        .is_err());
+}
+
+#[test]
+fn concurrent_registry_readers_serialize_but_external_writer_still_fails_closed() {
+    let f = Fixture::new();
+    let auth = f.auth();
+    // Force overlap: one legitimate in-process reader owns the mutex and Store
+    // flock while other OS threads enter reload. They must wait, not report busy.
+    let reader = auth.registry_read.lock().unwrap();
+    let store = protocol::store::Store::open(&auth.state).unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(9));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let auth = auth.clone();
+            let barrier = barrier.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..32 {
+                    if let Err(error) = auth.reload() {
+                        tx.send(Err(error.to_string())).unwrap();
+                        return;
+                    }
+                }
+                tx.send(Ok(())).unwrap();
+            })
+        })
+        .collect();
+    barrier.wait();
+    let before_release = rx.recv_timeout(Duration::from_millis(100));
+    drop(store);
+    drop(reader);
+    let results: Vec<_> = (0..8)
+        .map(|_| rx.recv_timeout(Duration::from_secs(5)).unwrap())
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    assert!(matches!(
+        before_release,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    assert!(results.iter().all(Result::is_ok), "{results:?}");
+    // An independent administrator/process holds flock without this Auth mutex.
+    // Do not retry, bypass, or broaden the lock: the authorization check must fail.
+    let external_writer = protocol::store::Store::open(&auth.state).unwrap();
+    assert!(auth
+        .reload()
+        .unwrap_err()
+        .to_string()
+        .contains("registry busy"));
+    drop(external_writer);
+    auth.reload().unwrap();
+}
+
+#[tokio::test]
+async fn confirmed_retry_preserves_adapter_identity_and_revalidates_signature_and_grant() {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let mut f = Fixture::new();
+    let dir = f._directory.path().canonicalize().unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let control = tokio::net::UnixListener::bind(dir.join("control.sock")).unwrap();
+    let console = tokio::net::UnixListener::bind(dir.join("console.sock")).unwrap();
+    for path in [dir.join("control.sock"), dir.join("console.sock")] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    Arc::get_mut(f.app.auth.as_mut().unwrap())
+        .unwrap()
+        .control_state = Some(dir.clone());
+    f.app.socket = dir.join("console.sock");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let requests = calls.clone();
+    let console_path = f.app.socket.clone();
+    let vm = f.auth().vm_id.clone();
+    let worker = tokio::spawn(async move {
+        loop {
+            let (socket, _) = control.accept().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(socket);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let reply = match request["method"].as_str().unwrap() {
+                "capabilities" => {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    json!({"control_session_fencing":{"retired_owner_ttl_seconds":120,"request_dispatch_deadline_seconds":30}})
+                }
+                "status" => {
+                    json!({"config":{"id":vm,"backend":"qemu-hvf"},"state":"running","capabilities":{"input":true},"runtime":{"console_socket":console_path},"pid":123})
+                }
+                "session_end" => {
+                    json!({"closed":true,"retired_owner":true,"retired_owner_ttl_seconds":120,"released_vm_ids":[]})
+                }
+                _ => panic!("unexpected controller fixture request"),
+            };
+            reader
+                .get_mut()
+                .write_all(format!("{}\n", json!({"result":reply})).as_bytes())
+                .await
+                .unwrap();
+        }
+    });
+    let answer = f.pending();
+    let (_, confirmed, _done) = f.install_session(&answer).await;
+    let confirmation = f.confirmation(&answer);
+    let body = |confirmation: protocol::Confirmation| json!({"session_id":answer.transcript.session_id,"confirmation":confirmation});
+    assert_eq!(
+        f.post(
+            "/auth/confirm",
+            body(confirmation.clone()),
+            Some(&f.app.origin)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert!(*confirmed.borrow());
+    let original = f
+        .app
+        .active
+        .lock()
+        .await
+        .active
+        .as_ref()
+        .unwrap()
+        .input
+        .clone()
+        .unwrap();
+    for _ in 0..3 {
+        assert_eq!(
+            f.post(
+                "/auth/confirm",
+                body(confirmation.clone()),
+                Some(&f.app.origin)
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let retained = f
+            .app
+            .active
+            .lock()
+            .await
+            .active
+            .as_ref()
+            .unwrap()
+            .input
+            .clone()
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&original, &retained),
+            "confirmation retry replaced the input owner"
+        );
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "retry must not attach a new controller session"
+    );
+    let mut invalid = confirmation.clone();
+    invalid.signature = TestIdentity::new(3)
+        .sign(&protocol::confirmation_bytes(&invalid.transcript_sha256).unwrap())
+        .unwrap();
+    assert_eq!(
+        f.post("/auth/confirm", body(invalid), Some(&f.app.origin))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    f.revoke_registry();
+    assert_eq!(
+        f.post("/auth/confirm", body(confirmation), Some(&f.app.origin))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert!(f
+        .auth()
+        .gate
+        .authorize_active(&answer.transcript.session_id, "observe")
+        .is_err());
+    original.end().await.unwrap();
+    worker.abort();
+    drop(console);
+}
+
+#[tokio::test]
+async fn failed_adapter_attach_revokes_and_cancels_session_without_confirming() {
+    let mut f = Fixture::new();
+    Arc::get_mut(f.app.auth.as_mut().unwrap())
+        .unwrap()
+        .control_state = Some(f._directory.path().join("unavailable-controller"));
+    let answer = f.pending();
+    let (cancelled, confirmed, _done) = f.install_session(&answer).await;
+    let body =
+        json!({"session_id":answer.transcript.session_id,"confirmation":f.confirmation(&answer)});
+    assert_eq!(
+        f.post("/auth/confirm", body.clone(), Some(&f.app.origin))
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    assert!(*cancelled.borrow());
+    assert!(!*confirmed.borrow());
+    assert!(f
+        .app
+        .active
+        .lock()
+        .await
+        .active
+        .as_ref()
+        .unwrap()
+        .input
+        .is_none());
+    assert!(f
+        .auth()
+        .gate
+        .authorize_session(&answer.transcript.session_id, "observe")
+        .is_err());
+    assert_eq!(
+        f.post("/auth/confirm", body, Some(&f.app.origin)).await.0,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn plaintext_control_route_is_absent_even_for_authenticated_origin() {
+    let f = Fixture::new();
+    assert_eq!(
+        f.post("/auth/control", json!({}), Some(&f.app.origin))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn closing_dispatch_during_confirm_attach_revokes_before_book_unlock() {
+    use crate::control_channel::ControlDispatch;
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    // Real route + real SessionInput attach + real ConsoleControlDispatch::end.
+    // Only the private controller's capabilities/status replies are fixtures;
+    // no Guest, Keychain, peer or encoder is claimed by this test.
+    let mut f = Fixture::new();
+    let dir = f._directory.path().canonicalize().unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let controller = tokio::net::UnixListener::bind(dir.join("control.sock")).unwrap();
+    let _console = tokio::net::UnixListener::bind(dir.join("console.sock")).unwrap();
+    for path in [dir.join("control.sock"), dir.join("console.sock")] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    Arc::get_mut(f.app.auth.as_mut().unwrap())
+        .unwrap()
+        .control_state = Some(dir.clone());
+    f.app.socket = dir.join("console.sock");
+    let vm = f.auth().vm_id.clone();
+    let console = f.app.socket.clone();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    let worker = tokio::spawn(async move {
+        let (socket, _) = controller.accept().await.unwrap();
+        let mut reader = tokio::io::BufReader::new(socket);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], "capabilities");
+        reader.get_mut().write_all(format!("{}\n",json!({"result":{"control_session_fencing":{"retired_owner_ttl_seconds":120,"request_dispatch_deadline_seconds":30}}})).as_bytes()).await.unwrap();
+        drop(reader);
+        let (socket, _) = controller.accept().await.unwrap();
+        let mut reader = tokio::io::BufReader::new(socket);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], "status");
+        entered_tx.send(()).unwrap();
+        resume_rx.await.unwrap();
+        reader.get_mut().write_all(format!("{}\n",json!({"result":{"config":{"id":vm,"backend":"qemu-hvf"},"state":"running","capabilities":{"input":true},"runtime":{"console_socket":console},"pid":123}})).as_bytes()).await.unwrap();
+    });
+    let answer = f.pending();
+    let id = answer.transcript.session_id.clone();
+    let (cancelled, confirmed, _done) = f.install_session(&answer).await;
+    let confirm = f.post(
+        "/auth/confirm",
+        json!({"session_id":id,"confirmation":f.confirmation(&answer)}),
+        Some(&f.app.origin),
+    );
+    let race = async {
+        tokio::time::timeout(Duration::from_secs(2), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        f.auth().gate.authorize_active(&id, "observe").unwrap();
+        assert!(
+            f.app.active.try_lock().is_err(),
+            "confirm must hold session book while attach awaits status"
+        );
+        let dispatch = crate::ConsoleControlDispatch {
+            app: f.app.clone(),
+            id: id.clone(),
+        };
+        let ending = tokio::spawn(async move { dispatch.end().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while f.auth().gate.authorize_active(&id, "observe").is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("authority must be revoked without waiting for the session book");
+        assert!(
+            !ending.is_finished(),
+            "end must still wait for attach to relinquish the session book"
+        );
+        assert!(!*confirmed.borrow());
+        resume_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), ending)
+            .await
+            .expect("cleanup must finish after attach resolves")
+            .unwrap()
+            .unwrap();
+    };
+    let (response, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(confirm, race)
+    })
+    .await
+    .unwrap();
+    assert_eq!(response.0, StatusCode::CONFLICT);
+    assert!(*cancelled.borrow());
+    assert!(!*confirmed.borrow());
+    assert!(f.auth().gate.authorize_session(&id, "observe").is_err());
+    assert!(f
+        .app
+        .active
+        .lock()
+        .await
+        .active
+        .as_ref()
+        .unwrap()
+        .input
+        .is_none());
+    worker.await.unwrap();
+}
+
+fn enable_ice(f: &mut Fixture) -> PathBuf {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let now = now().unwrap();
+    let path = f._directory.path().join("ice.json");
+    let config = protocol::ice::IceConfig {
+        version: 1,
+        transport_policy: "relay".into(),
+        issued_at: now,
+        expires_at: now + 600,
+        ice_servers: vec![protocol::ice::IceServer {
+            urls: vec!["turn:127.0.0.1:3478?transport=udp".into()],
+            username: "fixture-user".into(),
+            credential: "not-a-real-credential-secret".into(),
+        }],
+    };
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .unwrap()
+        .write_all(&serde_json::to_vec(&config).unwrap())
+        .unwrap();
+    let auth = Arc::get_mut(f.app.auth.as_mut().unwrap()).unwrap();
+    auth.ice_config = Some(Arc::new(
+        crate::ice_config::IceSource::open(path.clone(), now).unwrap(),
+    ));
+    auth.test_identity = Some(Arc::new(TestIdentity::new(1)));
+    path
+}
+fn ice_request(f: &Fixture) -> protocol::ice::SignedIceRequest {
+    let request = protocol::ice::IceRequest {
+        challenge: f
+            .auth()
+            .gate
+            .challenge(
+                &f.grant.grant.device_id,
+                &f.grant.grant.vm_id,
+                vec!["observe".into()],
+                now().unwrap(),
+            )
+            .unwrap(),
+        request_nonce: protocol::random32(),
+    };
+    protocol::ice::SignedIceRequest {
+        signature: f.device.sign(&request.canonical().unwrap()).unwrap(),
+        request,
+    }
+}
+async fn call_ice(f: &Fixture, signed: &protocol::ice::SignedIceRequest, origin: &str) -> Response {
+    Router::new()
+        .route("/auth/ice-config", post(super::ice_configuration))
+        .with_state(f.app.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/ice-config")
+                .header(header::HOST, &f.app.host)
+                .header(header::ORIGIN, origin)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(signed).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+#[tokio::test]
+async fn signed_ice_route_is_bound_single_use_private_and_no_store() {
+    let mut f = Fixture::new();
+    enable_ice(&mut f);
+    let signed = ice_request(&f);
+    let foreign = call_ice(&f, &signed, "http://foreign.invalid").await;
+    assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+    let mut bad = signed.clone();
+    bad.signature = "00".repeat(64);
+    assert_eq!(
+        call_ice(&f, &bad, &f.app.origin).await.status(),
+        StatusCode::FORBIDDEN
+    );
+    let response = call_ice(&f, &signed, &f.app.origin).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let bytes = to_bytes(response.into_body(), 16384).await.unwrap();
+    let answer: protocol::ice::SignedIceConfig = serde_json::from_slice(&bytes).unwrap();
+    answer
+        .verify(
+            &f.host.public_key().unwrap(),
+            &signed.request,
+            now().unwrap(),
+        )
+        .unwrap();
+    let replay = call_ice(&f, &signed, &f.app.origin).await;
+    assert_eq!(replay.status(), StatusCode::FORBIDDEN);
+    let bytes = to_bytes(replay.into_body(), 16384).await.unwrap();
+    assert!(!String::from_utf8_lossy(&bytes).contains("credential"));
+    let fresh = ice_request(&f);
+    f.revoke_registry();
+    assert_eq!(
+        call_ice(&f, &fresh, &f.app.origin).await.status(),
+        StatusCode::FORBIDDEN
+    );
+    let headers = HeaderMap::from_iter([(header::HOST, f.app.host.parse().unwrap())]);
+    let cap = crate::get_capabilities(State(f.app.clone()), headers).await;
+    let value =
+        String::from_utf8(to_bytes(cap.into_body(), 16384).await.unwrap().to_vec()).unwrap();
+    assert!(value.contains("ice_config_enabled"));
+    assert!(
+        !value.contains("fixture-user")
+            && !value.contains("not-a-real-credential-secret")
+            && !value.contains("3478")
+    );
+}
+#[tokio::test]
+async fn signed_ice_rate_limit_and_expired_file_fail_closed() {
+    let mut f = Fixture::new();
+    let path = enable_ice(&mut f);
+    for _ in 0..8 {
+        let signed = ice_request(&f);
+        assert_eq!(
+            call_ice(&f, &signed, &f.app.origin).await.status(),
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        call_ice(&f, &ice_request(&f), &f.app.origin).await.status(),
+        StatusCode::FORBIDDEN
+    );
+    let mut f = Fixture::new();
+    let expired = enable_ice(&mut f);
+    let signed = ice_request(&f);
+    let mut config: protocol::ice::IceConfig =
+        serde_json::from_slice(&std::fs::read(&expired).unwrap()).unwrap();
+    config.expires_at = now().unwrap() + 100;
+    std::fs::write(&expired, serde_json::to_vec(&config).unwrap()).unwrap();
+    assert_eq!(
+        call_ice(&f, &signed, &f.app.origin).await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert!(path.exists());
+}
+
+#[tokio::test]
+async fn source_failure_close_is_session_bound_repeatable_and_never_cleanup_proof() {
+    let f = Fixture::new();
+    let answer = f.pending();
+    let signed = serde_json::to_value(f.signed_close(&answer)).unwrap();
+    let request = answer.transcript.intent.request_id.clone();
+    let session = answer.transcript.session_id.clone();
+    f.complete(&answer, true).await;
+    f.app.active.lock().await.source_failures.insert(
+        request.clone(),
+        (
+            session.clone(),
+            crate::source_status::SourceFailure {
+                code: "guest_display_asleep",
+            },
+        ),
+    );
+    for _ in 0..2 {
+        let (status, body) = f
+            .post("/auth/close", signed.clone(), Some(&f.app.origin))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"closed":true,"media_failure":{"code":"guest_display_asleep"}})
+        );
+    }
+    f.complete(&answer, false).await;
+    let (status, body) = f
+        .post("/auth/close", signed.clone(), Some(&f.app.origin))
+        .await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+    assert!(!String::from_utf8(body)
+        .unwrap()
+        .contains("guest_display_asleep"));
+    f.complete(&answer, true).await;
+    f.app
+        .active
+        .lock()
+        .await
+        .source_failures
+        .get_mut(&request)
+        .unwrap()
+        .0 = "different-session".into();
+    let (_, body) = f.post("/auth/close", signed, Some(&f.app.origin)).await;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!({"closed":true})
+    );
+    let mut book = f.app.active.lock().await;
+    book.completed.clear();
+    book.prune();
+    assert!(book.source_failures.is_empty());
+}
+
+// Real private Unix controller transport; no Guest, peer or encoder is started.
+struct PreflightSource {
+    _directory: tempfile::TempDir,
+    _bridge: std::os::unix::net::UnixListener,
+    state: Arc<std::sync::Mutex<Value>>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    block: Arc<std::sync::atomic::AtomicBool>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    task: tokio::task::JoinHandle<()>,
+    marker: PathBuf,
+}
+impl Drop for PreflightSource {
+    fn drop(&mut self) {
+        self.release.notify_waiters();
+        self.task.abort();
+    }
+}
+impl PreflightSource {
+    async fn attach(f: &mut Fixture) -> Self {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().canonicalize().unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = path.join("bridge.sock");
+        let bridge = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let metadata = std::fs::metadata(&socket).unwrap();
+        let control = path.join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&control).unwrap();
+        std::fs::set_permissions(&control, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let state = Arc::new(std::sync::Mutex::new(
+            json!({"binding":{"version":1,"vm_id":f.grant.grant.vm_id,"worker_instance":"b".repeat(64),"bridge_instance":"c".repeat(64),"worker_pid":123,"socket_path":socket,"socket_device":metadata.dev(),"socket_inode":metadata.ino(),"guest_port":5001,"scope":"host-worker-listener-only","input_authorized":false}}),
+        ));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let block = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let task = {
+            let (state, calls, block, entered, release) = (
+                state.clone(),
+                calls.clone(),
+                block.clone(),
+                entered.clone(),
+                release.clone(),
+            );
+            tokio::spawn(async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    let mut stream = BufReader::new(socket);
+                    let mut line = String::new();
+                    if stream.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        continue;
+                    }
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    if block.load(Ordering::SeqCst) {
+                        entered.notify_one();
+                        release.notified().await;
+                    }
+                    let response = if request["method"] == "guest_info" {
+                        json!({"result":{"id":"fixture","result":{"console_identity":{"version":1,"security_session_id":42,"uid":501,"console_set":null,"display_id":1,"physical_width":2560,"physical_height":1440,"display_geometry_sha256":"a".repeat(64)},"console_identity_status":{"version":1,"identity_eligible":true}}}})
+                    } else {
+                        json!({"result":state.lock().unwrap().clone()})
+                    };
+                    let _ = stream
+                        .get_mut()
+                        .write_all(format!("{response}\n").as_bytes())
+                        .await;
+                }
+            })
+        };
+        let args = vec![
+            "--guest-binding-state".into(),
+            path.to_string_lossy().into_owned(),
+            "--guest-binding-vm".into(),
+            f.grant.grant.vm_id.clone(),
+            "--guest-worker-instance".into(),
+            "b".repeat(64),
+            "--guest-bridge-instance".into(),
+            "c".repeat(64),
+        ];
+        let options = guest_binding::parse_options(&args).unwrap().0.unwrap();
+        let source = guest_binding::Source::open(
+            options,
+            &socket,
+            &f.grant.grant.vm_id,
+            false,
+            true,
+            &json!({"console_identity_binding_version":1}),
+        )
+        .await
+        .unwrap();
+        f.app.guest_binding = Some(Arc::new(source));
+        Arc::get_mut(f.app.auth.as_mut().unwrap())
+            .unwrap()
+            .test_identity = Some(Arc::new(TestIdentity::new(1)));
+        // If the route accidentally reaches encoder spawn, leave an owned marker.
+        let marker = path.join("encoder-ran");
+        f.app.encoder = path.join("encoder.sh");
+        std::fs::write(
+            &f.app.encoder,
+            format!("#!/bin/sh\ntouch '{}'\nexit 99\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&f.app.encoder, std::fs::Permissions::from_mode(0o700)).unwrap();
+        Self {
+            _directory: directory,
+            _bridge: bridge,
+            state,
+            calls,
+            block,
+            entered,
+            release,
+            task,
+            marker,
+        }
+    }
+    fn invalidate(&self) {
+        self.state.lock().unwrap()["binding"]["bridge_instance"] = json!("d".repeat(64));
+    }
+    async fn assert_no_session_resources(&self, f: &Fixture) {
+        let book = f.app.active.lock().await;
+        assert!(book.active.is_none());
+        assert!(book.completed.is_empty());
+        assert!(book.recoveries.is_empty());
+        assert!(f.auth().close_proofs.lock().unwrap().is_empty());
+        assert!(!self.marker.exists());
+    }
+}
+async fn preflight_offer(f: &Fixture, offer: &protocol::SignedOffer) -> Response {
+    Router::new()
+        .route("/auth/offer", post(super::offer))
+        .with_state(f.app.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/offer")
+                .header(header::HOST, &f.app.host)
+                .header(header::ORIGIN, &f.app.origin)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"signed_offer":offer,"sdp":sdp("11")})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+async fn assert_preflight_rejection(
+    response: Response,
+    f: &Fixture,
+    offer: &protocol::SignedOffer,
+) {
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let body = to_bytes(response.into_body(), 65536).await.unwrap();
+    let wire: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(wire.as_object().unwrap().len(), 1);
+    let signed: protocol::rejection::SignedOfferRejection =
+        serde_json::from_value(wire["signed_rejection"].clone()).unwrap();
+    signed
+        .verify(&f.host.public_key().unwrap(), &offer.intent)
+        .unwrap();
+    assert_eq!(signed.rejection.code, "guest_capture_unavailable");
+    assert_eq!(signed.rejection.outcome, "not_admitted");
+}
+
+#[tokio::test]
+async fn signed_preflight_rejection_is_exact_private_and_replay_retired_without_resources() {
+    let mut f = Fixture::new();
+    let source = PreflightSource::attach(&mut f).await;
+    source.invalidate();
+    let offer = f.signed_offer();
+    let before = source.calls.load(Ordering::SeqCst);
+    assert_preflight_rejection(preflight_offer(&f, &offer).await, &f, &offer).await;
+    assert_eq!(source.calls.load(Ordering::SeqCst), before + 1);
+    source.assert_no_session_resources(&f).await;
+    assert!(f
+        .app
+        .active
+        .lock()
+        .await
+        .cancelled
+        .contains_key(&offer.intent.request_id));
+    assert!(f
+        .auth()
+        .gate
+        .accept_offer(&offer, &sdp("11"), now().unwrap())
+        .is_err());
+    assert_eq!(
+        preflight_offer(&f, &offer).await.status(),
+        StatusCode::FORBIDDEN
+    );
+    let mut fresh = f.signed_offer();
+    fresh.intent.request_id = offer.intent.request_id.clone();
+    fresh.signature = f.device.sign(&fresh.intent.canonical().unwrap()).unwrap();
+    assert_eq!(
+        preflight_offer(&f, &fresh).await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        source.calls.load(Ordering::SeqCst),
+        before + 1,
+        "request tombstone must stop repeated RPCs"
+    );
+    source.assert_no_session_resources(&f).await;
+}
+
+#[tokio::test]
+async fn preflight_source_errors_never_infer_sleep_from_untrusted_controller_text() {
+    let mut f = Fixture::new();
+    let source = PreflightSource::attach(&mut f).await;
+    *source.state.lock().unwrap() = json!({"error":"SECRET /private/data display_asleep locked"});
+    let offer = f.signed_offer();
+    assert_preflight_rejection(preflight_offer(&f, &offer).await, &f, &offer).await;
+    source.assert_no_session_resources(&f).await;
+}
+
+#[tokio::test]
+async fn concurrent_preflight_gate_denies_second_offer_without_rpc_or_rejection() {
+    let mut f = Fixture::new();
+    let source = PreflightSource::attach(&mut f).await;
+    source.invalidate();
+    source.block.store(true, Ordering::SeqCst);
+    let first = f.signed_offer();
+    let second = f.signed_offer();
+    let before = source.calls.load(Ordering::SeqCst);
+    let pending = preflight_offer(&f, &first);
+    tokio::pin!(pending);
+    tokio::select! {
+        _ = source.entered.notified() => {},
+        _ = &mut pending => panic!("first request escaped blocked controller"),
+        _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("preflight did not reach controller"),
+    }
+    let response = tokio::time::timeout(Duration::from_millis(200), preflight_offer(&f, &second))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!({"error":"authorization rejected"})
+    );
+    assert_eq!(source.calls.load(Ordering::SeqCst), before + 1);
+    assert!(!f
+        .app
+        .active
+        .lock()
+        .await
+        .cancelled
+        .contains_key(&second.intent.request_id));
+    assert!(f
+        .auth()
+        .gate
+        .accept_offer(&second, &sdp("11"), now().unwrap())
+        .is_err());
+    source.release.notify_one();
+    assert_preflight_rejection(
+        tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .unwrap(),
+        &f,
+        &first,
+    )
+    .await;
+    source.assert_no_session_resources(&f).await;
+    assert!(f
+        .app
+        .guest_binding
+        .as_ref()
+        .unwrap()
+        .admit_preflight()
+        .is_ok());
+}
+
+#[tokio::test]
+async fn failed_cleanup_before_or_during_preflight_cannot_be_overridden_by_rejection() {
+    for during in [false, true] {
+        let mut f = Fixture::new();
+        let source = PreflightSource::attach(&mut f).await;
+        source.invalidate();
+        source.block.store(during, Ordering::SeqCst);
+        let offer = f.signed_offer();
+        let old_request = uuid::Uuid::new_v4().to_string();
+        let old_session = uuid::Uuid::new_v4().to_string();
+        let before = source.calls.load(Ordering::SeqCst);
+        let pending = preflight_offer(&f, &offer);
+        tokio::pin!(pending);
+        if during {
+            tokio::select! {
+                _ = source.entered.notified() => {},
+                _ = &mut pending => panic!("first request escaped blocked controller"),
+                _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("preflight did not reach controller"),
+            }
+        }
+        f.app.active.lock().await.completed.insert(
+            old_request.clone(),
+            (Instant::now(), false, old_session.clone()),
+        );
+        source.release.notify_one();
+        let response = tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&to_bytes(response.into_body(), 4096).await.unwrap())
+                .unwrap(),
+            json!({"error":"authorization rejected"})
+        );
+        let book = f.app.active.lock().await;
+        assert!(!book.completed[&old_request].1);
+        assert_eq!(book.completed[&old_request].2, old_session);
+        assert!(!book.cancelled.contains_key(&offer.intent.request_id));
+        assert!(book.active.is_none());
+        assert!(f.auth().close_proofs.lock().unwrap().is_empty());
+        assert!(!source.marker.exists());
+        assert_eq!(
+            source.calls.load(Ordering::SeqCst),
+            before + usize::from(during)
+        );
+    }
+}
+#[test]
+fn file_opt_in_does_not_change_default_scopes_or_grant_input() {
+    let fixture = Fixture::new();
+    assert!(!scopes_permitted(
+        &fixture.auth(),
+        &["files".into(), "observe".into()]
+    ));
+    let mut auth = Arc::try_unwrap(fixture.app.auth.unwrap()).ok().unwrap();
+    auth.files_enabled = true;
+    assert!(scopes_permitted(&auth, &["files".into(), "observe".into()]));
+    for scopes in [
+        vec!["execute".into(), "observe".into()],
+        vec!["input".into(), "observe".into()],
+        vec!["files".into(), "input".into(), "observe".into()],
+    ] {
+        assert!(!scopes_permitted(&auth, &scopes));
+    }
+    assert!(from_args(&["--allow-files".into()]).is_err());
+    assert!(from_args(&["--allow-files".into(), "--allow-files".into()]).is_err());
 }

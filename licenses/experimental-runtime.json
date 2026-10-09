@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "status": "blocked",
+  "scope": "Exact local UTM5.0.5 bundle and selective SPICE diagnostic; not a reviewed commercial release.",
+  "roots": [
+    {
+      "id": "utm-5-0-5",
+      "path": ".local/windows-gpu/UTM.app",
+      "tree_sha256": "1414edb421021f84d9b748decad05160989a08904df2c8079da15cdb3cdf62e3"
+    },
+    {
+      "id": "spice-reconnect",
+      "path": ".local/spice-reconnect-build/runtime",
+      "tree_sha256": "ede167b4c4b33963b129cd7f47157a909c1e71ef3c61495899c189584d01f11b"
+    }
+  ],
+  "evidence": {
+    "component_inventory": null,
+    "license_notices": null,
+    "corresponding_source": null,
+    "build_and_patch_recipe": null,
+    "relink_and_installation": null,
+    "redistribution_review": null,
+    "product_license": null
+  },
+  "blockers": [
+    "Complete runtime/component closure and license attribution not reviewed.",
+    "Matching source/build/patch delivery for reused official UTM binaries is unverified.",
+    "Modified SPICE source/license/modification/relinking delivery has not been assembled.",
+    "D3DMetal distribution permission is not established by its xxHash notice.",
+    "Project product-source license has not been selected.",
+    "Scratch runtime contains absolute external symlinks and is not a self-contained release."
+  ]
+}

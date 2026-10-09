@@ -10,7 +10,8 @@ ROOT=Path(__file__).resolve().parents[1]
 BASE=ROOT/'.local/windows-gpu'; MEDIA=ROOT/'.local/media/alpine-3.24.2'
 def load(path,name):
     spec=importlib.util.spec_from_file_location(name,path); module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module); return module
-def fixture(directory,static=False,input_oracle=None):
+def fixture(directory,static=False,input_oracle=None,input_oracle_seconds=180,init_transform=None):
+    if type(input_oracle_seconds) is not int or not 30 <= input_oracle_seconds <= 3600: raise ValueError("invalid input oracle lifetime")
     desktop=load(ROOT/'scripts/windows-probe-linux-desktop.py','qemu_desktop')
     archive=BASE/'alpine-minirootfs-3.23.6-aarch64.tar.gz'
     assert hashlib.sha256(archive.read_bytes()).hexdigest()==desktop.ROOTFS_SHA
@@ -55,7 +56,12 @@ exec /sbin/init''')
         source=Path(input_oracle).read_bytes()
         init=init.replace('apk add --no-cache --no-progress','mount -t tmpfs -o remount,size=1100M rootfs /\napk add --no-cache --no-progress').replace('font-dejavu eudev','font-dejavu eudev build-base libx11-dev linux-headers')
         init=init.replace('twm &',f"base64 -d > /veynode/input-oracle.c <<'B64ORACLE'\n{base64.b64encode(source).decode()}\nB64ORACLE\ncc -Wall -Wextra -Werror -O2 /veynode/input-oracle.c -o /veynode/input-oracle -lX11\n"+'twm &')
-        init=init.replace('echo VEYNODE_DESKTOP_READY','/veynode/input-oracle &\nsleep 1\necho VEYNODE_DESKTOP_READY')
+        init=init.replace('echo VEYNODE_DESKTOP_READY',f'/veynode/input-oracle {input_oracle_seconds} &\nsleep 1\necho VEYNODE_DESKTOP_READY')
+    if init_transform is not None:
+        init=init_transform(init)
+        if not isinstance(init,str) or not init.startswith('#!/bin/sh\n'):
+            raise ValueError('invalid fixture init transformation')
+        subprocess.run(['/bin/sh','-n'],input=init,text=True,check=True)
     power='#!/bin/sh\necho VEYNODE_ACPI_POWER_BUTTON >/dev/console\n/sbin/poweroff\n'
     shutdown='#!/bin/sh\necho VEYNODE_INIT_NORMAL_SHUTDOWN >/dev/console\nsync\n'
     for name,data,mode in [('veynode/gpu-init',init.encode(),0o100755),('veynode/dhcp',desktop.DHCP.encode(),0o100755),('veynode/shutdown',shutdown.encode(),0o100755),('etc/inittab',b'::sysinit:/bin/true\n::shutdown:/veynode/shutdown\n',0o100644),('etc/acpi',b'',0o40755),('etc/acpi/PWRF',b'',0o40755),('etc/acpi/PWRF/00000080',power.encode(),0o100755)]: entries.append(cpio.entry(name,data,mode))
@@ -160,7 +166,7 @@ def main():
                 if args.static_desktop:
                     assert after_metadata['source_sequence']==metadata['source_sequence'] and base64.b64decode(after['content'][0]['data'],validate=True)==png
                 record('extra_console_consumer_closed_without_losing_vm_or_capture',{'log':str(log_path),'after_screenshot':after_metadata})
-            error=mcp.tool('vm_guest_info',{'id':config['id']});assert error['isError'] and 'unsupported' in error['content'][0]['text'];record('unsupported_guest_integration_is_error',True)
+            error=mcp.tool('vm_guest_info',{'id':config['id']});assert error['isError'] and 'guest integration unavailable' in error['content'][0]['text'];record('absent_guest_service_is_explicit_unavailable',True)
             ack=check_reply(mcp.tool('vm_shutdown',{'id':config['id']}));assert ack['requested'] and not ack['completed'];stopped=wait_state(config['id'],['stopped'],20)
             log=serial.read_text(errors='replace');assert 'VEYNODE_ACPI_POWER_BUTTON' in log and 'VEYNODE_INIT_NORMAL_SHUTDOWN' in log
             output.with_suffix('.serial.log').write_text(log);record('real_normal_shutdown_via_acpi_and_guest_init',{'ack':ack,'state':stopped,'button_marker':True,'init_shutdown_marker':True})

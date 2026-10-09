@@ -10,7 +10,7 @@ use std::{
         fs::PermissionsExt,
         net::{UnixListener, UnixStream},
     },
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -103,7 +103,7 @@ impl Owner {
 }
 struct Native {
     input: Mutex<ChildStdin>,
-    pending: Mutex<BTreeMap<String, mpsc::SyncSender<Value>>>,
+    pending: Mutex<BTreeMap<String, (u64, mpsc::SyncSender<Value>)>>,
     next: AtomicU64,
     alive: AtomicBool,
     ready: (Mutex<bool>, Condvar),
@@ -125,7 +125,7 @@ impl Native {
             if pending.len() >= 16 {
                 bail!("native request capacity reached")
             }
-            pending.insert(id.clone(), tx);
+            pending.insert(id.clone(), (command["epoch"].as_u64().unwrap_or(0), tx));
         }
         let send = {
             let mut input = self.input.lock().unwrap();
@@ -138,6 +138,17 @@ impl Native {
         }
         let reply = rx.recv_timeout(Duration::from_secs(if command["method"] == "shutdown" {
             1
+        } else if [
+            "show_window",
+            "close_window",
+            "window_status",
+            "validate_displayed_frame",
+            "rate_status",
+            "set_bitrate",
+        ]
+        .contains(&command["method"].as_str().unwrap_or(""))
+        {
+            2
         } else {
             12
         }));
@@ -145,6 +156,17 @@ impl Native {
         match reply {
             Ok(value) => {
                 if let Some(error) = value.get("error") {
+                    if matches!(
+                        command["method"].as_str(),
+                        Some("rate_status" | "set_bitrate")
+                    ) {
+                        bail!(
+                            "{}",
+                            vm_media_local::rate_control::error_code(
+                                error["code"].as_str().unwrap_or("")
+                            )
+                        )
+                    }
                     bail!("native operation failed: {error}")
                 }
                 match value.get("result").filter(|result| result.is_object()) {
@@ -243,6 +265,51 @@ impl Native {
         }
         result
     }
+    fn rate(&self, client: u64, request: &Request) -> Result<Value> {
+        use vm_media_local::rate_control::{Receipt, Request as RateRequest};
+        let rate = RateRequest {
+            version: request.version.context("missing rate version")?,
+            request_id: request.request_id.clone(),
+            method: request.method.clone(),
+            encoder_instance: request.encoder_instance.clone(),
+            epoch: request.epoch,
+            sequence: request.sequence,
+            target_bps: request.target_bps,
+        };
+        rate.validate()?;
+        if request.codec.is_some() || request.frame.is_some() {
+            bail!("invalid_request")
+        }
+        if self.capabilities["rate_control_version"] != 1 {
+            bail!("rate control unsupported")
+        }
+        let epoch = {
+            let owner = self.owner.lock().unwrap();
+            owner
+                .as_ref()
+                .filter(|o| o.client == client && !o.native_ended)
+                .context("not encoder owner")?
+                .epoch
+        };
+        if rate.epoch.is_some_and(|e| e != epoch) {
+            bail!("stale_encoder")
+        }
+        let mut command = serde_json::to_value(&rate)?;
+        command.as_object_mut().unwrap().remove("request_id");
+        command["epoch"] = json!(epoch);
+        let result = self.call(command)?;
+        let receipt: Receipt =
+            serde_json::from_value(result.clone()).context("invalid rate receipt")?;
+        receipt.validate(&rate, epoch)?;
+        let owner = self.owner.lock().unwrap();
+        if !owner
+            .as_ref()
+            .is_some_and(|o| o.client == client && o.epoch == epoch && !o.native_ended)
+        {
+            bail!("stale_encoder")
+        }
+        Ok(result)
+    }
     fn keyframe(&self, client: u64) -> Result<Value> {
         let epoch = {
             let owner = self.owner.lock().unwrap();
@@ -261,6 +328,12 @@ struct Request {
     request_id: String,
     method: String,
     codec: Option<String>,
+    frame: Option<vm_control::native_input::DisplayedFrame>,
+    version: Option<u64>,
+    encoder_instance: Option<String>,
+    epoch: Option<u64>,
+    sequence: Option<u64>,
+    target_bps: Option<u64>,
 }
 fn connection(stream: UnixStream, native: Arc<Native>, client: u64) -> Result<()> {
     stream.set_nonblocking(true)?;
@@ -296,7 +369,20 @@ fn connection(stream: UnixStream, native: Arc<Native>, client: u64) -> Result<()
             if request.request_id.is_empty() || request.request_id.len() > 64 {
                 bail!("invalid request identity")
             }
+            if matches!(request.method.as_str(), "rate_status" | "set_bitrate") {
+                vm_media_local::rate_control::Request::parse(&line)?;
+            }
+            if !matches!(request.method.as_str(), "rate_status" | "set_bitrate")
+                && (request.version.is_some()
+                    || request.encoder_instance.is_some()
+                    || request.epoch.is_some()
+                    || request.sequence.is_some()
+                    || request.target_bps.is_some())
+            {
+                bail!("unexpected rate fields")
+            }
             let result = match request.method.as_str() {
+                "rate_status" | "set_bitrate" => native.rate(client, &request),
                 "capabilities" => Ok(native.capabilities.clone()),
                 "status" => Ok(
                     json!({"capture_connected":native.alive.load(Ordering::Acquire),"encoder_active":native.owner.lock().unwrap().is_some()}),
@@ -308,6 +394,35 @@ fn connection(stream: UnixStream, native: Arc<Native>, client: u64) -> Result<()
                 ),
                 "stop" => native.close(client),
                 "keyframe" => native.keyframe(client),
+                "show_window" | "close_window" | "window_status" => {
+                    if !vm_control::backend::window_supported(&native.capabilities) {
+                        Err(anyhow!("native display-only window unavailable"))
+                    } else {
+                        native
+                            .call(json!({"method":request.method}))
+                            .and_then(|result| {
+                                vm_control::backend::validate_window_capabilities(result.clone())?;
+                                if !result["window_open"].is_boolean()
+                                    || !vm_control::backend::window_supported(&result)
+                                {
+                                    bail!("invalid native window acknowledgement")
+                                }
+                                if (request.method == "show_window"
+                                    && result["window_open"] != true)
+                                    || (request.method == "close_window"
+                                        && result["window_open"] != false)
+                                {
+                                    bail!("native window did not acknowledge requested state")
+                                }
+                                Ok(result)
+                            })
+                    }
+                }
+                "validate_displayed_frame" => {
+                    let frame = request.frame.as_ref().context("displayed frame required")?;
+                    frame.validate()?;
+                    native.call(json!({"method":"validate_displayed_frame","frame":frame}))
+                }
                 "frame_status" => native.call(json!({"method":"frame_status"})),
                 "screenshot" => match native.snapshot.try_lock() {
                     Ok(_guard) => native.call(json!({"method":"screenshot"})),
@@ -316,13 +431,24 @@ fn connection(stream: UnixStream, native: Arc<Native>, client: u64) -> Result<()
                 _ => Err(anyhow!("unsupported console operation")),
             };
             let started = request.method == "start" && result.is_ok();
-            let epoch = native
-                .owner
-                .lock()
-                .unwrap()
-                .as_ref()
-                .filter(|o| o.client == client)
-                .map_or(0, |o| o.epoch);
+            let epoch = if [
+                "show_window",
+                "close_window",
+                "window_status",
+                "validate_displayed_frame",
+            ]
+            .contains(&request.method.as_str())
+            {
+                0
+            } else {
+                native
+                    .owner
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .filter(|o| o.client == client)
+                    .map_or(0, |o| o.epoch)
+            };
             output.deliver(Record::json(
                 epoch,
                 &match result {
@@ -344,44 +470,34 @@ fn connection(stream: UnixStream, native: Arc<Native>, client: u64) -> Result<()
     let _ = writer.join();
     result
 }
-fn probe(path: &PathBuf) -> Result<Value> {
-    let mut child = OwnedChild(
-        Command::new(path)
-            .arg("--probe-codecs")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?,
-    );
-    let until = Instant::now() + Duration::from_secs(8);
-    loop {
-        if let Some(status) = child.0.try_wait()? {
-            if !status.success() {
-                bail!("native hardware probe failed")
-            }
-            break;
+fn probe(path: &Path) -> Result<Value> {
+    let display = vm_control::backend::probe_native_window(path)?;
+    let (status, bytes, _) = vm_control::backend::probe_process(path, "--probe-codecs")?;
+    // A codec allocation failure must not disable a verified display-only path.
+    let mut value = if status.success() {
+        let value: Value =
+            serde_json::from_slice(&bytes).context("invalid hardware capability JSON")?;
+        if !["verified-hardware", "unavailable"].contains(&value["h264"].as_str().unwrap_or(""))
+            || !["verified-hardware", "unavailable"].contains(&value["h265"].as_str().unwrap_or(""))
+        {
+            bail!("invalid hardware codec capability contract")
         }
-        if Instant::now() >= until {
-            bail!("native hardware probe timed out")
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    let mut bytes = Vec::new();
-    child
-        .0
-        .stdout
-        .take()
-        .unwrap()
-        .take(8193)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > 8192 {
-        bail!("hardware probe exceeds bound")
-    }
-    let value: Value = serde_json::from_slice(&bytes)?;
-    if value["h264"] != "verified-hardware" {
-        bail!("hardware H264 fallback unavailable")
-    }
+        value
+    } else if vm_control::backend::window_supported(&display) {
+        json!({"h264":"unavailable","h265":"unavailable","source":"hardware probe failed; display-only available"})
+    } else {
+        bail!("native hardware probe failed")
+    };
+    value
+        .as_object_mut()
+        .context("capabilities must be an object")?
+        .extend(display.as_object().unwrap().clone());
+    value["broker_window_protocol"] = json!(1);
+    value["broker_native_input_protocol"] = json!(1);
+    value["encoder_fps_request_supported"] = json!(false);
     Ok(value)
 }
+
 struct SocketPath(PathBuf);
 impl Drop for SocketPath {
     fn drop(&mut self) {
@@ -394,8 +510,26 @@ fn run() -> Result<()> {
         libc::signal(libc::SIGINT, stop as *const () as usize);
     }
     let args: Vec<_> = std::env::args().collect();
-    if args.len() != 4 {
+    if args.len() == 3 && args[1] == "--probe-capabilities" {
+        let mut capabilities = vm_control::backend::probe_native_window(&PathBuf::from(&args[2]))?;
+        capabilities["broker_window_protocol"] = json!(1);
+        capabilities["broker_native_input_protocol"] = json!(1);
+        capabilities["encoder_fps_request_supported"] = json!(false);
+        println!("{capabilities}");
+        return Ok(());
+    }
+    if args.len() != 4 && args.len() != 10 {
         bail!("usage: vm-console NATIVE_ENCODER SPICE_SOCKET PRIVATE_CONSOLE_SOCKET")
+    }
+    let native_args = &args[4..];
+    if !native_args.is_empty()
+        && (native_args[0] != "--control-socket"
+            || native_args[2] != "--vm-id"
+            || native_args[4] != "--worker-instance"
+            || !Path::new(&native_args[1]).is_absolute()
+            || !vm_control::native_input::hex(&native_args[5], 64))
+    {
+        bail!("invalid native controller binding")
     }
     let encoder = PathBuf::from(&args[1]).canonicalize()?;
     let spice = PathBuf::from(&args[2]).canonicalize()?;
@@ -418,6 +552,7 @@ fn run() -> Result<()> {
         Command::new(&encoder)
             .arg(spice)
             .arg("--persistent")
+            .args(native_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -461,7 +596,10 @@ fn run() -> Result<()> {
                 }
                 let value = record.value()?;
                 if let Some(id) = value["id"].as_str() {
-                    if let Some(tx) = receive.pending.lock().unwrap().remove(id) {
+                    if let Some((epoch, tx)) = receive.pending.lock().unwrap().remove(id) {
+                        if epoch != record.epoch {
+                            bail!("native reply epoch mismatch")
+                        }
                         let _ = tx.send(value);
                     }
                     continue;
@@ -501,7 +639,7 @@ fn run() -> Result<()> {
         }
         receive.alive.store(false, Ordering::Release);
         receive.ready.1.notify_all();
-        for (_, tx) in std::mem::take(&mut *receive.pending.lock().unwrap()) {
+        for (_, (_, tx)) in std::mem::take(&mut *receive.pending.lock().unwrap()) {
             let _ = tx.send(json!({"error":"capture process unavailable"}));
         }
         if let Some(owner) = receive.owner.lock().unwrap().as_ref() {

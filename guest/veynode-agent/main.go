@@ -22,18 +22,19 @@ const maxRequest = 65536
 const maxOutput = 65536
 
 type request struct {
-	ID        string   `json:"id"`
-	Method    string   `json:"method"`
-	Argv      []string `json:"argv,omitempty"`
-	TimeoutMS int      `json:"timeout_ms,omitempty"`
-	JobID     string   `json:"job_id,omitempty"`
-	Owner     string   `json:"owner,omitempty"`
-	Path      string   `json:"path,omitempty"`
-	Token     string   `json:"token,omitempty"`
-	Data      string   `json:"data,omitempty"`
-	Size      int64    `json:"size,omitempty"`
-	Offset    int64    `json:"offset,omitempty"`
-	SHA256    string   `json:"sha256,omitempty"`
+	ID        string       `json:"id"`
+	Scope     *serialScope `json:"scope,omitempty"`
+	Method    string       `json:"method"`
+	Argv      []string     `json:"argv,omitempty"`
+	TimeoutMS int          `json:"timeout_ms,omitempty"`
+	JobID     string       `json:"job_id,omitempty"`
+	Owner     string       `json:"owner,omitempty"`
+	Path      string       `json:"path,omitempty"`
+	Token     string       `json:"token,omitempty"`
+	Data      string       `json:"data,omitempty"`
+	Size      int64        `json:"size,omitempty"`
+	Offset    int64        `json:"offset,omitempty"`
+	SHA256    string       `json:"sha256,omitempty"`
 }
 type response struct {
 	ID     string    `json:"id"`
@@ -155,6 +156,8 @@ func serve(stream io.ReadWriteCloser, allowExec bool, allowShutdown ...bool) {
 	_ = json.NewEncoder(stream).Encode(reply)
 }
 func main() {
+	serialExec := flag.Bool("virtio-serial-exec", false, "private v2 rootless cgroup execution; requires host incarnation guardian, no reconnect")
+	serial := flag.Bool("virtio-serial", false, "observer-only private fixed virtio port; no reconnect or mutating capabilities")
 	legacyExec := flag.Bool("legacy-exec-process-groups", false, "DEVELOPMENT ONLY: allow uncontained process-group execution; setsid descendants can escape")
 	allowExec := flag.Bool("allow-execute", false, "allow host-authorized execution inside guest")
 	allowShutdown := flag.Bool("allow-shutdown", false, "allow host-authorized normal guest OS shutdown (requires root)")
@@ -164,6 +167,42 @@ func main() {
 	filesRoot := flag.String("files-root", "", "explicit file transfer directory")
 	fileWorker := flag.Bool("file-worker", false, "internal non-root worker")
 	flag.Parse()
+	if *serial {
+		if *serialExec || *allowExec || *allowShutdown || *allowFiles || *legacyExec || *execUser != "" || *filesUser != "" || *filesRoot != "" || *fileWorker {
+			fmt.Fprintln(os.Stderr, "virtio-serial is observer-only; privilege options rejected")
+			os.Exit(1)
+		}
+		if err := listenSerial(); err != nil {
+			fmt.Fprintln(os.Stderr, "virtio-serial integration fenced:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *serialExec {
+		if !*allowExec || *execUser == "" || *allowShutdown || *allowFiles || *legacyExec || *filesUser != "" || *filesRoot != "" || *fileWorker {
+			fmt.Fprintln(os.Stderr, "serial v2 requires --allow-execute and fixed --exec-user; files/shutdown/legacy forbidden")
+			os.Exit(1)
+		}
+		identity, err := resolveExecutionIdentity(*execUser)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "serial v2 execution identity unavailable:", err)
+			os.Exit(1)
+		}
+		commands.identity = identity
+		commands.boundary, commands.containmentMode, err = configureCommandContainment(identity, false)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "serial v2 cgroup containment unavailable:", err)
+			os.Exit(1)
+		}
+		// configureCommandContainment has already killed/drained prior service groups
+		// and verified real clone3 credentials before any fresh challenge is emitted.
+		installSignalCleanup(commands)
+		if err = listenSerialExec(); err != nil {
+			fmt.Fprintln(os.Stderr, "serial v2 incarnation fenced:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if *fileWorker {
 		if err := runFileWorker(*filesRoot); err != nil {
 			fmt.Fprintln(os.Stderr, err)

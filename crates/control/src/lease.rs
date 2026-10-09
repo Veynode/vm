@@ -15,6 +15,7 @@ struct Lease {
     owner: Option<String>,
     expires: Instant,
     human: bool,
+    native_owner: Option<String>,
 }
 const RETIRED_OWNER_TTL: Duration = Duration::from_secs(120);
 const RETIRED_OWNER_CAPACITY: usize = 4096;
@@ -51,6 +52,7 @@ impl Leases {
             owner: None,
             expires: now,
             human: false,
+            native_owner: None,
         });
         if lease.human {
             bail!("human controls this VM; local human_release is required")
@@ -72,6 +74,20 @@ impl Leases {
         lease.owner = Some(owner.into());
         lease.expires = now + Duration::from_secs(60);
         Ok(lease.epoch)
+    }
+    /// Fence existing authority without manufacturing a human hold that would
+    /// survive the worker's normal shutdown/restart. Manager separately blocks admission.
+    pub(crate) fn fence_for_shutdown(&mut self, id: &str, now: Instant) -> Result<()> {
+        if let Some(lease) = self.entries.get_mut(id) {
+            lease.epoch = lease
+                .epoch
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("control epoch exhausted"))?;
+            lease.owner = None;
+            lease.native_owner = None;
+            lease.expires = now;
+        }
+        Ok(())
     }
     pub fn check(&self, id: &str, owner: &str, epoch: u64, now: Instant) -> Result<()> {
         let lease = self
@@ -103,12 +119,112 @@ impl Leases {
         }
         released
     }
+    pub fn native_take(&mut self, id: &str, owner: &str, now: Instant) -> Result<u64> {
+        let epoch = self.human(id, true, now)?;
+        let lease = self.entries.get_mut(id).unwrap();
+        lease.native_owner = Some(owner.into());
+        lease.expires = now + Duration::from_secs(2);
+        Ok(epoch)
+    }
+    pub fn native_check(
+        &self,
+        id: &str,
+        owner: &str,
+        epoch: u64,
+        now: Instant,
+        active: bool,
+    ) -> Result<()> {
+        let lease = self
+            .entries
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("native authority absent"))?;
+        if !lease.human
+            || lease.native_owner.as_deref() != Some(owner)
+            || lease.epoch != epoch
+            || (active && lease.expires <= now)
+        {
+            bail!("native authority lost")
+        }
+        Ok(())
+    }
+    pub fn native_activate(
+        &mut self,
+        id: &str,
+        owner: &str,
+        epoch: u64,
+        now: Instant,
+    ) -> Result<()> {
+        self.native_check(id, owner, epoch, now, false)?;
+        self.entries.get_mut(id).unwrap().expires = now + Duration::from_secs(2);
+        Ok(())
+    }
+    pub fn native_renew(&mut self, id: &str, owner: &str, epoch: u64, now: Instant) -> Result<()> {
+        self.native_check(id, owner, epoch, now, true)?;
+        self.entries.get_mut(id).unwrap().expires = now + Duration::from_secs(2);
+        Ok(())
+    }
+    pub fn native_pause(&mut self, id: &str, owner: &str, epoch: u64, now: Instant) -> Result<()> {
+        self.native_check(id, owner, epoch, now, false)?;
+        self.entries.get_mut(id).unwrap().expires = now;
+        Ok(())
+    }
+    pub fn native_suspend(
+        &mut self,
+        id: &str,
+        owner: &str,
+        epoch: u64,
+        now: Instant,
+    ) -> Result<u64> {
+        self.native_check(id, owner, epoch, now, false)?;
+        let lease = self.entries.get_mut(id).unwrap();
+        lease.epoch = lease
+            .epoch
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("epoch exhausted"))?;
+        lease.expires = now;
+        Ok(lease.epoch)
+    }
+    pub fn native_return(
+        &mut self,
+        id: &str,
+        owner: &str,
+        epoch: u64,
+        now: Instant,
+    ) -> Result<u64> {
+        self.native_check(id, owner, epoch, now, false)?;
+        self.human(id, false, now)
+    }
+    pub fn native_detach(&mut self, id: &str, owner: &str, now: Instant) {
+        if self
+            .entries
+            .get(id)
+            .is_some_and(|l| l.native_owner.as_deref() == Some(owner))
+        {
+            let _ = self.human(id, true, now);
+        }
+    }
+    pub fn human_release_after_cleanup(
+        &mut self,
+        id: &str,
+        expected: u64,
+        now: Instant,
+    ) -> Result<u64> {
+        let lease = self
+            .entries
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("human hold unavailable"))?;
+        if !lease.human || lease.epoch != expected || lease.native_owner.is_some() {
+            bail!("human authority changed during cleanup")
+        }
+        self.human(id, false, now)
+    }
     pub fn human(&mut self, id: &str, take: bool, now: Instant) -> Result<u64> {
         let lease = self.entries.entry(id.into()).or_insert(Lease {
             epoch: 0,
             owner: None,
             expires: now,
             human: false,
+            native_owner: None,
         });
         lease.epoch = lease
             .epoch
@@ -116,6 +232,7 @@ impl Leases {
             .ok_or_else(|| anyhow::anyhow!("control epoch exhausted"))?;
         lease.owner = None;
         lease.human = take;
+        lease.native_owner = None;
         lease.expires = now;
         Ok(lease.epoch)
     }
@@ -198,5 +315,30 @@ mod retirement_tests {
         assert!(leases
             .acquire("vm", &"a".repeat(64), now + Duration::from_secs(121))
             .is_ok());
+    }
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+    #[test]
+    fn old_native_eof_cannot_revoke_replacement_and_suspend_does_not_return_agent() {
+        let mut l = Leases::default();
+        let now = Instant::now();
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let first = l.native_take("vm", &a, now).unwrap();
+        assert!(l
+            .native_check("vm", &a, first, now + Duration::from_secs(2), true)
+            .is_err());
+        let next = l.native_suspend("vm", &a, first, now).unwrap();
+        assert!(l.acquire("vm", &b, now).is_err());
+        assert!(l.native_check("vm", &a, next, now, true).is_err());
+        let replacement = l.native_take("vm", &b, now).unwrap();
+        l.native_detach("vm", &a, now);
+        l.native_check("vm", &b, replacement, now, true).unwrap();
+        assert!(l.native_return("vm", &a, next, now).is_err());
+        l.native_return("vm", &b, replacement, now).unwrap();
+        l.acquire("vm", &a, now).unwrap();
     }
 }

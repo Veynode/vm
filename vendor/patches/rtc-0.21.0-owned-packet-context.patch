@@ -1,0 +1,796 @@
+--- a/vendor/rtc-0.21.0/src/peer_connection/certificate/mod.rs
++++ b/vendor/rtc-0.21.0/src/peer_connection/certificate/mod.rs
+@@ -697,7 +697,7 @@
+             let hashed = crypto
+                 .hash(HashAlgorithm::Sha256, c.as_ref())
+                 .map_err(crypto_error)?;
+-            let values: Vec<String> = hashed.iter().map(|x| format! {"{x:02x}"}).collect();
++            let values: Vec<String> = hashed.iter().map(|x| format!("{x:02x}")).collect();
+ 
+             fingerprints.push(RTCDtlsFingerprint {
+                 algorithm: "sha-256".to_owned(),
+--- a/vendor/rtc-0.21.0/src/peer_connection/handler/datachannel.rs
++++ b/vendor/rtc-0.21.0/src/peer_connection/handler/datachannel.rs
+@@ -105,6 +105,7 @@
+             .ok_or(Error::ErrDataChannelNotExisted)?;
+ 
+         self.ctx.read_outs.push_back(TaggedRTCMessageInternal {
++            local_context: None,
+             now,
+             transport,
+             message: RTCMessageInternal::Dtls(DTLSMessage::DataChannel(ApplicationMessage {
+@@ -254,6 +255,7 @@
+                     };
+ 
+                     self.ctx.read_outs.push_back(TaggedRTCMessageInternal {
++                        local_context: None,
+                         now: msg.now,
+                         transport: msg.transport,
+                         message: RTCMessageInternal::Dtls(DTLSMessage::DataChannel(
+@@ -278,6 +280,7 @@
+             while let Some(data_channel_message) = data_channel.poll_write() {
+                 debug!("send data channel message from handle_read");
+                 self.ctx.write_outs.push_back(TaggedRTCMessageInternal {
++                    local_context: None,
+                     now,
+                     transport: TransportContext::default(),
+                     message: RTCMessageInternal::Dtls(DTLSMessage::Sctp(data_channel_message)),
+@@ -338,6 +341,7 @@
+                 while let Some(data_channel_message) = data_channel.poll_write() {
+                     debug!("send data channel message from handle_write");
+                     self.ctx.write_outs.push_back(TaggedRTCMessageInternal {
++                        local_context: None,
+                         now,
+                         transport: TransportContext::default(),
+                         message: RTCMessageInternal::Dtls(DTLSMessage::Sctp(data_channel_message)),
+@@ -363,6 +367,7 @@
+                 while let Some(data_channel_message) = data_channel.poll_write() {
+                     debug!("send data channel message from poll_write");
+                     self.ctx.write_outs.push_back(TaggedRTCMessageInternal {
++                        local_context: None,
+                         now: self.ctx.now,
+                         transport: TransportContext::default(),
+                         message: RTCMessageInternal::Dtls(DTLSMessage::Sctp(data_channel_message)),
+@@ -415,6 +420,7 @@
+                         while let Some(data_channel_message) = data_channel.poll_write() {
+                             debug!("send data channel message from handle_event");
+                             self.ctx.write_outs.push_back(TaggedRTCMessageInternal {
++                                local_context: None,
+                                 now,
+                                 transport: TransportContext::default(),
+                                 message: RTCMessageInternal::Dtls(DTLSMessage::Sctp(
+@@ -717,6 +723,7 @@
+             );
+             handler
+                 .handle_read(TaggedRTCMessageInternal {
++                    local_context: None,
+                     now,
+                     transport: TransportContext::default(),
+                     message: RTCMessageInternal::Dtls(DTLSMessage::Sctp(ack(0, 1))),
+@@ -915,6 +922,7 @@
+         );
+         handler
+             .handle_read(TaggedRTCMessageInternal {
++                local_context: None,
+                 now,
+                 transport: TransportContext::default(),
+                 message: RTCMessageInternal::Dtls(DTLSMessage::Sctp(ack(0, 1))),
+@@ -1084,6 +1092,7 @@
+             );
+             handler
+                 .handle_read(TaggedRTCMessageInternal {
++                    local_context: None,
+                     now,
+                     transport: TransportContext::default(),
+                     message: RTCMessageInternal::Dtls(DTLSMessage::Sctp(data_message(
+@@ -1114,6 +1123,7 @@
+             );
+             handler
+                 .handle_read(TaggedRTCMessageInternal {
++                    local_context: None,
+                     now,
+                     transport: TransportContext::default(),
+                     message: RTCMessageInternal::Dtls(DTLSMessage::Sctp(ack(0, 1))),
+@@ -1172,6 +1182,7 @@
+             );
+             handler
+                 .handle_read(TaggedRTCMessageInternal {
++                    local_context: None,
+                     now,
+                     transport: TransportContext::default(),
+                     message: RTCMessageInternal::Dtls(DTLSMessage::Sctp(data_message(
+--- a/vendor/rtc-0.21.0/src/peer_connection/handler/demuxer.rs
++++ b/vendor/rtc-0.21.0/src/peer_connection/handler/demuxer.rs
+@@ -88,18 +88,21 @@
+                 error!("drop invalid packet due to zero length");
+             } else if match_dtls(&message) {
+                 self.ctx.read_outs.push_back(TaggedRTCMessageInternal {
++                    local_context: msg.local_context,
+                     now: msg.now,
+                     transport: msg.transport,
+                     message: RTCMessageInternal::Dtls(DTLSMessage::Raw(message)),
+                 });
+             } else if match_srtp(&message) {
+                 self.ctx.read_outs.push_back(TaggedRTCMessageInternal {
++                    local_context: msg.local_context,
+                     now: msg.now,
+                     transport: msg.transport,
+                     message: RTCMessageInternal::Rtp(RTPMessage::Raw(message)),
+                 });
+             } else {
+                 self.ctx.read_outs.push_back(TaggedRTCMessageInternal {
++                    local_context: msg.local_context,
+                     now: msg.now,
+                     transport: msg.transport,
+                     message: RTCMessageInternal::Stun(STUNMessage::Raw(message)),
+@@ -125,6 +128,7 @@
+                 self.stats.transport.on_packet_sent(message.len());
+ 
+                 self.ctx.write_outs.push_back(TaggedRTCMessageInternal {
++                    local_context: msg.local_context,
+                     now: msg.now,
+                     transport: msg.transport,
+                     message: RTCMessageInternal::Raw(message),
+--- a/vendor/rtc-0.21.0/src/peer_connection/handler/dtls.rs
++++ b/vendor/rtc-0.21.0/src/peer_connection/handler/dtls.rs
+@@ -225,6 +225,7 @@
+ 
+             while let Some(transmit) = dtls_endpoint.poll_transmit() {
+                 self.ctx.write_outs.push_back(TaggedRTCMessageInternal {
++                    local_context: None,
+                     now: transmit.now,
+                     transport: transmit.transport,
+                     message: RTCMessageInternal::Dtls(DTLSMessage::Raw(transmit.message)),
+@@ -257,6 +258,7 @@
+             for message in messages {
+                 debug!("recv dtls application RAW {:?}", msg.transport.peer_addr);
+                 self.ctx.read_outs.push_back(TaggedRTCMessageInternal {
++                    local_context: None,
+                     now: msg.now,
+                     transport: msg.transport,
+                     message: RTCMessageInternal::Dtls(DTLSMessage::Raw(message)),
+@@ -288,6 +290,7 @@
+             dtls_endpoint.write(msg.now, msg.transport.peer_addr, &dtls_message)?;
+             while let Some(transmit) = dtls_endpoint.poll_transmit() {
+                 self.ctx.write_outs.push_back(TaggedRTCMessageInternal {
++                    local_context: None,
+                     now: transmit.now,
+                     transport: transmit.transport,
+                     message: RTCMessageInternal::Dtls(DTLSMessage::Raw(transmit.message)),
+@@ -348,6 +351,7 @@
+         }
+         while let Some(transmit) = dtls_endpoint.poll_transmit() {
+             self.ctx.write_outs.push_back(TaggedRTCMessageInternal {
++                local_context: None,
+                 now: transmit.now,
+                 transport: transmit.transport,
+                 message: RTCMessageInternal::Dtls(DTLSMessage::Raw(transmit.message)),
+--- a/vendor/rtc-0.21.0/src/peer_connection/handler/endpoint.rs
++++ b/vendor/rtc-0.21.0/src/peer_connection/handler/endpoint.rs
+@@ -186,6 +186,7 @@
+             }
+ 
+             self.ctx.read_outs.push_back(TaggedRTCMessageInternal {
++                local_context: None,
+                 now,
+                 transport: transport_context,
+                 message: RTCMessageInternal::Rtp(RTPMessage::TrackPacket(TrackPacket {
+@@ -216,6 +217,7 @@
+         if let Some(rtcp_ssrc) = rtcp_ssrc {
+             if let Some(track_id) = self.find_track_id(rtcp_ssrc, None) {
+                 self.ctx.read_outs.push_back(TaggedRTCMessageInternal {
++                    local_context: None,
+                     now,
+                     transport: transport_context,
+                     message: RTCMessageInternal::Rtp(RTPMessage::TrackPacket(TrackPacket {
+@@ -276,6 +278,7 @@
+     ) -> Result<()> {
+         debug!("data channel recv message for {:?}", transport_context);
+         self.ctx.read_outs.push_back(TaggedRTCMessageInternal {
++            local_context: None,
+             now,
+             transport: transport_context,
+             message: RTCMessageInternal::Dtls(DTLSMessage::DataChannel(ApplicationMessage {
+--- a/vendor/rtc-0.21.0/src/peer_connection/handler/ice.rs
++++ b/vendor/rtc-0.21.0/src/peer_connection/handler/ice.rs
+@@ -152,6 +152,7 @@
+     fn poll_write(&mut self) -> Option<Self::Wout> {
+         while let Some(transmit) = self.ctx.ice_transport.agent.poll_write() {
+             self.ctx.write_outs.push_back(TaggedRTCMessageInternal {
++                local_context: None,
+                 now: transmit.now,
+                 transport: transmit.transport,
+                 message: RTCMessageInternal::Stun(STUNMessage::Raw(transmit.message)),
+--- a/vendor/rtc-0.21.0/src/peer_connection/handler/interceptor.rs
++++ b/vendor/rtc-0.21.0/src/peer_connection/handler/interceptor.rs
+@@ -802,6 +802,7 @@
+                 }
+ 
+                 self.ctx.read_outs.push_back(TaggedRTCMessageInternal {
++                    local_context: None,
+                     now: packet.now,
+                     transport: packet.transport,
+                     message: RTCMessageInternal::Rtp(RTPMessage::Packet(packet.message.packet)),
+@@ -816,10 +817,16 @@
+         if self.ctx.is_dtls_handshake_complete
+             && let RTCMessageInternal::Rtp(RTPMessage::Packet(packet)) = msg.message
+         {
++            let mut attributed: interceptor::AttributedPacket = packet.into();
++            if let Some(context) = msg.local_context {
++                attributed
++                    .attributes
++                    .push(Attribute::Custom(std::sync::Arc::new(context)));
++            }
+             self.interceptor.handle_write(TaggedPacket {
+                 now: msg.now,
+                 transport: msg.transport,
+-                message: packet.into(),
++                message: attributed,
+             })?;
+         } else {
+             debug!("interceptor bypass {:?}", msg.transport.peer_addr);
+@@ -854,6 +861,10 @@
+                 }
+ 
+                 self.ctx.write_outs.push_back(TaggedRTCMessageInternal {
++                    local_context: packet
++                        .message
++                        .custom::<crate::peer_connection::message::LocalPacketContext>()
++                        .cloned(),
+                     now: packet.now,
+                     transport: packet.transport,
+                     message: RTCMessageInternal::Rtp(RTPMessage::Packet(packet.message.packet)),
+@@ -898,7 +909,24 @@
+     }
+ 
+     fn close(&mut self) -> Result<()> {
+-        self.interceptor.close()
++        let result = self.interceptor.close();
++        // Chain.close does not clear its own output queues. Drain actual owners,
++        // retaining only unannotated control/legacy output for shutdown processing.
++        while let Some(packet) = self.interceptor.poll_write() {
++            if packet
++                .message
++                .custom::<crate::peer_connection::message::LocalPacketContext>()
++                .is_none()
++            {
++                self.ctx.write_outs.push_back(TaggedRTCMessageInternal {
++                    local_context: None,
++                    now: packet.now,
++                    transport: packet.transport,
++                    message: RTCMessageInternal::Rtp(RTPMessage::Packet(packet.message.packet)),
++                });
++            }
++        }
++        result
+     }
+ }
+ 
+@@ -1300,6 +1328,7 @@
+             };
+             handler
+                 .handle_read(TaggedRTCMessageInternal {
++                    local_context: None,
+                     now: Instant::now(),
+                     transport: TransportContext::default(),
+                     message: RTCMessageInternal::Rtp(RTPMessage::Packet(Packet::Rtp(packet))),
+@@ -1528,6 +1557,7 @@
+             );
+             handler
+                 .handle_read(TaggedRTCMessageInternal {
++                    local_context: None,
+                     now: Instant::now(),
+                     transport: TransportContext::default(),
+                     message: RTCMessageInternal::Rtp(RTPMessage::Packet(Packet::Rtp(
+--- /dev/null
++++ b/vendor/rtc-0.21.0/src/peer_connection/handler/local_context_tests.rs
+@@ -0,0 +1,88 @@
++//! Actual queue/drop behavior, retaining the core object after close or a drop.
++use super::*;
++use crate::peer_connection::message::internal::{
++    RTCMessageInternal, RTPMessage, TaggedRTCMessageInternal,
++};
++use crate::peer_connection::{RTCPeerConnectionBuilder, message::LocalPacketContext};
++use shared::TransportContext;
++use std::sync::{
++    Arc,
++    atomic::{AtomicUsize, Ordering},
++};
++struct Witness(Arc<AtomicUsize>);
++impl Drop for Witness {
++    fn drop(&mut self) {
++        self.0.fetch_add(1, Ordering::SeqCst);
++    }
++}
++fn context(counter: &Arc<AtomicUsize>) -> LocalPacketContext {
++    LocalPacketContext(Arc::new(Witness(counter.clone())))
++}
++fn tagged(counter: &Arc<AtomicUsize>, raw: bool) -> TaggedRTCMessageInternal {
++    TaggedRTCMessageInternal {
++        now: Instant::now(),
++        transport: TransportContext::default(),
++        local_context: Some(context(counter)),
++        message: RTCMessageInternal::Rtp(if raw {
++            RTPMessage::Raw((&[0x80, 108, 0, 1, 0, 0, 0, 1, 0, 0, 0, 7][..]).into())
++        } else {
++            RTPMessage::Packet(::interceptor::Packet::Rtp(rtp::Packet::default()))
++        }),
++    }
++}
++#[test]
++fn close_drops_real_endpoint_and_completed_outputs_while_core_stays_alive() {
++    let mut pc = RTCPeerConnectionBuilder::new()
++        .build(Instant::now())
++        .unwrap();
++    let drops = Arc::new(AtomicUsize::new(0));
++    pc.get_endpoint_handler()
++        .handle_write(tagged(&drops, false))
++        .unwrap();
++    pc.pipeline_context
++        .srtp_handler_context
++        .write_outs
++        .push_back(tagged(&drops, true));
++    pc.pipeline_context.write_outs.push_back(OwnedTransmit {
++        now: Instant::now(),
++        transport: TransportContext::default(),
++        message: (&[1][..]).into(),
++        local_context: Some(context(&drops)),
++    });
++    assert_eq!(drops.load(Ordering::SeqCst), 0);
++    pc.close().unwrap();
++    assert_eq!(drops.load(Ordering::SeqCst), 3);
++    assert!(
++        pc.pipeline_context
++            .endpoint_handler_context
++            .write_outs
++            .is_empty()
++    );
++    assert!(
++        pc.pipeline_context
++            .srtp_handler_context
++            .write_outs
++            .is_empty()
++    );
++    pc.close().unwrap();
++    assert_eq!(drops.load(Ordering::SeqCst), 3);
++}
++#[test]
++fn srtp_missing_key_and_ice_no_selected_pair_drop_owned_contexts() {
++    let mut pc = RTCPeerConnectionBuilder::new()
++        .build(Instant::now())
++        .unwrap();
++    let drops = Arc::new(AtomicUsize::new(0));
++    assert!(
++        pc.get_srtp_handler()
++            .handle_write(tagged(&drops, false))
++            .is_err()
++    );
++    assert_eq!(drops.load(Ordering::SeqCst), 1);
++    pc.get_ice_handler()
++        .handle_write(tagged(&drops, true))
++        .unwrap();
++    assert_eq!(drops.load(Ordering::SeqCst), 2);
++    assert!(pc.get_ice_handler().poll_write().is_none());
++    pc.close().unwrap();
++}
+--- a/vendor/rtc-0.21.0/src/peer_connection/handler/mod.rs
++++ b/vendor/rtc-0.21.0/src/peer_connection/handler/mod.rs
+@@ -18,6 +18,7 @@
+ use crate::peer_connection::handler::interceptor::{InterceptorHandler, InterceptorHandlerContext};
+ use crate::peer_connection::handler::sctp::{SctpHandler, SctpHandlerContext};
+ use crate::peer_connection::handler::srtp::{SrtpHandler, SrtpHandlerContext};
++use crate::peer_connection::message::{LocalPacketContext, OwnedTransmit};
+ use crate::peer_connection::message::{
+     RTCMessage, TaggedRTCMessage,
+     internal::{
+@@ -30,6 +31,7 @@
+ use crate::statistics::accumulator::RTCStatsAccumulator;
+ use ::interceptor::Packet;
+ use log::warn;
++use sansio::Protocol;
+ use shared::TaggedBytesMut;
+ use shared::error::{Error, flatten_errs};
+ use std::collections::VecDeque;
+@@ -125,7 +127,7 @@
+     /// that declines to drain it throttles the peer — and nothing else. No counter to keep in
+     /// step with it: the queue is the count.
+     pub(crate) data_read_outs: VecDeque<TaggedRTCMessage>,
+-    pub(crate) write_outs: VecDeque<TaggedBytesMut>,
++    pub(crate) write_outs: VecDeque<OwnedTransmit>,
+     pub(crate) event_outs: VecDeque<RTCPeerConnectionEvent>,
+ 
+     // Statistics accumulator
+@@ -253,6 +255,7 @@
+     fn handle_read(&mut self, msg: TaggedBytesMut) -> Result<(), Self::Error> {
+         let mut intermediate_routs = VecDeque::new();
+         intermediate_routs.push_back(TaggedRTCMessageInternal {
++            local_context: None,
+             now: msg.now,
+             transport: msg.transport,
+             message: RTCMessageInternal::Raw(msg.message),
+@@ -337,57 +340,10 @@
+     }
+ 
+     fn handle_write(&mut self, msg: TaggedRTCMessage) -> Result<(), Self::Error> {
+-        let now = msg.now;
+-        let rtc_message_internal = match msg.message {
+-            RTCMessage::DataChannelMessage(data_channel_id, data_channel_message) => {
+-                RTCMessageInternal::Dtls(DTLSMessage::DataChannel(ApplicationMessage {
+-                    data_channel_id,
+-                    data_channel_event: DataChannelEvent::Message(data_channel_message),
+-                }))
+-            }
+-            RTCMessage::RtpPacket(_track_id, rtp_packet) => {
+-                RTCMessageInternal::Rtp(RTPMessage::Packet(Packet::Rtp(rtp_packet)))
+-            }
+-            RTCMessage::RtcpPacket(_track_id, rtcp_packet) => {
+-                RTCMessageInternal::Rtp(RTPMessage::Packet(Packet::Rtcp(rtcp_packet)))
+-            }
+-        };
+-
+-        // Only endpoint can handle user write message
+-        let mut endpoint_handler = self.get_endpoint_handler();
+-        endpoint_handler.handle_write(TaggedRTCMessageInternal {
+-            now,
+-            transport: Default::default(),
+-            message: rtc_message_internal,
+-        })
+-    }
+-
++        self.handle_write_with_context(msg, None)
++    }
+     fn poll_write(&mut self) -> Option<Self::Wout> {
+-        let mut intermediate_wouts = VecDeque::new();
+-
+-        for_each_handler!(reverse: process_handler!(self, handler, {
+-            while let Some(msg) = intermediate_wouts.pop_front() {
+-                if let Err(err) = handler.handle_write(msg) {
+-                    warn!("{}.handle_write got error: {}", handler.name(), err);
+-                }
+-            }
+-            while let Some(msg) = handler.poll_write() {
+-                intermediate_wouts.push_back(msg);
+-            }
+-        }));
+-
+-        // Final poll write out to pipeline's write out
+-        while let Some(msg) = intermediate_wouts.pop_front() {
+-            if let RTCMessageInternal::Raw(message) = msg.message {
+-                self.pipeline_context.write_outs.push_back(TaggedBytesMut {
+-                    now: msg.now,
+-                    transport: msg.transport,
+-                    message,
+-                });
+-            }
+-        }
+-
+-        self.pipeline_context.write_outs.pop_front()
++        self.poll_write_owned().map(OwnedTransmit::into_unannotated)
+     }
+ 
+     fn handle_event(&mut self, evt: TaggedRTCEvent) -> Result<(), Self::Error> {
+@@ -456,6 +412,44 @@
+             return Ok(());
+         }
+ 
++        // Local ownership is not an on-wire extension. Discard attributed media
++        // retained at any pipeline stage, while preserving ordinary control close traffic.
++        self.pipeline_context
++            .endpoint_handler_context
++            .write_outs
++            .retain(|m| m.local_context.is_none());
++        self.pipeline_context
++            .interceptor_handler_context
++            .write_outs
++            .retain(|m| m.local_context.is_none());
++        self.pipeline_context
++            .srtp_handler_context
++            .write_outs
++            .retain(|m| m.local_context.is_none());
++        self.pipeline_context
++            .datachannel_handler_context
++            .write_outs
++            .retain(|m| m.local_context.is_none());
++        self.pipeline_context
++            .sctp_handler_context
++            .write_outs
++            .retain(|m| m.local_context.is_none());
++        self.pipeline_context
++            .dtls_handler_context
++            .write_outs
++            .retain(|m| m.local_context.is_none());
++        self.pipeline_context
++            .ice_handler_context
++            .write_outs
++            .retain(|m| m.local_context.is_none());
++        self.pipeline_context
++            .demuxer_handler_context
++            .write_outs
++            .retain(|m| m.local_context.is_none());
++        self.pipeline_context
++            .write_outs
++            .retain(|m| m.local_context.is_none());
++
+         // https://www.w3.org/TR/webrtc/#dom-rtcpeerconnection-close (step #3)
+         self.signaling_state = RTCSignalingState::Closed;
+ 
+@@ -465,11 +459,10 @@
+         // 2. A Mux stops this chain. It won't close the underlying
+         //    Conn if one of the endpoints is closed down. To
+         //    continue the chain the Mux has to be closed.
++        let mut close_errs: Vec<Error> = vec![];
+         for_each_handler!(forward: process_handler!(self, handler, {
+-            handler.close()?;
++            if let Err(error)=handler.close() { close_errs.push(error); }
+         }));
+-
+-        let close_errs: Vec<Error> = vec![];
+ 
+         /* TODO:
+         if let Err(err) = self.interceptor.close().await {
+@@ -660,3 +653,69 @@
+         assert_ne!(queued.now, t(0), "and not the construction instant either");
+     }
+ }
++
++impl RTCPeerConnection {
++    pub(crate) fn handle_write_with_context(
++        &mut self,
++        msg: TaggedRTCMessage,
++        local_context: Option<LocalPacketContext>,
++    ) -> Result<(), Error> {
++        let now = msg.now;
++        let rtc_message_internal = match msg.message {
++            RTCMessage::DataChannelMessage(data_channel_id, data_channel_message) => {
++                RTCMessageInternal::Dtls(DTLSMessage::DataChannel(ApplicationMessage {
++                    data_channel_id,
++                    data_channel_event: DataChannelEvent::Message(data_channel_message),
++                }))
++            }
++            RTCMessage::RtpPacket(_track_id, rtp_packet) => {
++                RTCMessageInternal::Rtp(RTPMessage::Packet(Packet::Rtp(rtp_packet)))
++            }
++            RTCMessage::RtcpPacket(_track_id, rtcp_packet) => {
++                RTCMessageInternal::Rtp(RTPMessage::Packet(Packet::Rtcp(rtcp_packet)))
++            }
++        };
++
++        // Only endpoint can handle user write message
++        let mut endpoint_handler = self.get_endpoint_handler();
++        endpoint_handler.handle_write(TaggedRTCMessageInternal {
++            local_context,
++            now,
++            transport: Default::default(),
++            message: rtc_message_internal,
++        })
++    }
++
++    /// Drain network output without discarding process-local packet ownership.
++    pub fn poll_write_owned(&mut self) -> Option<OwnedTransmit> {
++        let mut intermediate_wouts = VecDeque::new();
++
++        for_each_handler!(reverse: process_handler!(self, handler, {
++            while let Some(msg) = intermediate_wouts.pop_front() {
++                if let Err(err) = handler.handle_write(msg) {
++                    warn!("{}.handle_write got error: {}", handler.name(), err);
++                }
++            }
++            while let Some(msg) = handler.poll_write() {
++                intermediate_wouts.push_back(msg);
++            }
++        }));
++
++        // Final poll write out to pipeline's write out
++        while let Some(msg) = intermediate_wouts.pop_front() {
++            if let RTCMessageInternal::Raw(message) = msg.message {
++                self.pipeline_context.write_outs.push_back(OwnedTransmit {
++                    local_context: msg.local_context,
++                    now: msg.now,
++                    transport: msg.transport,
++                    message,
++                });
++            }
++        }
++
++        self.pipeline_context.write_outs.pop_front()
++    }
++}
++
++#[cfg(test)]
++mod local_context_tests;
+--- a/vendor/rtc-0.21.0/src/peer_connection/handler/sctp.rs
++++ b/vendor/rtc-0.21.0/src/peer_connection/handler/sctp.rs
+@@ -240,6 +240,7 @@
+                 if let SctpMessage::Inbound(message) = message {
+                     drained_any = true;
+                     self.ctx.read_outs.push_back(TaggedRTCMessageInternal {
++                        local_context: None,
+                         now,
+                         transport,
+                         message: RTCMessageInternal::Dtls(DTLSMessage::Sctp(message)),
+@@ -271,6 +272,7 @@
+                     if let Payload::RawEncode(raw_data) = transmit.message {
+                         for raw in raw_data {
+                             self.ctx.write_outs.push_back(TaggedRTCMessageInternal {
++                                local_context: None,
+                                 now: transmit.now,
+                                 transport: transmit.transport,
+                                 message: RTCMessageInternal::Dtls(DTLSMessage::Raw(
+@@ -477,6 +479,7 @@
+                             msg.transport.peer_addr
+                         );
+                         self.ctx.read_outs.push_back(TaggedRTCMessageInternal {
++                            local_context: None,
+                             now: msg.now,
+                             transport: msg.transport,
+                             message: RTCMessageInternal::Dtls(DTLSMessage::Sctp(message)),
+@@ -486,6 +489,7 @@
+                         if let Payload::RawEncode(raw_data) = transmit.message {
+                             for raw in raw_data {
+                                 self.ctx.write_outs.push_back(TaggedRTCMessageInternal {
++                                    local_context: None,
+                                     now: transmit.now,
+                                     transport: transmit.transport,
+                                     message: RTCMessageInternal::Dtls(DTLSMessage::Raw(
+@@ -758,6 +762,7 @@
+             if let Payload::RawEncode(raw_data) = transmit.message {
+                 for raw in raw_data {
+                     self.ctx.write_outs.push_back(TaggedRTCMessageInternal {
++                        local_context: None,
+                         now: transmit.now,
+                         transport: transmit.transport,
+                         message: RTCMessageInternal::Dtls(DTLSMessage::Raw(BytesMut::from(
+@@ -1318,6 +1323,7 @@
+ 
+     fn raw_read(now: Instant, dgram: Bytes) -> TaggedRTCMessageInternal {
+         TaggedRTCMessageInternal {
++            local_context: None,
+             now,
+             transport: TransportContext {
+                 local_addr: client_addr(),
+@@ -1673,6 +1679,7 @@
+             let mut handler = SctpHandler::new(&mut ctx, 0);
+             for d in ack_dgrams {
+                 let msg = TaggedRTCMessageInternal {
++                    local_context: None,
+                     now,
+                     transport: TransportContext {
+                         local_addr: client_addr(),
+@@ -1888,6 +1895,7 @@
+             for (i, d) in dgrams.iter().enumerate() {
+                 handler
+                     .handle_read(TaggedRTCMessageInternal {
++                        local_context: None,
+                         now: t(i as u64),
+                         transport: TransportContext {
+                             local_addr: client_addr(),
+--- a/vendor/rtc-0.21.0/src/peer_connection/handler/srtp.rs
++++ b/vendor/rtc-0.21.0/src/peer_connection/handler/srtp.rs
+@@ -61,6 +61,7 @@
+                     }
+ 
+                     self.ctx.read_outs.push_back(TaggedRTCMessageInternal {
++                        local_context: msg.local_context,
+                         now: msg.now,
+                         transport: msg.transport,
+                         message: RTCMessageInternal::Rtp(RTPMessage::Packet(Packet::Rtcp(
+@@ -79,6 +80,7 @@
+                     let rtp_packet = rtp::Packet::unmarshal(&mut decrypted)?;
+ 
+                     self.ctx.read_outs.push_back(TaggedRTCMessageInternal {
++                        local_context: msg.local_context,
+                         now: msg.now,
+                         transport: msg.transport,
+                         message: RTCMessageInternal::Rtp(RTPMessage::Packet(Packet::Rtp(
+@@ -152,6 +154,7 @@
+             };
+ 
+             self.ctx.write_outs.push_back(TaggedRTCMessageInternal {
++                local_context: msg.local_context,
+                 now: msg.now,
+                 transport: msg.transport,
+                 message: RTCMessageInternal::Rtp(RTPMessage::Raw(encrypted)),
+--- a/vendor/rtc-0.21.0/src/peer_connection/message/internal.rs
++++ b/vendor/rtc-0.21.0/src/peer_connection/message/internal.rs
+@@ -100,6 +100,7 @@
+ }
+ 
+ pub(crate) struct TaggedRTCMessageInternal {
++    pub(crate) local_context: Option<super::LocalPacketContext>,
+     pub(crate) now: Instant,
+     pub(crate) transport: TransportContext,
+     pub(crate) message: RTCMessageInternal,
+--- a/vendor/rtc-0.21.0/src/peer_connection/message/mod.rs
++++ b/vendor/rtc-0.21.0/src/peer_connection/message/mod.rs
+@@ -560,3 +560,44 @@
+     /// The message itself.
+     pub message: RTCMessage,
+ }
++
++/// Owned, process-local packet annotation. Never serialized or accepted from a peer.
++/// The wrapper may put a private typed value here; core only preserves ownership.
++#[derive(Clone)]
++pub struct LocalPacketContext(pub std::sync::Arc<dyn std::any::Any + Send + Sync>);
++impl std::fmt::Debug for LocalPacketContext {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str("LocalPacketContext(..)")
++    }
++}
++/// Network output preserving its local annotation through real queue ownership.
++pub struct OwnedTransmit {
++    /// Original local enqueue time; not a capture timestamp.
++    pub now: std::time::Instant,
++    /// Actual selected transport after ICE processing.
++    pub transport: shared::TransportContext,
++    /// Final serialized network datagram.
++    pub message: bytes::BytesMut,
++    /// Local annotation transferred with this owned datagram.
++    pub local_context: Option<LocalPacketContext>,
++}
++impl From<shared::TaggedBytesMut> for OwnedTransmit {
++    fn from(v: shared::TaggedBytesMut) -> Self {
++        Self {
++            now: v.now,
++            transport: v.transport,
++            message: v.message,
++            local_context: None,
++        }
++    }
++}
++impl OwnedTransmit {
++    /// Compatibility output. Provenance-aware callers must use owned output instead.
++    pub fn into_unannotated(self) -> shared::TaggedBytesMut {
++        shared::TaggedBytesMut {
++            now: self.now,
++            transport: self.transport,
++            message: self.message,
++        }
++    }
++}
+--- a/vendor/rtc-0.21.0/src/peer_connection/transport/dtls/mod.rs
++++ b/vendor/rtc-0.21.0/src/peer_connection/transport/dtls/mod.rs
+@@ -219,7 +219,7 @@
+                                 .hash(HashAlgorithm::Sha256, &certs[0])
+                                 .map_err(|error| Error::Crypto(error.to_string()))?;
+                             let values: Vec<String> =
+-                                hashed.iter().map(|x| format! {"{x:02x}"}).collect();
++                                hashed.iter().map(|x| format!("{x:02x}")).collect();
+                             let remote_value = values.join(":").to_lowercase();
+ 
+                             if remote_value == fp.value.to_lowercase() {
+--- a/vendor/rtc-0.21.0/src/rtp_transceiver/rtp_sender/mod.rs
++++ b/vendor/rtc-0.21.0/src/rtp_transceiver/rtp_sender/mod.rs
+@@ -388,6 +388,15 @@
+     /// carries a header extension whose id is not negotiated on this sender leg, or internal
+     /// handle_write returns error
+     pub fn write_rtp(&mut self, now: Instant, packet: rtp::Packet) -> Result<()> {
++        self.write_rtp_with_context(now, packet, None)
++    }
++    /// Same validation as write_rtp, preserving an owned local annotation.
++    pub fn write_rtp_with_context(
++        &mut self,
++        now: Instant,
++        packet: rtp::Packet,
++        local_context: Option<crate::peer_connection::message::LocalPacketContext>,
++    ) -> Result<()> {
+         // peer_connection is mutable borrow, its rtp_transceivers won't be resized and
+         // the direction won't be changed too, so, unwrap() here is safe.
+ 
+@@ -467,10 +476,13 @@
+         }
+ 
+         let track_id = sender.track().track_id().to_string();
+-        self.peer_connection.handle_write(TaggedRTCMessage {
+-            now,
+-            message: RTCMessage::RtpPacket(track_id, packet),
+-        })
++        self.peer_connection.handle_write_with_context(
++            TaggedRTCMessage {
++                now,
++                message: RTCMessage::RtpPacket(track_id, packet),
++            },
++            local_context,
++        )
+     }
+ 
+     /// Writes RTCP packets to the network.

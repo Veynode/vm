@@ -1,0 +1,37 @@
+{
+  "release_allowed": false,
+  "errors": [
+    "release_review_not_complete",
+    "unresolved_release_blockers",
+    "spice-reconnect:nonportable_or_external_symlink:UTM.app",
+    "spice-reconnect:nonportable_or_external_symlink:alpine-minirootfs-3.23.6-aarch64.tar.gz",
+    "spice-reconnect:nonportable_or_external_symlink:spice-capture",
+    "missing_evidence:component_inventory",
+    "missing_evidence:license_notices",
+    "missing_evidence:corresponding_source",
+    "missing_evidence:build_and_patch_recipe",
+    "missing_evidence:relink_and_installation",
+    "missing_evidence:redistribution_review",
+    "missing_evidence:product_license"
+  ],
+  "observed_roots": {
+    "utm-5-0-5": {
+      "tree_sha256": "1414edb421021f84d9b748decad05160989a08904df2c8079da15cdb3cdf62e3",
+      "regular_files": 552,
+      "symlinks": 243,
+      "bytes": 1387657335,
+      "problems": []
+    },
+    "spice-reconnect": {
+      "tree_sha256": "ede167b4c4b33963b129cd7f47157a909c1e71ef3c61495899c189584d01f11b",
+      "regular_files": 4,
+      "symlinks": 3,
+      "bytes": 3558574,
+      "problems": [
+        "nonportable_or_external_symlink:UTM.app",
+        "nonportable_or_external_symlink:alpine-minirootfs-3.23.6-aarch64.tar.gz",
+        "nonportable_or_external_symlink:spice-capture"
+      ]
+    }
+  }
+}

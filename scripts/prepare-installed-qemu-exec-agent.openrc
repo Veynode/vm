@@ -1,0 +1,26 @@
+#!/sbin/openrc-run
+name="Veynode private serial execution v2"
+command="/usr/local/bin/veynode-guest"
+command_args="--virtio-serial-exec --allow-execute --exec-user=veynode"
+command_background="yes"
+pidfile="/run/veynode-agent.pid"
+depend() { need modules localmount veynode-desktop; }
+start_pre() {
+    /bin/sh /opt/veynode-exec-v2/cgroup.sh || return 1
+    n=0
+    while [ "$n" -lt 90 ]; do
+        if [ -f /run/veynode-desktop.ready ] && [ -e /dev/virtio-ports/org.veynode.agent.0 ]; then
+            port=$(readlink -f /dev/virtio-ports/org.veynode.agent.0)
+            case "$port" in /dev/vport[0-9]*p[0-9]*) ;; *) return 1 ;; esac
+            test -c "$port" && test "$(stat -c %u "$port")" = 0 || return 1
+            chmod 600 "$port" || return 1
+            # This marker reports prerequisites only; real v2 info is the readiness proof.
+            echo VEYNODE_EXEC_V2_START_PREREQUISITES >/dev/console
+            return 0
+        fi
+        sleep 1
+        n=$((n+1))
+    done
+    eerror "GPU or private serial endpoint not ready"
+    return 1
+}

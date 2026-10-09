@@ -1,13 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { AuthenticatedReceiver } from '../dist/native-auth.js';
-import { DeviceIdentity, grantBytes, verifyOffer, answerBytes, sdpBinding, verifyConfirmation, verifyClose } from '../dist/session-auth.js';
+import { DeviceIdentity, grantBytes, verifyOffer, answerBytes, sdpBinding, verifyConfirmation, verifyClose, offerRejectionBytes } from '../dist/session-auth.js';
 const sdp = byte => `v=0\r\na=fingerprint:sha-256 ${Array(32).fill(byte).join(':')}\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n`;
 async function setup(mode = 'normal') {
   const host = await DeviceIdentity.generate(), device = await DeviceIdentity.generate();
   const receiver = await AuthenticatedReceiver.fromIdentity(device, { pinnedHostPublicKey: host.publicKey, vmId: 'fixture-vm' });
   const grant = { host_id: host.id, device_id: device.id, device_public_key: device.publicKey, vm_id: 'fixture-vm', scopes: ['observe'], version: 1 };
-  await receiver.acceptGrant({ grant, signature: await host.sign(await grantBytes(grant)) });
+  const signedGrant = { grant, signature: await host.sign(await grantBytes(grant)) };
+  await receiver.acceptGrant(signedGrant);
   const now = Math.floor(Date.now() / 1000);
   const challenge = { host_id: host.id, device_id: device.id, vm_id: grant.vm_id, scopes: ['observe'], grant_version: 1, instance_nonce: '11'.repeat(32), nonce: '22'.repeat(32), issued_at: now, expires_at: now + 60 };
   let transcript, closeCount = 0; const calls = [];
@@ -24,7 +25,7 @@ async function setup(mode = 'normal') {
     if (path === '/auth/close') { await verifyClose(body, transcript, device.publicKey); closeCount++; return Response.json(mode === 'cleanup-failure' && closeCount === 1 ? { closed: false } : { closed: true }); }
     throw new Error('Unexpected endpoint');
   };
-  return { receiver, host, device, fetcher, calls };
+  return { receiver, host, device, fetcher, calls, signedGrant };
 }
 test('receiver verifies answer before caller can install it; confirms and signs scoped close', async () => {
   const f = await setup(), original = globalThis.fetch; globalThis.fetch = f.fetcher;
@@ -40,7 +41,7 @@ test('receiver verifies answer before caller can install it; confirms and signs 
 });
 test('receiver rejects substituted answer and sends no confirmation', async () => {
   const f = await setup('substitute'), original = globalThis.fetch; globalThis.fetch = f.fetcher;
-  try { await assert.rejects(f.receiver.offer(sdp('AA'), 'fixture-request', 'h264'), /SDP substituted/); await assert.rejects(f.receiver.confirm(), /No verified/); assert.deepEqual(f.calls, ['/auth/challenge', '/auth/offer']); f.receiver.dispose(); }
+  try { await assert.rejects(f.receiver.offer(sdp('AA'), 'fixture-request', 'h264'), /SDP substituted/); await assert.rejects(f.receiver.confirm(), /No verified/); assert.deepEqual(f.calls, ['/auth/challenge', '/auth/offer']); assert.throws(() => f.receiver.dispose(), /Close the session/); }
   finally { globalThis.fetch = original; }
 });
 test('receiver retains session on missing cleanup attestation, rejects broader or foreign grant', async () => {
@@ -53,23 +54,90 @@ test('receiver retains session on missing cleanup attestation, rejects broader o
   } finally { globalThis.fetch = original; }
 });
 
+// These cases distinguish local pre-transmission failure from an offer whose
+// delivery/answer is uncertain. Host signatures are real; HTTP is controlled.
+for (const mode of ['challenge-denied', 'invalid-challenge', 'invalid-sdp', 'already-aborted', 'abort-during-signing', 'signing-failed']) test(`safe local cleanup before offer transmission: ${mode}`, async () => {
+  const f = await setup(), original = globalThis.fetch, controller = new AbortController();
+  let channelClosed = 0, offerCalls = 0;
+  f.receiver.bindControlTransport(async () => { throw Error('unused'); }, () => channelClosed++);
+  globalThis.fetch = async (path, options) => {
+    if (path === '/auth/offer') offerCalls++;
+    if (path === '/auth/challenge' && mode === 'challenge-denied') return Response.json({ error: 'denied' }, { status: 403 });
+    const response = await f.fetcher(path, options);
+    if (path === '/auth/challenge' && mode === 'invalid-challenge') { const challenge = await response.json(); challenge.vm_id = 'substituted'; return Response.json(challenge); }
+    return response;
+  };
+  const sign = f.device.sign;
+  if (mode === 'abort-during-signing') f.device.sign = async function (...args) { const value = await sign.apply(this, args); controller.abort(); return value; };
+  if (mode === 'signing-failed') f.device.sign = async () => { throw Error('signing failed'); };
+  if (mode === 'already-aborted') controller.abort();
+  try {
+    assert.equal(f.receiver.offerTransmissionState, 'not-sent');
+    await assert.rejects(f.receiver.offer(mode === 'invalid-sdp' ? 'invalid SDP' : sdp('AA'), 'fixture-request', 'h264', controller.signal));
+    assert.equal(offerCalls, 0); assert.equal(f.receiver.offerTransmissionState, 'not-sent');
+    await f.receiver.close(); assert.equal(channelClosed, 1); assert.equal(f.calls.includes('/auth/close'), false);
+    f.receiver.clearUnopenedControlTransport();
+    f.device.sign = sign; globalThis.fetch = f.fetcher;
+    await f.receiver.acceptGrant(f.signedGrant); await f.receiver.pairingRequest();
+    f.receiver.bindControlTransport(async () => { throw Error('unused'); });
+    await f.receiver.offer(sdp('AA'), 'retry-request', 'h264');
+    assert.equal(f.receiver.offerTransmissionState, 'verified'); await f.receiver.close();
+    assert.equal(f.receiver.offerTransmissionState, 'not-sent');
+  } finally { f.device.sign = sign; f.receiver.dispose(); globalThis.fetch = original; }
+});
+for (const mode of ['lost-answer', 'tampered-answer', 'offer-denied']) test(`transmitted offer cannot claim local cleanup or replace authority: ${mode}`, async () => {
+  const f = await setup(mode === 'tampered-answer' ? 'substitute' : 'normal'), original = globalThis.fetch;
+  globalThis.fetch = async (path, options) => {
+    const response = await f.fetcher(path, options);
+    if (path === '/auth/offer' && mode === 'lost-answer') throw Error('answer lost after host acceptance');
+    if (path === '/auth/offer' && mode === 'offer-denied') return Response.json({ error: 'denied' }, { status: 403 });
+    return response;
+  };
+  try {
+    await assert.rejects(f.receiver.offer(sdp('AA'), 'fixture-request', 'h264'));
+    assert.equal(f.receiver.offerTransmissionState, 'uncertain');
+    await assert.rejects(f.receiver.close(), /cleanup is unconfirmed/);
+    assert.throws(() => f.receiver.clearUnopenedControlTransport(), /admission/);
+    await assert.rejects(f.receiver.acceptGrant(f.signedGrant), /uncertain session/);
+    await assert.rejects(f.receiver.offer(sdp('AA'), 'retry', 'h264'), /uncertain/);
+    await assert.rejects(f.receiver.unpair(), /Close the session/);
+    assert.equal(f.calls.filter(path => path === '/auth/offer').length, 1);
+    assert.equal(f.calls.includes('/auth/close'), false);
+  } finally { assert.throws(() => f.receiver.dispose(), /Close the session/); globalThis.fetch = original; }
+});
+test('pending challenge cannot be cleared while signaling is still busy', async () => {
+  const f = await setup(), original = globalThis.fetch; let release, entered;
+  const reached = new Promise(resolve => { entered = resolve; }), blocked = new Promise(resolve => { release = resolve; });
+  globalThis.fetch = async () => { entered(); await blocked; return Response.json({}, { status: 403 }); };
+  try {
+    const offered = f.receiver.offer(sdp('AA'), 'pending-request', 'h264'); await reached;
+    assert.throws(() => f.receiver.clearUnopenedControlTransport(), /admission/);
+    await assert.rejects(f.receiver.close(), /pending/); await assert.rejects(f.receiver.acceptGrant(f.signedGrant), /session/);
+    release(); await assert.rejects(offered, /403/); await f.receiver.close();
+    assert.equal(f.receiver.offerTransmissionState, 'not-sent');
+  } finally { release(); f.receiver.dispose(); globalThis.fetch = original; }
+});
+
 // Exercise the actual native.ts event handlers and production AuthenticatedReceiver.
 // DOM/RTCPeerConnection and delayed HTTP transport are synthetic; signatures are
 // real P-256. This tests cancellation ordering, not a real browser or VM.
-for (const scenario of [{ name: 'successful confirmation', confirmFails: false }, { name: 'rejected confirmation', confirmFails: true }, { name: 'lost close response', retry: 'lost' }, { name: 'false retry receipt', retry: 'false' }, { name: 'lost answer stays fenced', offerFails: true }]) test(`native page cleanup: ${scenario.name}`, async () => {
-  const { confirmFails, retry, offerFails } = scenario;
+for (const scenario of [{ name: 'successful confirmation', confirmFails: false }, { name: 'rejected confirmation', confirmFails: true }, { name: 'lost close response', retry: 'lost' }, { name: 'false retry receipt', retry: 'false' }, { name: 'lost answer stays fenced', offerFails: true }, { name: 'signed source rejection cleans locally without codec fallback', offerRejected: true }]) test(`native page cleanup: ${scenario.name}`, async () => {
+  const { confirmFails, retry, offerFails, offerRejected } = scenario;
   const f = await setup(); const saved = new Map();
   const replace = (name, value) => { saved.set(name, Object.getOwnPropertyDescriptor(globalThis, name)); Object.defineProperty(globalThis, name, { value, writable: true, configurable: true }); };
   class Element {
     listeners = new Map(); disabled = false; hidden = false; value = ''; textContent = ''; style = {}; srcObject = null;
     addEventListener(type, callback) { const list = this.listeners.get(type) ?? []; list.push(callback); this.listeners.set(type, list); }
     click() { return Promise.all((this.listeners.get('click') ?? []).map(callback => callback())); }
+    setAttribute() {}
+    getBoundingClientRect() { return { left: 0, top: 0, right: 640, bottom: 360, width: 640, height: 360 }; }
     getContext() { return {}; }
     requestVideoFrameCallback() { return 1; }
     cancelVideoFrameCallback() {}
   }
   const elements = new Map(); const element = id => { if (!elements.has(id)) elements.set(id, new Element()); return elements.get(id); };
   const caps = [{ mimeType: 'video/h264', clockRate: 90000, sdpFmtpLine: 'profile-level-id=42e01f;packetization-mode=1' }];
+  if (offerRejected) caps.unshift({ mimeType: 'video/h265', clockRate: 90000, sdpFmtpLine: 'profile-id=1;tier-flag=0;level-id=120' });
   class Peer extends EventTarget {
     iceGatheringState = 'complete'; connectionState = 'new'; localDescription = null;
     addTransceiver() { return { setCodecPreferences() {} }; }
@@ -88,7 +156,13 @@ for (const scenario of [{ name: 'successful confirmation', confirmFails: false }
     replace('document', { querySelector: element, createElement: () => new Element() }); replace('window', new EventTarget());
     replace('MediaStream', class {}); replace('RTCPeerConnection', Peer); replace('RTCRtpReceiver', { getCapabilities: () => ({ codecs: caps }) });
     replace('fetch', async (path, options) => {
-      if (path === '/capabilities') return Response.json({ h264: 'verified-hardware', h265: 'unavailable', authentication: { required: true, vm_id: 'fixture-vm' } });
+      if (path === '/capabilities') return Response.json({ h264: 'verified-hardware', h265: offerRejected ? 'verified-hardware' : 'unavailable', authentication: { required: true, vm_id: 'fixture-vm' } });
+      if (path === '/auth/offer' && offerRejected) {
+        await f.fetcher(path, options); reached(); await blocked;
+        const rejection = { intent: JSON.parse(options.body).signed_offer.intent, code: 'guest_display_inactive', outcome: 'not_admitted', version: 1 };
+        assert.equal(rejection.intent.codec, 'h265');
+        return Response.json({ signed_rejection: { rejection, signature: await f.host.sign(offerRejectionBytes(rejection)) } });
+      }
       if (path === '/auth/offer' && offerFails) { await f.fetcher(path, options); reached(); throw new TypeError('Synthetic lost signed answer'); }
       if (path === '/auth/confirm') { reached(); await blocked; if (confirmFails) throw new TypeError('Synthetic lost confirmation response'); }
       if (path === '/auth/close' && retry) {
@@ -108,11 +182,20 @@ for (const scenario of [{ name: 'successful confirmation', confirmFails: false }
     await element('#prepare-pairing').click(); await poll(() => element('#pairing-request').textContent.includes('digest'));
     await element('#accept-grant').click(); await poll(() => element('#pairing-status').textContent.includes('Ready'));
     connectTask = element('#connect').click(); await waiting;
-    disconnectTask = element('#disconnect').click();
+    if (!offerRejected) disconnectTask = element('#disconnect').click();
     await new Promise(r => setTimeout(r, 10)); assert.equal(f.calls.filter(path => path === '/auth/close').length, 0);
     release(); await Promise.all([connectTask, disconnectTask]);
-    assert.equal(f.calls.filter(path => path === '/auth/close').length, offerFails ? 0 : 1, 'Only a verified answer permits signed close');
+    assert.equal(f.calls.filter(path => path === '/auth/close').length, offerFails || offerRejected ? 0 : 1, 'Only a verified answer permits signed close');
     assert.equal(element('#result').textContent.includes('Signaling is pending'), false);
+    if (offerRejected) {
+      assert.match(element('#result').textContent, /signed-offer-rejection/);
+      assert.match(element('#result').textContent, /guest_display_inactive/);
+      assert.equal(f.calls.filter(path => path === '/auth/offer').length, 1, 'Source rejection must not fall back to H264');
+      assert.equal(f.calls.includes('/auth/confirm'), false);
+      assert.equal(element('#connect').disabled, false);
+      assert.equal(element('#retry-cleanup').hidden, true);
+      assert.equal(f.receiver.offerTransmissionState, 'not-sent');
+    }
     if (retry || offerFails) {
       assert.equal(element('#connect').disabled, true); assert.equal(element('#retry-cleanup').hidden, false);
       assert.equal(element('#retry-cleanup').disabled, false);
@@ -140,9 +223,27 @@ for (const scenario of [{ name: 'successful confirmation', confirmFails: false }
         assert.match(element('#result').textContent, /Synthetic response lost/, 'Historical cleanup error remains in evidence');
       }
     }
-    f.receiver.dispose();
+    if (offerFails) assert.throws(() => f.receiver.dispose(), /Close the session/); else f.receiver.dispose();
   } finally {
     release(); await Promise.allSettled([connectTask, disconnectTask].filter(Boolean)); AuthenticatedReceiver.open = oldOpen;
     for (const [name, descriptor] of saved) { if (descriptor) Object.defineProperty(globalThis, name, descriptor); else delete globalThis[name]; }
   }
+});
+
+test('source failure is returned only after cleanup ACK; false receipt keeps the same signed-close binding', async () => {
+  const f = await setup(), original = globalThis.fetch, bodies = []; let clean = false;
+  globalThis.fetch = async (path, options) => {
+    const result = await f.fetcher(path, options);
+    if (path !== '/auth/close') return result;
+    bodies.push(JSON.parse(options.body));
+    return Response.json({ closed: clean, media_failure: { code: 'guest_display_asleep' } });
+  };
+  try {
+    await f.receiver.offer(sdp('AA'), 'fixture-source-request', 'h264'); await f.receiver.confirm();
+    await assert.rejects(f.receiver.close(), /not acknowledged/);
+    assert.throws(() => f.receiver.dispose(), /Close the session/);
+    clean = true; assert.deepEqual(await f.receiver.close(), { code: 'guest_display_asleep' });
+    assert.equal(bodies[0].session_id, bodies[1].session_id); assert.equal(bodies[0].transcript_sha256, bodies[1].transcript_sha256);
+    f.receiver.dispose();
+  } finally { globalThis.fetch = original; }
 });

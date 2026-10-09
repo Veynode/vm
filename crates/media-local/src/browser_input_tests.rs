@@ -79,12 +79,16 @@ impl Fixture {
             })
             .unwrap();
         let auth = Arc::new(Auth {
+            ice_config: None,
+            test_identity: None,
+            registry_read: std::sync::Mutex::new(()),
             host_public_key: public.clone(),
             state,
             namespace: "never-keychain".into(),
             vm_id: grant.grant.vm_id.clone(),
             gate: protocol::SessionGate::new(&public, std::slice::from_ref(&grant)).unwrap(),
             control_state: Some(dir.clone()),
+            files_enabled: false,
             close_proofs: StdMutex::new(BTreeMap::new()),
         });
         let sdp = format!(

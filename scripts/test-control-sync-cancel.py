@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Actual installed Linux synchronous MCP cancellation; one VM <= 1 GiB, no fake Guest."""
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import select
@@ -11,11 +12,12 @@ import time
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
+CONTROL = ROOT / 'target/debug/vm-control'
 
 
 class MCP:
     def __init__(self, state, scopes=None):
-        self.process = subprocess.Popen([str(ROOT / 'target/debug/vm-control'), 'mcp', '--state-dir', str(state),
+        self.process = subprocess.Popen([str(CONTROL), 'mcp', '--state-dir', str(state),
                                         *['--allow-'+scope for scope in (['lifecycle','execute'] if scopes is None else scopes)]], stdin=subprocess.PIPE,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
         self.number = 0
@@ -57,25 +59,30 @@ class MCP:
 
 
 def main():
+    global CONTROL
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--binary', type=Path, default=CONTROL)
+    parser.add_argument('--backend', type=Path, default=ROOT / '.local/bin/vm-apple')
     parser.add_argument('--config', type=Path, required=True)
     parser.add_argument('--output', type=Path, default=ROOT / 'docs/evidence/control-sync-cancel.json')
     args = parser.parse_args()
+    CONTROL = args.binary.resolve(strict=True)
+    assert not args.output.exists() and not args.output.with_suffix('.failed.json').exists(), 'refusing evidence overwrite'
     config = json.loads(args.config.read_text())
     assert Path(config['disk']).resolve().is_relative_to(ROOT / '.local/vms'), 'only repository-created fixture disks'
     assert config['memory_mib'] <= 1024, 'one VM at most 1 GiB'
     config.update(id='sync-cancel-validation', window=False)
-    evidence = {'started_at_unix': time.time(), 'checks': [], 'scope': 'Actual installed Linux, one VM <=1 GiB, MCP + daemon cancellation'}
+    evidence = {'started_at_unix': time.time(), 'checks': [], 'controller_sha256': hashlib.sha256(CONTROL.read_bytes()).hexdigest(), 'scope': 'Actual installed Linux, one VM <=1 GiB, MCP + daemon cancellation'}
     def record(name, value):
         evidence['checks'].append({'name': name, 'evidence': value})
     with tempfile.TemporaryDirectory(prefix='vm-sync-cancel-') as directory:
         state = Path(directory) / 'state'
         config['serial_log'] = str(Path(directory) / 'serial.log')
-        daemon = subprocess.Popen([str(ROOT / 'target/debug/vm-control'), 'daemon', '--state-dir', str(state),
-                                   '--backend', str(ROOT / '.local/bin/vm-apple')], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        daemon = subprocess.Popen([str(CONTROL), 'daemon', '--state-dir', str(state),
+                                   '--backend', str(args.backend.resolve(strict=True))], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         clients = []
         def local(method, value):
-            return json.loads(subprocess.check_output([str(ROOT / 'target/debug/vm-control'), 'call', '--state-dir',
+            return json.loads(subprocess.check_output([str(CONTROL), 'call', '--state-dir',
                                                       str(state), method, json.dumps(value)], text=True, timeout=40))
         def client():
             instance = MCP(state)

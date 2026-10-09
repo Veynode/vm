@@ -1,5 +1,13 @@
+#include "../shared/encoder-rate.h"
 // Per-VM persistent SPICE capture owner. Local single-owner framed pipe only.
 #include "hevc-profile.h"
+#include "../console/EncodedGeometry.h"
+#include "../console/ScreenshotDiagnostic.h"
+#ifdef VEYNODE_NATIVE_DISPLAY
+#import "../console/Display.h"
+#include "../console/FramePacing.h"
+#define main VeynodeConsoleMain
+#endif
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <VideoToolbox/VideoToolbox.h>
@@ -26,8 +34,12 @@ static NSString *failure,*fatal,*codecName,*actualH264Profile;
 static NSDictionary *actualHEVCProfile;
 static BOOL useHEVC,hardwareVerified,hardwareProbe,probeOutput,active,forceKeyframe,mainOpen,displayOpen,readySent,closing,awaitingSource=YES;
 static NSUInteger sourceWidth,sourceHeight,width,height,encoded,keyframes,sourceCopies,resizeCopies,received,idleFrames;
-static uint64_t epoch,lastEpoch,generation,sequence,cachedGeneration;
+static uint64_t epoch,lastEpoch,generation,sequence,cachedGeneration,rateSubmitted;
 static NSUInteger scanoutLogCount,channelLogCount;
+#ifdef VEYNODE_NATIVE_DISPLAY
+static VNFramePacing capturePacing;
+static NSUInteger capturePacingDrops,capturePoolDrops,visibleSourceCopies,backgroundSourceCopies;
+#endif
 static gint64 capturedWall,capturedMono,lastCapture,firstPTS,lastEncode;
 static int generationFD=-1;
 static NSMutableData *input;
@@ -105,7 +117,7 @@ static BOOL createEncoder(CVPixelBufferRef pixel){
     hardwareVerified=result==noErr&&usingHardware&&CFGetTypeID(usingHardware)==CFBooleanGetTypeID()&&CFBooleanGetValue(usingHardware);
     if(usingHardware)CFRelease(usingHardware);
     if(!hardwareVerified){fail(@"Encoder did not confirm hardware acceleration; software fallback rejected");return NO;}
-    return YES;
+    rateReset();rateSubmitted=0;return YES;
 }
 static CVPixelBufferRef allocatePixel(NSUInteger w,NSUInteger h){
  NSDictionary *attributes=@{(__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey:@{},(__bridge NSString *)kCVPixelBufferMetalCompatibilityKey:@YES};CVPixelBufferRef pixel=NULL;
@@ -123,7 +135,20 @@ static BOOL copyPixels(IOSurfaceRef src,NSUInteger sw,NSUInteger sh,CVPixelBuffe
  if(!from||!to||!compute)return NO;[compute setComputePipelineState:pipeline];[compute setTexture:from atIndex:0];[compute setTexture:to atIndex:1];[compute dispatchThreads:MTLSizeMake(dw,dh,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];[compute endEncoding];[command commit];[command waitUntilCompleted];return command.status==MTLCommandBufferStatusCompleted;
 }
 static BOOL cacheValid(void){return owned&&cachedGeneration==generation&&surfaceLive();}
-static void clearCache(void){cachedGeneration=0;if(owned){CVPixelBufferRelease(owned);owned=NULL;}}
+static void clearCache(void){cachedGeneration=0;if(owned){
+#ifdef VEYNODE_NATIVE_DISPLAY
+ VeynodeDisplayRelease(owned);
+#else
+ CVPixelBufferRelease(owned);
+#endif
+ owned=NULL;}}
+static NSDictionary *displayCapabilities(void){
+#ifdef VEYNODE_NATIVE_DISPLAY
+ NSMutableDictionary *caps=[VeynodeDisplayCapabilities() mutableCopy];caps[@"rate_control_version"]=@1;caps[@"rate_min_bps"]=@(rateMinimum);caps[@"rate_max_bps"]=@(rateMaximum);return caps;
+#else
+ return @{@"rate_control_version":@1,@"rate_min_bps":@(rateMinimum),@"rate_max_bps":@(rateMaximum),@"native_window":@NO,@"native_window_protocol":@1,@"display_only":@YES,@"input_enabled":@NO};
+#endif
+}
 static void closeEncoder(void){
  if(encoder){if(VTCompressionSessionCompleteFrames(encoder,kCMTimeInvalid)!=noErr)fail(@"Encoder drain failed");VTCompressionSessionInvalidate(encoder);CFRelease(encoder);encoder=NULL;}
  if(scaled){CVPixelBufferRelease(scaled);scaled=NULL;}active=NO;forceKeyframe=NO;
@@ -135,9 +160,9 @@ static void sessionFailure(void){
 static void encodeLatest(gint64 now,BOOL idle){
  if(!active||!cacheValid())return;
  if(!encoder){
-  if(useHEVC&&(sourceWidth>1920||sourceHeight>1080)){fail(@"HEVC geometry exceeds validated level4 bound");sessionFailure();return;}
-  double scale=useHEVC?1.0:fmin(1.0,fmin(1280.0/sourceWidth,720.0/sourceHeight));width=(NSUInteger)floor(sourceWidth*scale/2)*2;height=(NSUInteger)floor(sourceHeight*scale/2)*2;
-  if(width<2||height<2){fail(@"Encoded dimensions too small");sessionFailure();return;}
+  size_t selectedWidth=0,selectedHeight=0;
+  if(!VNEncodedGeometry(sourceWidth,sourceHeight,useHEVC,&selectedWidth,&selectedHeight)){fail(@"Source geometry cannot fit even codec bounds");sessionFailure();return;}
+  width=selectedWidth;height=selectedHeight;
   if(width!=sourceWidth||height!=sourceHeight){scaled=allocatePixel(width,height);if(!scaled){fail(@"Scale buffer unavailable");sessionFailure();return;}}
   if(!createEncoder(scaled?:owned)){sessionFailure();return;}
   emit(epoch,@{@"event":@"encoding",@"codec":codecName,@"hardware_verified":@(hardwareVerified),@"width":@(width),@"height":@(height),@"source_width":@(sourceWidth),@"source_height":@(sourceHeight),@"source_generation":@(generation),@"source_sequence":@(sequence)});
@@ -147,10 +172,13 @@ static void encodeLatest(gint64 now,BOOL idle){
  if(!firstPTS)firstPTS=now;lastEncode=now;CMTime pts=CMTimeMake(now-firstPTS,1000000);
  NSDictionary *options=forceKeyframe?@{(__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame:@YES}:nil;forceKeyframe=NO;
  CVPixelBufferRetain(pixel);OSStatus status=VTCompressionSessionEncodeFrame(encoder,pixel,pts,CMTimeMake(1,30),(__bridge CFDictionaryRef)options,NULL,NULL);
- if(status!=noErr)fail(@"Frame submission failed");else if(VTCompressionSessionCompleteFrames(encoder,pts)!=noErr)fail(@"Frame completion failed");CVPixelBufferRelease(pixel);
+ if(status!=noErr)fail(@"Frame submission failed");else {rateSubmitted++;if(VTCompressionSessionCompleteFrames(encoder,pts)!=noErr)fail(@"Frame completion failed");}CVPixelBufferRelease(pixel);
  if(idle)idleFrames++;sessionFailure();
 }
 static void awaitSource(NSString *reason){
+#ifdef VEYNODE_NATIVE_DISPLAY
+ VeynodeDisplayInvalidate();capturePacing.initialized=false;
+#endif
  cachedGeneration=0; // Invalidate publication before draining, retain storage until drain.
  if(active&&encoder){fail(@"Source generation unavailable; start a fresh encoding epoch after replacement");sessionFailure();}
  clearCache();
@@ -180,11 +208,26 @@ static void scanout(SpiceDisplayChannel *channel,GParamSpec *spec,gpointer conte
 static void draw(SpiceDisplayChannel *channel,guint32 x,guint32 y,guint32 w,guint32 h,gpointer context){@autoreleasepool{
  received++;gint64 now=g_get_monotonic_time();
  if(!surfaceLive()){awaitSource(@"generation_retired_during_draw");}
- else if(!lastCapture||now-lastCapture>=33333){
+ else {
+#ifdef VEYNODE_NATIVE_DISPLAY
+  BOOL nativeVisible=VeynodeDisplayVisible();
+  if(!VNFramePacingAdmit(&capturePacing,now,nativeVisible)){capturePacingDrops++;}
+  else{
+  CVPixelBufferRef next=VeynodeDisplayAcquire(sourceWidth,sourceHeight);
+  if(next){
+   if(!copyPixels(surface,sourceWidth,sourceHeight,next)){VeynodeDisplayRelease(next);captureFail(@"source_copy_failed");}
+   else if(!surfaceLive()){VeynodeDisplayRelease(next);awaitSource(@"generation_retired_during_copy");}
+   else{clearCache();owned=next;sourceCopies++;sequence++;cachedGeneration=generation;capturedMono=g_get_monotonic_time();capturedWall=g_get_real_time();lastCapture=now;if(nativeVisible)visibleSourceCopies++;else backgroundSourceCopies++;VeynodeDisplayPublish(owned,generation,sequence,capturedMono);}
+  }else capturePoolDrops++;
+  } // Pool exhaustion deliberately drops a source update without blocking ACK.
+#else
+  if(!lastCapture||now-lastCapture>=33333){
   cachedGeneration=0;if(!owned)owned=allocatePixel(sourceWidth,sourceHeight);
   if(!owned||!copyPixels(surface,sourceWidth,sourceHeight,owned)){clearCache();captureFail(@"source_copy_failed");}
   else if(!surfaceLive()){awaitSource(@"generation_retired_during_copy");}
   else{sourceCopies++;sequence++;cachedGeneration=generation;capturedMono=g_get_monotonic_time();capturedWall=g_get_real_time();lastCapture=now;}
+  }
+#endif
  }
  // Producer ACK is after the source copy, before encoding our owned buffer.
  spice_display_channel_gl_draw_done(channel);
@@ -195,7 +238,11 @@ static void channelEvent(SpiceChannel *channel,SpiceChannelEvent event,gpointer 
  if(channelLogCount++<32){int type=0,ident=0;g_object_get(channel,"channel-type",&type,"channel-id",&ident,NULL);NSData *log=[NSJSONSerialization dataWithJSONObject:@{@"event":@"channel-event",@"channel_type":@(type),@"channel_id":@(ident),@"event_code":@(event)} options:NSJSONWritingSortedKeys error:nil];fwrite(log.bytes,1,log.length,stderr);fputc('\n',stderr);fflush(stderr);}
  if(event==SPICE_CHANNEL_OPENED){if(SPICE_IS_MAIN_CHANNEL(channel))mainOpen=YES;if(SPICE_IS_DISPLAY_CHANNEL(channel))displayOpen=YES;
   if(mainOpen&&displayOpen&&!readySent){readySent=YES;emit(0,@{@"event":@"ready",@"protocol":@1,@"capture_connected":@YES,@"frame_available":@(cacheValid())});}}
- else if(event==SPICE_CHANNEL_CLOSED||event>=SPICE_CHANNEL_ERROR_CONNECT){clearCache();captureFail(@"spice_disconnected");}
+ else if(event==SPICE_CHANNEL_CLOSED||event>=SPICE_CHANNEL_ERROR_CONNECT){
+#ifdef VEYNODE_NATIVE_DISPLAY
+ VeynodeDisplayInvalidate();
+#endif
+ clearCache();captureFail(@"spice_disconnected");}
 }
 static void newChannel(SpiceSession *session,SpiceChannel *channel,gpointer data){
  if(SPICE_IS_DISPLAY_CHANNEL(channel)){g_signal_connect(channel,"notify::gl-scanout",G_CALLBACK(scanout),NULL);g_signal_connect(channel,"gl-draw",G_CALLBACK(draw),NULL);g_signal_connect(channel,"channel-event",G_CALLBACK(channelEvent),NULL);spice_channel_connect(channel);}
@@ -203,8 +250,29 @@ static void newChannel(SpiceSession *session,SpiceChannel *channel,gpointer data
 }
 static void reply(id ident,uint64_t e,NSDictionary *result){emit(e,@{@"id":ident,@"result":result});}
 static void reject(id ident,uint64_t e,NSString *code){emit(e,@{@"id":ident?:[NSNull null],@"error":@{@"code":code,@"message":code}});}
-static NSDictionary *screenshot(void){
- if(!cacheValid())return nil;
+#ifdef VEYNODE_NATIVE_DISPLAY
+static BOOL displayCommandPending;
+static void windowCommand(NSString *method,NSString *ident,NSDictionary *frame){
+ if(displayCommandPending){reject(ident,0,@"native_window_busy");return;}displayCommandPending=YES;
+ GMainContext *context=g_main_context_ref(g_main_loop_get_context(loop));
+ VeynodeDisplayCommand(method,frame,^(NSDictionary *result,NSString *error){
+  void (^finish)(void)=[^{displayCommandPending=NO;if(!closing&&!fatal){if(error)reject(ident,0,error);else{if([method isEqual:@"show_window"]&&cacheValid())VeynodeDisplayPublish(owned,generation,sequence,capturedMono);if([method isEqual:@"validate_displayed_frame"]){reply(ident,0,result);return;}NSMutableDictionary *status=[result mutableCopy];status[@"source_width"]=@(cacheValid()?sourceWidth:0);status[@"source_height"]=@(cacheValid()?sourceHeight:0);status[@"source_frame_available"]=@(cacheValid());status[@"encoder_width"]=@(encoder?width:0);status[@"encoder_height"]=@(encoder?height:0);status[@"source_draw_events"]=@(received);status[@"source_copies"]=@(sourceCopies);status[@"capture_pacing_drops"]=@(capturePacingDrops);status[@"capture_pool_drops"]=@(capturePoolDrops);status[@"visible_source_copies"]=@(visibleSourceCopies);status[@"background_source_copies"]=@(backgroundSourceCopies);status[@"encoder_output_frames_current_epoch"]=@(encoded);status[@"encoder_idle_frames_current_epoch"]=@(idleFrames);status[@"encoder_active"]=@(active);status[@"sampled_monotonic_us"]=@(g_get_monotonic_time());reply(ident,0,status);}}} copy];
+  // A C trampoline owns the retained block; no stdout emission from AppKit.
+  extern gboolean VeynodeConsoleInvoke(gpointer);
+  extern void VeynodeConsoleInvokeFree(gpointer);
+  // invoke_full can execute inline if the caller can acquire an idle context.
+  // Attaching a source always defers work to the sole GLib-loop owner instead.
+  GSource *source=g_idle_source_new();
+  g_source_set_callback(source,VeynodeConsoleInvoke,(__bridge_retained void *)finish,VeynodeConsoleInvokeFree);
+  g_source_attach(source,context);g_source_unref(source);g_main_context_unref(context);
+ });
+}
+gboolean VeynodeConsoleInvoke(gpointer data){void (^block)(void)=(__bridge id)data;block();return G_SOURCE_REMOVE;}
+void VeynodeConsoleInvokeFree(gpointer data){CFBridgingRelease(data);}
+#endif
+static NSDictionary *screenshot(NSDictionary **diagnostic){
+ *diagnostic=nil;
+ if(!cacheValid()){*diagnostic=VNScreenshotFailure(@"cache_invalid_before_copy",nil);return nil;}
  CVPixelBufferLockBaseAddress(owned,kCVPixelBufferLock_ReadOnly);
  size_t row=CVPixelBufferGetBytesPerRow(owned);NSData *pixels=[NSData dataWithBytes:CVPixelBufferGetBaseAddress(owned) length:row*sourceHeight];
  CVPixelBufferUnlockBaseAddress(owned,kCVPixelBufferLock_ReadOnly);
@@ -212,7 +280,8 @@ static NSDictionary *screenshot(void){
  CGImageRef image=CGImageCreate(sourceWidth,sourceHeight,8,32,row,color,kCGBitmapByteOrder32Little|kCGImageAlphaNoneSkipFirst,provider,NULL,false,kCGRenderingIntentDefault);
  NSMutableData *png=[NSMutableData new];CGImageDestinationRef destination=CGImageDestinationCreateWithData((__bridge CFMutableDataRef)png,CFSTR("public.png"),1,NULL);BOOL okay=NO;
  if(image&&destination){CGImageDestinationAddImage(destination,image,NULL);okay=CGImageDestinationFinalize(destination);}if(destination)CFRelease(destination);if(image)CGImageRelease(image);CGColorSpaceRelease(color);CGDataProviderRelease(provider);
- if(!okay||png.length>700*1024||!cacheValid())return nil;
+ *diagnostic=VNScreenshotEncodingFailure(okay,png.length,cacheValid());
+ if(*diagnostic)return nil;
  return @{@"source_generation":@(generation),@"source_sequence":@(sequence),@"captured_at_us":@(capturedWall),@"captured_monotonic_us":@(capturedMono),@"width":@(sourceWidth),@"height":@(sourceHeight),@"coordinate_space":@"guest-physical-pixels",@"mime_type":@"image/png",@"data_base64":[png base64EncodedStringWithOptions:0],@"byte_length":@(png.length)};
 }
 static void command(NSData *line){
@@ -220,8 +289,18 @@ static void command(NSData *line){
  if(![obj isKindOfClass:NSDictionary.class]){reject(nil,0,@"invalid_request");return;}NSDictionary *request=obj;id ident=request[@"id"];
  if(!([ident isKindOfClass:NSString.class]&&[ident length]>0&&[ident length]<=128)){reject(nil,0,@"invalid_id");return;}
  NSString *method=request[@"method"];if(![method isKindOfClass:NSString.class]){reject(ident,0,@"invalid_method");return;}
+ if([method isEqual:@"capabilities"]){if(request.count!=2){reject(ident,0,@"invalid_window_request");return;}reply(ident,0,displayCapabilities());return;}
+ if([@[@"show_window",@"close_window",@"window_status",@"validate_displayed_frame"] containsObject:method]){
+  if(request.count!=([method isEqual:@"validate_displayed_frame"]?3:2)){reject(ident,0,@"invalid_window_request");return;}
+#ifdef VEYNODE_NATIVE_DISPLAY
+  windowCommand(method,ident,request[@"frame"]);
+#else
+  reject(ident,0,@"native_window_unavailable");
+#endif
+  return;
+ }
  if([method isEqual:@"shutdown"]){closeEncoder();reply(ident,0,@{@"state":@"stopped"});closing=YES;g_main_loop_quit(loop);return;}
- if([method isEqual:@"screenshot"]){NSDictionary *png=screenshot();if(png)reply(ident,0,png);else reject(ident,0,cacheValid()?@"screenshot_unavailable_or_too_large":@"frame_unavailable");return;}
+ if([method isEqual:@"screenshot"]){NSDictionary *diagnostic=nil;NSDictionary *png=screenshot(&diagnostic);if(png){NSData *body=VNScreenshotResponseData(ident,png);if(body)record(1,0,body);else captureFail(@"json_serialization_failed");}else{NSString *code=cacheValid()?@"screenshot_unavailable_or_too_large":@"frame_unavailable";emit(0,@{@"id":ident,@"error":@{@"code":code,@"message":code,@"diagnostic":diagnostic}});}return;}
  if([method isEqual:@"frame_status"]){BOOL valid=cacheValid();reply(ident,0,@{@"capture_connected":(mainOpen&&displayOpen&&!fatal)?@YES:@NO,@"frame_available":valid?@YES:@NO,@"source_generation":@(generation),@"source_sequence":@(sequence),@"width":@(valid?sourceWidth:0),@"height":@(valid?sourceHeight:0)});return;}
  id requested=request[@"epoch"];double number=[requested isKindOfClass:NSNumber.class]?[requested doubleValue]:0;
  if(![requested isKindOfClass:NSNumber.class]||CFGetTypeID((__bridge CFTypeRef)requested)==CFBooleanGetTypeID()||!isfinite(number)||number<1||number>9007199254740991.0||floor(number)!=number){reject(ident,0,@"invalid_epoch");return;}uint64_t e=(uint64_t)number;
@@ -232,6 +311,13 @@ static void command(NSData *line){
   reply(ident,e,@{@"state":cacheValid()?@"encoding":@"waiting-frame",@"epoch":@(epoch),@"frame_available":@(cacheValid())});if(cacheValid())encodeLatest(g_get_monotonic_time(),NO);return;
  }
  if(!active||e!=epoch){reject(ident,e,@"stale_or_inactive_epoch");return;}
+ if([@[@"rate_status",@"set_bitrate"] containsObject:method]){
+  NSDictionary *strict=rateParse(line);if(!strict){reject(ident,e,@"invalid_request");return;}
+  NSMutableDictionary *q=[strict mutableCopy];[q removeObjectForKey:@"id"];q[@"request_id"]=ident;
+  if([method isEqual:@"rate_status"])[q removeObjectForKey:@"epoch"];
+  NSDictionary *answer=rateApply(q,encoder,hardwareVerified,epoch,rateSubmitted);
+  if(answer[@"error"])reject(ident,e,answer[@"error"][@"code"]);else reply(ident,e,answer[@"result"]);return;
+ }
  if([method isEqual:@"stop"]){closeEncoder();if(failure){reject(ident,e,@"encoder_drain_failed");failure=nil;return;}reply(ident,e,@{@"state":@"stopped",@"encoded":@(encoded),@"keyframes":@(keyframes),@"idle_frames":@(idleFrames),@"frame_available":@(cacheValid()),@"source_generation":@(generation),@"source_sequence":@(sequence)});return;}
  if([method isEqual:@"keyframe"]){forceKeyframe=YES;reply(ident,e,@{@"requested":@YES});if(cacheValid()&&g_get_monotonic_time()-lastEncode>=33333)encodeLatest(g_get_monotonic_time(),YES);return;}
  reject(ident,e,@"unsupported_method");
@@ -254,16 +340,19 @@ static int probeCodecs(void){
   result[useHEVC?@"h265":@"h264"]=(!failure&&hardwareVerified&&probeOutput)?@"verified-hardware":@"unavailable";
   if(encoder){VTCompressionSessionInvalidate(encoder);CFRelease(encoder);encoder=NULL;}
  }
- CVPixelBufferRelease(pixel);result[@"source"]=@"VideoToolbox required-hardware session property";
+ CVPixelBufferRelease(pixel);result[@"source"]=@"VideoToolbox required-hardware session property";[result addEntriesFromDictionary:displayCapabilities()];
  NSData *json=[NSJSONSerialization dataWithJSONObject:result options:NSJSONWritingSortedKeys error:nil];fwrite(json.bytes,1,json.length,stdout);fputc('\n',stdout);return 0;
 }
 int main(int argc,char **argv){@autoreleasepool{
- lock=[NSLock new];if(argc==2&&!strcmp(argv[1],"--probe-codecs"))return probeCodecs();
+ lock=[NSLock new];if(argc==2&&!strcmp(argv[1],"--probe-capabilities")){NSData *json=[NSJSONSerialization dataWithJSONObject:displayCapabilities() options:NSJSONWritingSortedKeys error:nil];fwrite(json.bytes,1,json.length,stdout);fputc('\n',stdout);return 0;}if(argc==2&&!strcmp(argv[1],"--probe-codecs"))return probeCodecs();
  if(argc!=3||strcmp(argv[2],"--persistent")){fprintf(stderr,"Usage: spice-console SOCKET --persistent\n");return 2;}
  signal(SIGPIPE,SIG_IGN);lock=[NSLock new];input=[NSMutableData new];fcntl(STDOUT_FILENO,F_SETFL,fcntl(STDOUT_FILENO,F_GETFL)|O_NONBLOCK);fcntl(STDIN_FILENO,F_SETFL,fcntl(STDIN_FILENO,F_GETFL)|O_NONBLOCK);
  loop=g_main_loop_new(NULL,FALSE);SpiceSession *session=spice_session_new();g_object_set(session,"unix-path",argv[1],NULL);g_signal_connect(session,"channel-new",G_CALLBACK(newChannel),NULL);
  GIOChannel *channel=g_io_channel_unix_new(STDIN_FILENO);g_io_add_watch(channel,G_IO_IN|G_IO_HUP|G_IO_ERR,control,NULL);g_timeout_add(100,tick,NULL);
  if(!spice_session_connect(session))captureFail(@"spice_connect_failed");if(!fatal)g_main_loop_run(loop);
+ #ifdef VEYNODE_NATIVE_DISPLAY
+ VeynodeDisplayInvalidate();
+ #endif
  closeEncoder();clearCache();if(fatal)emit(0,@{@"event":@"capture-error",@"error":@{@"code":fatal,@"message":fatal}});
  // Disconnect only after final replies; callbacks must not add teardown errors.
  closing=YES;g_signal_handlers_disconnect_by_func(session,G_CALLBACK(newChannel),NULL);spice_session_disconnect(session);g_object_unref(session);g_io_channel_unref(channel);g_main_loop_unref(loop);loop=NULL;
