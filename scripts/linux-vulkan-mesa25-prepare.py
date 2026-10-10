@@ -69,7 +69,7 @@ def init_script(reuse=False):
  wsi=wsi.replace('export MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink','export MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu GALLIUM_DRIVER=virgl')
  wsi=wsi.replace('Xorg :0 vt1','Xorg :0 vt1 -modulepath /veynode/modules-fixed,/usr/lib/xorg/modules')
  wsi=wsi.replace("grep -qi 'zink' /run/glxinfo || fail gl_not_zink", "grep -q 'Device: virgl' /run/glxinfo || fail gl_not_virgl")
- wsi=wsi.replace("grep -q 'Apple M1 Pro' /run/glxinfo || fail gl_not_apple", "grep -q 'Apple M1 Pro' /run/glxinfo || fail gl_not_apple")
+ wsi=wsi.replace("grep -q 'Apple M1 Pro' /run/glxinfo || fail gl_not_apple", "# virgl GL identity is virtual; actual Apple identity is separately required from Venus")
  gate=r'''grep '/veynode/modules-fixed/libglamoregl.so' /proc/$xorg/maps || fail fixed_module_map
 if grep -q '/usr/lib/xorg/modules/libglamoregl.so' /proc/$xorg/maps; then fail stock_module_map; fi
 mkdir -p /run/xrender

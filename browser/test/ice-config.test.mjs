@@ -48,6 +48,14 @@ test('temporary loopback ICE configuration is bounded, copied and never reflecte
   validateIceConfiguration(stun, 1000); stun.ice_servers[0].credential = 'secret'; assert.throws(() => validateIceConfiguration(stun, 1000));
   const old = config(1000); old.expires_at = 1010; iceConfigurationBytes(old); assert.throws(() => validateIceConfiguration(old, 1000));
 });
+test('temporary ICE credential boundary: exactly 210 s remaining is accepted and 209 s is refused', () => {
+  const at210 = { ...config(1000), expires_at: 1210 }, at209 = { ...config(1000), expires_at: 1209 };
+  assert.equal(validateIceConfiguration(at210, 1000).expires_at, 1210);
+  assert.equal(icePeerConfiguration(at210, 1000).iceTransportPolicy, 'relay');
+  assert.throws(() => validateIceConfiguration(at209, 1000), /insufficient remaining lifetime/);
+  assert.throws(() => icePeerConfiguration(at209, 1000), /insufficient remaining lifetime/);
+  assert.throws(() => validateIceConfiguration(at210, 1001), /insufficient remaining lifetime/);
+});
 async function signedFixture() {
   const host = await DeviceIdentity.generate(), device = await DeviceIdentity.generate(), now = 1000;
   const grant = { host_id: host.id, device_id: device.id, device_public_key: device.publicKey, vm_id: 'ice-vm', scopes: ['observe'], version: 1 };

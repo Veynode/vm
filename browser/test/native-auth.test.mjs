@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { AuthenticatedReceiver } from '../dist/native-auth.js';
-import { DeviceIdentity, grantBytes, verifyOffer, answerBytes, sdpBinding, verifyConfirmation, verifyClose, offerRejectionBytes } from '../dist/session-auth.js';
+import { DeviceIdentity, grantBytes, verifyGrant, verifyOffer, answerBytes, sdpBinding, verifyConfirmation, verifyClose, offerRejectionBytes } from '../dist/session-auth.js';
 const sdp = byte => `v=0\r\na=fingerprint:sha-256 ${Array(32).fill(byte).join(':')}\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n`;
 async function setup(mode = 'normal') {
   const host = await DeviceIdentity.generate(), device = await DeviceIdentity.generate();
@@ -246,4 +247,49 @@ test('source failure is returned only after cleanup ACK; false receipt keeps the
     assert.equal(bodies[0].session_id, bodies[1].session_id); assert.equal(bodies[0].transcript_sha256, bodies[1].transcript_sha256);
     f.receiver.dispose();
   } finally { globalThis.fetch = original; }
+});
+
+// Minimal in-memory IndexedDB covering only the calls BrowserIdentityStore makes.
+function installFakeIndexedDB() {
+  const rows = new Map();
+  const transaction = () => {
+    const queue = []; const tx = { oncomplete: null, onabort: null, onerror: null, aborted: false, abort() { tx.aborted = true; }, objectStore: () => store };
+    const request = operation => { const pending = { result: undefined, onsuccess: null }; queue.push(() => { pending.result = operation(); pending.onsuccess?.(); }); return pending; };
+    const store = { get: key => request(() => rows.get(key)), add: (value, key) => request(() => { rows.set(key, value); }), delete: key => request(() => { rows.delete(key); }) };
+    setTimeout(() => { while (queue.length && !tx.aborted) queue.shift()(); if (tx.aborted) tx.onabort?.(); else tx.oncomplete?.(); }, 0);
+    return tx;
+  };
+  const database = { close() {}, createObjectStore() { return {}; }, transaction };
+  const fake = { open() { const request = { result: undefined, onupgradeneeded: null, onsuccess: null, onerror: null, onblocked: null }; setTimeout(() => { request.result = database; request.onupgradeneeded?.(); request.onsuccess?.(); }, 0); return request; } };
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'indexedDB');
+  Object.defineProperty(globalThis, 'indexedDB', { value: fake, configurable: true, writable: true });
+  return { rows, restore() { if (original) Object.defineProperty(globalThis, 'indexedDB', original); else delete globalThis.indexedDB; } };
+}
+// Pins current behaviour: local unpair removes only the browser identity record. It
+// makes no host request, so the host-side grant stays active until the operator revokes it.
+test('local unpair removes only this browser identity, never contacts the host, and leaves the host grant unrevoked', async () => {
+  const fake = installFakeIndexedDB(), original = globalThis.fetch; let networkCalls = 0;
+  globalThis.fetch = async () => { networkCalls++; throw new Error('unexpected network call'); };
+  try {
+    const host = await DeviceIdentity.generate();
+    const receiver = await AuthenticatedReceiver.open({ pinnedHostPublicKey: host.publicKey, vmId: 'fixture-vm', databaseName: 'veynode-session-auth-unpair-test' });
+    const grant = { host_id: host.id, device_id: receiver.deviceId, device_public_key: receiver.publicKey, vm_id: 'fixture-vm', scopes: ['observe'], version: 1 };
+    const signedGrant = { grant, signature: await host.sign(await grantBytes(grant)) };
+    await receiver.acceptGrant(signedGrant);
+    assert.equal(fake.rows.size, 1, 'identity record exists before unpair');
+    const identity = receiver.identity;
+    await receiver.unpair();
+    assert.equal(networkCalls, 0, 'local unpair must not contact the host');
+    assert.equal(fake.rows.size, 0, 'only this browser identity record is removed');
+    await assert.rejects(identity.sign(new Uint8Array([1])), /unpaired/);
+    // Nothing in the browser revokes the host-side grant: the host-signed artifact still verifies.
+    await verifyGrant(signedGrant, host.publicKey, { device_public_key: grant.device_public_key, vm_id: 'fixture-vm', scopes: ['observe'] });
+  } finally { fake.restore(); globalThis.fetch = original; }
+});
+// Pins current behaviour: the native page has no unpair control and no operator revoke text.
+// The `vm-pair revoke` instruction exists only in crates/session-auth/README.md.
+test('native page exposes no unpair control and no operator revoke instruction', () => {
+  const html = readFileSync(new URL('../native.html', import.meta.url), 'utf8');
+  assert.doesNotMatch(html, /vm-pair revoke/);
+  assert.doesNotMatch(html, /unpair/i);
 });

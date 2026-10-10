@@ -99,6 +99,8 @@ source. A command already submitted cannot be retroactively erased; the next
 available render tick clears the display. Source-liveness detection retains the
 existing capture timer interval. These are not atomic zero-stale-frame claims.
 
+`DrawCompletionOwnershipTests.m`, run by `test.sh`, is a headless regression test for the completion ownership fix in 74dfa73. It includes the production `Display.m`, retires the source generation from a fake view's `currentDrawable`, and asserts that an invalid draw releases its frame lease exactly once. It opens no window and no NSApplication; its GPU work is offscreen.
+
 The headless compile path retains its original owned buffer and encoder logic.
 The display compile path reuses all original screenshot, codec, source generation,
 stop and terminal handling rather than maintaining a second protocol implementation.
@@ -388,3 +390,43 @@ nil. The installed macOS SDK `AppKit.framework/Headers/NSApplication.h` provides
 `firstResponder`. Pure policy tests cover inactive-but-key and active/key with
 wrong first responder; existing real Unix cancellation tests cover queued and
 in-flight authority cancellation. They are not an actual GUI deactivation test.
+
+### Passive copy timing (native helper only)
+
+`window_status.copy_timing` version 1 reports two independent rolling windows,
+`source_copy` and `encoder_resize`, each retaining at most 120 attempts. Lifetime
+`attempts/succeeded/failed` counters are separate from `window_samples`; they
+saturate at the JSON safe integer limit and set `counters_saturated`.
+
+Each window exposes `cpu_total_us`, `commit_wait_us`, and `gpu_execution_us` with
+`valid_count`, `invalid_count`, `min`, nearest-rank `p50/p95/p99`, and `max`.
+No valid samples yields null statistics. CPU time uses GLib's monotonic clock:
+entry to the post-wait/pre-statistics timestamp (including first-use shader/pipeline
+setup), and immediately before commit to that same post-wait timestamp. Recording
+lock/aggregate overhead and final return/ARC destruction are excluded. Commit-wait
+includes API submission and CPU scheduling/synchronization; subtracting GPU time
+from it does not establish pure GPU queue wait. GPU duration uses the completed command's public
+`GPUStartTime`/`GPUEndTime`, requiring finite positive ordered timestamps; missing,
+zero, invalid or unsuccessful-command timestamps are counted invalid, never as
+zero-duration work. CPU/GPU clocks are not subtracted from each other.
+
+These are aggregate copy measurements, not source capture age, ACK latency,
+window drawable presentation, display scanout, input-to-photon, or physical FPS.
+Windows can span source generations and geometry changes; no per-frame identity
+or pixels are recorded. Multiple status windows may overlap: **do not combine
+their percentiles into a whole-run percentile**. There is no raw trace mode,
+encoder/scheduling change, or altered producer ACK ordering. Headless compilation
+excludes this module and instrumentation.
+
+Native input diagnostics expose `native_input_suspension_count` and the latest
+at most eight `native_input_suspensions` through `window_status`. Each explicit
+Take Control starts a new first-cause record: subsequent release/focus callbacks
+do not overwrite that cause. Fixed reason labels distinguish focus, source,
+layout, queue overflow/age, unsupported key and remote rejection. The optional
+`queue_age_ms` is sampled at dequeue, before RPC, and is not end-to-end latency.
+An optional `remote_diagnostic` contains only version 1, an allowlisted stage and
+bounded integer worker elapsed milliseconds. Neither record contains keys,
+coordinates, frame payloads, identities or arbitrary peer messages. Invalid
+remote diagnostics are omitted; the original rejection and cleanup still occur.
+These observations do not alter the 200ms queue age, frame validation, authority,
+focus or release-ACK rules and do not prove guest delivery.

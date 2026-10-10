@@ -410,6 +410,7 @@ pub fn confirmation_bytes(digest: &str) -> Result<Vec<u8>> {
 }
 
 struct GateState {
+    /// Per-key replay floor: the active version, or last revoked version + 1 (the durable tombstone).
     highest: BTreeMap<String, u64>,
     grants: BTreeMap<String, Grant>,
     challenges: BTreeMap<String, Challenge>,
@@ -422,12 +423,48 @@ pub struct SessionGate {
     state: Mutex<GateState>,
 }
 impl SessionGate {
+    /// Fresh host with no durable registry history. Any start from an existing
+    /// registry must use `with_versions`, which keeps tombstones across restarts.
     pub fn new(host_public: &str, grants: &[SignedGrant]) -> Result<Self> {
+        Self::build(host_public, BTreeMap::new(), grants)
+    }
+    /// Restart path: seeds the replay floor from the durable per-key version map.
+    /// A revoked key keeps its tombstone (last version + 1), so superseded versions
+    /// stay refused. Every active grant must match its durable version, and malformed
+    /// or oversized maps fail closed.
+    pub fn with_versions(
+        host_public: &str,
+        grants: &[SignedGrant],
+        versions: &BTreeMap<String, u64>,
+    ) -> Result<Self> {
+        ensure!(versions.len() <= 1024, "grant history capacity");
+        for (key, version) in versions {
+            let (device, vm) = key.split_once(':').context("invalid registry key")?;
+            unhex(device, 32)?;
+            identifier(vm)?;
+            ensure!(
+                (1..=MAX_SAFE_INTEGER).contains(version),
+                "invalid persisted version"
+            );
+        }
+        for signed in grants {
+            ensure!(
+                versions.get(&signed.grant.key()) == Some(&signed.grant.version),
+                "registry grant/version mismatch"
+            );
+        }
+        Self::build(host_public, versions.clone(), grants)
+    }
+    fn build(
+        host_public: &str,
+        highest: BTreeMap<String, u64>,
+        grants: &[SignedGrant],
+    ) -> Result<Self> {
         let gate = Self {
             host_id: identity_id(host_public)?,
             instance: random32(),
             state: Mutex::new(GateState {
-                highest: BTreeMap::new(),
+                highest,
                 grants: BTreeMap::new(),
                 challenges: BTreeMap::new(),
                 pending: BTreeMap::new(),
@@ -458,8 +495,21 @@ impl SessionGate {
                     grant.version >= old.version && (grant.version != old.version || grant == old),
                     "grant rollback/replacement"
                 )
-            } else if let Some(highest) = state.highest.get(key) {
-                ensure!(grant.version > *highest, "revoked grant replay")
+            } else if let Some(floor) = state.highest.get(key) {
+                // A non-active key's floor is its durable tombstone (last revoked version + 1),
+                // so only a newer approval can pass here.
+                ensure!(grant.version >= *floor, "revoked grant replay")
+            }
+        }
+        // A grant absent from this snapshot is revoked. Advance its floor to the
+        // tombstone the durable registry records (last version + 1).
+        let mut tombstones = Vec::new();
+        for (key, old) in &state.grants {
+            if !current.contains_key(key) {
+                tombstones.push((
+                    key.clone(),
+                    old.version.checked_add(1).context("version overflow")?,
+                ));
             }
         }
         ensure!(
@@ -471,6 +521,10 @@ impl SessionGate {
                 <= 1024,
             "grant history capacity"
         );
+        for (key, floor) in tombstones {
+            let entry = state.highest.entry(key).or_insert(0);
+            *entry = (*entry).max(floor);
+        }
         for (key, grant) in &current {
             state.highest.insert(key.clone(), grant.version);
         }

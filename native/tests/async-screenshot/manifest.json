@@ -1,0 +1,115 @@
+{
+  "version": 1,
+  "source_files": [
+    {
+      "path": "native/tools/spice-console.m",
+      "bytes": 43430,
+      "sha256": "ce63d68c24f8517fa6fc9e0044a3d2526e7052c85729b10c4ec400e67b6ad59e"
+    },
+    {
+      "path": "native/console/Display.h",
+      "bytes": 841,
+      "sha256": "ce3ba2848e5a459d92c46cc9bc140466f3cb9655e428a10f439442541e0137e0"
+    },
+    {
+      "path": "native/console/Display.m",
+      "bytes": 35100,
+      "sha256": "2e8db83cfb801109b0865841cab797cc45a90cb5b69207f66c29f7cdfb5dc4ae"
+    },
+    {
+      "path": "native/console/build.sh",
+      "bytes": 2389,
+      "sha256": "04234ee3aae6af0365d80466518bd17e4cff8724d2efabd7625a4a0040fa94d5"
+    },
+    {
+      "path": "native/console/AsyncScreenshot.h",
+      "bytes": 598,
+      "sha256": "9c49c0d0b860eedee4337303f4f2b4621b55183060355ce8dd6326092bea43fe"
+    },
+    {
+      "path": "native/console/AsyncScreenshot.m",
+      "bytes": 5336,
+      "sha256": "912be35f3af9496f0a8900032f286da54cfc5053a0d6a92b05f523b81ff821c1"
+    },
+    {
+      "path": "native/console/AsyncScreenshotTests.m",
+      "bytes": 5536,
+      "sha256": "7d137adea11ee4ec15c7e271f7ffd7f63def88c7d2e3a5ffc5a44c81a5f09b2b"
+    },
+    {
+      "path": "native/console/RecordWriter.h",
+      "bytes": 443,
+      "sha256": "802d74d472e67adc37e30d605254af03326b17fe0fc82f3a517ebd2973aba847"
+    },
+    {
+      "path": "native/console/RecordWriter.m",
+      "bytes": 4030,
+      "sha256": "66650da35a74245f826e0e55c6b25f0a9386bcbcd4748e663b0928e9cb74ebf2"
+    },
+    {
+      "path": "native/console/RecordWriterAdversarialTests.m",
+      "bytes": 9339,
+      "sha256": "81dc1d0db3e5fa6c5fbf7049b3e68ed87162f28bd1f57acdc18b6ec647e9c794"
+    },
+    {
+      "path": "native/console/ScreenshotPipelineTests.inc",
+      "bytes": 4286,
+      "sha256": "d3535d76b367596f3968116a17071bf11b11d8ffea2448fcf379b05e7b786ca9"
+    },
+    {
+      "path": "native/console/test-screenshot.sh",
+      "bytes": 1964,
+      "sha256": "f03060ce2830440404d1d708f6f7dab9d4b6ac71eee092f85009bae743c6c2ea"
+    },
+    {
+      "path": "native/console/test.sh",
+      "bytes": 3687,
+      "sha256": "133f9bc2977440adabb3eadee008e96babc8eb196454b810b29b93ee66263348"
+    }
+  ],
+  "staged_binary": {
+    "path": ".local/VeynodeQEMUConsole-screenshot-async-v2.app/Contents/MacOS/spice-console",
+    "bytes": 321632,
+    "sha256": "a4dfd6bdf594a34d72ffe6dfbc72d41ff9376059a5fdf13019aaffad8e958301"
+  },
+  "raw_logs": [
+    {
+      "path": ".local/evidence/native-async-screenshot-component-v1/build-final.log",
+      "bytes": 282,
+      "sha256": "41a4b2a73e941bdad7255b9ac598fca01669e9b80e565911a3bd7ba173b95431"
+    },
+    {
+      "path": ".local/evidence/native-async-screenshot-component-v1/build.log",
+      "bytes": 282,
+      "sha256": "dc37db3d71c0ddf963b54a805d36744a2a2c4140bdb82f702c5cb7ebda33aec6"
+    },
+    {
+      "path": ".local/evidence/native-async-screenshot-component-v1/native-regression-final.log",
+      "bytes": 1599,
+      "sha256": "c922a0a3486a9e4958571ec1db6a23c568e53df7317e27840bd89a4ff5e10858"
+    },
+    {
+      "path": ".local/evidence/native-async-screenshot-component-v1/native-regression.log",
+      "bytes": 1599,
+      "sha256": "c922a0a3486a9e4958571ec1db6a23c568e53df7317e27840bd89a4ff5e10858"
+    },
+    {
+      "path": ".local/evidence/native-async-screenshot-component-v1/tests-deadline-final.log",
+      "bytes": 788,
+      "sha256": "465a6829c295b6839e70e093e70f9141567435824b0167760435f4b7b358a452"
+    },
+    {
+      "path": ".local/evidence/native-async-screenshot-component-v1/tests-final.log",
+      "bytes": 788,
+      "sha256": "465a6829c295b6839e70e093e70f9141567435824b0167760435f4b7b358a452"
+    },
+    {
+      "path": ".local/evidence/native-async-screenshot-component-v1/tests-first.log",
+      "bytes": 788,
+      "sha256": "465a6829c295b6839e70e093e70f9141567435824b0167760435f4b7b358a452"
+    }
+  ],
+  "component_passed": true,
+  "vm_started": false,
+  "actual_cadence_validated": false
+}

@@ -26,6 +26,34 @@ static STOP: AtomicBool = AtomicBool::new(false);
 extern "C" fn stop(_: i32) {
     STOP.store(true, Ordering::Release);
 }
+// Readiness wakes on a new connection; timeout only bounds maintenance latency.
+// An interrupted wait returns to the outer STOP/child checks without retrying.
+fn wait_listener_readable(fd: std::os::fd::RawFd, timeout: Duration) -> Result<bool> {
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let result = unsafe {
+        libc::poll(
+            &mut pollfd,
+            1,
+            timeout.as_millis().clamp(1, i32::MAX as u128) as i32,
+        )
+    };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(error.into());
+    }
+    if pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+        bail!("console listener readiness failed");
+    }
+    Ok(result > 0 && pollfd.revents & libc::POLLIN != 0)
+}
+
 struct OwnedChild(Child);
 impl Drop for OwnedChild {
     fn drop(&mut self) {
@@ -112,6 +140,71 @@ struct Native {
     snapshot: Mutex<()>,
     capabilities: Value,
 }
+fn receive_native(receive: &Native, pipe: &mut impl Read) -> Result<()> {
+    let result = (|| {
+        loop {
+            let record = read_record(pipe)?;
+            if record.kind == 2 {
+                let mut owner = receive.owner.lock().unwrap();
+                if let Some(owner) = owner.as_mut().filter(|o| o.epoch == record.epoch) {
+                    owner.deliver(record);
+                }
+                continue;
+            }
+            let value = record.value()?;
+            if let Some(id) = value["id"].as_str() {
+                if let Some((epoch, tx)) = receive.pending.lock().unwrap().remove(id) {
+                    if epoch != record.epoch {
+                        bail!("native reply epoch mismatch")
+                    }
+                    let _ = tx.send(value);
+                }
+                continue;
+            }
+            if value["event"] == "ready"
+                && value["protocol"] == 1
+                && value["capture_connected"] == true
+            {
+                let mut ready = receive.ready.0.lock().unwrap();
+                *ready = true;
+                receive.ready.1.notify_all();
+            }
+            if value["event"] == "capture-error" {
+                bail!("native capture failed")
+            }
+            if value["event"] == "session-error" {
+                if record.epoch == 0 || value["epoch"].as_u64() != Some(record.epoch) {
+                    bail!("native session error has inconsistent epoch")
+                }
+                if let Some(owner) = receive
+                    .owner
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .filter(|o| o.epoch == record.epoch)
+                {
+                    owner.native_ended = true;
+                    owner.deliver(record);
+                }
+            }
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    })();
+    if let Err(error) = &result {
+        eprintln!("console reader stopped: {error}");
+    }
+    receive.alive.store(false, Ordering::Release);
+    receive.ready.1.notify_all();
+    for (_, (_, tx)) in std::mem::take(&mut *receive.pending.lock().unwrap()) {
+        let _ = tx.send(json!({"error":"capture process unavailable"}));
+    }
+    if let Some(owner) = receive.owner.lock().unwrap().as_ref() {
+        let _ = owner.output.socket.shutdown(std::net::Shutdown::Both);
+    }
+    result
+}
+
 impl Native {
     fn call(&self, mut command: Value) -> Result<Value> {
         if !self.alive.load(Ordering::Acquire) {
@@ -125,7 +218,17 @@ impl Native {
             if pending.len() >= 16 {
                 bail!("native request capacity reached")
             }
-            pending.insert(id.clone(), (command["epoch"].as_u64().unwrap_or(0), tx));
+            // Display commands use envelope epoch zero. Their acquisition epoch
+            // belongs to native input authority, not an encoder incarnation.
+            let epoch = if matches!(
+                command["method"].as_str(),
+                Some("show_window" | "close_window" | "window_status" | "validate_displayed_frame")
+            ) {
+                0
+            } else {
+                command["epoch"].as_u64().unwrap_or(0)
+            };
+            pending.insert(id.clone(), (epoch, tx));
         }
         let send = {
             let mut input = self.input.lock().unwrap();
@@ -156,6 +259,9 @@ impl Native {
         match reply {
             Ok(value) => {
                 if let Some(error) = value.get("error") {
+                    if let Some(stage) = helper_display_rejection(&command["method"], error) {
+                        return Err(stage.into());
+                    }
                     if matches!(
                         command["method"].as_str(),
                         Some("rate_status" | "set_bitrate")
@@ -329,12 +435,40 @@ struct Request {
     method: String,
     codec: Option<String>,
     frame: Option<vm_control::native_input::DisplayedFrame>,
+    #[serde(
+        default,
+        deserialize_with = "vm_control::native_input::deserialize_diagnostic_id"
+    )]
+    diagnostic_id: Option<u64>,
+    #[serde(
+        default,
+        deserialize_with = "vm_control::native_input::deserialize_acquisition_receipt"
+    )]
+    acquisition_receipt: Option<String>,
     version: Option<u64>,
     encoder_instance: Option<String>,
     epoch: Option<u64>,
     sequence: Option<u64>,
     target_bps: Option<u64>,
 }
+fn helper_display_rejection(
+    method: &Value,
+    error: &Value,
+) -> Option<vm_control::native_input::RejectionStage> {
+    if method != "validate_displayed_frame" {
+        return None;
+    }
+    vm_control::native_input::RejectionStage::display_rejection(&error["code"])
+}
+
+fn rejection_reply(request_id: &str, error: &anyhow::Error) -> Value {
+    let mut reply = json!({"request_id":request_id,"error":error.to_string()});
+    if let Some(stage) = error.downcast_ref::<vm_control::native_input::RejectionStage>() {
+        reply["display_rejection"] = json!(stage);
+    }
+    reply
+}
+
 fn connection(stream: UnixStream, native: Arc<Native>, client: u64) -> Result<()> {
     stream.set_nonblocking(true)?;
     let shared = Arc::new(stream.try_clone()?);
@@ -372,14 +506,23 @@ fn connection(stream: UnixStream, native: Arc<Native>, client: u64) -> Result<()
             if matches!(request.method.as_str(), "rate_status" | "set_bitrate") {
                 vm_media_local::rate_control::Request::parse(&line)?;
             }
-            if !matches!(request.method.as_str(), "rate_status" | "set_bitrate")
-                && (request.version.is_some()
-                    || request.encoder_instance.is_some()
-                    || request.epoch.is_some()
-                    || request.sequence.is_some()
-                    || request.target_bps.is_some())
+            if request.acquisition_receipt.is_some() && request.method != "validate_displayed_frame"
+            {
+                bail!("unexpected frame acquisition receipt")
+            }
+            if !matches!(
+                request.method.as_str(),
+                "rate_status" | "set_bitrate" | "validate_displayed_frame"
+            ) && (request.version.is_some()
+                || request.encoder_instance.is_some()
+                || request.epoch.is_some()
+                || request.sequence.is_some()
+                || request.target_bps.is_some())
             {
                 bail!("unexpected rate fields")
+            }
+            if request.diagnostic_id.is_some() && request.method != "validate_displayed_frame" {
+                bail!("unexpected native diagnostic identity")
             }
             let result = match request.method.as_str() {
                 "rate_status" | "set_bitrate" => native.rate(client, &request),
@@ -421,7 +564,33 @@ fn connection(stream: UnixStream, native: Arc<Native>, client: u64) -> Result<()
                 "validate_displayed_frame" => {
                     let frame = request.frame.as_ref().context("displayed frame required")?;
                     frame.validate()?;
-                    native.call(json!({"method":"validate_displayed_frame","frame":frame}))
+                    let mut command = json!({"method":"validate_displayed_frame","frame":frame});
+                    if let Some(id) = request.diagnostic_id {
+                        command["diagnostic_id"] = json!(id);
+                    }
+                    let raw: Value = serde_json::from_slice(&line)?;
+                    if raw.get("version").is_some()
+                        || raw.get("encoder_instance").is_some()
+                        || raw.get("target_bps").is_some()
+                    {
+                        bail!("unexpected frame validation fields")
+                    }
+                    if let Some(receipt) = &request.acquisition_receipt {
+                        let epoch = request
+                            .epoch
+                            .filter(|n| *n > 0)
+                            .context("frame acquisition epoch required")?;
+                        let sequence = request
+                            .sequence
+                            .filter(|n| *n > 0)
+                            .context("frame acquisition sequence required")?;
+                        command["acquisition_receipt"] = json!(receipt);
+                        command["epoch"] = json!(epoch);
+                        command["sequence"] = json!(sequence);
+                    } else if raw.get("epoch").is_some() || raw.get("sequence").is_some() {
+                        bail!("unexpected legacy frame acquisition fields")
+                    }
+                    native.call(command)
                 }
                 "frame_status" => native.call(json!({"method":"frame_status"})),
                 "screenshot" => match native.snapshot.try_lock() {
@@ -453,9 +622,7 @@ fn connection(stream: UnixStream, native: Arc<Native>, client: u64) -> Result<()
                 epoch,
                 &match result {
                     Ok(value) => json!({"request_id":request.request_id,"result":value}),
-                    Err(error) => {
-                        json!({"request_id":request.request_id,"error":error.to_string()})
-                    }
+                    Err(error) => rejection_reply(&request.request_id, &error),
                 },
             ));
             if started {
@@ -584,67 +751,7 @@ fn run() -> Result<()> {
     });
     let receive = native.clone();
     thread::spawn(move || {
-        let result = (|| {
-            loop {
-                let record = read_record(&mut pipe)?;
-                if record.kind == 2 {
-                    let mut owner = receive.owner.lock().unwrap();
-                    if let Some(owner) = owner.as_mut().filter(|o| o.epoch == record.epoch) {
-                        owner.deliver(record);
-                    }
-                    continue;
-                }
-                let value = record.value()?;
-                if let Some(id) = value["id"].as_str() {
-                    if let Some((epoch, tx)) = receive.pending.lock().unwrap().remove(id) {
-                        if epoch != record.epoch {
-                            bail!("native reply epoch mismatch")
-                        }
-                        let _ = tx.send(value);
-                    }
-                    continue;
-                }
-                if value["event"] == "ready"
-                    && value["protocol"] == 1
-                    && value["capture_connected"] == true
-                {
-                    let mut ready = receive.ready.0.lock().unwrap();
-                    *ready = true;
-                    receive.ready.1.notify_all();
-                }
-                if value["event"] == "capture-error" {
-                    bail!("native capture failed")
-                }
-                if value["event"] == "session-error" {
-                    if record.epoch == 0 || value["epoch"].as_u64() != Some(record.epoch) {
-                        bail!("native session error has inconsistent epoch")
-                    }
-                    if let Some(owner) = receive
-                        .owner
-                        .lock()
-                        .unwrap()
-                        .as_mut()
-                        .filter(|o| o.epoch == record.epoch)
-                    {
-                        owner.native_ended = true;
-                        owner.deliver(record);
-                    }
-                }
-            }
-            #[allow(unreachable_code)]
-            Ok::<(), anyhow::Error>(())
-        })();
-        if let Err(error) = result {
-            eprintln!("console reader stopped: {error}");
-        }
-        receive.alive.store(false, Ordering::Release);
-        receive.ready.1.notify_all();
-        for (_, (_, tx)) in std::mem::take(&mut *receive.pending.lock().unwrap()) {
-            let _ = tx.send(json!({"error":"capture process unavailable"}));
-        }
-        if let Some(owner) = receive.owner.lock().unwrap().as_ref() {
-            let _ = owner.output.socket.shutdown(std::net::Shutdown::Both);
-        }
+        let _ = receive_native(&receive, &mut pipe);
     });
     let until = Instant::now() + Duration::from_secs(12);
     let mut ready = native.ready.0.lock().unwrap();
@@ -699,7 +806,8 @@ fn run() -> Result<()> {
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(20))
+                use std::os::fd::AsRawFd;
+                wait_listener_readable(listener.as_raw_fd(), Duration::from_millis(20))?;
             }
             Err(e) => return Err(e.into()),
         }
@@ -725,5 +833,365 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("vm-console: {error:#}");
         std::process::exit(1)
+    }
+}
+
+#[cfg(test)]
+mod display_rejection_tests {
+    use super::*;
+    #[test]
+    fn helper_rejection_is_method_scoped_and_does_not_copy_raw_fields() {
+        let error =
+            json!({"code":"display_history_miss","message":"SECRET raw error","key":"SECRET"});
+        let stage = helper_display_rejection(&json!("validate_displayed_frame"), &error).unwrap();
+        let reply = rejection_reply("original-request", &stage.into());
+        assert_eq!(reply["request_id"], "original-request");
+        assert_eq!(reply["display_rejection"], "display_history_miss");
+        assert!(!reply.to_string().contains("SECRET"));
+        for method in ["window_status", "screenshot", "start"] {
+            assert!(helper_display_rejection(&json!(method), &error).is_none());
+        }
+        for error in [
+            json!({"code":"authority"}),
+            json!({"code":"unknown","message":"display_history_miss"}),
+            json!({"code":{"stage":"display_history_miss"}}),
+        ] {
+            assert!(helper_display_rejection(&json!("validate_displayed_frame"), &error).is_none());
+        }
+        assert!(rejection_reply("r", &anyhow!("ordinary transport failure"))
+            .get("display_rejection")
+            .is_none());
+    }
+}
+
+#[cfg(test)]
+mod listener_readiness_tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+    #[test]
+    fn actual_unix_connections_wake_wait_and_preserve_separate_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("listener.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            for expected in *b"12" {
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                ready_tx.send(()).unwrap();
+                // Longer test-only wait makes an unconditional sleep fail clearly;
+                // production always uses the unchanged 20 ms maintenance budget.
+                assert!(
+                    wait_listener_readable(listener.as_raw_fd(), Duration::from_secs(2)).unwrap()
+                );
+                let (mut accepted, _) = listener.accept().unwrap();
+                accepted.set_nonblocking(false).unwrap();
+                accepted
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut byte = [0];
+                accepted.read_exact(&mut byte).unwrap();
+                assert_eq!(byte, [expected]);
+                done_tx.send(()).unwrap();
+            }
+        });
+        for byte in *b"12" {
+            ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let mut client = UnixStream::connect(&path).unwrap();
+            client.write_all(&[byte]).unwrap();
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("connection must wake poll before its 2-second budget");
+        }
+        server.join().unwrap();
+    }
+    #[test]
+    fn idle_listener_returns_for_maintenance_without_accepting() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = UnixListener::bind(dir.path().join("idle.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert!(!wait_listener_readable(listener.as_raw_fd(), Duration::from_millis(20)).unwrap());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+    #[test]
+    fn invalid_listener_fd_is_failure_not_readiness() {
+        assert!(wait_listener_readable(i32::MAX, Duration::from_millis(20)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod frame_diagnostic_id_tests {
+    use super::*;
+    #[test]
+    fn real_unix_request_keeps_exact_optional_id_through_helper_pipe() {
+        for (id, receipt) in [
+            (None, None),
+            (Some(1), None),
+            (Some(9_007_199_254_740_991u64), None),
+            (None, Some("a".repeat(32))),
+            (Some(9_007_199_254_740_991u64), Some("f".repeat(32))),
+        ] {
+            let mut child = OwnedChild(
+                Command::new("/bin/cat")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let stdout = child.0.stdout.take().unwrap();
+            let native = Arc::new(Native {
+                input: Mutex::new(child.0.stdin.take().unwrap()),
+                pending: Mutex::new(BTreeMap::new()),
+                next: AtomicU64::new(1),
+                alive: AtomicBool::new(true),
+                ready: (Mutex::new(true), Condvar::new()),
+                owner: Mutex::new(None),
+                next_epoch: AtomicU64::new(1),
+                snapshot: Mutex::new(()),
+                capabilities: json!({"native_window":true,"native_window_protocol":1,"display_only":true,"input_enabled":false}),
+            });
+            let sink = native.clone();
+            let (mut record_write, mut record_read) = UnixStream::pair().unwrap();
+            record_read
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let receiver = thread::spawn(move || receive_native(&sink, &mut record_read));
+            let helper_receipt = receipt.clone();
+            let helper = thread::spawn(move || {
+                let mut line = String::new();
+                let mut commands = BufReader::new(stdout);
+                commands.read_line(&mut line).unwrap();
+                let command: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(command.get("diagnostic_id"), id.map(|n| json!(n)).as_ref());
+                assert_eq!(command["frame"].as_object().unwrap().len(), 8);
+                assert_eq!(
+                    command.get("acquisition_receipt"),
+                    helper_receipt.as_ref().map(|s| json!(s)).as_ref()
+                );
+                if helper_receipt.is_some() {
+                    assert_eq!(command["epoch"], u64::MAX);
+                    assert_eq!(command["sequence"], u64::MAX - 1);
+                } else {
+                    assert!(command.get("epoch").is_none() && command.get("sequence").is_none());
+                }
+                let mut result = json!({"valid":true,"current":true,"frame":command["frame"]});
+                if helper_receipt.is_some() {
+                    result["acquisition"] = json!({"version":1,"epoch":u64::MAX,"sequence":u64::MAX-1,"remaining_us":123456});
+                }
+                vm_media_local::console_wire::write_record(
+                    &mut record_write,
+                    &Record::json(0, &json!({"id":command["id"],"result":result})),
+                )
+                .unwrap();
+                line.clear();
+                commands.read_line(&mut line).unwrap();
+                let status: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(status["method"], "window_status");
+                assert!(status.get("epoch").is_none());
+                vm_media_local::console_wire::write_record(&mut record_write, &Record::json(0, &json!({"id":status["id"],"result":{"window_open":true,"native_window":true,"native_window_protocol":1,"display_only":true,"input_enabled":false}}))).unwrap();
+                command
+            });
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let broker = thread::spawn(move || connection(server, native, 1));
+            let mut request = json!({"request_id":"test-frame","method":"validate_displayed_frame","frame":{
+                "display_instance":"d".repeat(32),"presentation_serial":1,"window_epoch":1,"invalidation_epoch":0,"source_generation":7,"source_sequence":42,"width":1280,"height":800}});
+            if let Some(n) = id {
+                request["diagnostic_id"] = json!(n);
+            }
+            if let Some(receipt) = &receipt {
+                request["acquisition_receipt"] = json!(receipt);
+                request["epoch"] = json!(u64::MAX);
+                request["sequence"] = json!(u64::MAX - 1);
+            }
+            serde_json::to_writer(&mut client, &request).unwrap();
+            client.write_all(b"\n").unwrap();
+            let reply = read_record(&mut client).unwrap().value().unwrap();
+            assert_eq!(reply["result"]["valid"], true);
+            if receipt.is_some() {
+                assert_eq!(
+                    reply["result"]["acquisition"],
+                    json!({"version":1,"epoch":u64::MAX,"sequence":u64::MAX-1,"remaining_us":123456})
+                );
+            } else {
+                assert!(reply["result"].get("acquisition").is_none());
+            }
+            serde_json::to_writer(
+                &mut client,
+                &json!({"request_id":"status-after-receipt","method":"window_status"}),
+            )
+            .unwrap();
+            client.write_all(b"\n").unwrap();
+            let status = read_record(&mut client).unwrap();
+            assert_eq!(status.epoch, 0);
+            assert_eq!(status.value().unwrap()["result"]["window_open"], true);
+            let command = helper.join().unwrap();
+            assert!(receiver.join().unwrap().is_err()); // helper EOF after its framed response
+            assert_eq!(command["frame"], request["frame"]);
+            drop(client);
+            broker.join().unwrap().unwrap();
+        }
+    }
+    #[test]
+    fn real_framed_reader_rejects_wrong_display_and_encoder_epochs() {
+        for (method, authority_epoch, reply_epoch) in [
+            ("validate_displayed_frame", u64::MAX, u64::MAX),
+            ("start", 7, 0),
+            ("set_bitrate", 7, 8),
+        ] {
+            let mut child = OwnedChild(
+                Command::new("/bin/cat")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let stdout = child.0.stdout.take().unwrap();
+            let native = Arc::new(Native {
+                input: Mutex::new(child.0.stdin.take().unwrap()),
+                pending: Mutex::new(BTreeMap::new()),
+                next: AtomicU64::new(1),
+                alive: AtomicBool::new(true),
+                ready: (Mutex::new(true), Condvar::new()),
+                owner: Mutex::new(None),
+                next_epoch: AtomicU64::new(1),
+                snapshot: Mutex::new(()),
+                capabilities: json!({}),
+            });
+            let (mut writer, mut reader) = UnixStream::pair().unwrap();
+            reader
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let receive = native.clone();
+            let receiving = thread::spawn(move || receive_native(&receive, &mut reader));
+            let helper = thread::spawn(move || {
+                let mut line = String::new();
+                BufReader::new(stdout).read_line(&mut line).unwrap();
+                let command: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(command["epoch"], authority_epoch);
+                vm_media_local::console_wire::write_record(
+                    &mut writer,
+                    &Record::json(
+                        reply_epoch,
+                        &json!({"id":command["id"],"result":{"valid":true}}),
+                    ),
+                )
+                .unwrap();
+            });
+            assert!(native
+                .call(json!({"method":method,"epoch":authority_epoch}))
+                .is_err());
+            helper.join().unwrap();
+            assert_eq!(
+                receiving.join().unwrap().unwrap_err().to_string(),
+                "native reply epoch mismatch"
+            );
+            assert!(!native.alive.load(Ordering::Acquire));
+            assert!(native.pending.lock().unwrap().is_empty());
+            assert!(native.call(json!({"method":"window_status"})).is_err());
+        }
+    }
+    #[test]
+    fn acquisition_incomplete_or_malformed_unix_request_never_reaches_helper() {
+        let good = json!({"acquisition_receipt":"a".repeat(32),"epoch":1,"sequence":2});
+        let mut cases = vec![
+            json!({"epoch":1}),
+            json!({"sequence":2}),
+            json!({"epoch":null}),
+            json!({"acquisition_receipt":"a".repeat(32)}),
+            json!({"acquisition_receipt":"a".repeat(32),"epoch":1}),
+            json!({"acquisition_receipt":"a".repeat(32),"sequence":2}),
+        ];
+        for key in ["epoch", "sequence"] {
+            for value in [Value::Null, json!(true), json!(1.0), json!("1"), json!(0)] {
+                let mut bad = good.clone();
+                bad[key] = value;
+                cases.push(bad);
+            }
+        }
+        for value in [
+            Value::Null,
+            json!(true),
+            json!(1),
+            json!("A".repeat(32)),
+            json!("a".repeat(31)),
+        ] {
+            let mut bad = good.clone();
+            bad["acquisition_receipt"] = value;
+            cases.push(bad);
+        }
+        for key in ["version", "encoder_instance", "target_bps"] {
+            let mut bad = good.clone();
+            bad[key] = Value::Null;
+            cases.push(bad);
+        }
+        for fields in cases {
+            let mut child = OwnedChild(
+                Command::new("/bin/cat")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let native = Arc::new(Native {
+                input: Mutex::new(child.0.stdin.take().unwrap()),
+                pending: Mutex::new(BTreeMap::new()),
+                next: AtomicU64::new(1),
+                alive: AtomicBool::new(true),
+                ready: (Mutex::new(true), Condvar::new()),
+                owner: Mutex::new(None),
+                next_epoch: AtomicU64::new(1),
+                snapshot: Mutex::new(()),
+                capabilities: json!({}),
+            });
+            let observed = native.clone();
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let broker = thread::spawn(move || connection(server, native, 1));
+            let mut request = json!({"request_id":"bad","method":"validate_displayed_frame","frame":{
+                "display_instance":"d".repeat(32),"presentation_serial":1,"window_epoch":1,"invalidation_epoch":0,"source_generation":7,"source_sequence":42,"width":1280,"height":800}});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            serde_json::to_writer(&mut client, &request).unwrap();
+            client.write_all(b"\n").unwrap();
+            assert!(broker.join().unwrap().is_err(), "{fields}");
+            assert_eq!(
+                observed.next.load(Ordering::Acquire),
+                1,
+                "no helper request allocated: {fields}"
+            );
+            assert!(observed.pending.lock().unwrap().is_empty());
+        }
+    }
+    #[test]
+    fn malformed_present_id_is_not_treated_as_absent() {
+        for id in [
+            Value::Null,
+            json!(true),
+            json!(1.0),
+            json!(0),
+            json!(-1),
+            json!("1"),
+            json!(9_007_199_254_740_992u64),
+            json!({}),
+        ] {
+            assert!(serde_json::from_value::<Request>(
+                json!({"request_id":"x","method":"validate_displayed_frame","diagnostic_id":id})
+            )
+            .is_err());
+        }
     }
 }

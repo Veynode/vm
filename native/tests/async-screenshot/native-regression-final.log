@@ -1,0 +1,8 @@
+PASS copy timing finite rolling bounds, nearest-rank, invalid GPU/CPU, kind isolation and typed JSON (no GPU executed)
+PASS active/key/first-responder focus truth table; runtime JSON CFBoolean types across connecting/attached/active/pending/suspended/failed states; real private Unix socket framing, explicit acquisition, one in-flight blocked ACK, 1000 coalesced moves, bounded 32-transition overflow fences and confirms release, retained advanced epoch for explicit return, late take ACK cannot rearm after focus cancellation, wrong sequence permanently fences. No VM or host input.
+PASS immutable displayed-frame state, late-callback invalidation, static-time preservation and exact Retina/nonzero/letterbox/flip/edge mappings (pure tests; no presentation or input).
+PASS real headless VNDisplay status/close/invalidate lifecycle, before native channel and while unstarted connecting, typed JSON and no NSApplication/window/input
+PASS HEVC/H264 landscape/portrait/small/max geometry and invalid boundaries; bounded presentation metadata policy (synthetic inputs only), rational 60/30 Hz pacing, policy transition and no catch-up burst; actual CVPixelBuffer bounded slot leases, replacement, in-flight pin, generation invalidation and closed publication. No AppKit window, SPICE connection or GPU command.
+PASS actual Metal device, command queue, fixed shader compilation, function lookup and render pipeline creation; no window or GPU command submission.
+PASS independent headless build and typed capability contract; device availability: True
+PASS existing staged app refused and hash unchanged

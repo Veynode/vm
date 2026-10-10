@@ -144,6 +144,10 @@ impl Auth {
         let signed = self
             .gate
             .answer(accepted, id.to_owned(), sdp, identity, now()?)?;
+        // The session id takes over the deadline of the credential that admitted the offer.
+        if let Some(source) = &self.ice_config {
+            source.bind_session(&signed.transcript.intent.request_id, id)?;
+        }
         let registry = self.load_registry()?;
         let c = &signed.transcript.intent.challenge;
         let grant = registry
@@ -170,6 +174,18 @@ impl Auth {
         );
         Ok(signed)
     }
+}
+/// Startup and restart construction. Tests call this same helper with an in-memory registry.
+#[cfg(any(test, target_os = "macos"))]
+fn gate_for_registry(
+    host_public_key: &str,
+    registry: &protocol::store::Registry,
+) -> Result<protocol::SessionGate> {
+    protocol::SessionGate::with_versions(
+        host_public_key,
+        &registry.grants.values().cloned().collect::<Vec<_>>(),
+        &registry.versions,
+    )
 }
 pub fn from_args(args: &[String]) -> Result<Option<Arc<Auth>>> {
     let mut state = None;
@@ -233,10 +249,7 @@ pub fn from_args(args: &[String]) -> Result<Option<Arc<Auth>>> {
             registry.host_public_key == host_public_key,
             "registry host identity mismatch"
         );
-        let gate = protocol::SessionGate::new(
-            &host_public_key,
-            &registry.grants.into_values().collect::<Vec<_>>(),
-        )?;
+        let gate = gate_for_registry(&host_public_key, &registry)?;
         Ok(Some(Arc::new(Auth {
             host_public_key,
             vm_id,
@@ -357,7 +370,13 @@ pub async fn offer(
             "wrong VM/scopes"
         );
         a.reload()?;
-        a.gate.accept_offer(&req.signed_offer, &req.sdp, now()?)
+        let accepted = a.gate.accept_offer(&req.signed_offer, &req.sdp, now()?)?;
+        // Admission records the deadline of the ICE credential this session will use.
+        // An expired or short-lived credential is refused here, before any session slot.
+        if let Some(source) = &a.ice_config {
+            source.admit_offer(&req.signed_offer.intent.request_id, now()?)?;
+        }
+        Ok::<_, anyhow::Error>(accepted)
     })();
     match result {
         Ok(accepted) => {
@@ -614,15 +633,25 @@ pub async fn watch_authorization(auth: Option<Arc<Auth>>, id: &str, active: bool
         return std::future::pending().await;
     };
     loop {
-        // Fail closed on malformed/unreadable/busy registry too. Transport owns actual teardown.
-        auth.reload()?;
-        if active {
-            auth.gate.authorize_active(id, "observe")?;
-        } else {
-            auth.gate.authorize_session(id, "observe")?;
-        }
+        authorization_check(&auth, id, active, now()?)?;
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+/// One watch step with an injected clock: registry, grant and credential deadline.
+fn authorization_check(auth: &Auth, id: &str, active: bool, now: u64) -> Result<()> {
+    // Fail closed on malformed/unreadable/busy registry too. Transport owns actual teardown.
+    auth.reload()?;
+    if active {
+        auth.gate.authorize_active(id, "observe")?;
+    } else {
+        auth.gate.authorize_session(id, "observe")?;
+    }
+    // A session may not outlive the ICE credential that admitted it. Failing here takes
+    // the same watch arm as a revoked grant, so the existing teardown path ends the session.
+    if let Some(source) = &auth.ice_config {
+        source.check_session(id, now)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

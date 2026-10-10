@@ -69,7 +69,7 @@ while :; do
 done
 cat /run/windows
 cat /run/vkmark.log
-printf 'VEYNODE_WSI_WINDOW_READY\n'
+printf '\nVEYNODE_WSI_WINDOW_READY\n'
 wait "$app"; rc=$?
 printf 'WSI_APP_LOG_BEGIN\n'; cat /run/vkmark.log; printf 'WSI_APP_LOG_END\n'
 printf 'WSI_CASE_EXIT shading-phong %s\n' "$rc"

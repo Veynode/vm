@@ -1,4 +1,5 @@
 use p256::ecdsa::{signature::Signer, SigningKey};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Barrier};
 use vm_session_auth::*;
 struct TestKey(SigningKey);
@@ -326,4 +327,156 @@ fn durable_registry_permissions_lock_and_repairless_revoke() {
     let alias = dir.path().join("alias");
     symlink(&path, &alias).unwrap();
     assert!(Store::open(&alias).is_err());
+}
+// Restart coverage: a restarted host starts from the durable registry snapshot
+// (active grants plus per-key versions, tombstones included) and must keep
+// superseded versions refused without any in-memory history.
+fn registry_for(h: &TestKey) -> store::Registry {
+    store::Registry {
+        host_public_key: h.public_key().unwrap(),
+        ..store::Registry::default()
+    }
+}
+fn approve_observe(registry: &mut store::Registry, h: &TestKey, d: &TestKey) -> SignedGrant {
+    let pairing = Pairing {
+        host_public_key: h.public_key().unwrap(),
+        device_public_key: d.public_key().unwrap(),
+        nonce: random32(),
+        vm_id: "linux".into(),
+        scopes: vec!["observe".into()],
+    };
+    registry
+        .approve(&pairing, &pairing.digest().unwrap(), h)
+        .unwrap()
+}
+fn device_id(d: &TestKey) -> String {
+    identity_id(&d.public_key().unwrap()).unwrap()
+}
+fn linux_key(d: &TestKey) -> String {
+    format!("{}:linux", device_id(d))
+}
+#[test]
+fn restarted_gate_refuses_grant_revoked_before_restart() {
+    let (h, d, _, _) = fixture();
+    let host = h.public_key().unwrap();
+    let mut registry = registry_for(&h);
+    let v1 = approve_observe(&mut registry, &h, &d);
+    registry.revoke(&device_id(&d), "linux").unwrap();
+    // Restart from the same durable snapshot: no active grant, tombstone at version 2.
+    let restarted = SessionGate::with_versions(&host, &[], &registry.versions).unwrap();
+    assert!(
+        restarted
+            .replace_grants(&host, std::slice::from_ref(&v1))
+            .is_err(),
+        "revoked version 1 was re-admitted after restart"
+    );
+    assert!(restarted
+        .challenge(&device_id(&d), "linux", vec!["observe".into()], 100)
+        .is_err());
+}
+#[test]
+fn restarted_gate_accepts_reapproved_version_three_and_refuses_version_one() {
+    let (h, d, _, _) = fixture();
+    let host = h.public_key().unwrap();
+    let mut registry = registry_for(&h);
+    let v1 = approve_observe(&mut registry, &h, &d);
+    registry.revoke(&device_id(&d), "linux").unwrap();
+    let v3 = approve_observe(&mut registry, &h, &d);
+    assert_eq!(v3.grant.version, 3);
+    let restarted =
+        SessionGate::with_versions(&host, std::slice::from_ref(&v3), &registry.versions).unwrap();
+    restarted
+        .replace_grants(&host, std::slice::from_ref(&v3))
+        .unwrap();
+    assert!(
+        restarted
+            .replace_grants(&host, std::slice::from_ref(&v1))
+            .is_err(),
+        "version 1 replay admitted after re-approval"
+    );
+    let a = answer(&restarted, &v3, &h, &d);
+    restarted
+        .confirm(&a.transcript.session_id, &confirmation(&a, &d), 103)
+        .unwrap();
+    restarted
+        .authorize_active(&a.transcript.session_id, "observe")
+        .unwrap();
+}
+#[test]
+fn restarted_gate_keeps_active_grant_at_durable_version() {
+    let (h, d, _, _) = fixture();
+    let host = h.public_key().unwrap();
+    let mut registry = registry_for(&h);
+    let v1 = approve_observe(&mut registry, &h, &d);
+    let restarted =
+        SessionGate::with_versions(&host, std::slice::from_ref(&v1), &registry.versions).unwrap();
+    restarted
+        .replace_grants(&host, std::slice::from_ref(&v1))
+        .unwrap();
+    let a = answer(&restarted, &v1, &h, &d);
+    restarted
+        .confirm(&a.transcript.session_id, &confirmation(&a, &d), 103)
+        .unwrap();
+    restarted
+        .authorize_active(&a.transcript.session_id, "observe")
+        .unwrap();
+}
+#[test]
+fn restart_after_second_revocation_refuses_every_superseded_version() {
+    let (h, d, _, _) = fixture();
+    let host = h.public_key().unwrap();
+    let mut registry = registry_for(&h);
+    let v1 = approve_observe(&mut registry, &h, &d);
+    registry.revoke(&device_id(&d), "linux").unwrap();
+    let v3 = approve_observe(&mut registry, &h, &d);
+    registry.revoke(&device_id(&d), "linux").unwrap();
+    let restarted = SessionGate::with_versions(&host, &[], &registry.versions).unwrap();
+    assert!(
+        restarted
+            .replace_grants(&host, std::slice::from_ref(&v1))
+            .is_err(),
+        "version 1 replay admitted after restart"
+    );
+    assert!(
+        restarted
+            .replace_grants(&host, std::slice::from_ref(&v3))
+            .is_err(),
+        "version 3 replay admitted after restart"
+    );
+    let v5 = approve_observe(&mut registry, &h, &d);
+    assert_eq!(v5.grant.version, 5);
+    restarted
+        .replace_grants(&host, std::slice::from_ref(&v5))
+        .unwrap();
+}
+#[test]
+fn restart_rejects_durable_map_that_disagrees_with_active_grant() {
+    let (h, d, _, _) = fixture();
+    let host = h.public_key().unwrap();
+    let mut registry = registry_for(&h);
+    let v1 = approve_observe(&mut registry, &h, &d);
+    let mut stale = registry.versions.clone();
+    stale.insert(linux_key(&d), 2);
+    assert!(SessionGate::with_versions(&host, std::slice::from_ref(&v1), &stale).is_err());
+}
+#[test]
+fn restart_rejects_malformed_persisted_entries() {
+    let (h, _, _, _) = fixture();
+    let host = h.public_key().unwrap();
+    let mut zero = BTreeMap::new();
+    zero.insert(format!("{:064x}:linux", 1), 0);
+    assert!(SessionGate::with_versions(&host, &[], &zero).is_err());
+    let mut malformed = BTreeMap::new();
+    malformed.insert("no-separator".to_string(), 1);
+    assert!(SessionGate::with_versions(&host, &[], &malformed).is_err());
+}
+#[test]
+fn restart_seed_keeps_the_1024_grant_history_capacity() {
+    let (h, _, _, _) = fixture();
+    let host = h.public_key().unwrap();
+    let seed = |n: u64| -> BTreeMap<String, u64> {
+        (0..n).map(|i| (format!("{i:064x}:linux"), 1)).collect()
+    };
+    assert!(SessionGate::with_versions(&host, &[], &seed(1024)).is_ok());
+    assert!(SessionGate::with_versions(&host, &[], &seed(1025)).is_err());
 }

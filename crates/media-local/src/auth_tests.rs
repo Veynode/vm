@@ -1385,6 +1385,96 @@ async fn signed_ice_rate_limit_and_expired_file_fail_closed() {
 }
 
 #[tokio::test]
+async fn expired_or_short_ice_credential_refuses_offer_before_session_reservation() {
+    for remaining in [-1_i64, 100] {
+        let mut f = Fixture::new();
+        let path = enable_ice(&mut f);
+        let now = now().unwrap();
+        let mut config: protocol::ice::IceConfig =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        config.issued_at = now - 500;
+        config.expires_at = now.checked_add_signed(remaining).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let signed = f.signed_offer();
+        let (status, _) = f
+            .post(
+                "/auth/offer",
+                json!({"signed_offer": signed, "sdp": sdp("11")}),
+                Some(&f.app.origin),
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{remaining}s of ICE credential must be refused at admission"
+        );
+        assert!(f.app.active.lock().await.active.is_none());
+    }
+}
+
+#[tokio::test]
+async fn admitted_offer_records_credential_deadline_before_session_work() {
+    let mut f = Fixture::new();
+    let path = enable_ice(&mut f);
+    // Refused at the codec gate: after admission, before any session slot exists.
+    f.app.capabilities = json!({"h265":"unavailable","h264":"unavailable"});
+    let signed = f.signed_offer();
+    let request = signed.intent.request_id.clone();
+    let (status, _) = f
+        .post(
+            "/auth/offer",
+            json!({"signed_offer": signed, "sdp": sdp("11")}),
+            Some(&f.app.origin),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(f.app.active.lock().await.active.is_none());
+    let config: protocol::ice::IceConfig =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let source = f.auth().ice_config.clone().unwrap();
+    source.bind_session(&request, "admitted-session").unwrap();
+    let end = config.expires_at - crate::ice_config::SESSION_END_MARGIN_SECONDS;
+    assert!(source.check_session("admitted-session", end - 1).is_ok());
+    assert!(source.check_session("admitted-session", end).is_err());
+}
+
+#[tokio::test]
+async fn admitted_session_authorization_ends_at_ice_credential_deadline_on_synthetic_clock() {
+    let mut f = Fixture::new();
+    let path = enable_ice(&mut f);
+    let config: protocol::ice::IceConfig =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let auth = f.auth();
+    let source = auth.ice_config.clone().unwrap();
+    // Admission in the offer handler's order: accept the signed offer, then admit its credential.
+    let signed = f.signed_offer();
+    let accepted = auth
+        .gate
+        .accept_offer(&signed, &sdp("11"), now().unwrap())
+        .unwrap();
+    source
+        .admit_offer(&signed.intent.request_id, now().unwrap())
+        .unwrap();
+    // Signing binds the admitted offer to its session id; confirmation makes it active.
+    let session = uuid::Uuid::new_v4().to_string();
+    let answer = auth
+        .sign_answer_with(accepted, &session, &sdp("22"), &f.host)
+        .unwrap();
+    auth.gate
+        .confirm(&session, &f.confirmation(&answer), now().unwrap())
+        .unwrap();
+    let end = config.expires_at - crate::ice_config::SESSION_END_MARGIN_SECONDS;
+    // Synthetic clock: the same step the 250 ms watch loop runs.
+    assert!(authorization_check(&auth, &session, true, end - 1).is_ok());
+    assert!(
+        authorization_check(&auth, &session, true, end).is_err(),
+        "session must end at credential expiry minus margin"
+    );
+    // The grant is still valid, so the credential bound is what ended the session.
+    assert!(auth.gate.authorize_active(&session, "observe").is_ok());
+}
+
+#[tokio::test]
 async fn source_failure_close_is_session_bound_repeatable_and_never_cleanup_proof() {
     let f = Fixture::new();
     let answer = f.pending();
@@ -1781,4 +1871,45 @@ fn file_opt_in_does_not_change_default_scopes_or_grant_input() {
     }
     assert!(from_args(&["--allow-files".into()]).is_err());
     assert!(from_args(&["--allow-files".into(), "--allow-files".into()]).is_err());
+}
+// Restart path: the gate is rebuilt from the durable registry file exactly as
+// startup does (load, then gate_for_registry); no Keychain or real encoder is used.
+fn restart_gate(f: &Fixture) -> protocol::SessionGate {
+    let registry = protocol::store::Store::open(&f.auth().state)
+        .unwrap()
+        .load()
+        .unwrap();
+    gate_for_registry(&f.host.public_key().unwrap(), &registry).unwrap()
+}
+#[test]
+fn restarted_gate_refuses_grant_revoked_before_restart() {
+    let f = Fixture::new();
+    f.revoke_registry();
+    let restarted = restart_gate(&f);
+    assert!(
+        restarted
+            .replace_grants(
+                &f.host.public_key().unwrap(),
+                std::slice::from_ref(&f.grant)
+            )
+            .is_err(),
+        "grant revoked before restart was re-admitted"
+    );
+}
+#[test]
+fn restarted_gate_keeps_active_grant_at_durable_version() {
+    let f = Fixture::new();
+    let restarted = restart_gate(&f);
+    let host = f.host.public_key().unwrap();
+    restarted
+        .replace_grants(&host, std::slice::from_ref(&f.grant))
+        .unwrap();
+    restarted
+        .challenge(
+            &f.grant.grant.device_id,
+            &f.grant.grant.vm_id,
+            vec!["observe".into()],
+            100,
+        )
+        .unwrap();
 }

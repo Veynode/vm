@@ -5,7 +5,14 @@
 #include "../console/ScreenshotDiagnostic.h"
 #ifdef VEYNODE_NATIVE_DISPLAY
 #import "../console/Display.h"
+#import "../console/InputFrameDiagnostic.h"
+#import "../console/FrameAcquisition.h"
 #include "../console/FramePacing.h"
+#import "../console/CopyTiming.h"
+#import "../console/AsyncScreenshot.h"
+#import "../console/RecordWriter.h"
+#include <time.h>
+#include <math.h>
 #define main VeynodeConsoleMain
 #endif
 #import <Foundation/Foundation.h>
@@ -38,6 +45,16 @@ static uint64_t epoch,lastEpoch,generation,sequence,cachedGeneration,rateSubmitt
 static NSUInteger scanoutLogCount,channelLogCount;
 #ifdef VEYNODE_NATIVE_DISPLAY
 static VNFramePacing capturePacing;
+static VNCopyTiming *copyTiming;
+static VNRecordWriter *outputWriter;
+static VNAsyncScreenshot *screenshotJob;
+static VNWriteReceipt *screenshotWrite;
+static NSString *screenshotID,*shutdownID;
+static NSDictionary *screenshotMetadata,*lastScreenshotTiming;
+static NSMutableDictionary *screenshotTiming;
+static BOOL screenshotDelivered,shutdownReplied;
+static double screenshotDeadline,shutdownDeadline;
+static double nativeClock(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec/1e9;}
 static NSUInteger capturePacingDrops,capturePoolDrops,visibleSourceCopies,backgroundSourceCopies;
 #endif
 static gint64 capturedWall,capturedMono,lastCapture,firstPTS,lastEncode;
@@ -48,6 +65,10 @@ static BOOL surfaceLive(void){if(generationFD<0)return NO;struct pollfd p={.fd=g
 static void fail(NSString *message){[lock lock];if(!failure)failure=message;[lock unlock];}
 static void captureFail(NSString *message){if(!fatal)fatal=message;if(loop)g_main_loop_quit(loop);}
 static BOOL record(uint8_t kind,uint64_t recordEpoch,NSData *body){
+#ifdef VEYNODE_NATIVE_DISPLAY
+ if(!outputWriter||![outputWriter enqueueKind:kind epoch:recordEpoch body:body]){captureFail(@"stdout_closed_or_stalled");return NO;}
+ return YES;
+#else
  if(body.length==0||body.length>maxAU){captureFail(@"output_record_limit");return NO;}
  uint8_t header[13];uint32_t n=CFSwapInt32HostToBig((uint32_t)body.length);uint64_t e=CFSwapInt64HostToBig(recordEpoch);memcpy(header,&n,4);header[4]=kind;memcpy(header+5,&e,8);
  gint64 deadline=g_get_monotonic_time()+500000;
@@ -58,6 +79,7 @@ static BOOL record(uint8_t kind,uint64_t recordEpoch,NSData *body){
    captureFail(@"stdout_closed_or_stalled");return NO;
   }
  }return YES;
+#endif
 }
 static void emit(uint64_t e,NSDictionary *value){NSData *body=[NSJSONSerialization dataWithJSONObject:value options:NSJSONWritingSortedKeys error:nil];if(body)record(1,e,body);else captureFail(@"json_serialization_failed");}
 static void diagnostic(NSDictionary *value){NSMutableDictionary *event=[value mutableCopy];event[@"epoch"]=@(epoch);emit(epoch,event);}
@@ -123,16 +145,40 @@ static CVPixelBufferRef allocatePixel(NSUInteger w,NSUInteger h){
  NSDictionary *attributes=@{(__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey:@{},(__bridge NSString *)kCVPixelBufferMetalCompatibilityKey:@YES};CVPixelBufferRef pixel=NULL;
  if(CVPixelBufferCreate(NULL,w,h,kCVPixelFormatType_32BGRA,(__bridge CFDictionaryRef)attributes,&pixel)!=kCVReturnSuccess)return NULL;return pixel;
 }
-static BOOL copyPixels(IOSurfaceRef src,NSUInteger sw,NSUInteger sh,CVPixelBufferRef destination){
+#ifdef VEYNODE_NATIVE_DISPLAY
+static BOOL finishCopyTiming(VNCopyKind kind,double begin,double commit,id<MTLCommandBuffer> command,BOOL success){
+ double end=g_get_monotonic_time()/1e6;
+ if(!copyTiming)copyTiming=[VNCopyTiming new];
+ [copyTiming recordKind:kind cpuSeconds:end-begin commitWaitSeconds:isfinite(commit)?end-commit:NAN gpuStartSeconds:success?command.GPUStartTime:NAN gpuEndSeconds:success?command.GPUEndTime:NAN succeeded:success];
+ return success;
+}
+#endif
+static BOOL copyPixels(IOSurfaceRef src,NSUInteger sw,NSUInteger sh,CVPixelBufferRef destination
+#ifdef VEYNODE_NATIVE_DISPLAY
+ ,VNCopyKind copyKind
+#endif
+ ){
+ id<MTLCommandBuffer> command=nil;
+#ifdef VEYNODE_NATIVE_DISPLAY
+ double copyBegin=g_get_monotonic_time()/1e6,commitBegin=NAN;
+#define COPY_RETURN(value) return finishCopyTiming(copyKind,copyBegin,commitBegin,command,(value))
+#else
+#define COPY_RETURN(value) return (value)
+#endif
  if(!metal){metal=MTLCreateSystemDefaultDevice();queue=[metal newCommandQueue];NSError *error=nil;
   NSString *shader=@"#include <metal_stdlib>\nusing namespace metal;\nkernel void copy_frame(texture2d<float,access::read> src [[texture(0)]],texture2d<float,access::write> dst [[texture(1)]],uint2 p [[thread_position_in_grid]]){if(p.x>=dst.get_width()||p.y>=dst.get_height())return;uint sx=min(src.get_width()-1,((2*p.x+1)*src.get_width())/(2*dst.get_width()));uint sy=min(src.get_height()-1,((2*p.y+1)*src.get_height())/(2*dst.get_height()));dst.write(src.read(uint2(sx,sy)),p);}";
-  id<MTLLibrary> library=[metal newLibraryWithSource:shader options:nil error:&error];if(library)pipeline=[metal newComputePipelineStateWithFunction:[library newFunctionWithName:@"copy_frame"] error:&error];if(!queue||!pipeline)return NO;
+  id<MTLLibrary> library=[metal newLibraryWithSource:shader options:nil error:&error];if(library)pipeline=[metal newComputePipelineStateWithFunction:[library newFunctionWithName:@"copy_frame"] error:&error];if(!queue||!pipeline)COPY_RETURN(NO);
  }
  NSUInteger dw=CVPixelBufferGetWidth(destination),dh=CVPixelBufferGetHeight(destination);
  MTLTextureDescriptor *d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:sw height:sh mipmapped:NO];d.storageMode=MTLStorageModeShared;d.usage=MTLTextureUsageShaderRead;
  id<MTLTexture> from=[metal newTextureWithDescriptor:d iosurface:src plane:0];d.width=dw;d.height=dh;d.usage=MTLTextureUsageShaderWrite;
- id<MTLTexture> to=[metal newTextureWithDescriptor:d iosurface:CVPixelBufferGetIOSurface(destination) plane:0];id<MTLCommandBuffer> command=[queue commandBuffer];id<MTLComputeCommandEncoder> compute=[command computeCommandEncoder];
- if(!from||!to||!compute)return NO;[compute setComputePipelineState:pipeline];[compute setTexture:from atIndex:0];[compute setTexture:to atIndex:1];[compute dispatchThreads:MTLSizeMake(dw,dh,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];[compute endEncoding];[command commit];[command waitUntilCompleted];return command.status==MTLCommandBufferStatusCompleted;
+ id<MTLTexture> to=[metal newTextureWithDescriptor:d iosurface:CVPixelBufferGetIOSurface(destination) plane:0];command=[queue commandBuffer];id<MTLComputeCommandEncoder> compute=[command computeCommandEncoder];
+ if(!from||!to||!compute)COPY_RETURN(NO);[compute setComputePipelineState:pipeline];[compute setTexture:from atIndex:0];[compute setTexture:to atIndex:1];[compute dispatchThreads:MTLSizeMake(dw,dh,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];[compute endEncoding];
+#ifdef VEYNODE_NATIVE_DISPLAY
+ commitBegin=g_get_monotonic_time()/1e6;
+#endif
+ [command commit];[command waitUntilCompleted];COPY_RETURN(command.status==MTLCommandBufferStatusCompleted);
+#undef COPY_RETURN
 }
 static BOOL cacheValid(void){return owned&&cachedGeneration==generation&&surfaceLive();}
 static void clearCache(void){cachedGeneration=0;if(owned){
@@ -168,7 +214,11 @@ static void encodeLatest(gint64 now,BOOL idle){
   emit(epoch,@{@"event":@"encoding",@"codec":codecName,@"hardware_verified":@(hardwareVerified),@"width":@(width),@"height":@(height),@"source_width":@(sourceWidth),@"source_height":@(sourceHeight),@"source_generation":@(generation),@"source_sequence":@(sequence)});
  }
  CVPixelBufferRef pixel=owned;
- if(scaled){if(!copyPixels(CVPixelBufferGetIOSurface(owned),sourceWidth,sourceHeight,scaled)){fail(@"Owned scaling failed");sessionFailure();return;}resizeCopies++;pixel=scaled;}
+ if(scaled){if(!copyPixels(CVPixelBufferGetIOSurface(owned),sourceWidth,sourceHeight,scaled
+#ifdef VEYNODE_NATIVE_DISPLAY
+ ,VNCopyEncoderResize
+#endif
+ )){fail(@"Owned scaling failed");sessionFailure();return;}resizeCopies++;pixel=scaled;}
  if(!firstPTS)firstPTS=now;lastEncode=now;CMTime pts=CMTimeMake(now-firstPTS,1000000);
  NSDictionary *options=forceKeyframe?@{(__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame:@YES}:nil;forceKeyframe=NO;
  CVPixelBufferRetain(pixel);OSStatus status=VTCompressionSessionEncodeFrame(encoder,pixel,pts,CMTimeMake(1,30),(__bridge CFDictionaryRef)options,NULL,NULL);
@@ -182,6 +232,9 @@ static void awaitSource(NSString *reason){
  cachedGeneration=0; // Invalidate publication before draining, retain storage until drain.
  if(active&&encoder){fail(@"Source generation unavailable; start a fresh encoding epoch after replacement");sessionFailure();}
  clearCache();
+#ifdef VEYNODE_NATIVE_DISPLAY
+ if(![outputWriter drainFor:.6]){if(!fatal)fatal=@"stdout_cleanup_unconfirmed";[outputWriter invalidate];[outputWriter drainFor:.1];if(outputWriter.pending){fputs("stdout_cleanup_unconfirmed\n",stderr);_exit(1);}}
+#endif
  if(generationFD>=0)close(generationFD);generationFD=-1;if(surface)CFRelease(surface);surface=NULL;
  if(!awaitingSource){emit(0,@{@"event":@"source-unavailable",@"reason":reason,@"source_generation":@(generation),@"frame_available":@NO});}
  awaitingSource=YES;
@@ -215,7 +268,7 @@ static void draw(SpiceDisplayChannel *channel,guint32 x,guint32 y,guint32 w,guin
   else{
   CVPixelBufferRef next=VeynodeDisplayAcquire(sourceWidth,sourceHeight);
   if(next){
-   if(!copyPixels(surface,sourceWidth,sourceHeight,next)){VeynodeDisplayRelease(next);captureFail(@"source_copy_failed");}
+   if(!copyPixels(surface,sourceWidth,sourceHeight,next,VNCopySource)){VeynodeDisplayRelease(next);captureFail(@"source_copy_failed");}
    else if(!surfaceLive()){VeynodeDisplayRelease(next);awaitSource(@"generation_retired_during_copy");}
    else{clearCache();owned=next;sourceCopies++;sequence++;cachedGeneration=generation;capturedMono=g_get_monotonic_time();capturedWall=g_get_real_time();lastCapture=now;if(nativeVisible)visibleSourceCopies++;else backgroundSourceCopies++;VeynodeDisplayPublish(owned,generation,sequence,capturedMono);}
   }else capturePoolDrops++;
@@ -252,11 +305,11 @@ static void reply(id ident,uint64_t e,NSDictionary *result){emit(e,@{@"id":ident
 static void reject(id ident,uint64_t e,NSString *code){emit(e,@{@"id":ident?:[NSNull null],@"error":@{@"code":code,@"message":code}});}
 #ifdef VEYNODE_NATIVE_DISPLAY
 static BOOL displayCommandPending;
-static void windowCommand(NSString *method,NSString *ident,NSDictionary *frame){
+static void windowCommand(NSString *method,NSString *ident,NSDictionary *frame,NSNumber *diagnosticID,NSDictionary *receiptFields){
  if(displayCommandPending){reject(ident,0,@"native_window_busy");return;}displayCommandPending=YES;
  GMainContext *context=g_main_context_ref(g_main_loop_get_context(loop));
- VeynodeDisplayCommand(method,frame,^(NSDictionary *result,NSString *error){
-  void (^finish)(void)=[^{displayCommandPending=NO;if(!closing&&!fatal){if(error)reject(ident,0,error);else{if([method isEqual:@"show_window"]&&cacheValid())VeynodeDisplayPublish(owned,generation,sequence,capturedMono);if([method isEqual:@"validate_displayed_frame"]){reply(ident,0,result);return;}NSMutableDictionary *status=[result mutableCopy];status[@"source_width"]=@(cacheValid()?sourceWidth:0);status[@"source_height"]=@(cacheValid()?sourceHeight:0);status[@"source_frame_available"]=@(cacheValid());status[@"encoder_width"]=@(encoder?width:0);status[@"encoder_height"]=@(encoder?height:0);status[@"source_draw_events"]=@(received);status[@"source_copies"]=@(sourceCopies);status[@"capture_pacing_drops"]=@(capturePacingDrops);status[@"capture_pool_drops"]=@(capturePoolDrops);status[@"visible_source_copies"]=@(visibleSourceCopies);status[@"background_source_copies"]=@(backgroundSourceCopies);status[@"encoder_output_frames_current_epoch"]=@(encoded);status[@"encoder_idle_frames_current_epoch"]=@(idleFrames);status[@"encoder_active"]=@(active);status[@"sampled_monotonic_us"]=@(g_get_monotonic_time());reply(ident,0,status);}}} copy];
+ VeynodeDisplayCommand(method,frame,diagnosticID,receiptFields,^(NSDictionary *result,NSString *error){
+  void (^finish)(void)=[^{displayCommandPending=NO;if(!closing&&!fatal){if(error)reject(ident,0,error);else{if([method isEqual:@"show_window"]&&cacheValid())VeynodeDisplayPublish(owned,generation,sequence,capturedMono);if([method isEqual:@"validate_displayed_frame"]){reply(ident,0,result);return;}NSMutableDictionary *status=[result mutableCopy];if(!copyTiming)copyTiming=[VNCopyTiming new];status[@"copy_timing"]=[copyTiming statistics];status[@"screenshot_timing"]=lastScreenshotTiming?:[NSNull null];status[@"source_width"]=@(cacheValid()?sourceWidth:0);status[@"source_height"]=@(cacheValid()?sourceHeight:0);status[@"source_frame_available"]=@(cacheValid());status[@"encoder_width"]=@(encoder?width:0);status[@"encoder_height"]=@(encoder?height:0);status[@"source_draw_events"]=@(received);status[@"source_copies"]=@(sourceCopies);status[@"capture_pacing_drops"]=@(capturePacingDrops);status[@"capture_pool_drops"]=@(capturePoolDrops);status[@"visible_source_copies"]=@(visibleSourceCopies);status[@"background_source_copies"]=@(backgroundSourceCopies);status[@"encoder_output_frames_current_epoch"]=@(encoded);status[@"encoder_idle_frames_current_epoch"]=@(idleFrames);status[@"encoder_active"]=@(active);status[@"sampled_monotonic_us"]=@(g_get_monotonic_time());reply(ident,0,status);}}} copy];
   // A C trampoline owns the retained block; no stdout emission from AppKit.
   extern gboolean VeynodeConsoleInvoke(gpointer);
   extern void VeynodeConsoleInvokeFree(gpointer);
@@ -270,6 +323,51 @@ static void windowCommand(NSString *method,NSString *ident,NSDictionary *frame){
 gboolean VeynodeConsoleInvoke(gpointer data){void (^block)(void)=(__bridge id)data;block();return G_SOURCE_REMOVE;}
 void VeynodeConsoleInvokeFree(gpointer data){CFBridgingRelease(data);}
 #endif
+#ifdef VEYNODE_NATIVE_DISPLAY
+static void beginScreenshot(NSString *ident){
+ if(screenshotJob||screenshotWrite){reject(ident,0,@"screenshot_busy");return;}
+ if(!cacheValid()||!mainOpen||!displayOpen){emit(0,@{@"id":ident,@"error":@{@"code":@"frame_unavailable",@"message":@"frame_unavailable",@"diagnostic":VNScreenshotFailure(@"cache_invalid_before_copy",nil)}});return;}
+ CVPixelBufferRef pixel=owned;
+ if(!VeynodeDisplayRetain(pixel)){reject(ident,0,@"frame_unavailable");return;}
+ screenshotID=[ident copy];screenshotMetadata=@{@"source_generation":@(generation),@"source_sequence":@(sequence),@"captured_at_us":@(capturedWall),@"captured_monotonic_us":@(capturedMono),@"width":@(sourceWidth),@"height":@(sourceHeight),@"coordinate_space":@"guest-physical-pixels",@"mime_type":@"image/png"};
+ screenshotTiming=[@{@"version":@1,@"timing_clock":@"CLOCK_MONOTONIC",@"source_generation":@(generation),@"source_sequence":@(sequence),@"admitted_monotonic_us":@(nativeClock()*1e6),@"success":@NO} mutableCopy];
+ screenshotDeadline=nativeClock()+2.0;screenshotDelivered=NO;
+ screenshotJob=[[VNAsyncScreenshot alloc] initWithPixel:pixel metadata:screenshotMetadata requestID:screenshotID release:^{VeynodeDisplayRelease(pixel);}];
+}
+static gboolean screenshotTick(gpointer unused){
+ if(outputWriter.failed){captureFail(@"stdout_closed_or_stalled");return G_SOURCE_CONTINUE;}
+ if(screenshotJob&&!screenshotDelivered){
+  NSDictionary *result=[screenshotJob resultIfFinished];
+  if(result){
+   [screenshotTiming addEntriesFromDictionary:result[@"timing"]];screenshotTiming[@"glib_completion_monotonic_us"]=@(nativeClock()*1e6);
+   // A delayed owner tick cannot accept a worker that finished after admission's
+   // absolute deadline. Finishing before it remains valid even if this tick is late.
+   if([result[@"timing"][@"worker_completed_monotonic_us"] doubleValue]>screenshotDeadline*1e6){[screenshotJob invalidate];captureFail(@"screenshot_worker_deadline");}
+   BOOL valid=!closing&&!fatal&&!shutdownID&&mainOpen&&displayOpen&&cacheValid()&&generation==[screenshotMetadata[@"source_generation"] unsignedLongLongValue]&&sourceWidth==[screenshotMetadata[@"width"] unsignedIntegerValue]&&sourceHeight==[screenshotMetadata[@"height"] unsignedIntegerValue];
+   if(!closing&&!fatal&&!shutdownID){
+    NSData *body=nil;
+    if(valid&&result[@"error"]==[NSNull null]){body=result[@"body"];screenshotTiming[@"success"]=@YES;}
+    else{NSString *code=valid?@"screenshot_unavailable_or_too_large":@"frame_unavailable";body=[NSJSONSerialization dataWithJSONObject:@{@"id":screenshotID,@"error":@{@"code":code,@"message":code,@"diagnostic":valid?result[@"diagnostic"]:VNScreenshotFailure(@"cache_invalid_after_encode",nil)}} options:0 error:nil];}
+    screenshotTiming[@"output_admitted_monotonic_us"]=@(nativeClock()*1e6);
+    screenshotWrite=[outputWriter enqueueKind:1 epoch:0 body:body];
+    if(!screenshotWrite)captureFail(@"stdout_closed_or_stalled");
+   }
+   screenshotDelivered=YES;
+  }else if(nativeClock()>=screenshotDeadline){[screenshotJob invalidate];captureFail(@"screenshot_worker_deadline");}
+ }
+ if(screenshotJob&&screenshotDelivered&&(!screenshotWrite||[[screenshotWrite status][@"finished"] boolValue])){
+  if(screenshotWrite){NSDictionary *s=[screenshotWrite status];screenshotTiming[@"output_queue_us"]=s[@"queue_us"];screenshotTiming[@"output_write_us"]=s[@"write_us"];screenshotTiming[@"output_completed_monotonic_us"]=s[@"completed_monotonic_us"];if(![s[@"success"] boolValue])screenshotTiming[@"success"]=@NO;}
+  lastScreenshotTiming=[screenshotTiming copy];screenshotJob=nil;screenshotWrite=nil;screenshotID=nil;screenshotMetadata=nil;screenshotTiming=nil;
+ }
+ if(shutdownID){
+  if(nativeClock()>=shutdownDeadline){captureFail(@"screenshot_shutdown_deadline");return G_SOURCE_CONTINUE;}
+  if(!screenshotJob&&!shutdownReplied){reply(shutdownID,0,@{@"state":@"stopped"});shutdownReplied=YES;}
+  if(shutdownReplied&&outputWriter.pending==0){closing=YES;g_main_loop_quit(loop);}
+ }
+ return G_SOURCE_CONTINUE;
+}
+#endif
+#ifndef VEYNODE_NATIVE_DISPLAY
 static NSDictionary *screenshot(NSDictionary **diagnostic){
  *diagnostic=nil;
  if(!cacheValid()){*diagnostic=VNScreenshotFailure(@"cache_invalid_before_copy",nil);return nil;}
@@ -284,23 +382,46 @@ static NSDictionary *screenshot(NSDictionary **diagnostic){
  if(*diagnostic)return nil;
  return @{@"source_generation":@(generation),@"source_sequence":@(sequence),@"captured_at_us":@(capturedWall),@"captured_monotonic_us":@(capturedMono),@"width":@(sourceWidth),@"height":@(sourceHeight),@"coordinate_space":@"guest-physical-pixels",@"mime_type":@"image/png",@"data_base64":[png base64EncodedStringWithOptions:0],@"byte_length":@(png.length)};
 }
+#endif
 static void command(NSData *line){
  id obj=[NSJSONSerialization JSONObjectWithData:line options:0 error:nil];
  if(![obj isKindOfClass:NSDictionary.class]){reject(nil,0,@"invalid_request");return;}NSDictionary *request=obj;id ident=request[@"id"];
  if(!([ident isKindOfClass:NSString.class]&&[ident length]>0&&[ident length]<=128)){reject(nil,0,@"invalid_id");return;}
+#ifdef VEYNODE_NATIVE_DISPLAY
+ if(shutdownID){reject(ident,0,@"shutdown_pending");return;}
+#endif
  NSString *method=request[@"method"];if(![method isKindOfClass:NSString.class]){reject(ident,0,@"invalid_method");return;}
  if([method isEqual:@"capabilities"]){if(request.count!=2){reject(ident,0,@"invalid_window_request");return;}reply(ident,0,displayCapabilities());return;}
  if([@[@"show_window",@"close_window",@"window_status",@"validate_displayed_frame"] containsObject:method]){
-  if(request.count!=([method isEqual:@"validate_displayed_frame"]?3:2)){reject(ident,0,@"invalid_window_request");return;}
+  BOOL validating=[method isEqual:@"validate_displayed_frame"];id diagnosticID=request[@"diagnostic_id"];
+  BOOL hasReceipt=request[@"acquisition_receipt"]||request[@"epoch"]||request[@"sequence"];
+  if(request.count!=(validating?(3+(diagnosticID?1:0)+(hasReceipt?3:0)):2)||(!validating&&(diagnosticID||hasReceipt))){reject(ident,0,@"invalid_window_request");return;}
+  #ifdef VEYNODE_NATIVE_DISPLAY
+  NSDictionary *receiptFields=nil;
+  if(hasReceipt){if(!VNFrameReceiptIdentifier(request[@"acquisition_receipt"])||!VNFrameUnsignedInteger(request[@"epoch"],NO)||!VNFrameUnsignedInteger(request[@"sequence"],NO)){reject(ident,0,@"invalid_window_request");return;}receiptFields=@{@"acquisition_receipt":request[@"acquisition_receipt"],@"epoch":request[@"epoch"],@"sequence":request[@"sequence"]};}
+  if(diagnosticID&&!VNInputDiagnosticIDValid(diagnosticID)){reject(ident,0,@"invalid_window_request");return;}
+#endif
 #ifdef VEYNODE_NATIVE_DISPLAY
-  windowCommand(method,ident,request[@"frame"]);
+  windowCommand(method,ident,request[@"frame"],diagnosticID,receiptFields);
 #else
   reject(ident,0,@"native_window_unavailable");
 #endif
   return;
  }
- if([method isEqual:@"shutdown"]){closeEncoder();reply(ident,0,@{@"state":@"stopped"});closing=YES;g_main_loop_quit(loop);return;}
- if([method isEqual:@"screenshot"]){NSDictionary *diagnostic=nil;NSDictionary *png=screenshot(&diagnostic);if(png){NSData *body=VNScreenshotResponseData(ident,png);if(body)record(1,0,body);else captureFail(@"json_serialization_failed");}else{NSString *code=cacheValid()?@"screenshot_unavailable_or_too_large":@"frame_unavailable";emit(0,@{@"id":ident,@"error":@{@"code":code,@"message":code,@"diagnostic":diagnostic}});}return;}
+ if([method isEqual:@"shutdown"]){closeEncoder();
+#ifdef VEYNODE_NATIVE_DISPLAY
+ shutdownID=[ident copy];shutdownDeadline=nativeClock()+2.5;[screenshotJob invalidate];
+#else
+ reply(ident,0,@{@"state":@"stopped"});closing=YES;g_main_loop_quit(loop);
+#endif
+ return;}
+ if([method isEqual:@"screenshot"]){
+#ifdef VEYNODE_NATIVE_DISPLAY
+ beginScreenshot(ident);
+#else
+ NSDictionary *diagnostic=nil;NSDictionary *png=screenshot(&diagnostic);if(png){NSData *body=VNScreenshotResponseData(ident,png);if(body)record(1,0,body);else captureFail(@"json_serialization_failed");}else{NSString *code=cacheValid()?@"screenshot_unavailable_or_too_large":@"frame_unavailable";emit(0,@{@"id":ident,@"error":@{@"code":code,@"message":code,@"diagnostic":diagnostic}});}
+#endif
+ return;}
  if([method isEqual:@"frame_status"]){BOOL valid=cacheValid();reply(ident,0,@{@"capture_connected":(mainOpen&&displayOpen&&!fatal)?@YES:@NO,@"frame_available":valid?@YES:@NO,@"source_generation":@(generation),@"source_sequence":@(sequence),@"width":@(valid?sourceWidth:0),@"height":@(valid?sourceHeight:0)});return;}
  id requested=request[@"epoch"];double number=[requested isKindOfClass:NSNumber.class]?[requested doubleValue]:0;
  if(![requested isKindOfClass:NSNumber.class]||CFGetTypeID((__bridge CFTypeRef)requested)==CFBooleanGetTypeID()||!isfinite(number)||number<1||number>9007199254740991.0||floor(number)!=number){reject(ident,0,@"invalid_epoch");return;}uint64_t e=(uint64_t)number;
@@ -343,19 +464,39 @@ static int probeCodecs(void){
  CVPixelBufferRelease(pixel);result[@"source"]=@"VideoToolbox required-hardware session property";[result addEntriesFromDictionary:displayCapabilities()];
  NSData *json=[NSJSONSerialization dataWithJSONObject:result options:NSJSONWritingSortedKeys error:nil];fwrite(json.bytes,1,json.length,stdout);fputc('\n',stdout);return 0;
 }
+#ifdef VEYNODE_SCREENSHOT_TESTING
+#include "../console/ScreenshotPipelineTests.inc"
+#endif
 int main(int argc,char **argv){@autoreleasepool{
+#ifdef VEYNODE_SCREENSHOT_TESTING
+ if(argc==2&&!strcmp(argv[1],"--screenshot-pipeline-self-test"))return screenshotPipelineSelfTest();
+#endif
  lock=[NSLock new];if(argc==2&&!strcmp(argv[1],"--probe-capabilities")){NSData *json=[NSJSONSerialization dataWithJSONObject:displayCapabilities() options:NSJSONWritingSortedKeys error:nil];fwrite(json.bytes,1,json.length,stdout);fputc('\n',stdout);return 0;}if(argc==2&&!strcmp(argv[1],"--probe-codecs"))return probeCodecs();
  if(argc!=3||strcmp(argv[2],"--persistent")){fprintf(stderr,"Usage: spice-console SOCKET --persistent\n");return 2;}
  signal(SIGPIPE,SIG_IGN);lock=[NSLock new];input=[NSMutableData new];fcntl(STDOUT_FILENO,F_SETFL,fcntl(STDOUT_FILENO,F_GETFL)|O_NONBLOCK);fcntl(STDIN_FILENO,F_SETFL,fcntl(STDIN_FILENO,F_GETFL)|O_NONBLOCK);
+#ifdef VEYNODE_NATIVE_DISPLAY
+ outputWriter=[[VNRecordWriter alloc] initWithFD:STDOUT_FILENO];if(!outputWriter)return 1;
+#endif
  loop=g_main_loop_new(NULL,FALSE);SpiceSession *session=spice_session_new();g_object_set(session,"unix-path",argv[1],NULL);g_signal_connect(session,"channel-new",G_CALLBACK(newChannel),NULL);
  GIOChannel *channel=g_io_channel_unix_new(STDIN_FILENO);g_io_add_watch(channel,G_IO_IN|G_IO_HUP|G_IO_ERR,control,NULL);g_timeout_add(100,tick,NULL);
+#ifdef VEYNODE_NATIVE_DISPLAY
+ g_timeout_add(10,screenshotTick,NULL);
+#endif
  if(!spice_session_connect(session))captureFail(@"spice_connect_failed");if(!fatal)g_main_loop_run(loop);
  #ifdef VEYNODE_NATIVE_DISPLAY
+ // No success while a CPU task still owns a frame. ImageIO cannot be forcibly
+ // cancelled; a stuck worker forces process failure, never a clean receipt.
+ [screenshotJob invalidate];
+ if(screenshotJob&&![screenshotJob waitFor:.25]){[outputWriter invalidate];fputs("screenshot_cleanup_unconfirmed\n",stderr);_exit(1);}
+ screenshotJob=nil;screenshotWrite=nil;
  VeynodeDisplayInvalidate();
  #endif
  closeEncoder();clearCache();if(fatal)emit(0,@{@"event":@"capture-error",@"error":@{@"code":fatal,@"message":fatal}});
  // Disconnect only after final replies; callbacks must not add teardown errors.
  closing=YES;g_signal_handlers_disconnect_by_func(session,G_CALLBACK(newChannel),NULL);spice_session_disconnect(session);g_object_unref(session);g_io_channel_unref(channel);g_main_loop_unref(loop);loop=NULL;
+#ifdef VEYNODE_NATIVE_DISPLAY
+ if(![outputWriter drainFor:.6]){if(!fatal)fatal=@"stdout_cleanup_unconfirmed";[outputWriter invalidate];[outputWriter drainFor:.1];if(outputWriter.pending){fputs("stdout_cleanup_unconfirmed\n",stderr);_exit(1);}}
+#endif
  if(generationFD>=0)close(generationFD);if(surface)CFRelease(surface);
  NSData *summary=[NSJSONSerialization dataWithJSONObject:@{@"event":@"capture-stopped",@"error":fatal?:[NSNull null],@"source_copies":@(sourceCopies),@"resize_copies":@(resizeCopies),@"draw_events":@(received),@"cached_frame_released":@YES} options:NSJSONWritingSortedKeys error:nil];fwrite(summary.bytes,1,summary.length,stderr);fputc('\n',stderr);return fatal?1:0;
 }}

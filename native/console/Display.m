@@ -3,6 +3,9 @@
 #import "Presented.h"
 #import "DisplayedFrame.h"
 #import "NativeControl.h"
+#import "InputFrameDiagnostic.h"
+#import "FrameAcquisition.h"
+#import "DrawTiming.h"
 #include "FramePacing.h"
 #include "EncodedGeometry.h"
 #include "InputFocus.h"
@@ -18,8 +21,13 @@ static int64_t sourceCapturedMono;
 static VNDisplayedFrameStore *displayed;
 static BOOL enabled,visible;
 static VNNativeControl *nativeControl;
-static void initializeState(void){static dispatch_once_t once;dispatch_once(&once,^{pool=[VNFramePool new];publicationLock=[NSLock new];displayed=[VNDisplayedFrameStore new];});}
+static VNInputFrameDiagnostic *inputFrameDiagnostic;
+static VNFrameAcquisition *frameAcquisition;
+static BOOL frameAcquisitionRequested;
+static VNDrawTiming *drawTiming;
+static void initializeState(void){static dispatch_once_t once;dispatch_once(&once,^{pool=[VNFramePool new];publicationLock=[NSLock new];displayed=[VNDisplayedFrameStore new];drawTiming=[[VNDrawTiming alloc] initWithEnabled:NO];});}
 CVPixelBufferRef VeynodeDisplayAcquire(NSUInteger w,NSUInteger h){initializeState();return [pool acquireWidth:w height:h];}
+BOOL VeynodeDisplayRetain(CVPixelBufferRef pixel){initializeState();return [pool retainPixel:pixel];}
 void VeynodeDisplayRelease(CVPixelBufferRef pixel){[pool releasePixel:pixel];}
 void VeynodeDisplayPublish(CVPixelBufferRef pixel,uint64_t generation,uint64_t sequence,int64_t capturedMonotonicUS){
     initializeState();[publicationLock lock];
@@ -27,12 +35,12 @@ void VeynodeDisplayPublish(CVPixelBufferRef pixel,uint64_t generation,uint64_t s
     [publicationLock unlock];
 }
 void VeynodeDisplayInvalidate(void){
-    [nativeControl suspend];
-    initializeState();[publicationLock lock];if(latest)[pool releasePixel:latest];latest=NULL;sourceGeneration=sourceSequence=0;sourceCapturedMono=0;[displayed invalidate];[publicationLock unlock];
+    [nativeControl suspendWithReason:@"source_invalidated"];
+    initializeState();[publicationLock lock];if(latest)[pool releasePixel:latest];latest=NULL;sourceGeneration=sourceSequence=0;sourceCapturedMono=0;[displayed invalidate];[frameAcquisition invalidateFrames];[publicationLock unlock];
 }
 BOOL VeynodeDisplayVisible(void){initializeState();[publicationLock lock];BOOL result=enabled&&visible;[publicationLock unlock];return result;}
 static NSDictionary *nativeInputStatus(void){
-    return nativeControl?[nativeControl status]:@{@"native_input_protocol":@1,@"native_input_supported":@YES,@"native_input_available":@NO,@"input_enabled":@NO,@"display_only":@YES,@"native_input_state":@"view_only",@"native_input_ready":@NO,@"native_human_hold":@NO,@"native_release_confirmed":@YES,@"native_input_epoch":[NSNull null],@"native_input_queued_transitions":@0,@"native_input_pending_move":@NO,@"native_input_transition_limit":@32};
+    return nativeControl?[nativeControl status]:@{@"native_frame_acquisition_protocol":@1,@"native_frame_acquisition_negotiated":@NO,@"native_frame_acquisition_enabled":@NO,@"native_input_protocol":@1,@"native_input_supported":@YES,@"native_input_available":@NO,@"input_enabled":@NO,@"display_only":@YES,@"native_input_state":@"view_only",@"native_input_ready":@NO,@"native_human_hold":@NO,@"native_release_confirmed":@YES,@"native_input_epoch":[NSNull null],@"native_input_queued_transitions":@0,@"native_input_pending_move":@NO,@"native_input_transition_limit":@32};
 }
 NSDictionary *VeynodeDisplayCapabilities(void){
     NSMutableDictionary *caps=[@{@"native_window":(MTLCreateSystemDefaultDevice()!=nil?@YES:@NO),@"display_instance":[displayed instance],@"native_window_protocol":@2,@"displayed_frame_protocol":@1,@"display_only":@YES,@"input_enabled":@NO,@"display_path":@"owned-BGRA-MetalKit-no-video-encoding",@"capture_limit_fps":@60,@"native_window_capture_limit_fps":@60,@"background_capture_limit_fps":@30,@"encoder_limit_fps":@30,@"idle_encode_interval_ms":@1000,@"display_refresh_preference_hz":@60,@"physical_presentation_measurement":@"unavailable",@"presented_time_sample_limit":@120,@"presented_time_source":@"CAMetalDrawable.addPresentedHandler/presentedTime",@"owned_slot_limit":@3,@"display_gpu_inflight_limit":@1} mutableCopy];
@@ -73,6 +81,7 @@ NSDictionary *VeynodeDisplayCapabilities(void){
 - (void)inputEvent:(NSEvent *)event;
 - (void)updateInput;
 - (void)suspendInput;
+- (void)suspendInputWithReason:(NSString *)reason;
 - (void)takeControl:(id)sender;
 - (void)returnAgent:(id)sender;
 @property VNReadOnlyView *view;
@@ -143,17 +152,17 @@ static NSString *displayMetalFailure(NSString *phase,NSError *error){
     [self.window center];[self.window makeKeyAndOrderFront:nil];[NSApp activateIgnoringOtherApps:YES];[self updateVisibility];return nil;
 }
 - (void)close {
-    [self suspendInput];[self.inputTimer invalidate];self.inputTimer=nil;
+    [self suspendInputWithReason:@"window_closed"];[self.inputTimer invalidate];self.inputTimer=nil;
     NSAssert([NSThread isMainThread],@"AppKit thread");
-    [publicationLock lock];enabled=NO;visible=NO;if(latest)[pool releasePixel:latest];latest=NULL;sourceGeneration=sourceSequence=0;sourceCapturedMono=0;[displayed invalidate];[publicationLock unlock];
+    [publicationLock lock];enabled=NO;visible=NO;if(latest)[pool releasePixel:latest];latest=NULL;sourceGeneration=sourceSequence=0;sourceCapturedMono=0;[displayed invalidate];[frameAcquisition invalidateFrames];[publicationLock unlock];
     self.windowEpoch++;self.view.paused=YES;self.view.delegate=nil;self.window.delegate=nil;[self.window close];self.window=nil;self.view=nil;
     // A previously submitted GPU command retains its own frame lease until its
     // completion handler; closing a window never overwrites/recycles that slot.
 }
 - (BOOL)windowShouldClose:(NSWindow *)window {[self close];return NO;}
 - (void)invalidateLayout {
-    [self suspendInput];
-    [publicationLock lock];[displayed invalidate];[publicationLock unlock];
+    [self suspendInputWithReason:@"layout_changed"];
+    [publicationLock lock];[displayed invalidate];[frameAcquisition invalidateFrames];[publicationLock unlock];
     self.lastGeneration=UINT64_MAX;self.lastSequence=UINT64_MAX;
 }
 - (void)refreshLayout {
@@ -168,14 +177,15 @@ static NSString *displayMetalFailure(NSString *phase,NSError *error){
 - (void)windowDidChangeBackingProperties:(NSNotification *)notification{[self invalidateLayout];[self refreshLayout];}
 - (void)updateVisibility {
     BOOL current=self.window&&self.window.visible&&!self.window.miniaturized&&(self.window.occlusionState&NSWindowOcclusionStateVisible);
-    [publicationLock lock];BOOL changed=visible!=(enabled&&current);visible=enabled&&current;if(changed)[displayed invalidate];[publicationLock unlock];if(changed){[self suspendInput];self.lastGeneration=UINT64_MAX;self.lastSequence=UINT64_MAX;}
+    [publicationLock lock];BOOL changed=visible!=(enabled&&current);visible=enabled&&current;if(changed){[displayed invalidate];[frameAcquisition invalidateFrames];}[publicationLock unlock];if(changed){[self suspendInputWithReason:@"visibility_changed"];self.lastGeneration=UINT64_MAX;self.lastSequence=UINT64_MAX;}
 }
 - (void)windowDidChangeOcclusionState:(NSNotification *)notification{[self updateVisibility];}
 - (void)windowDidMiniaturize:(NSNotification *)notification{[self updateVisibility];}
 - (void)windowDidDeminiaturize:(NSNotification *)notification{[self updateVisibility];}
-- (void)suspendInput{[nativeControl suspend];[self.heldKeys removeAllObjects];[self.heldButtons removeAllObjects];self.inputWasReady=NO;}
-- (void)windowDidResignKey:(NSNotification *)notification{[self suspendInput];}
-- (void)applicationDidResignActive:(NSNotification *)notification{[self suspendInput];}
+- (void)suspendInput{[self suspendInputWithReason:@"explicit"];}
+- (void)suspendInputWithReason:(NSString *)reason{[nativeControl suspendWithReason:reason];[self.heldKeys removeAllObjects];[self.heldButtons removeAllObjects];self.inputWasReady=NO;}
+- (void)windowDidResignKey:(NSNotification *)notification{[self suspendInputWithReason:@"window_focus_lost"];}
+- (void)applicationDidResignActive:(NSNotification *)notification{[self suspendInputWithReason:@"application_focus_lost"];}
 - (void)takeControl:(id)sender{
     if(!VNInputMayTakeControl(NSApp.active,self.window.keyWindow))return;
     // Keys physically held before acquisition are not owned synthetic presses.
@@ -185,9 +195,9 @@ static NSString *displayMetalFailure(NSString *phase,NSError *error){
 - (void)returnAgent:(id)sender{[self.heldKeys removeAllObjects];[self.heldButtons removeAllObjects];self.inputWasReady=NO;[nativeControl returnAgent];[self updateInput];}
 - (void)updateInput{
     NSDictionary *s=nativeInputStatus();BOOL ready=[s[@"input_enabled"] boolValue];
-    if(ready&&!VNInputMayTakeControl(NSApp.active,self.window.keyWindow)){[self suspendInput];s=nativeInputStatus();ready=NO;}
+    if(ready&&!VNInputMayTakeControl(NSApp.active,self.window.keyWindow)){[self suspendInputWithReason:@"dispatch_focus_lost"];s=nativeInputStatus();ready=NO;}
     if(ready&&!self.inputWasReady)[self.window makeFirstResponder:self.view];
-    if(ready&&!VNInputMayDispatch(NSApp.active,self.window.keyWindow,self.view&&self.window.firstResponder==self.view)){[self suspendInput];s=nativeInputStatus();ready=NO;}
+    if(ready&&!VNInputMayDispatch(NSApp.active,self.window.keyWindow,self.view&&self.window.firstResponder==self.view)){[self suspendInputWithReason:@"dispatch_focus_lost"];s=nativeInputStatus();ready=NO;}
     if(!ready){[self.heldKeys removeAllObjects];[self.heldButtons removeAllObjects];}
     self.inputWasReady=ready;
     NSString *state=s[@"native_input_state"]?:@"view_only";
@@ -199,26 +209,30 @@ static NSString *displayMetalFailure(NSString *phase,NSError *error){
     self.window.title=[@"Veynode VM Console — " stringByAppendingString:label];
 }
 - (void)inputEvent:(NSEvent *)e{
-    if(!VNInputMayDispatch(NSApp.active,self.window.keyWindow,self.view&&self.window.firstResponder==self.view)){[self suspendInput];return;}
+    if(!VNInputMayDispatch(NSApp.active,self.window.keyWindow,self.view&&self.window.firstResponder==self.view)){[self suspendInputWithReason:@"dispatch_focus_lost"];return;}
     if(![[nativeControl status][@"input_enabled"] boolValue])return;
-    [self refreshLayout];[publicationLock lock];NSDictionary *frame=[displayed snapshot];[publicationLock unlock];
-    if(!frame){[self suspendInput];return;}
+    [self refreshLayout];NSDictionary *controlContext=[nativeControl acquisitionContext];
+    [publicationLock lock];NSDictionary *frame=[displayed snapshot];double acquired=NSProcessInfo.processInfo.systemUptime;NSDictionary *acquisition=inputFrameDiagnostic.enabled?[displayed diagnosticToken:VNDisplayedFrameToken(frame) now:acquired]:nil;NSString *receipt=frameAcquisitionRequested?[frameAcquisition issueFromStore:displayed context:controlContext now:acquired]:nil;[publicationLock unlock];
+    if(frameAcquisitionRequested&&!receipt){[self suspendInputWithReason:@"enqueue_rejected"];return;}
+    @try {
+    if(!frame){[self suspendInputWithReason:@"displayed_frame_missing"];return;}
     NSDictionary *token=VNDisplayedFrameToken(frame);NSDictionary *event=nil;
     if(e.type==NSEventTypeKeyDown||e.type==NSEventTypeKeyUp||e.type==NSEventTypeFlagsChanged){
-        NSString *q=VNNativeQCode(e.keyCode);if(!q){if(e.type!=NSEventTypeKeyUp)[self suspendInput];return;}
+        NSString *q=VNNativeQCode(e.keyCode);if(!q){if(e.type!=NSEventTypeKeyUp)[self suspendInputWithReason:@"unsupported_key"];return;}
         BOOL down=e.type==NSEventTypeKeyDown;
         if(e.type==NSEventTypeFlagsChanged&&!VNNativeModifierDown(e.keyCode,e.modifierFlags,&down))return;
         if(down&&[self.heldKeys containsObject:q])return;
         if(!down&&![self.heldKeys containsObject:q])return;
         event=@{@"kind":@"key",@"qcode":q,@"down":@(down)};
-        if([nativeControl enqueueEvent:event frame:token]){if(down)[self.heldKeys addObject:q];else[self.heldKeys removeObject:q];}else[self suspendInput];return;
+        if([nativeControl enqueueEvent:event frame:token acquisition:acquisition receipt:receipt context:controlContext]){receipt=nil;if(down)[self.heldKeys addObject:q];else[self.heldKeys removeObject:q];}else[self suspendInputWithReason:@"enqueue_rejected"];return;
     }
     NSPoint point=[self.view convertPointToBacking:[self.view convertPoint:e.locationInWindow fromView:nil]];VNDisplayGeometry geometry;size_t x,y;
-    if(!VNDisplayedFrameGeometry(frame,&geometry)||!VNDisplayMapBackingPoint(geometry,point.x,point.y,&x,&y)){if(self.heldButtons.count)[self suspendInput];return;}
+    if(!VNDisplayedFrameGeometry(frame,&geometry)||!VNDisplayMapBackingPoint(geometry,point.x,point.y,&x,&y)){if(self.heldButtons.count)[self suspendInputWithReason:@"pointer_outside"];return;}
     if(e.type==NSEventTypeMouseMoved||e.type==NSEventTypeLeftMouseDragged||e.type==NSEventTypeRightMouseDragged||e.type==NSEventTypeOtherMouseDragged)event=@{@"kind":@"move",@"x":@(x),@"y":@(y)};
     else if(e.type==NSEventTypeScrollWheel){double dx=e.scrollingDeltaX,dy=e.scrollingDeltaY;if(!isfinite(dx)||!isfinite(dy))return;double delta=fabs(dy)>=fabs(dx)?dy:dx;if(delta==0)return;NSString *direction=fabs(dy)>=fabs(dx)?(dy>0?@"up":@"down"):(dx>0?@"left":@"right");event=@{@"kind":@"scroll",@"direction":direction,@"ticks":@(MIN(20,MAX(1,(int)ceil(fabs(delta))))),@"x":@(x),@"y":@(y)};}
-    else{if(e.buttonNumber>2)return;NSString *button=@[@"left",@"right",@"middle"][e.buttonNumber];BOOL down=e.type==NSEventTypeLeftMouseDown||e.type==NSEventTypeRightMouseDown||e.type==NSEventTypeOtherMouseDown;if(down==[self.heldButtons containsObject:button])return;event=@{@"kind":@"button",@"button":button,@"down":@(down),@"x":@(x),@"y":@(y)};if([nativeControl enqueueEvent:event frame:token]){if(down)[self.heldButtons addObject:button];else[self.heldButtons removeObject:button];}else[self suspendInput];return;}
-    if(event&&![nativeControl enqueueEvent:event frame:token])[self suspendInput];
+    else{if(e.buttonNumber>2)return;NSString *button=@[@"left",@"right",@"middle"][e.buttonNumber];BOOL down=e.type==NSEventTypeLeftMouseDown||e.type==NSEventTypeRightMouseDown||e.type==NSEventTypeOtherMouseDown;if(down==[self.heldButtons containsObject:button])return;event=@{@"kind":@"button",@"button":button,@"down":@(down),@"x":@(x),@"y":@(y)};if([nativeControl enqueueEvent:event frame:token acquisition:acquisition receipt:receipt context:controlContext]){receipt=nil;if(down)[self.heldButtons addObject:button];else[self.heldButtons removeObject:button];}else[self suspendInputWithReason:@"enqueue_rejected"];return;}
+    if(event){if([nativeControl enqueueEvent:event frame:token acquisition:acquisition receipt:receipt context:controlContext])receipt=nil;else[self suspendInputWithReason:@"enqueue_rejected"];}
+    } @finally {[frameAcquisition cancel:receipt];}
 }
 - (NSDictionary *)status {
     [self updateVisibility];[self refreshLayout];[self updateInput];
@@ -235,28 +249,39 @@ static NSString *displayMetalFailure(NSString *phase,NSError *error){
     double scale=sw&&sh?fmin(drawable.width/sw,drawable.height/sh):0;
     value[@"display_source_width"]=@(sw);value[@"display_source_height"]=@(sh);
     value[@"viewport_width_pixels"]=@(sw*scale);value[@"viewport_height_pixels"]=@(sh*scale);
-    value[@"frame_available"]=(latest!=NULL?@YES:@NO);value[@"source_generation"]=@(sourceGeneration);value[@"source_sequence"]=@(sourceSequence);NSDictionary *shown=[displayed snapshot];value[@"displayed_frame_available"]=shown?@YES:@NO;value[@"displayed_frame"]=shown?:[NSNull null];value[@"displayed_frame_authorizes_input"]=@NO;value[@"displayed_frame_age_ms"]=shown?@(MAX(0,NSProcessInfo.processInfo.systemUptime-[shown[@"callback_received_monotonic_seconds"] doubleValue])*1000):[NSNull null];[publicationLock unlock];[value addEntriesFromDictionary:[self.presented statistics]];return value;
+    value[@"frame_available"]=(latest!=NULL?@YES:@NO);value[@"source_generation"]=@(sourceGeneration);value[@"source_sequence"]=@(sourceSequence);NSDictionary *shown=[displayed snapshot];value[@"displayed_frame_available"]=shown?@YES:@NO;value[@"displayed_frame"]=shown?:[NSNull null];value[@"displayed_frame_authorizes_input"]=@NO;value[@"displayed_frame_age_ms"]=shown?@(MAX(0,NSProcessInfo.processInfo.systemUptime-[shown[@"callback_received_monotonic_seconds"] doubleValue])*1000):[NSNull null];[publicationLock unlock];[value addEntriesFromDictionary:[self.presented statistics]];if(inputFrameDiagnostic)value[@"input_frame_diagnostic"]=[inputFrameDiagnostic statistics];if(frameAcquisition)value[@"frame_acquisition"]=[frameAcquisition statistics];value[@"draw_timing"]=[drawTiming statistics];return value;
 }
 - (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size{[self invalidateLayout];}
 - (void)drawInMTKView:(MTKView *)view {
-    [self updateVisibility];[self refreshLayout];if(self.inflight||!self.window||!VeynodeDisplayVisible())return;
+    // Timing is observed only when the opt-in diagnostic is enabled; every branch below is unchanged.
+    VNDrawTiming *timing=drawTiming;BOOL timed=timing.enabled;double entry=timed?NSProcessInfo.processInfo.systemUptime:0;
+    [self updateVisibility];[self refreshLayout];
+    if(self.inflight){[timing recordCallbackBranch:VNDrawBranchInflight];return;}
+    if(!self.window){[timing recordCallbackBranch:VNDrawBranchNoWindow];return;}
+    if(!VeynodeDisplayVisible()){[timing recordCallbackBranch:VNDrawBranchInvisible];return;}
     [publicationLock lock];CVPixelBufferRef frame=latest;uint64_t generation=sourceGeneration,sequence=sourceSequence;int64_t captured=sourceCapturedMono;uint64_t submissionRevision=displayed.revision;
-    if(frame&&![pool retainPixel:frame])frame=NULL;[publicationLock unlock];
-    if(generation==self.lastGeneration&&sequence==self.lastSequence&&CGSizeEqualToSize(view.drawableSize,self.lastDrawableSize)){if(frame)[pool releasePixel:frame];return;}
+    BOOL leaseLost=NO;if(frame&&![pool retainPixel:frame]){frame=NULL;leaseLost=YES;}[publicationLock unlock];
+    if(generation==self.lastGeneration&&sequence==self.lastSequence&&CGSizeEqualToSize(view.drawableSize,self.lastDrawableSize)){if(frame)[pool releasePixel:frame];[timing recordCallbackBranch:VNDrawBranchUnchangedSource];return;}
     uint64_t displayEpoch=self.windowEpoch;CGSize drawableSize=view.drawableSize;
+    double acquireBegin=timed?NSProcessInfo.processInfo.systemUptime:0;
     id<CAMetalDrawable> drawable=view.currentDrawable;MTLRenderPassDescriptor *pass=view.currentRenderPassDescriptor;
-    if(!drawable||!pass){if(frame)[pool releasePixel:frame];return;}
+    double acquireEnd=timed?NSProcessInfo.processInfo.systemUptime:0;
+    if(!drawable||!pass){
+        uint64_t unacquired=[timing admitAttemptWithEntry:entry acquireBegin:acquireBegin acquireEnd:acquireEnd windowEpoch:displayEpoch generation:(frame?generation:0) sequence:(frame?sequence:0) revision:submissionRevision drawableWidth:0 drawableHeight:0 clear:frame==NULL leaseLost:leaseLost];
+        if(frame)[pool releasePixel:frame];[timing attempt:unacquired terminal:VNDrawBranchNoDrawableOrPass];return;
+    }
     // Freeze actual target pixels after drawable acquisition, not a possibly
     // changing view size. Render viewport and observation use this same value.
     drawableSize=CGSizeMake(drawable.texture.width,drawable.texture.height);
+    uint64_t attempt=[timing admitAttemptWithEntry:entry acquireBegin:acquireBegin acquireEnd:acquireEnd windowEpoch:displayEpoch generation:(frame?generation:0) sequence:(frame?sequence:0) revision:submissionRevision drawableWidth:(NSUInteger)drawableSize.width drawableHeight:(NSUInteger)drawableSize.height clear:frame==NULL leaseLost:leaseLost];
     id<MTLCommandBuffer> command=[self.commands commandBuffer];id<MTLRenderCommandEncoder> render=[command renderCommandEncoderWithDescriptor:pass];
-    if(!command||!render){if(frame)[pool releasePixel:frame];self.failed++;return;}
+    if(!command||!render){if(frame)[pool releasePixel:frame];self.failed++;[timing attempt:attempt terminal:VNDrawBranchCommandOrEncoderFailed];return;}
     VNDisplayGeometry geometry={0};
     if(frame){
         NSUInteger w=CVPixelBufferGetWidth(frame),h=CVPixelBufferGetHeight(frame);
         MTLTextureDescriptor *desc=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w height:h mipmapped:NO];desc.storageMode=MTLStorageModeShared;desc.usage=MTLTextureUsageShaderRead;
         id<MTLTexture> texture=[self.device newTextureWithDescriptor:desc iosurface:CVPixelBufferGetIOSurface(frame) plane:0];
-        if(!texture){[render endEncoding];[pool releasePixel:frame];self.failed++;return;}
+        if(!texture){[render endEncoding];[pool releasePixel:frame];self.failed++;[timing attempt:attempt terminal:VNDrawBranchTextureFailed];return;}
         double scale=fmin(drawableSize.width/w,drawableSize.height/h);double dw=w*scale,dh=h*scale;
         NSRect vb=view.bounds,bb=[view convertRectToBacking:view.bounds];
         geometry=(VNDisplayGeometry){.sourceWidth=w,.sourceHeight=h,.drawableWidth=drawableSize.width,.drawableHeight=drawableSize.height,.viewBounds={vb.origin.x,vb.origin.y,vb.size.width,vb.size.height},.backingBounds={bb.origin.x,bb.origin.y,bb.size.width,bb.size.height},.viewport={(drawableSize.width-dw)/2,(drawableSize.height-dh)/2,dw,dh},.viewFlipped=view.flipped};
@@ -264,10 +289,6 @@ static NSString *displayMetalFailure(NSString *phase,NSError *error){
         [render setRenderPipelineState:self.pipeline];[render setFragmentTexture:texture atIndex:0];[render drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     }
     [render endEncoding];self.inflight=YES;self.submitted++;
-    [command addCompletedHandler:^(id<MTLCommandBuffer> completed){
-        if(frame)[pool releasePixel:frame];
-        dispatch_async(dispatch_get_main_queue(),^{self.inflight=NO;if(completed.status==MTLCommandBufferStatusCompleted){self.completed++;[publicationLock lock];if(self.windowEpoch==displayEpoch&&displayed.revision==submissionRevision){self.lastGeneration=generation;self.lastSequence=sequence;self.lastDrawableSize=drawableSize;}[publicationLock unlock];}else{self.failed++;}});
-    }];
     // Do not newly submit a frame whose generation retired while building its
     // command. An already submitted GPU command cannot be retroactively erased;
     // next tick clears it, and its slot remains pinned through completion.
@@ -275,35 +296,106 @@ static NSString *displayMetalFailure(NSString *phase,NSError *error){
     BOOL valid=!frame||(enabled&&sourceGeneration==generation);
     if(valid){
         NSDictionary *candidate=frame?[displayed candidateGeometry:geometry generation:generation sequence:sequence windowEpoch:displayEpoch capturedMonotonicUS:captured]:nil;
+        // Register completion ownership only for a committed command. Metal runs the
+        // completed handlers of a command buffer deallocated without commit, so a
+        // handler registered before this retired-generation check released the frame
+        // a second time on the !valid path below.
+        [command addCompletedHandler:^(id<MTLCommandBuffer> completed){
+            [timing attempt:attempt completionEnteredAt:(timed?NSProcessInfo.processInfo.systemUptime:0) status:completed.status gpuStart:(timed?completed.GPUStartTime:0) gpuEnd:(timed?completed.GPUEndTime:0)];
+            if(frame)[pool releasePixel:frame];
+            dispatch_async(dispatch_get_main_queue(),^{
+                self.inflight=NO;VNDrawCompletionGate gate=VNDrawGateCommandFailed;
+                if(completed.status==MTLCommandBufferStatusCompleted){
+                    self.completed++;[publicationLock lock];
+                    if(self.windowEpoch!=displayEpoch)gate=VNDrawGateEpochChanged;
+                    else if(displayed.revision!=submissionRevision)gate=VNDrawGateRevisionChanged;
+                    else{self.lastGeneration=generation;self.lastSequence=sequence;self.lastDrawableSize=drawableSize;gate=VNDrawGateApplied;}
+                    [publicationLock unlock];
+                }else{self.failed++;}
+                [timing attempt:attempt inflightClearedAt:(timed?NSProcessInfo.processInfo.systemUptime:0) gate:gate];
+            });
+        }];
         [drawable addPresentedHandler:^(id<MTLDrawable> shown){
             double time=shown.presentedTime,received=NSProcessInfo.processInfo.systemUptime;
+            [timing attempt:attempt presentedEnteredAt:received metalPresented:time];
             dispatch_async(dispatch_get_main_queue(),^{
                 [self.presented recordTime:time generation:generation sequence:sequence windowEpoch:displayEpoch];
                 [self updateVisibility];[self refreshLayout];
                 [publicationLock lock];
                 if(enabled&&visible&&self.windowEpoch==displayEpoch&&sourceGeneration==generation)[displayed commitCandidate:candidate presentedTime:time receivedMonotonic:received];
                 [publicationLock unlock];
+                [timing attempt:attempt presentedMainAt:(timed?NSProcessInfo.processInfo.systemUptime:0)];
             });
         }];
         [command presentDrawable:drawable];[command commit];
+        [timing attempt:attempt committedAt:(timed?NSProcessInfo.processInfo.systemUptime:0) clear:frame==NULL];
     }
     [publicationLock unlock];
-    if(!valid){self.inflight=NO;self.submitted--;if(frame)[pool releasePixel:frame];}
+    if(!valid){self.inflight=NO;self.submitted--;if(frame)[pool releasePixel:frame];[timing attempt:attempt terminal:VNDrawBranchRetiredGeneration];}
 
 }
 @end
+static int drawTimingStatusSelfTest(void){@autoreleasepool{
+    initializeState();NSCAssert(NSApp==nil,@"no AppKit application");
+    drawTiming=[[VNDrawTiming alloc] initWithEnabled:YES];
+    inputFrameDiagnostic=[[VNInputFrameDiagnostic alloc] initWithEnabled:YES];
+    VNDisplay *headless=[VNDisplay new];
+    VNDisplayGeometry g={.sourceWidth=8192,.sourceHeight=8192,.drawableWidth=8192,.drawableHeight=8192,.viewBounds={0,0,8192,8192},.backingBounds={0,0,8192,8192},.viewport={0,0,8192,8192}};
+    NSDictionary *c=[displayed candidateGeometry:g generation:9007199254740991ULL sequence:9007199254740991ULL windowEpoch:9007199254740991ULL capturedMonotonicUS:9007199254740991LL];
+    NSCAssert([displayed commitCandidate:c presentedTime:100 receivedMonotonic:100],@"synthetic component candidate");
+    NSDictionary *token=VNDisplayedFrameToken([displayed snapshot]);
+    for(int i=0;i<16;i++){NSNumber *n=[inputFrameDiagnostic acquireToken:token observation:[displayed diagnosticToken:token now:1000.123456789] epoch:9007199254740991ULL];[inputFrameDiagnostic dispatched:n sequence:9007199254740991ULL epoch:9007199254740991ULL now:1000.123456999 queueAge:.199999999];[inputFrameDiagnostic validated:n token:token observation:[displayed diagnosticToken:token now:1000.123459999] accepted:NO reason:@"display_historical_expired"];}
+    for(int i=0;i<120;i++)[headless.presented recordTime:1000+i*.0123456789 generation:9007199254740991ULL sequence:9007199254740991ULL windowEpoch:9007199254740991ULL];
+    // 40 fully observed attempts saturate the 32-record ring: 8 evictions, none pending.
+    for(int i=0;i<40;i++){
+        double base=1000+i*0.0166667;
+        uint64_t a=[drawTiming admitAttemptWithEntry:base acquireBegin:base+0.00011 acquireEnd:base+0.00042 windowEpoch:9007199254740991ULL generation:9007199254740991ULL sequence:9007199254740991ULL revision:9007199254740991ULL drawableWidth:3840 drawableHeight:2160 clear:NO leaseLost:NO];
+        [drawTiming attempt:a committedAt:base+0.00100 clear:NO];
+        [drawTiming attempt:a completionEnteredAt:base+0.01800 status:4 gpuStart:83734.123456789+i*0.0166667 gpuEnd:83734.130123456+i*0.0166667];
+        [drawTiming attempt:a inflightClearedAt:base+0.01802 gate:VNDrawGateApplied];
+        [drawTiming attempt:a presentedEnteredAt:base+0.02500 metalPresented:83734.200123456+i*0.0166667];
+        [drawTiming attempt:a presentedMainAt:base+0.02502];
+    }
+    NSMutableDictionary *status=[[headless status] mutableCopy];
+    NSDictionary *draw=status[@"draw_timing"];
+    NSCAssert([draw[@"records"] count]==32&&[draw[@"evicted"] unsignedLongLongValue]==8&&[draw[@"pending_evicted"] unsignedLongLongValue]==0&&[draw[@"attempts_issued"] unsignedLongLongValue]==40,@"saturated draw timing ring");
+    NSCAssert([status[@"input_frame_diagnostic"][@"records"] count]==16&&[status[@"presented_time_samples"] count]==120,@"saturated rings");
+    // Measured: the existing saturated baseline with a minimal disabled draw_timing object is 38121 bytes.
+    // With 32 fully populated draw timing records it measured 55357 bytes; it must stay below the 56 KiB wire budget.
+    NSData *wire=[NSJSONSerialization dataWithJSONObject:@{@"event":@"response",@"epoch":@0,@"id":@"draw-timing-status-bound",@"result":status} options:NSJSONWritingWithoutEscapingSlashes error:nil];
+    NSCAssert(wire&&wire.length<56*1024,@"saturated status must retain wire headroom");
+    printf("PASS saturated actual VNDisplay status with 32 draw timing records (8 evicted, 0 pending), 16 input diagnostics and 120 presentation samples: %lu bytes, below 56KiB; no AppKit/GPU.\n",(unsigned long)wire.length);
+    drawTiming=[[VNDrawTiming alloc] initWithEnabled:NO];return 0;
+}}
 static VNDisplay *display;
-void VeynodeDisplayCommand(NSString *method,NSDictionary *frame,void (^completion)(NSDictionary *,NSString *)){
+void VeynodeDisplayCommand(NSString *method,NSDictionary *frame,NSNumber *diagnosticID,NSDictionary *receiptFields,void (^completion)(NSDictionary *,NSString *)){
     NSTimeInterval issued=NSProcessInfo.processInfo.systemUptime;
     dispatch_async(dispatch_get_main_queue(),^{@autoreleasepool{
         if(NSProcessInfo.processInfo.systemUptime-issued>1.0){completion(nil,@"native_window_request_expired");return;}
         NSString *error=nil;
-        if([method isEqual:@"validate_displayed_frame"]){[display updateVisibility];[display refreshLayout];[publicationLock lock];NSDictionary *r=[displayed validateToken:frame now:NSProcessInfo.processInfo.systemUptime];[publicationLock unlock];completion(r,r?nil:@"displayed_frame_unavailable_or_expired");return;}
+        if([method isEqual:@"validate_displayed_frame"]){[display updateVisibility];[display refreshLayout];BOOL receiptFocus=YES;if(receiptFields){receiptFocus=[frameAcquisition requireFocusReady:[[nativeControl status][@"input_enabled"] boolValue] applicationActive:NSApp.active windowKey:display.window.keyWindow firstResponder:(display.view&&display.window.firstResponder==display.view)];if(!receiptFocus)[display suspendInputWithReason:@"dispatch_focus_lost"];}[publicationLock lock];NSString *reason=nil;double now=NSProcessInfo.processInfo.systemUptime;NSDictionary *r=receiptFields?(receiptFocus?[frameAcquisition consume:receiptFields[@"acquisition_receipt"] token:frame epoch:[receiptFields[@"epoch"] unsignedLongLongValue] sequence:[receiptFields[@"sequence"] unsignedLongLongValue] store:displayed now:now failure:&reason]:nil):[displayed validateToken:frame now:now failure:&reason];if(receiptFields&&!receiptFocus)reason=@"acquisition_invalidated";NSDictionary *observation=[displayed diagnosticToken:frame now:now];if(receiptFields&&r){double received=[r[@"frame"][@"callback_received_monotonic_seconds"] doubleValue];observation=@{@"monotonic_seconds":@(now),@"record_found":@YES,@"current":r[@"current"],@"callback_received_monotonic_seconds":@(received),@"callback_age_ms":@((now-received)*1000)};}if(diagnosticID)[inputFrameDiagnostic validated:diagnosticID token:frame observation:observation accepted:r!=nil reason:reason];[publicationLock unlock];completion(r,r?nil:(reason?:@"display_no_snapshot"));return;}
         if([method isEqual:@"show_window"])error=[display show];
         else if([method isEqual:@"close_window"])[display close];
         if(error)completion(nil,error);else completion([display status],nil);
     }});
 }
+static int inputFrameDiagnosticStatusSelfTest(void){@autoreleasepool{
+    initializeState();NSCAssert(NSApp==nil,@"no AppKit application");
+    VNDisplay *headless=[VNDisplay new];inputFrameDiagnostic=[[VNInputFrameDiagnostic alloc] initWithEnabled:YES];
+    VNDisplayGeometry g={.sourceWidth=8192,.sourceHeight=8192,.drawableWidth=8192,.drawableHeight=8192,.viewBounds={0,0,8192,8192},.backingBounds={0,0,8192,8192},.viewport={0,0,8192,8192}};
+    NSDictionary *c=[displayed candidateGeometry:g generation:9007199254740991ULL sequence:9007199254740991ULL windowEpoch:9007199254740991ULL capturedMonotonicUS:9007199254740991LL];
+    NSCAssert([displayed commitCandidate:c presentedTime:100 receivedMonotonic:100],@"synthetic component candidate");
+    NSDictionary *token=VNDisplayedFrameToken([displayed snapshot]);
+    for(int i=0;i<16;i++){NSNumber *n=[inputFrameDiagnostic acquireToken:token observation:[displayed diagnosticToken:token now:1000.123456789] epoch:9007199254740991ULL];[inputFrameDiagnostic dispatched:n sequence:9007199254740991ULL epoch:9007199254740991ULL now:1000.123456999 queueAge:.199999999];[inputFrameDiagnostic validated:n token:token observation:[displayed diagnosticToken:token now:1000.123459999] accepted:NO reason:@"display_historical_expired"];}
+    for(int i=0;i<120;i++)[headless.presented recordTime:1000+i*.0123456789 generation:9007199254740991ULL sequence:9007199254740991ULL windowEpoch:9007199254740991ULL];
+    NSMutableDictionary *status=[[headless status] mutableCopy];
+    NSCAssert([status[@"input_frame_diagnostic"][@"records"] count]==16&&[status[@"presented_time_samples"] count]==120,@"saturated rings");
+    // Leave at least 8KiB within a conservative 64KiB envelope for the existing
+    // GLib-owner counters/copy aggregates/suspensions. No wire limit is increased.
+    NSData *wire=[NSJSONSerialization dataWithJSONObject:@{@"event":@"response",@"epoch":@0,@"id":@"diagnostic-status-bound",@"result":status} options:NSJSONWritingWithoutEscapingSlashes error:nil];
+    NSCAssert(wire&&wire.length<56*1024,@"saturated status must retain wire headroom");
+    printf("PASS saturated actual VNDisplay status: %lu bytes, 16 complete diagnostics + 120 presentation samples, below 56KiB conservative budget; no AppKit/GPU.\n",(unsigned long)wire.length);return 0;
+}}
 int VeynodeDisplayHeadlessSelfTest(void){@autoreleasepool{
     initializeState();NSCAssert(NSApp==nil,@"test must not initialize NSApplication or open a window");
     VNDisplay *headless=[VNDisplay new];
@@ -360,12 +452,19 @@ int VeynodeDisplaySelfTest(void){@autoreleasepool{
 }}
 int main(int argc,char **argv){@autoreleasepool{
     initializeState();
+    BOOL frameDiagnostics=NO,drawTimingRequested=NO;
+    while(argc>3){if(!strcmp(argv[argc-1],"--input-frame-diagnostic")&&!frameDiagnostics){frameDiagnostics=YES;argc--;}else if(!strcmp(argv[argc-1],"--native-frame-acquisition")&&!frameAcquisitionRequested){frameAcquisitionRequested=YES;argc--;}else if(!strcmp(argv[argc-1],"--draw-timing-diagnostic")&&!drawTimingRequested){drawTimingRequested=YES;argc--;}else break;}
+    frameAcquisition=[VNFrameAcquisition new];
+    inputFrameDiagnostic=[[VNInputFrameDiagnostic alloc] initWithEnabled:frameDiagnostics];
+    drawTiming=[[VNDrawTiming alloc] initWithEnabled:drawTimingRequested];
+    if(argc==2&&!strcmp(argv[1],"--input-frame-diagnostic-self-test"))return inputFrameDiagnosticStatusSelfTest();
+    if(argc==2&&!strcmp(argv[1],"--draw-timing-status-self-test"))return drawTimingStatusSelfTest();
     if(argc==2&&!strcmp(argv[1],"--display-headless-self-test"))return VeynodeDisplayHeadlessSelfTest();
     if(argc==2&&!strcmp(argv[1],"--display-self-test"))return VeynodeDisplaySelfTest();
     if(argc==2&&!strcmp(argv[1],"--display-metal-self-test")){VNDisplay *check=[VNDisplay new];if([check prepareMetal])return 1;puts("PASS actual Metal device, command queue, fixed shader compilation, function lookup and render pipeline creation; no window or GPU command submission.");return 0;}
     if(argc<3||strcmp(argv[2],"--persistent"))return VeynodeConsoleMain(argc,argv);
     if(argc!=3&&argc!=9){fprintf(stderr,"Invalid native control configuration\n");return 2;}
-    if(argc==9){if(strcmp(argv[3],"--control-socket")||strcmp(argv[5],"--vm-id")||strcmp(argv[7],"--worker-instance")){fprintf(stderr,"Invalid native control configuration\n");return 2;}nativeControl=[[VNNativeControl alloc] initWithSocket:@(argv[4]) vm:@(argv[6]) worker:@(argv[8]) display:[displayed instance]];[nativeControl start];}
+    if(argc==9){if(strcmp(argv[3],"--control-socket")||strcmp(argv[5],"--vm-id")||strcmp(argv[7],"--worker-instance")){fprintf(stderr,"Invalid native control configuration\n");return 2;}nativeControl=[[VNNativeControl alloc] initWithSocket:@(argv[4]) vm:@(argv[6]) worker:@(argv[8]) display:[displayed instance]];nativeControl.frameDiagnostic=inputFrameDiagnostic;nativeControl.frameAcquisition=frameAcquisition;nativeControl.frameAcquisitionRequested=frameAcquisitionRequested;[nativeControl start];}
     [NSApplication sharedApplication];[NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];display=[VNDisplay new];NSApp.delegate=display;
     __block int code=1;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{code=VeynodeConsoleMain(3,argv);dispatch_async(dispatch_get_main_queue(),^{[display close];[NSApp stop:nil];[NSApp postEvent:[NSEvent otherEventWithType:NSEventTypeApplicationDefined location:NSZeroPoint modifierFlags:0 timestamp:0 windowNumber:0 context:nil subtype:0 data1:0 data2:0] atStart:NO];});});

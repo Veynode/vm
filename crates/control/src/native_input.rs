@@ -3,6 +3,122 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+/// Fixed internal rejection telemetry. Never contains key, coordinates, owner or error text.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectionStage {
+    Admission,
+    BeginDisplay,
+    Authority,
+    FrameDecode,
+    FrameInstance,
+    EventValidation,
+    DisplayValidationIo,
+    DisplayValidationRejected,
+    SourceStatusIo,
+    SourceChanged,
+    ValidationExpired,
+    QmpDispatch,
+    DisplayInvalidToken,
+    DisplayNoSnapshot,
+    DisplayInstanceMismatch,
+    DisplayEpochMismatch,
+    DisplayHistoryMiss,
+    DisplayHistoricalExpired,
+    DisplayRecordMismatch,
+}
+/// Only helper token-validation codes may become typed display rejections.
+impl RejectionStage {
+    pub fn display_rejection(value: &Value) -> Option<Self> {
+        let stage: Self = serde_json::from_value(value.clone()).ok()?;
+        match stage {
+            Self::DisplayInvalidToken
+            | Self::DisplayNoSnapshot
+            | Self::DisplayInstanceMismatch
+            | Self::DisplayEpochMismatch
+            | Self::DisplayHistoryMiss
+            | Self::DisplayHistoricalExpired
+            | Self::DisplayRecordMismatch => Some(stage),
+            _ => None,
+        }
+    }
+}
+impl std::fmt::Display for RejectionStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("native displayed frame rejected")
+    }
+}
+impl std::error::Error for RejectionStage {}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RejectionDiagnostic {
+    pub version: u8,
+    pub stage: RejectionStage,
+    pub elapsed_ms: u64,
+}
+impl RejectionDiagnostic {
+    pub fn from_wire(value: &Value) -> Option<Self> {
+        let value: Self = serde_json::from_value(value.clone()).ok()?;
+        (value.version == 1 && value.elapsed_ms <= 60_000).then_some(value)
+    }
+}
+impl std::fmt::Display for RejectionDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("native input operation rejected")
+    }
+}
+impl std::error::Error for RejectionDiagnostic {}
+
+/// Optional correlation only: never input authority or a displayed-frame token field.
+/// A present null, float, boolean or out-of-range integer is invalid.
+pub fn diagnostic_id(value: Option<&Value>) -> Result<Option<u64>> {
+    match value {
+        None => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .filter(|id| (1..=9_007_199_254_740_991).contains(id))
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("invalid native diagnostic identity")),
+    }
+}
+pub fn deserialize_diagnostic_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<u64>, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    diagnostic_id(Some(&value)).map_err(serde::de::Error::custom)
+}
+
+/// Presence selects a distinct eligibility protocol; null is never legacy.
+pub fn frame_acquisition_protocol(value: Option<&Value>) -> Result<Option<u64>> {
+    match value {
+        None => Ok(None),
+        Some(value) if value.as_u64() == Some(1) => Ok(Some(1)),
+        _ => bail!("invalid frame acquisition protocol"),
+    }
+}
+pub fn deserialize_frame_acquisition_protocol<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<u64>, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    frame_acquisition_protocol(Some(&value)).map_err(serde::de::Error::custom)
+}
+pub fn acquisition_receipt(value: Option<&Value>) -> Result<Option<String>> {
+    match value {
+        None => Ok(None),
+        Some(value) => value
+            .as_str()
+            .filter(|s| hex(s, 32))
+            .map(|s| Some(s.to_owned()))
+            .ok_or_else(|| anyhow::anyhow!("invalid frame acquisition receipt")),
+    }
+}
+pub fn deserialize_acquisition_receipt<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    acquisition_receipt(Some(&value)).map_err(serde::de::Error::custom)
+}
+
 pub const PROTOCOL: u64 = 1;
 pub const MAX_LINE: usize = 8192;
 pub fn hex(value: &str, length: usize) -> bool {
@@ -131,6 +247,8 @@ impl Event {
 #[serde(deny_unknown_fields)]
 pub struct Attach {
     pub protocol_version: u64,
+    #[serde(default, deserialize_with = "deserialize_frame_acquisition_protocol")]
+    pub frame_acquisition_protocol: Option<u64>,
     pub id: String,
     pub worker_instance: String,
     pub display_instance: String,
@@ -150,6 +268,10 @@ pub enum Message {
         epoch: u64,
         frame: DisplayedFrame,
         event: Event,
+        #[serde(default, deserialize_with = "deserialize_diagnostic_id")]
+        diagnostic_id: Option<u64>,
+        #[serde(default, deserialize_with = "deserialize_acquisition_receipt")]
+        acquisition_receipt: Option<String>,
     },
     Suspend {
         sequence: u64,
@@ -224,5 +346,54 @@ mod tests {
             .len(),
             42
         );
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    #[test]
+    fn display_rejection_allows_only_fixed_helper_validation_codes() {
+        for name in [
+            "display_invalid_token",
+            "display_no_snapshot",
+            "display_instance_mismatch",
+            "display_epoch_mismatch",
+            "display_history_miss",
+            "display_historical_expired",
+            "display_record_mismatch",
+        ] {
+            let stage = RejectionStage::display_rejection(&json!(name)).unwrap();
+            let value = json!({"version":1,"stage":stage,"elapsed_ms":23});
+            assert!(RejectionDiagnostic::from_wire(&value).is_some());
+        }
+        for value in [
+            json!("authority"),
+            json!("display_validation_io"),
+            json!("display_history_miss SECRET"),
+            json!({"code":"display_history_miss"}),
+            Value::Null,
+        ] {
+            assert!(RejectionStage::display_rejection(&value).is_none());
+        }
+    }
+    #[test]
+    fn diagnostic_has_strict_fixed_schema_and_bounds() {
+        let valid = json!({"version":1,"stage":"qmp_dispatch","elapsed_ms":60000});
+        assert!(RejectionDiagnostic::from_wire(&valid).is_some());
+        for (key, value) in [
+            ("version", json!(2)),
+            ("elapsed_ms", json!(-1)),
+            ("elapsed_ms", json!(1.5)),
+            ("elapsed_ms", json!(true)),
+            ("stage", json!("raw key / secret")),
+        ] {
+            let mut bad = valid.clone();
+            bad[key] = value;
+            assert!(RejectionDiagnostic::from_wire(&bad).is_none());
+        }
+        let mut bad = valid;
+        bad["raw_error"] = json!("secret");
+        assert!(RejectionDiagnostic::from_wire(&bad).is_none());
     }
 }

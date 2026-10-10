@@ -22,9 +22,12 @@ bool VNDisplayMapBackingPoint(VNDisplayGeometry geometry,double x,double y,size_
 - (void)invalidate;
 - (NSString *)instance;
 - (NSDictionary *)validateToken:(NSDictionary *)token now:(double)now;
+- (NSDictionary *)validateToken:(NSDictionary *)token now:(double)now failure:(NSString **)failure;
 - (NSDictionary *)candidateGeometry:(VNDisplayGeometry)geometry generation:(uint64_t)generation sequence:(uint64_t)sequence windowEpoch:(uint64_t)windowEpoch capturedMonotonicUS:(int64_t)captured;
 - (BOOL)commitCandidate:(NSDictionary *)candidate presentedTime:(double)presented receivedMonotonic:(double)received;
 - (NSDictionary *)snapshot;
+// Diagnostic observation only; does not validate, refresh, retain or authorize a token.
+- (NSDictionary *)diagnosticToken:(NSDictionary *)token now:(double)now;
 @end
 
 NSDictionary *VNDisplayedFrameToken(NSDictionary *frame);

@@ -37,15 +37,34 @@ static NSDictionary *rectJSON(VNDisplayRect r){return @{@"x":@(r.x),@"y":@(r.y),
     NSMutableDictionary *value=[candidate mutableCopy];value[@"presentation_serial"]=@(++_serial);value[@"metal_presented_time_seconds"]=@(presented);value[@"callback_received_monotonic_seconds"]=@(received);_lastPresented=presented;_snapshot=[value copy];[_history addObject:_snapshot];while(_history.count>8)[_history removeObjectAtIndex:0];return YES;
 }
 - (NSDictionary *)snapshot{return _snapshot;}
-- (NSDictionary *)validateToken:(NSDictionary *)token now:(double)now{
+- (NSDictionary *)diagnosticToken:(NSDictionary *)token now:(double)now{
+    NSDictionary *matched=nil;for(NSDictionary *f in [_history reverseObjectEnumerator])if([VNDisplayedFrameToken(f) isEqual:token]){matched=f;break;}
+    double received=[matched[@"callback_received_monotonic_seconds"] doubleValue];
+    return @{@"monotonic_seconds":isfinite(now)?@(now):[NSNull null],@"record_found":matched?@YES:@NO,@"current":matched?(matched==_snapshot?@YES:@NO):[NSNull null],@"callback_received_monotonic_seconds":matched?@(received):[NSNull null],@"callback_age_ms":matched&&isfinite(now)?@((now-received)*1000):[NSNull null]};
+}
+- (NSDictionary *)validateToken:(NSDictionary *)token now:(double)now{return [self validateToken:token now:now failure:NULL];}
+- (NSDictionary *)validateToken:(NSDictionary *)token now:(double)now failure:(NSString **)failure{
+    if(failure)*failure=@"display_invalid_token";
     if(!isfinite(now)||now<=0||![token isKindOfClass:NSDictionary.class]||token.count!=8)return nil;
     for(NSString *key in @[@"presentation_serial",@"window_epoch",@"invalidation_epoch",@"source_generation",@"source_sequence",@"width",@"height"]){
         id value=token[key];if(![value isKindOfClass:NSNumber.class]||CFGetTypeID((__bridge CFTypeRef)value)==CFBooleanGetTypeID()||[value doubleValue]<=0||[value doubleValue]!=floor([value doubleValue]))return nil;
     }
+    BOOL expiredMatch=NO,serialSeen=NO;
     for(NSDictionary *frame in [_history reverseObjectEnumerator]){
         double received=[frame[@"callback_received_monotonic_seconds"] doubleValue];
-        if(frame!=_snapshot&&(now<received||now-received>0.250))continue;
-        if([VNDisplayedFrameToken(frame) isEqual:token])return @{@"valid":@YES,@"frame":frame,@"current":(frame==_snapshot?@YES:@NO)};
+        BOOL matches=[VNDisplayedFrameToken(frame) isEqual:token];
+        if([frame[@"presentation_serial"] isEqual:token[@"presentation_serial"]])serialSeen=YES;
+        if(frame!=_snapshot&&(now<received||now-received>0.250)){if(matches)expiredMatch=YES;continue;}
+        if(matches){if(failure)*failure=nil;return @{@"valid":@YES,@"frame":frame,@"current":(frame==_snapshot?@YES:@NO)};}
+    }
+    // Classification only after the original validation rejected. History miss
+    // does not assert that this token ever existed, or that it was evicted.
+    if(failure){
+        if(!_snapshot)*failure=@"display_no_snapshot";
+        else if(![token[@"display_instance"] isEqual:_instance])*failure=@"display_instance_mismatch";
+        else if(![token[@"invalidation_epoch"] isEqual:_snapshot[@"invalidation_epoch"]]||![token[@"window_epoch"] isEqual:_snapshot[@"window_epoch"]])*failure=@"display_epoch_mismatch";
+        else if(expiredMatch)*failure=@"display_historical_expired";
+        else *failure=serialSeen?@"display_record_mismatch":@"display_history_miss";
     }
     return nil;
 }

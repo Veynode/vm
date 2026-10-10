@@ -1,15 +1,28 @@
 #!/bin/bash
-# Offline checks only: no NSWindow, SPICE connection, VM or GPU command.
+# Offline checks only: no NSWindow, SPICE connection or VM. The draw-completion regression test submits small offscreen GPU command buffers.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 [[ $# == 1 && "$1" == /*.app && -x "$1/Contents/MacOS/spice-console" ]] || { echo 'Usage: test.sh ABSOLUTE_STAGED_APP' >&2; exit 2; }
 APP="$1"
 TEMP=$(mktemp -d "${TMPDIR:-/tmp}/veynode-console-test.XXXXXXXX")
 trap 'rm -rf "$TEMP"' EXIT
+clang -fobjc-arc -Wall -Wextra -Werror -framework Foundation "$ROOT/native/console/CopyTiming.m" "$ROOT/native/console/CopyTimingTests.m" -o "$TEMP/copy-timing-tests"
+clang -fobjc-arc -Wall -Wextra -Werror -framework Foundation "$ROOT/native/console/DisplayedFrame.m" "$ROOT/native/console/FrameAcquisition.m" "$ROOT/native/console/InputFrameDiagnostic.m" "$ROOT/native/console/InputFrameDiagnosticTests.m" -o "$TEMP/input-frame-tests"
+clang -fobjc-arc -Wall -Wextra -Werror -framework Foundation "$ROOT/native/console/DisplayedFrame.m" "$ROOT/native/console/FrameAcquisition.m" "$ROOT/native/console/FrameAcquisitionTests.m" -o "$TEMP/frame-acquisition-tests"
+"$TEMP/frame-acquisition-tests"
+"$TEMP/input-frame-tests"
+"$TEMP/copy-timing-tests"
+clang -fobjc-arc -Wall -Wextra -Werror -framework Foundation "$ROOT/native/console/DrawTiming.m" "$ROOT/native/console/DrawTimingTests.m" -o "$TEMP/draw-timing-tests"
+"$TEMP/draw-timing-tests"
+# Includes the production Display.m for its publication state; see DrawCompletionOwnershipTests.m.
+clang -fobjc-arc -fblocks -Wall -Wextra -Werror -Wno-unused-parameter -DVEYNODE_NATIVE_DISPLAY -framework AppKit -framework MetalKit -framework Foundation -framework AVFoundation -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework ImageIO -framework CoreGraphics -framework IOSurface -framework Metal -framework QuartzCore "$ROOT/native/console/FramePool.m" "$ROOT/native/console/Presented.m" "$ROOT/native/console/CopyTiming.m" "$ROOT/native/console/AsyncScreenshot.m" "$ROOT/native/console/RecordWriter.m" "$ROOT/native/console/DisplayedFrame.m" "$ROOT/native/console/FrameAcquisition.m" "$ROOT/native/console/InputFrameDiagnostic.m" "$ROOT/native/console/DrawTiming.m" "$ROOT/native/console/NativeControl.m" "$ROOT/native/console/DrawCompletionOwnershipTests.m" -o "$TEMP/draw-completion-ownership-tests"
+"$TEMP/draw-completion-ownership-tests"
 clang -fobjc-arc -Wall -Wextra -framework Foundation "$ROOT/native/console/DisplayedFrame.m" "$ROOT/native/console/DisplayedFrameTests.m" -o "$TEMP/displayed-frame-tests"
-clang -fobjc-arc -Wall -Wextra -framework Foundation "$ROOT/native/console/NativeControl.m" "$ROOT/native/console/NativeControlTests.m" -o "$TEMP/native-control-tests"
+clang -fobjc-arc -Wall -Wextra -framework Foundation "$ROOT/native/console/DisplayedFrame.m" "$ROOT/native/console/FrameAcquisition.m" "$ROOT/native/console/InputFrameDiagnostic.m" "$ROOT/native/console/NativeControl.m" "$ROOT/native/console/NativeControlTests.m" -o "$TEMP/native-control-tests"
 "$TEMP/native-control-tests"
 "$TEMP/displayed-frame-tests"
+"$APP/Contents/MacOS/spice-console" --input-frame-diagnostic-self-test
+"$APP/Contents/MacOS/spice-console" --draw-timing-status-self-test
 "$APP/Contents/MacOS/spice-console" --display-headless-self-test
 "$APP/Contents/MacOS/spice-console" --display-self-test
 "$APP/Contents/MacOS/spice-console" --display-metal-self-test

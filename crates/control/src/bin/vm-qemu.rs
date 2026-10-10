@@ -1,4 +1,6 @@
 //! One independently supervised QEMU/HVF instance. Protocol output is JSON only.
+#[path = "../qemu_deadline_io.rs"]
+mod deadline_io;
 #[path = "../qemu_guardian.rs"]
 mod guardian;
 #[path = "../qemu_guest_exec.rs"]
@@ -11,7 +13,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{BufReader, Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     os::unix::{fs::OpenOptionsExt, net::UnixStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -98,6 +100,8 @@ struct Qmp {
     stream: UnixStream,
     reader: BufReader<UnixStream>,
     next: u64,
+    poisoned: bool,
+    reply_prefix: Vec<u8>,
 }
 impl Qmp {
     fn connect(path: &Path, child: &mut Child) -> Result<Self> {
@@ -123,6 +127,8 @@ impl Qmp {
             reader: BufReader::new(stream.try_clone()?),
             stream,
             next: 1,
+            poisoned: false,
+            reply_prefix: Vec::new(),
         };
         let greeting: Value =
             serde_json::from_slice(&read_frame(&mut qmp.reader)?.context("missing QMP greeting")?)?;
@@ -136,24 +142,57 @@ impl Qmp {
         self.arguments(method, json!({}))
     }
     fn arguments(&mut self, method: &str, arguments: Value) -> Result<Value> {
+        // Cleanup is also a framed write: a partial release must never permit
+        // another JSON record to be appended. Its independent budget remains
+        // three seconds and is never inherited from an expired input receipt.
+        self.arguments_before(method, arguments, Instant::now() + Duration::from_secs(3))
+    }
+    fn ensure_usable(&self) -> Result<()> {
+        if self.poisoned {
+            bail!("QMP framing uncertain; input cleanup unconfirmed")
+        }
+        Ok(())
+    }
+    fn arguments_before(
+        &mut self,
+        method: &str,
+        arguments: Value,
+        deadline: Instant,
+    ) -> Result<Value> {
+        self.ensure_usable()?;
         let number = self.next;
+        let mut bytes =
+            serde_json::to_vec(&json!({"execute":method,"id":number,"arguments":arguments}))?;
+        if bytes.len() >= vm_control::MAX_MESSAGE {
+            bail!("QMP input record bound")
+        }
+        bytes.push(b'\n');
         self.next += 1;
-        serde_json::to_writer(
-            &mut self.stream,
-            &json!({"execute":method,"id":number,"arguments":arguments}),
-        )?;
-        self.stream.write_all(b"\n")?;
+        self.write_record_before(&bytes, deadline)?;
+        self.reply(number, method)
+    }
+    fn write_record_before(&mut self, bytes: &[u8], deadline: Instant) -> Result<()> {
+        self.ensure_usable()?;
+        let write = deadline_io::write(&mut self.stream, bytes, deadline);
+        if write.written > 0 && write.written < bytes.len() {
+            self.poisoned = true;
+        }
+        // BufReader shares this descriptor's nonblocking flag. Restore even on failure.
+        if let Err(error) = self.stream.set_nonblocking(false) {
+            self.poisoned = true;
+            return Err(error.into());
+        }
+        write.result
+    }
+    fn reply(&mut self, number: u64, method: &str) -> Result<Value> {
+        // ACK waiting does not admit new input or renew acquisition eligibility.
         // Event storms cannot extend one request forever.
         let deadline = Instant::now() + Duration::from_secs(3);
         for _ in 0..128 {
-            self.reader.get_ref().set_read_timeout(Some(
-                deadline
-                    .saturating_duration_since(Instant::now())
-                    .max(Duration::from_millis(1)),
-            ))?;
-            let value: Value = serde_json::from_slice(
-                &read_frame(&mut self.reader)?.context("QMP disconnected")?,
-            )?;
+            let value: Value = serde_json::from_slice(&self.line_before(deadline)?)?;
+            if Instant::now() >= deadline {
+                bail!("QMP response deadline expired after decoding")
+            }
             if value["id"] == number {
                 if let Some(error) = value.get("error") {
                     bail!("QMP {method} failed: {error}")
@@ -169,6 +208,94 @@ impl Qmp {
         }
         bail!("QMP response deadline or event bound exceeded")
     }
+    fn line_before(&mut self, deadline: Instant) -> Result<Vec<u8>> {
+        self.ensure_usable()?;
+        if let Err(error) = self.stream.set_nonblocking(true) {
+            self.poisoned = true;
+            return Err(error.into());
+        }
+        let result = self.line_nonblocking_before(deadline);
+        if let Err(error) = self.stream.set_nonblocking(false) {
+            self.poisoned = true;
+            return Err(error.into());
+        }
+        result
+    }
+    fn line_nonblocking_before(&mut self, deadline: Instant) -> Result<Vec<u8>> {
+        use std::os::fd::AsRawFd;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|d| !d.is_zero())
+                .context("QMP response deadline expired")?;
+            if self.reader.buffer().is_empty() {
+                let mut pollfd = libc::pollfd {
+                    fd: self.stream.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let ready = unsafe {
+                    libc::poll(
+                        &mut pollfd,
+                        1,
+                        remaining.as_millis().clamp(1, i32::MAX as u128) as i32,
+                    )
+                };
+                if ready < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    self.poisoned = true;
+                    return Err(error.into());
+                }
+                if ready == 0 {
+                    continue;
+                }
+                if Instant::now() >= deadline {
+                    bail!("QMP response deadline expired")
+                }
+            }
+            let available = match self.reader.fill_buf() {
+                Ok(bytes) if !bytes.is_empty() => bytes,
+                Ok(_) => {
+                    self.poisoned = true;
+                    bail!("QMP disconnected; input cleanup unconfirmed")
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    // Readiness can race. Keep the exact prefix and poll again
+                    // against the same deadline, never a fresh per-byte timeout.
+                    continue;
+                }
+                Err(error) => {
+                    self.poisoned = true;
+                    return Err(error.into());
+                }
+            };
+            // If completion is observed late, leave even newly buffered bytes
+            // untouched for the next bounded reply operation.
+            if Instant::now() >= deadline {
+                bail!("QMP response deadline expired")
+            }
+            let end = available.iter().position(|b| *b == b'\n');
+            let count = end.map_or(available.len(), |n| n + 1);
+            if count > vm_control::MAX_MESSAGE.saturating_sub(self.reply_prefix.len()) {
+                self.poisoned = true;
+                bail!("QMP response bound exceeded; input cleanup unconfirmed")
+            }
+            self.reply_prefix.extend_from_slice(&available[..count]);
+            self.reader.consume(count);
+            if end.is_some() {
+                return Ok(std::mem::take(&mut self.reply_prefix));
+            }
+        }
+    }
 }
 #[derive(Default)]
 struct InputState {
@@ -181,6 +308,7 @@ struct InputState {
 }
 impl InputState {
     fn cleanup(&mut self, qmp: &mut Qmp) -> Result<()> {
+        qmp.ensure_usable()?;
         if !self.held.is_empty() {
             qmp.arguments(
                 "input-send-event",
@@ -232,6 +360,14 @@ impl InputState {
         )
     }
     fn send_events(&mut self, events: &[Value], qmp: &mut Qmp) -> Result<()> {
+        self.send_events_before(events, qmp, None)
+    }
+    fn send_events_before(
+        &mut self,
+        events: &[Value],
+        qmp: &mut Qmp,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
         let mut releases = Vec::new();
         for event in events {
             if ["key", "btn"].contains(&event["type"].as_str().unwrap_or("")) {
@@ -249,7 +385,11 @@ impl InputState {
                 }
             }
         }
-        qmp.arguments("input-send-event", json!({"events":events}))?;
+        if let Some(deadline) = deadline {
+            qmp.arguments_before("input-send-event", json!({"events":events}), deadline)?;
+        } else {
+            qmp.arguments("input-send-event", json!({"events":events}))?;
+        }
         for identity in releases {
             self.held.remove(&identity);
         }
@@ -567,6 +707,13 @@ fn read_console_reply_bounded(
         bail!("console screenshot response identity mismatch")
     }
     if let Some(error) = reply.get("error") {
+        if request_id == "native-frame" {
+            if let Some(stage) = vm_control::native_input::RejectionStage::display_rejection(
+                &reply["display_rejection"],
+            ) {
+                return Err(stage.into());
+            }
+        }
         bail!("console operation failed: {error}")
     }
     reply
@@ -1318,7 +1465,15 @@ fn run() -> Result<()> {
         };
         emit(match result {
             Ok(value) => json!({"id":id,"result":value}),
-            Err(error) => json!({"id":id,"error":error.to_string()}),
+            Err(error) => {
+                let mut reply = json!({"id":id,"error":error.to_string()});
+                if let Some(diagnostic) =
+                    error.downcast_ref::<vm_control::native_input::RejectionDiagnostic>()
+                {
+                    reply["native_input_diagnostic"] = serde_json::to_value(diagnostic)?;
+                }
+                reply
+            }
         })?;
     }
     let _ = input.cleanup(&mut qmp);
@@ -1441,6 +1596,8 @@ mod tests {
             reader: BufReader::new(client.try_clone().unwrap()),
             stream: client,
             next: 1,
+            poisoned: false,
+            reply_prefix: Vec::new(),
         };
         let mut state = json!({"state":"paused","disk_provenance":{"device":7,"inode":9,"qmp_fdsets_verified_at_start":true}});
         let mut events = Vec::new();
@@ -1464,6 +1621,8 @@ mod tests {
             reader: BufReader::new(client.try_clone().unwrap()),
             stream: client,
             next: 1,
+            poisoned: false,
+            reply_prefix: Vec::new(),
         };
         assert!(publish_startup_then_resume(
             &mut qmp,
@@ -1733,6 +1892,8 @@ f.close();c.close();s.close()
             reader: BufReader::new(stream.try_clone().unwrap()),
             stream,
             next: 1,
+            poisoned: false,
+            reply_prefix: Vec::new(),
         };
         let mut state = InputState {
             active_epoch: Some(1),
@@ -2002,6 +2163,8 @@ mod venus_qmp_admission_tests {
                 reader: BufReader::new(client.try_clone().unwrap()),
                 stream: client,
                 next: 1,
+                poisoned: false,
+                reply_prefix: Vec::new(),
             };
             let admitted = vm_control::qemu_graphics::verify_gpu_properties(|method, args| {
                 qmp.arguments(method, args)

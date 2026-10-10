@@ -57,6 +57,19 @@ pub fn key_names() -> Vec<String> {
             "f10",
             "f11",
             "f12",
+            // QEMU 10.0 QKeyCode ANSI punctuation names (qapi/ui.json).
+            // These describe physical positions, never text/layout translation.
+            "minus",
+            "equal",
+            "bracket_left",
+            "bracket_right",
+            "semicolon",
+            "apostrophe",
+            "grave_accent",
+            "backslash",
+            "comma",
+            "dot",
+            "slash",
         ]
         .into_iter()
         .map(String::from),
@@ -226,6 +239,71 @@ mod tests {
         let mut c = current;
         c["frame_available"] = json!(false);
         assert!(frames.check(&a, &c, now).is_err());
+    }
+    #[test]
+    fn punctuation_plans_and_native_events_preserve_physical_edges() {
+        use crate::native_input::{DisplayedFrame, Event};
+        let frame = DisplayedFrame {
+            display_instance: "a".repeat(32),
+            presentation_serial: 1,
+            window_epoch: 1,
+            invalidation_epoch: 0,
+            source_generation: 4,
+            source_sequence: 1,
+            width: 1280,
+            height: 800,
+        };
+        for qcode in [
+            "minus",
+            "equal",
+            "bracket_left",
+            "bracket_right",
+            "semicolon",
+            "apostrophe",
+            "grave_accent",
+            "backslash",
+            "comma",
+            "dot",
+            "slash",
+        ] {
+            let args = json!({"frame_id":"00000000-0000-0000-0000-000000000000",
+                "width":1280,"height":800,"source_generation":4,"keys":["shift",qcode]});
+            let steps = plan("input_key", &args).unwrap();
+            assert_eq!(
+                steps,
+                vec![
+                    vec![key("shift", true), key(qcode, true)],
+                    vec![key(qcode, false), key("shift", false)],
+                ],
+                "{qcode}"
+            );
+            for down in [true, false] {
+                let event: Event = serde_json::from_value(json!({
+                    "kind":"key", "qcode":qcode, "down":down,
+                }))
+                .unwrap();
+                assert_eq!(event.qmp(&frame).unwrap(), vec![key(qcode, down)]);
+            }
+        }
+        for raw in [
+            "-", "=", "[", "]", ";", "'", "`", "\\", ",", ".", "/", "?", ":", "SLASH", "period",
+            "unknown", "你好", "／",
+        ] {
+            let args = json!({"frame_id":"00000000-0000-0000-0000-000000000000",
+                "width":1280,"height":800,"source_generation":4,"keys":[raw]});
+            assert!(plan("input_key", &args).is_err(), "{raw}");
+            for down in [true, false] {
+                let event = Event::Key {
+                    qcode: raw.into(),
+                    down,
+                };
+                assert!(event.qmp(&frame).is_err(), "{raw}");
+            }
+        }
+        // Capability enumeration stays a unique list; no raw-text aliases.
+        let names = key_names();
+        let unique: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(names.len(), unique.len());
     }
     #[test]
     fn plans_are_bounded_and_reject_text() {

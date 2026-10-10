@@ -31,7 +31,7 @@ def workload(serial, desktop="zink"):
  if '\nVEYNODE_WSI_READY\n' not in text:return None
  bodies=re.findall(r'^WSI_APP_LOG_BEGIN\n(.*?)^WSI_APP_LOG_END$',text,re.M|re.S)
  BASE.require(len(bodies)==1,'application log framing')
- body=bodies[0]
+ body=re.sub(r'^Info: ','',bodies[0],flags=re.M)
  BASE.require('Virtio-GPU Venus (Apple M1 Pro)' in body and '0x106B' in body,'application hardware identity')
  BASE.require(not re.search(r'llvmpipe|lavapipe|softpipe|SwiftShader|Skipping benchmark|Failed with exception',body,re.I),'application failed or software')
  BASE.require('Swapchain contains' in body and 'XcbNativeSystem:' in body,'actual XCB swapchain missing')
@@ -39,11 +39,12 @@ def workload(serial, desktop="zink"):
  BASE.require(len(rows)==1 and int(rows[0][1])>0 and all(x in rows[0][0].split(':') for x in ['duration=60.0','shading=phong']),'scene not completed')
  BASE.require(text.splitlines().count('WSI_CASE_EXIT shading-phong 0')==1,'scene exit failed')
  gl=re.findall(r'^WSI_GL_BEGIN\n(.*?)^WSI_GL_END$',text,re.M|re.S)
- BASE.require(len(gl)==1 and desktop in gl[0].lower() and 'Apple M1 Pro' in gl[0] and 'Accelerated: yes' in gl[0],'desktop hardware identity')
+ BASE.require(len(gl)==1 and desktop in gl[0].lower() and (desktop=='virgl' or 'Apple M1 Pro' in gl[0]) and 'Accelerated: yes' in gl[0],'desktop hardware identity')
  BASE.require(not re.search('llvmpipe|lavapipe|softpipe|SwiftShader',gl[0],re.I),'software desktop')
  if desktop=='virgl':
   cases=re.findall(r'^XRENDER_CASE (.*)$',text,re.M)
-  BASE.require(len(cases)==15 and all(json.loads(c)['passed'] is True for c in cases),'XRender 15-case guard')
+  cases=[json.loads(c) for c in cases]
+  BASE.require(len(cases)==15 and len({c['name'] for c in cases})==15 and all(c['passed'] is True and c['mismatched_pixels']==0 for c in cases),'XRender 15-case guard')
   BASE.require(text.splitlines().count('XRENDER_SUMMARY {"cases":15,"failed":0,"passed":true}')==1,'XRender summary')
  return {'application_completed':True,'xcb_swapchain_logged':True,'desktop_gl_identity':gl[0], 'performance_validated':False,'visual_conformance_validated':False}
 
@@ -55,6 +56,15 @@ def guest_observer(info):
 def read_serial(path):
  with path.open('rb') as f:data=f.read(8*1024*1024+1)
  BASE.require(len(data)<=8*1024*1024,'serial bound');return data
+
+def retirement_basis(status, vm, force_receipt=None):
+ # A signal exit has no ExitStatus.code(). The exact synchronous force_stop RPC
+ # waits the owned worker; require its receipt as well as this VM's terminal view.
+ BASE.require(status.get('config',{}).get('id')==vm and status.get('pid') is None,'wrong or live worker')
+ BASE.require(status.get('state') in ['stopped','crashed'],'worker not terminal')
+ if status.get('exit_code') is not None:return 'terminal-exit-code'
+ BASE.require(force_receipt=={'forced':True,'state':'stopped'} and status.get('state')=='stopped' and status.get('runtime',{}).get('reason')=='force_stopped','signal retirement lacks exact force receipt')
+ return 'synchronous-force-receipt-and-terminal-view'
 
 def main():
  p=argparse.ArgumentParser(description=__doc__)
@@ -129,10 +139,11 @@ def main():
  finally:
   if registered:
    try:
+    force_receipt=None
     status=call('status',{'id':vm});record('cleanup initial status',status)
     if status.get('state') not in ['stopped','crashed','error']:
-     record('failure force request',call('force_stop',{'id':vm,'confirm':vm}));status=terminal(15);record('failure terminal',status)
-    BASE.require(status.get('state') in ['stopped','crashed'] and status.get('exit_code') is not None,'owned worker retirement unconfirmed')
+     force_receipt=call('force_stop',{'id':vm,'confirm':vm});record('failure force request',force_receipt);status=terminal(15);record('failure terminal',status)
+    record('worker retirement basis',retirement_basis(status,vm,force_receipt))
    except Exception as e:report['cleanup_unconfirmed']=type(e).__name__;report['passed']=False
   if client is not None and hasattr(client,'p'):
    try:client.close();record('MCP final cleanup',{'exit_code':client.p.returncode})

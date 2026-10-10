@@ -54,12 +54,15 @@ int main(void){@autoreleasepool{
     verified=[store validateToken:VNDisplayedFrameToken(first) now:10.2];
     decoded=[NSJSONSerialization JSONObjectWithData:[NSJSONSerialization dataWithJSONObject:verified options:0 error:nil] options:0 error:nil];
     CHECK(CFGetTypeID((__bridge CFTypeRef)decoded[@"current"])==CFBooleanGetTypeID()&&![decoded[@"current"] boolValue]);
-    CHECK(![store validateToken:VNDisplayedFrameToken(first) now:10.251]);
-    NSMutableDictionary *wrong=[VNDisplayedFrameToken([store snapshot]) mutableCopy];wrong[@"width"]=@1;CHECK(![store validateToken:wrong now:10.2]);
-    wrong=[VNDisplayedFrameToken([store snapshot]) mutableCopy];wrong[@"window_epoch"]=@YES;CHECK(![store validateToken:wrong now:10.2]);
+    NSString *reason=nil;CHECK(![store validateToken:VNDisplayedFrameToken(first) now:10.251 failure:&reason]);CHECK([reason isEqual:@"display_historical_expired"]);
+    NSMutableDictionary *wrong=[VNDisplayedFrameToken([store snapshot]) mutableCopy];wrong[@"width"]=@1;CHECK(![store validateToken:wrong now:10.2 failure:&reason]);CHECK([reason isEqual:@"display_record_mismatch"]);
+    wrong=[VNDisplayedFrameToken([store snapshot]) mutableCopy];wrong[@"window_epoch"]=@YES;CHECK(![store validateToken:wrong now:10.2 failure:&reason]);CHECK([reason isEqual:@"display_invalid_token"]);
+    wrong=[VNDisplayedFrameToken([store snapshot]) mutableCopy];wrong[@"display_instance"]=[other instance];CHECK(![store validateToken:wrong now:10.2 failure:&reason]);CHECK([reason isEqual:@"display_instance_mismatch"]);
+    wrong=[VNDisplayedFrameToken([store snapshot]) mutableCopy];wrong[@"window_epoch"]=@99;CHECK(![store validateToken:wrong now:10.2 failure:&reason]);CHECK([reason isEqual:@"display_epoch_mismatch"]);
     for(int i=0;i<9;i++)CHECK([store commitCandidate:second presentedTime:10.01+i*.001 receivedMonotonic:10.101+i*.001]);
-    CHECK(![store validateToken:VNDisplayedFrameToken(first) now:10.2]); // Count limit independent of age.
-    [store invalidate];CHECK(![store snapshot]);CHECK(![store validateToken:VNDisplayedFrameToken(first) now:10.2]);
+    CHECK(![store validateToken:VNDisplayedFrameToken(first) now:10.2 failure:&reason]);CHECK([reason isEqual:@"display_history_miss"]); // Count limit independent of age.
+    CHECK([store validateToken:VNDisplayedFrameToken([store snapshot]) now:999 failure:&reason]&&!reason);
+    [store invalidate];CHECK(![store snapshot]);CHECK(![store validateToken:VNDisplayedFrameToken(first) now:10.2 failure:&reason]);CHECK([reason isEqual:@"display_no_snapshot"]);
     CHECK(![store commitCandidate:candidate presentedTime:11 receivedMonotonic:12]); // Late callback cannot revive retired geometry/source/window.
     NSDictionary *fresh=[store candidateGeometry:nonzero generation:9 sequence:1 windowEpoch:3 capturedMonotonicUS:1500];
     CHECK([store commitCandidate:fresh presentedTime:12 receivedMonotonic:13]);

@@ -1,0 +1,13 @@
+PASS mixed framing, FIFO, actual receipt bytes
+PASS concurrent mixed producers, no interleaving
+PASS independent wire storage
+PASS actual partial pipe timeout, permanent fence
+PASS count bound includes current writer
+PASS byte bound before count bound
+PASS cancellation, drain timeout, actual EPIPE
+PASS invalid admission
+PASS all eight real-pipe writer groups; no GPU workload
+PASS frozen actual pixels, real lease prevents slot reuse, original metadata and monotonic stages
+PASS cancellation and actual exception settle only after lease release; no private exception text
+PASS actual incompressible PNG bounded sink overflow, no invented final length
+PASS actual owner screenshot commands: single flight, new sequence, generation/connection invalidation, shutdown settlement, EOF fence

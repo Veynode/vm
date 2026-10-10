@@ -76,6 +76,11 @@ impl Session {
         pending.lock().unwrap().remove(&number);
         let value = result.context("native worker response unavailable")?;
         if value.get("error").is_some() {
+            if let Some(diagnostic) =
+                native_input::RejectionDiagnostic::from_wire(&value["native_input_diagnostic"])
+            {
+                return Err(diagnostic.into());
+            }
             bail!("native worker rejected operation")
         }
         value
@@ -179,16 +184,27 @@ impl Session {
                             worker_instance: self.attach.worker_instance.clone(),
                         })?;
                 }
-                let reply=self.rpc("native_begin",json!({"owner":self.owner,"epoch":epoch,"sequence":sequence,"display_instance":self.attach.display_instance}))?;
+                let mut args = json!({"owner":self.owner,"epoch":epoch,"sequence":sequence,"display_instance":self.attach.display_instance});
+                if let Some(mode) = self.attach.frame_acquisition_protocol {
+                    args["frame_acquisition_protocol"] = json!(mode);
+                }
+                let reply = self.rpc("native_begin", args)?;
                 self.lease(epoch, true)?;
                 if reply["ready"] != true
                     || reply["epoch"].as_u64() != Some(epoch)
+                    || native_input::frame_acquisition_protocol(
+                        reply.get("frame_acquisition_protocol"),
+                    )? != self.attach.frame_acquisition_protocol
                     || peer_disconnected(&[stream.as_raw_fd()])
                 {
                     bail!("native begin unconfirmed")
                 }
                 self.active = true;
-                Ok(json!({"ready":true,"epoch":epoch}))
+                let mut result = json!({"ready":true,"epoch":epoch});
+                if let Some(mode) = self.attach.frame_acquisition_protocol {
+                    result["frame_acquisition_protocol"] = json!(mode);
+                }
+                Ok(result)
             }
             Message::Heartbeat { epoch, .. } => {
                 if !self.active {
@@ -217,6 +233,8 @@ impl Session {
                 epoch,
                 frame,
                 event,
+                diagnostic_id,
+                acquisition_receipt,
                 ..
             } => {
                 if !self.active {
@@ -226,8 +244,19 @@ impl Session {
                 if frame.display_instance != self.attach.display_instance {
                     bail!("foreign display")
                 }
+                if acquisition_receipt.is_some() != self.attach.frame_acquisition_protocol.is_some()
+                {
+                    bail!("native frame acquisition mode mismatch")
+                }
                 event.qmp(frame)?;
-                let result=self.rpc("native_event",json!({"owner":self.owner,"epoch":epoch,"sequence":sequence,"frame":frame,"event":event}))?;
+                let mut args = json!({"owner":self.owner,"epoch":epoch,"sequence":sequence,"frame":frame,"event":event});
+                if let Some(id) = diagnostic_id {
+                    args["diagnostic_id"] = json!(id);
+                }
+                if let Some(receipt) = acquisition_receipt {
+                    args["acquisition_receipt"] = json!(receipt);
+                }
+                let result = self.rpc("native_event", args)?;
                 self.lease(*epoch, true)?;
                 if result["dispatched"] != true
                     || result["guest_delivery_confirmed"] != false
@@ -420,6 +449,13 @@ pub(super) fn serve(
         {
             bail!("display binding mismatch")
         }
+        if session.attach.frame_acquisition_protocol.is_some()
+            && native_input::frame_acquisition_protocol(
+                status.get("native_frame_acquisition_protocol"),
+            )? != Some(1)
+        {
+            bail!("native frame acquisition unsupported")
+        }
         Ok(session)
     })();
     let mut session = match setup {
@@ -433,10 +469,12 @@ pub(super) fn serve(
         }
     };
     let outcome = (|| -> Result<()> {
-        write_json(
-            &mut stream,
-            &json!({"result":{"native_control_protocol":1,"native_session":session.owner,"ready":false}}),
-        )?;
+        let mut result =
+            json!({"native_control_protocol":1,"native_session":session.owner,"ready":false});
+        if let Some(mode) = session.attach.frame_acquisition_protocol {
+            result["frame_acquisition_protocol"] = json!(mode);
+        }
+        write_json(&mut stream, &json!({"result":result}))?;
         let mut expected = 1u64;
         while let Some(bytes) = line(&mut stream)? {
             let message: Message = serde_json::from_slice(&bytes)?;
@@ -466,7 +504,7 @@ pub(super) fn serve(
                     };
                     write_json(
                         &mut stream,
-                        &json!({"sequence":message.sequence(),"error":{"code":code,"message":"Native control operation rejected"}}),
+                        &json!({"sequence":message.sequence(),"error":{"code":code,"message":"Native control operation rejected","diagnostic":error.downcast_ref::<native_input::RejectionDiagnostic>()}}),
                     )?;
                     if !clean {
                         bail!("native cleanup unconfirmed")
@@ -499,6 +537,12 @@ mod tests {
             Self::with_revoke_failure(false)
         }
         fn with_revoke_failure(fail: bool) -> Self {
+            Self::with_diagnostic(fail, Value::Null)
+        }
+        fn with_diagnostic(fail: bool, diagnostic: Value) -> Self {
+            Self::with_acquisition(fail, diagnostic, Value::Null, Value::Null)
+        }
+        fn with_acquisition(fail: bool, diagnostic: Value, capability: Value, echo: Value) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let listener = UnixListener::bind(dir.path().join("control.sock")).unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -524,15 +568,24 @@ mod tests {
             let script = r#"import json,sys
 for line in sys.stdin:
  r=json.loads(line);a=r.get('arguments',{});method=r['method']
+ with open(sys.argv[3],'a') as log: log.write(json.dumps(r)+'\n')
  if method=='input_revoke' and sys.argv[1]=='fail':
   print(json.dumps({'id':r['id'],'error':'injected release failure'}),flush=True);continue
+ if method=='native_event' and sys.argv[2]!='null':
+  print(json.dumps({'id':r['id'],'error':'SECRET must not leave worker boundary','native_input_diagnostic':json.loads(sys.argv[2])}),flush=True);continue
  if method=='window_status': out={'display_instance':'d'*32,'native_input_protocol':1}
  elif method=='input_revoke': out={'released':True,'synthetic_release_dispatched':True,'through_epoch':a['through_epoch'],'guest_delivery_confirmed':False}
  else: out={'ready':True,'epoch':a['epoch'],'dispatched':True,'guest_delivery_confirmed':False}
+ if method=='window_status' and sys.argv[4]!='null': out['native_frame_acquisition_protocol']=json.loads(sys.argv[4])
+ if method=='native_begin' and sys.argv[5]!='null': out['frame_acquisition_protocol']=json.loads(sys.argv[5])
  print(json.dumps({'id':r['id'],'result':out}),flush=True)
 "#;
             let mut child = Command::new("/usr/bin/python3")
                 .args(["-u", "-c", script, if fail { "fail" } else { "okay" }])
+                .arg(diagnostic.to_string())
+                .arg(dir.path().join("worker-requests.jsonl"))
+                .arg(capability.to_string())
+                .arg(echo.to_string())
                 .process_group(0)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -599,6 +652,13 @@ for line in sys.stdin:
             &self,
             worker: Option<String>,
         ) -> (BufReader<UnixStream>, thread::JoinHandle<Result<()>>) {
+            self.attach_mode(worker, None)
+        }
+        fn attach_mode(
+            &self,
+            worker: Option<String>,
+            mode: Option<Value>,
+        ) -> (BufReader<UnixStream>, thread::JoinHandle<Result<()>>) {
             let (worker_instance, manager) = {
                 let m = self.manager.lock().unwrap();
                 (
@@ -617,14 +677,11 @@ for line in sys.stdin:
             client
                 .set_read_timeout(Some(Duration::from_secs(8)))
                 .unwrap();
-            let thread = thread::spawn(move || {
-                serve(
-                    server,
-                    manager,
-                    json!({"method":"native_attach","arguments":{"protocol_version":1,"id":"vm","worker_instance":worker_instance,"display_instance":"d".repeat(32)}}),
-                    Instant::now(),
-                )
-            });
+            let mut attach = json!({"method":"native_attach","arguments":{"protocol_version":1,"id":"vm","worker_instance":worker_instance,"display_instance":"d".repeat(32)}});
+            if let Some(mode) = mode {
+                attach["arguments"]["frame_acquisition_protocol"] = mode;
+            }
+            let thread = thread::spawn(move || serve(server, manager, attach, Instant::now()));
             (BufReader::new(client), thread)
         }
     }
@@ -643,6 +700,219 @@ for line in sys.stdin:
     fn request(reader: &mut BufReader<UnixStream>, value: Value) -> Value {
         write_json(reader.get_mut(), &value).unwrap();
         read(reader)
+    }
+    fn worker_requests(f: &Fixture, method: &str) -> Vec<Value> {
+        std::fs::read_to_string(f._dir.path().join("worker-requests.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|r| r["method"] == method)
+            .collect()
+    }
+    #[test]
+    fn acquisition_negotiation_requires_helper_and_worker_echo_before_ready() {
+        for (cap, echo, attach_ok, begin_ok) in [
+            (Value::Null, json!(1), false, false),
+            (json!(true), json!(1), false, false),
+            (json!(1), Value::Null, true, false),
+            (json!(1), json!(1.0), true, false),
+            (json!(1), json!(2), true, false),
+            (json!(1), json!(1), true, true),
+        ] {
+            let f = Fixture::with_acquisition(false, Value::Null, cap, echo);
+            let (mut client, thread) = f.attach_mode(None, Some(json!(1)));
+            if attach_ok {
+                let attached = read(&mut client);
+                assert_eq!(attached["result"]["frame_acquisition_protocol"], 1);
+                assert_eq!(attached["result"]["ready"], false);
+                let take = request(&mut client, json!({"sequence":1,"method":"take_control"}));
+                assert_eq!(take["result"]["ready"] == true, begin_ok);
+                if begin_ok {
+                    assert_eq!(take["result"]["frame_acquisition_protocol"], 1);
+                } else {
+                    assert_eq!(take["error"]["code"], "authority_lost");
+                }
+            } else {
+                assert_eq!(read(&mut client)["error"]["code"], "unavailable");
+            }
+            drop(client);
+            assert!(thread.join().unwrap().is_ok());
+            assert_eq!(
+                worker_requests(&f, "native_begin").len(),
+                usize::from(attach_ok)
+            );
+            assert!(worker_requests(&f, "native_event").is_empty());
+        }
+    }
+    #[test]
+    fn acquisition_real_unix_event_requires_exact_negotiated_receipt() {
+        for (mode, receipt, accepted, malformed) in [
+            (Some(json!(1)), Some(json!("a".repeat(32))), true, false),
+            (Some(json!(1)), None, false, false),
+            (None, None, true, false),
+            (None, Some(json!("a".repeat(32))), false, false),
+            (Some(json!(1)), Some(json!("A".repeat(32))), false, true),
+            (Some(json!(1)), Some(Value::Null), false, true),
+        ] {
+            let echo = mode.clone().unwrap_or(Value::Null);
+            let f = Fixture::with_acquisition(false, Value::Null, json!(1), echo);
+            let (mut client, thread) = f.attach_mode(None, mode.clone());
+            read(&mut client);
+            let take = request(&mut client, json!({"sequence":1,"method":"take_control"}));
+            assert_eq!(take["result"]["ready"], true);
+            let mut event = json!({"sequence":2,"method":"event","epoch":take["result"]["epoch"],
+                "frame":{"display_instance":"d".repeat(32),"presentation_serial":1,"window_epoch":1,"invalidation_epoch":0,"source_generation":7,"source_sequence":u64::MAX,"width":1280,"height":800},
+                "diagnostic_id":9007199254740991u64,"event":{"kind":"key","qcode":"ret","down":true}});
+            if let Some(receipt) = &receipt {
+                event["acquisition_receipt"] = receipt.clone();
+            }
+            write_json(client.get_mut(), &event).unwrap();
+            if malformed {
+                assert!(read_frame(&mut client).unwrap().is_none());
+            } else {
+                assert_eq!(read(&mut client)["result"]["dispatched"] == true, accepted);
+            }
+            drop(client);
+            assert_eq!(thread.join().unwrap().is_ok(), !malformed);
+            let begins = worker_requests(&f, "native_begin");
+            assert_eq!(
+                begins[0]["arguments"].get("frame_acquisition_protocol"),
+                mode.as_ref()
+            );
+            let events = worker_requests(&f, "native_event");
+            assert_eq!(events.len(), usize::from(accepted));
+            if accepted {
+                assert_eq!(
+                    events[0]["arguments"].get("acquisition_receipt"),
+                    receipt.as_ref()
+                );
+                assert_eq!(events[0]["arguments"]["frame"], event["frame"]);
+                assert_eq!(
+                    events[0]["arguments"]["diagnostic_id"],
+                    event["diagnostic_id"]
+                );
+            }
+        }
+    }
+    #[test]
+    fn acquisition_malformed_attach_never_reaches_worker() {
+        for mode in [
+            Value::Null,
+            json!(true),
+            json!(1.0),
+            json!(0),
+            json!(2),
+            json!("1"),
+        ] {
+            let f = Fixture::new();
+            let (mut client, thread) = f.attach_mode(None, Some(mode));
+            assert_eq!(read(&mut client)["error"]["code"], "unavailable");
+            drop(client);
+            assert!(thread.join().unwrap().is_ok());
+            assert!(worker_requests(&f, "native_begin").is_empty());
+        }
+    }
+    #[test]
+    fn real_unix_event_diagnostic_id_is_exact_or_absent_and_malformed_never_dispatched() {
+        for id in [
+            None,
+            Some(json!(1)),
+            Some(json!(9_007_199_254_740_991u64)),
+            Some(Value::Null),
+            Some(json!(true)),
+            Some(json!(1.0)),
+            Some(json!(0)),
+            Some(json!(-1)),
+            Some(json!("1")),
+            Some(json!(9_007_199_254_740_992u64)),
+        ] {
+            let f = Fixture::new();
+            let (mut client, thread) = f.attach(None);
+            read(&mut client);
+            let take = request(&mut client, json!({"sequence":1,"method":"take_control"}));
+            let mut event = json!({"sequence":2,"method":"event","epoch":take["result"]["epoch"],
+                "frame":{"display_instance":"d".repeat(32),"presentation_serial":1,"window_epoch":1,"invalidation_epoch":0,"source_generation":7,"source_sequence":42,"width":1280,"height":800},
+                "event":{"kind":"key","qcode":"ret","down":true}});
+            if let Some(value) = &id {
+                event["diagnostic_id"] = value.clone();
+            }
+            let valid = native_input::diagnostic_id(id.as_ref()).is_ok();
+            write_json(client.get_mut(), &event).unwrap();
+            if valid {
+                assert_eq!(read(&mut client)["result"]["dispatched"], true);
+            } else {
+                assert!(read_frame(&mut client).unwrap().is_none());
+            }
+            drop(client);
+            assert_eq!(thread.join().unwrap().is_ok(), valid);
+            let log = std::fs::read_to_string(f._dir.path().join("worker-requests.jsonl")).unwrap();
+            let requests: Vec<Value> = log
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .filter(|r: &Value| r["method"] == "native_event")
+                .collect();
+            assert_eq!(requests.len(), usize::from(valid));
+            if valid {
+                assert_eq!(requests[0]["arguments"].get("diagnostic_id"), id.as_ref());
+                assert_eq!(
+                    requests[0]["arguments"]["frame"].as_object().unwrap().len(),
+                    8
+                );
+            }
+        }
+    }
+    #[test]
+    fn worker_diagnostic_crosses_pipe_only_when_allowlisted_and_cleanup_stays_required() {
+        let good = json!({"version":1,"stage":"display_validation_rejected","elapsed_ms":17});
+        for diagnostic in [
+            good.clone(),
+            json!({"version":1,"stage":"SECRET","elapsed_ms":17}),
+            json!({"version":1,"stage":"authority","elapsed_ms":17,"key":"SECRET"}),
+            json!({"version":1,"stage":"authority","elapsed_ms":60001}),
+        ] {
+            let f = Fixture::with_diagnostic(false, diagnostic.clone());
+            let (mut client, thread) = f.attach(None);
+            read(&mut client);
+            let take = request(&mut client, json!({"sequence":1,"method":"take_control"}));
+            let epoch = take["result"]["epoch"].as_u64().unwrap();
+            let reply = request(
+                &mut client,
+                json!({"sequence":2,"method":"event","epoch":epoch,
+                "frame":{"display_instance":"d".repeat(32),"presentation_serial":1,"window_epoch":1,"invalidation_epoch":1,"source_generation":1,"source_sequence":1,"width":1280,"height":800},
+                "event":{"kind":"key","qcode":"slash","down":true}}),
+            );
+            assert_eq!(reply["error"]["code"], "stale_frame");
+            assert_eq!(
+                reply["error"]["diagnostic"],
+                if diagnostic == good {
+                    good.clone()
+                } else {
+                    Value::Null
+                }
+            );
+            assert!(!reply.to_string().contains("SECRET"));
+            assert!(f
+                .manager
+                .lock()
+                .unwrap()
+                .input_retirements
+                .lock()
+                .unwrap()
+                .records(None, None)
+                .is_empty());
+            // Rejecting the event does not return human authority to an agent.
+            assert!(f
+                .manager
+                .lock()
+                .unwrap()
+                .leases
+                .lock()
+                .unwrap()
+                .acquire("vm", &"a".repeat(64), Instant::now())
+                .is_err());
+            drop(client);
+            thread.join().unwrap().unwrap();
+        }
     }
     #[test]
     fn persistent_native_suspend_retains_hold_return_is_explicit_and_eof_releases() {
@@ -828,6 +1098,7 @@ for line in sys.stdin:
         let s = Session {
             manager: f.manager.clone(),
             attach: Attach {
+                frame_acquisition_protocol: None,
                 protocol_version: 1,
                 id: "vm".into(),
                 worker_instance: worker,
@@ -986,6 +1257,7 @@ for line in sys.stdin:
         let old = Session {
             manager: f.manager.clone(),
             attach: Attach {
+                frame_acquisition_protocol: None,
                 protocol_version: 1,
                 id: "vm".into(),
                 worker_instance: old_worker,
