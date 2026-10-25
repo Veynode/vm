@@ -16,17 +16,23 @@ use std::{
 
 const OUTPUT_LIMIT: usize = 64 * 1024;
 
-pub fn tools(lifecycle: bool) -> Vec<Value> {
+pub fn tools(lifecycle: bool, execute: bool) -> Vec<Value> {
     let container = json!({"type":"object","properties":{"container":{"type":"string","description":"Container name or id (prefix)"}},"required":["container"],"additionalProperties":false});
     let mut tools = vec![
         json!({"name":"container_list","description":"List micro-VM containers (all states) with image, status, published ports, GPU profile and the backing vm_id usable with vm_* tools (screenshot, exec, input).","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}),
         json!({"name":"container_inspect","description":"Container record, current state, guest IP, exit code, GPU device report and backing VM status.","inputSchema":container}),
-        json!({"name":"container_logs","description":"Container output so far (console between start and exit markers), last 64 KiB.","inputSchema":container}),
-        json!({"name":"image_list","description":"List local OCI images (linux/arm64).","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}),
+        json!({"name":"container_logs","description":"Container output so far (console between start and exit markers; for macOS, the output of the run COMMAND), last 64 KiB.","inputSchema":container}),
+        json!({"name":"image_list","description":"List local images: linux/arm64 OCI images and Tart-format macOS images.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}),
     ];
+    if execute {
+        tools.push(json!({"name":"container_exec","description":"Run a command in a running container and return exit_code/stdout/stderr. Linux: bounded Guest job (30 s). macOS: over SSH with the image login, waiting for the Guest to boot first.","inputSchema":{"type":"object","properties":{
+            "container":{"type":"string"},
+            "command":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":128}
+        },"required":["container","command"],"additionalProperties":false}}));
+    }
     if lifecycle {
-        tools.push(json!({"name":"image_pull","description":"Pull a linux/arm64 OCI image from a registry (anonymous) and prepare its read-only root.","inputSchema":{"type":"object","properties":{"image":{"type":"string"}},"required":["image"],"additionalProperties":false}}));
-        tools.push(json!({"name":"container_run","description":"Create and start a detached container as its own micro-VM. Without gpus/desktop it runs on Apple Virtualization; gpus selects QEMU/HVF with virgl (GL) or experimental Venus (Vulkan via MoltenVK). Host bind mounts are not available through MCP.","inputSchema":{"type":"object","properties":{
+        tools.push(json!({"name":"image_pull","description":"Pull an image from a registry (anonymous): linux/arm64 OCI images get a read-only root; Tart macOS images (e.g. ghcr.io/cirruslabs/macos-tahoe-vanilla, ~25 GB download, ~40 GB disk) become a macOS VM base.","inputSchema":{"type":"object","properties":{"image":{"type":"string"}},"required":["image"],"additionalProperties":false}}));
+        tools.push(json!({"name":"container_run","description":"Create and start a detached container as its own micro-VM. Without gpus/desktop it runs on Apple Virtualization; gpus selects QEMU/HVF with virgl (GL) or experimental Venus (Vulkan via MoltenVK). A macOS image runs as a macOS VM with Apple's paravirtualized Metal GPU (omit command and gpus; use container_exec, and the vm_* screenshot and input tools on its vm_id through Guest Screen Sharing). Host bind mounts are not available through MCP.","inputSchema":{"type":"object","properties":{
             "image":{"type":"string"},
             "command":{"type":"array","items":{"type":"string"},"maxItems":128},
             "name":{"type":"string","pattern":"^[A-Za-z0-9_.-]{1,64}$"},
@@ -149,6 +155,15 @@ pub fn call(dir: &Path, name: &str, args: &Value) -> Result<Value> {
             }
             run(dir, &["rm".into(), container], Duration::from_secs(60))
         }
+        "container_exec" => {
+            let mut argv = vec!["exec".into(), string(args, "container")?];
+            let command = strings(args, "command")?;
+            if command.is_empty() {
+                bail!("command must not be empty")
+            }
+            argv.extend(command);
+            run(dir, &argv, Duration::from_secs(600))
+        }
         "image_pull" => run(
             dir,
             &["pull".into(), string(args, "image")?],
@@ -199,7 +214,7 @@ mod tests {
     #[test]
     fn scopes() {
         let names = |l| {
-            super::tools(l)
+            super::tools(l, false)
                 .iter()
                 .map(|t| t["name"].as_str().unwrap().to_owned())
                 .collect::<Vec<_>>()
@@ -207,6 +222,12 @@ mod tests {
         assert!(!names(false).contains(&"container_run".to_owned()));
         assert!(names(true).contains(&"container_run".to_owned()));
         assert!(names(false).contains(&"container_list".to_owned()));
+        assert!(super::tools(false, true)
+            .iter()
+            .any(|t| t["name"] == "container_exec"));
+        assert!(!super::tools(true, false)
+            .iter()
+            .any(|t| t["name"] == "container_exec"));
     }
     #[test]
     fn option_injection_refused() {

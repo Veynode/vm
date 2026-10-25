@@ -4,12 +4,14 @@
 //! <root>/blobs/sha256/<hex>     manifests, configs and layer blobs (verified)
 //! <root>/images.json            image records (reference → manifest/config/layers)
 //! <root>/rootfs/<config>.sqfs   read-only flattened root, built once per image
+//! <root>/macos/<manifest>/      read-only macOS machine from a Tart image (see `tart`)
 //! <root>/store.lock             flock held across mutations
 //! ```
 use crate::{
     flatten,
     reference::{validate_digest, Reference},
     registry::{Client, LINUX_ARM64},
+    tart,
 };
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -266,6 +268,9 @@ impl Store {
         let (manifest_digest, manifest) = client.resolve(&reference, &LINUX_ARM64)?;
         let value: Value = serde_json::from_slice(&manifest)?;
         self.put_bytes(&manifest)?;
+        if tart::is_tart(&value) {
+            return self.pull_macos(&reference, manifest_digest, &value, progress);
+        }
         let config = &value["config"];
         let config_digest = config["digest"]
             .as_str()
@@ -329,6 +334,43 @@ impl Store {
             config: image_config,
             created_at: now(),
         })
+    }
+
+    /// Tart macOS image. Tart configs are not unique per image, so the manifest
+    /// digest identifies it (as `config_digest`) and names its machine directory.
+    fn pull_macos(
+        &self,
+        reference: &Reference,
+        manifest_digest: String,
+        manifest: &Value,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<ImageRecord> {
+        let pulled = tart::pull(&self.root, reference, &manifest_digest, manifest, progress)?;
+        progress(&format!("pulled {reference} ({})", &manifest_digest[7..19]));
+        self.upsert(ImageRecord {
+            reference: reference.familiar(),
+            manifest_digest: Some(manifest_digest.clone()),
+            config_digest: manifest_digest,
+            layers: Vec::new(),
+            size: tart::allocated(&pulled.dir),
+            config: ImageConfig {
+                os: "darwin".into(),
+                architecture: "arm64".into(),
+                ..Default::default()
+            },
+            created_at: now(),
+        })
+    }
+
+    /// Machine directory of a macOS image (see `tart`).
+    pub fn macos_dir(&self, image: &ImageRecord) -> Result<PathBuf> {
+        if image.config.os != "darwin" {
+            bail!("{} is not a macOS image", image.reference)
+        }
+        Ok(self
+            .root
+            .join("macos")
+            .join(validate_digest(&image.config_digest)?))
     }
 
     /// Import a `docker save` archive (manifest.json + config + layers).
@@ -424,6 +466,12 @@ impl Store {
 
     /// Build (once) the read-only squashfs root for an image with `sqfstar`.
     pub fn rootfs(&self, image: &ImageRecord, progress: &mut dyn FnMut(&str)) -> Result<PathBuf> {
+        if image.config.os == "darwin" {
+            bail!(
+                "{} is a macOS image; it runs as a macOS VM, not on a Linux root",
+                image.reference
+            )
+        }
         let target = self.rootfs_path(image)?;
         if target.exists() {
             return Ok(target);
@@ -532,6 +580,31 @@ impl Store {
                 fs::remove_file(entry.path())?;
             }
         }
+        let machines = self.root.join("macos");
+        for entry in fs::read_dir(&machines).into_iter().flatten() {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if keep_roots.contains(&name) {
+                continue;
+            }
+            // An interrupted pull resumes from its partial directory until gc
+            // drops it; one that a pull still holds locked stays.
+            let _pulling = if name.starts_with(".partial-") {
+                match tart::try_lock_partial(&entry.path())? {
+                    Some(lock) => Some(lock),
+                    None => continue,
+                }
+            } else {
+                None
+            };
+            freed += tart::allocated(&entry.path());
+            for file in fs::read_dir(entry.path())? {
+                let file = file?.path();
+                fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+                fs::remove_file(file)?;
+            }
+            fs::remove_dir(entry.path())?;
+        }
         Ok(freed)
     }
 }
@@ -611,5 +684,54 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn gc_drops_unused_and_abandoned_macos_machines() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("images")).unwrap();
+        let machines = dir.path().join("images/macos");
+        let hex = |c: char| c.to_string().repeat(64);
+        let machine = |name: &str| {
+            let path = machines.join(name);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("disk.img"), vec![1u8; 8192]).unwrap();
+            fs::set_permissions(path.join("disk.img"), fs::Permissions::from_mode(0o444)).unwrap();
+            path
+        };
+        let record = |c: char| ImageRecord {
+            reference: format!("example/mac-{c}:latest"),
+            manifest_digest: Some(format!("sha256:{}", hex(c))),
+            config_digest: format!("sha256:{}", hex(c)),
+            layers: Vec::new(),
+            size: 0,
+            config: ImageConfig {
+                os: "darwin".into(),
+                ..Default::default()
+            },
+            created_at: 0,
+        };
+        machine(&hex('a'));
+        machine(&hex('b'));
+        machine(&hex('c'));
+        store.upsert(record('a')).unwrap();
+        store.upsert(record('b')).unwrap();
+        // b's image is removed but a container still uses it; c has no record.
+        store.remove("example/mac-b:latest").unwrap();
+        let abandoned = machine(&format!(".partial-{}", hex('d')));
+        fs::write(abandoned.join("lock"), b"").unwrap();
+        let pulling = machine(&format!(".partial-{}", hex('e')));
+        fs::write(pulling.join("lock"), b"").unwrap();
+        let held = tart::try_lock_partial(&pulling).unwrap();
+        assert!(held.is_some());
+        let in_use = HashSet::from([format!("sha256:{}", hex('b'))]);
+        assert!(store.gc(&in_use).unwrap() > 0);
+        let mut left: Vec<String> = fs::read_dir(&machines)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, [format!(".partial-{}", hex('e')), hex('a'), hex('b')]);
     }
 }

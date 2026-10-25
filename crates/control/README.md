@@ -539,6 +539,20 @@ actual `image/jpeg`; QEMU retains `image/png`. JSON/request/output limits stay
 unchanged. Screenshot support is conditional on Guest service permission, not a
 claim that every running macOS VM has automatically granted observation.
 
+### macOS containers through Screen Sharing
+
+Apple macOS configs may set `mac_address` (a locally administered unicast MAC
+for the NAT NIC) and `screen_sharing_login` (an absolute path to a private file
+holding `user\npassword`, which requires `mac_address`). With both, the worker
+answers `vm_guest_info`, `vm_screenshot` and bounded input itself: it finds the
+Guest address in the host DHCP leases for that MAC, connects to the Guest's
+Screen Sharing on port 5900 with Apple authentication (RFB type 30), reads raw
+frames and sends pointer/key events. Responses use the same JPEG ladder, frame
+UUIDs, generations and input validation as the Guest service, and
+`vm_guest_info` reports transport `screen-sharing-rfb`. No TCC permission is
+needed in the Guest; it shows its "screen is being observed" indicator.
+`veynodevm` writes these fields for macOS containers.
+
 See [Guest service](../../native/guest-macos/README.md) for staging/restart and
 capture behavior. Registering an existing stopped macOS config does not clone,
 format or reinstall its disk. A daemon cannot attach a standalone running worker:

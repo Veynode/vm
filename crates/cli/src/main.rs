@@ -2,13 +2,15 @@
 //!
 //! Containers run as micro-VMs (one VM per container, GPU through QEMU/HVF
 //! when requested) or, with `--shared`, inside the shared engine VM that also
-//! serves the docker CLI. All state lives under `veynodevm_home` (see
+//! serves the docker CLI. Tart-format macOS images run as macOS VMs. All state lives under `veynodevm_home` (see
 //! `vm_control::home`); the per-user daemon owns VM processes.
 mod args;
 mod container;
 mod daemon;
 mod desktop;
 mod engine;
+mod gpt;
+mod macos;
 mod proxy;
 mod ui;
 
@@ -30,9 +32,14 @@ Containers:
       -u, --user USER  --entrypoint CMD  --cpus N  -m, --memory SIZE
       --disk-size GiB  --dns IP  --mtu N  --gpus all|virgl|venus  --desktop  --shared
       (--gpus selects QEMU/HVF; otherwise Apple Virtualization)
+      macOS images (e.g. ghcr.io/cirruslabs/macos-tahoe-vanilla) run as macOS VMs
+      with Metal; COMMAND runs over SSH (-d: in the background, see logs; no
+      COMMAND: a login shell), -u sets the login (password from
+      VEYNODEVM_MACOS_PASSWORD, default admin), --disk-size grows the disk
   ps [-a] [-q]                       List containers
   logs [-f] CONTAINER                Show container output
-  exec CONTAINER COMMAND...          Run a command (bounded, 30 s max)
+  exec [-i] [-t] CONTAINER COMMAND...  Run a command (Linux: bounded, 30 s max)
+  cp SRC DST                         Copy files; one side is CONTAINER:PATH (macOS)
   start [-a] CONTAINER               Start a stopped container
   stop [-t SECONDS] CONTAINER...     Stop containers
   rm [-f] CONTAINER...               Remove containers
@@ -47,6 +54,7 @@ Images:
 
 Shared engine (docker CLI compatible):
   engine start|stop|status|env      Shared Linux VM running dockerd
+      start [--gpus venus|virgl] [--share DIR]...  (applied when the engine is created)
 
 Virtual machines:
   vm ls | vm create CONFIG.json | vm start|stop|rm|inspect ID
@@ -137,10 +145,11 @@ fn run(rest: &[String], json_output: bool) -> Result<i32> {
         .clone();
     let command: Vec<String> = p.positional[1..].to_vec();
     if p.has("shared") {
+        let store = Store::open(&home::images_dir()?)?;
+        if store.find(&image)?.is_some_and(|i| i.config.os == "darwin") {
+            bail!("macOS images run as their own VM; drop --shared")
+        }
         return engine::run_shared(rest, RUN_SPEC);
-    }
-    if p.has("interactive") || p.has("tty") {
-        eprintln!("veynodevm: -i/-t are accepted but interactive stdin is not wired to micro-VMs yet; output is streamed");
     }
     let options = container::RunOptions {
         image,
@@ -184,6 +193,18 @@ fn run(rest: &[String], json_output: bool) -> Result<i32> {
     };
     container::install_interrupt_handler();
     let c = container::create_and_start(&options)?;
+    if c.os == "darwin" {
+        return run_macos(
+            &c,
+            &options,
+            p.has("tty"),
+            p.has("interactive"),
+            json_output,
+        );
+    }
+    if p.has("interactive") || p.has("tty") {
+        eprintln!("veynodevm: -i/-t are accepted but interactive stdin is not wired to micro-VMs yet; output is streamed");
+    }
     if options.detach {
         if json_output {
             print_json(&json!({"id":c.id,"name":c.name}))?;
@@ -193,6 +214,40 @@ fn run(rest: &[String], json_output: bool) -> Result<i32> {
         return Ok(0);
     }
     attach(&c)
+}
+
+/// macOS has no entrypoint: COMMAND (or a login shell) runs over SSH once the
+/// Guest is up. In the foreground the container stops when it exits, as a
+/// Linux container does; with `-d` the COMMAND runs in the background.
+fn run_macos(
+    c: &container::Container,
+    options: &container::RunOptions,
+    tty: bool,
+    interactive: bool,
+    json_output: bool,
+) -> Result<i32> {
+    if options.detach {
+        if options.command.is_empty() {
+            if !c.volumes.is_empty() {
+                macos::ensure_ready(c, options.quiet)?;
+            }
+        } else {
+            macos::start_command(c)?;
+        }
+        if json_output {
+            print_json(&json!({"id":c.id,"name":c.name}))?;
+        } else {
+            println!("{}", c.id);
+        }
+        return Ok(0);
+    }
+    let code = macos::exec(c, &options.command, tty, interactive);
+    if c.auto_remove {
+        container::remove(c, true)?;
+    } else {
+        container::stop(c, Duration::from_secs(10))?;
+    }
+    code
 }
 
 fn attach(c: &container::Container) -> Result<i32> {
@@ -304,12 +359,12 @@ fn images(rest: &[String], json_output: bool) -> Result<i32> {
         return Ok(0);
     }
     println!(
-        "{:<40}{:<16}{:<18}SIZE",
+        "{:<40} {:<15} {:<17} SIZE",
         "REPOSITORY:TAG", "IMAGE ID", "CREATED"
     );
     for i in list {
         println!(
-            "{:<40}{:<16}{:<18}{}",
+            "{:<40} {:<15} {:<17} {}",
             i.reference,
             i.id(),
             age(i.created_at),
@@ -399,6 +454,9 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
         "logs" => {
             let p = parse(rest, &[("follow", Some('f'), false)], false)?;
             let c = container::find(p.positional.first().context("logs requires a CONTAINER")?)?;
+            if c.os == "darwin" {
+                return macos::logs(&c, p.has("follow"));
+            }
             container::stream_logs(
                 &c,
                 p.has("follow"),
@@ -426,6 +484,14 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
             if argv.is_empty() {
                 bail!("exec requires a COMMAND")
             }
+            if c.os == "darwin" {
+                if json_output {
+                    let result = macos::exec_capture(&c, argv)?;
+                    print_json(&result)?;
+                    return Ok(result["exit_code"].as_i64().unwrap_or(255) as i32);
+                }
+                return macos::exec(&c, argv, p.has("tty"), p.has("interactive"));
+            }
             let timeout = p
                 .value("timeout")
                 .map(str::parse)
@@ -444,11 +510,18 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
             }
             Ok(result["exit_code"].as_i64().unwrap_or(126) as i32)
         }
+        "cp" => match rest {
+            [source, target] => macos::cp(source, target),
+            _ => bail!("usage: veynodevm cp SRC DST (one side CONTAINER:PATH)"),
+        },
         "start" => {
             let (p, names) = names(rest, &[("attach", Some('a'), false)])?;
             for name in names {
                 let c = container::find(&name)?;
                 container::start(&c)?;
+                if p.has("attach") && c.os == "darwin" {
+                    return macos::logs(&c, true);
+                }
                 if p.has("attach") {
                     container::install_interrupt_handler();
                     return attach(&c);
@@ -502,11 +575,13 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
                     eprintln!("{m}")
                 }
             })?;
-            store.rootfs(&image, &mut |m| {
-                if !json_output {
-                    eprintln!("{m}")
-                }
-            })?;
+            if image.config.os != "darwin" {
+                store.rootfs(&image, &mut |m| {
+                    if !json_output {
+                        eprintln!("{m}")
+                    }
+                })?;
+            }
             if json_output {
                 print_json(&serde_json::to_value(&image)?)?;
             } else {

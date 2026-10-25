@@ -69,6 +69,11 @@ pub struct Container {
     pub memory_mib: u64,
     pub created_at: u64,
     pub vm_id: String,
+    /// "darwin" for macOS containers (see `macos`); empty for Linux.
+    #[serde(default)]
+    pub os: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac_address: Option<String>,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -190,7 +195,7 @@ pub fn find(name: &str) -> Result<Container> {
     }
 }
 
-fn save(container: &Container) -> Result<()> {
+pub fn save(container: &Container) -> Result<()> {
     let dir = container_dir(&container.id)?;
     let tmp = dir.join("container.json.tmp");
     fs::write(&tmp, serde_json::to_vec_pretty(container)?)?;
@@ -215,6 +220,10 @@ pub fn vm_state(container: &Container) -> String {
         Err(e) if e.to_string().contains("VM not found") => "missing".to_owned(),
         Err(_) => "unknown".to_owned(),
     }
+}
+
+pub fn is_active(container: &Container) -> bool {
+    active(&vm_state(container))
 }
 
 fn active(state: &str) -> bool {
@@ -266,6 +275,10 @@ pub fn parse_marker(line: &str) -> Option<(&str, &str)> {
 
 pub fn status_text(container: &Container) -> (String, String) {
     let state = vm_state(container);
+    if container.os == "darwin" {
+        let text = if active(&state) { "Up" } else { "Exited" };
+        return (state, text.to_owned());
+    }
     let console = read_console(container);
     let text = if active(&state) {
         if console.started {
@@ -319,28 +332,9 @@ fn ensure_image(store: &Store, name: &str, quiet: bool) -> Result<ImageRecord> {
     })
 }
 
-/// Create and start a container. Returns the record; the caller attaches.
-pub fn create_and_start(options: &RunOptions) -> Result<Container> {
-    let runtime = home::Runtime::load()?;
-    let boot = runtime
-        .boot
-        .clone()
-        .context("no micro-VM boot assets registered: run scripts/install-dev-runtime.py (runtime.json \"boot\")")?;
-    let store = Store::open(&home::images_dir()?)?;
-    let image = ensure_image(&store, &options.image, options.quiet)?;
-    let rootfs = store.rootfs(&image, &mut |m| {
-        if !options.quiet {
-            eprintln!("{m}")
-        }
-    })?;
-    // GPU acceleration is the QEMU/HVF path; a desktop without --gpus uses the
-    // Apple Virtualization 2D virtio-gpu display and AppKit window.
-    let qemu = options.gpus.is_some();
-    if qemu && runtime.qemu.is_none() {
-        bail!("--gpus needs the QEMU/HVF GPU runtime: run runtime/fetch-utm.sh and scripts/install-dev-runtime.py --qemu")
-    }
-    let id = random_hex(6);
-    let name = match &options.name {
+/// Validated `--name`, or one derived from the image reference.
+pub fn container_name(options: &RunOptions, image: &ImageRecord, id: &str) -> Result<String> {
+    Ok(match &options.name {
         Some(n) => {
             if n.is_empty()
                 || n.len() > 64
@@ -366,7 +360,11 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
                 .collect();
             format!("{base}-{}", &id[..4])
         }
-    };
+    })
+}
+
+/// Published ports, checked to be free. UDP needs QEMU's user network.
+pub fn parse_ports(options: &RunOptions, qemu: bool) -> Result<Vec<PortSpec>> {
     let ports = options
         .ports
         .iter()
@@ -382,6 +380,11 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
         }
         port_free(p)?;
     }
+    Ok(ports)
+}
+
+/// Bind mounts with created, canonical host directories.
+pub fn parse_volumes(options: &RunOptions) -> Result<Vec<VolumeSpec>> {
     let mut volumes = options
         .volumes
         .iter()
@@ -392,6 +395,36 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
             .with_context(|| format!("create volume directory {}", v.host.display()))?;
         v.host = v.host.canonicalize()?;
     }
+    Ok(volumes)
+}
+
+/// Create and start a container. Returns the record; the caller attaches.
+pub fn create_and_start(options: &RunOptions) -> Result<Container> {
+    let store = Store::open(&home::images_dir()?)?;
+    let image = ensure_image(&store, &options.image, options.quiet)?;
+    if image.config.os == "darwin" {
+        return crate::macos::create_and_start(options, &store, &image);
+    }
+    let runtime = home::Runtime::load()?;
+    let boot = runtime
+        .boot
+        .clone()
+        .context("no micro-VM boot assets registered: run scripts/install-dev-runtime.py (runtime.json \"boot\")")?;
+    let rootfs = store.rootfs(&image, &mut |m| {
+        if !options.quiet {
+            eprintln!("{m}")
+        }
+    })?;
+    // GPU acceleration is the QEMU/HVF path; a desktop without --gpus uses the
+    // Apple Virtualization 2D virtio-gpu display and AppKit window.
+    let qemu = options.gpus.is_some();
+    if qemu && runtime.qemu.is_none() {
+        bail!("--gpus needs the QEMU/HVF GPU runtime: run runtime/fetch-utm.sh and scripts/install-dev-runtime.py --qemu")
+    }
+    let id = random_hex(6);
+    let name = container_name(options, &image, &id)?;
+    let ports = parse_ports(options, qemu)?;
+    let volumes = parse_volumes(options)?;
     let config = &image.config;
     let entrypoint = options
         .entrypoint
@@ -549,6 +582,8 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
             memory_mib,
             created_at: now(),
             vm_id: vm_id.clone(),
+            os: String::new(),
+            mac_address: None,
         };
         save(&container)?;
         daemon_call("create", vm)?;
@@ -586,6 +621,9 @@ pub fn stream_logs(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<Option<i32>> {
+    if container.os == "darwin" {
+        bail!("macOS containers have no entrypoint output; use veynodevm exec")
+    }
     let path = container_dir(&container.id)?.join("console.log");
     let deadline = Instant::now() + Duration::from_secs(30);
     while !path.exists() {
@@ -693,8 +731,15 @@ pub fn start(container: &Container) -> Result<()> {
     }
     reconcile_execution(container)?;
     daemon_call("start", json!({"id":container.vm_id}))?;
+    if container.os == "darwin" {
+        crate::macos::wait_started(container)?;
+    }
     if !container.ports.is_empty() && container.backend == "apple-virtualization" {
         crate::proxy::spawn(container)?;
+    }
+    if container.os == "darwin" && !container.argv.is_empty() {
+        // Like an entrypoint, the COMMAND runs again on every start.
+        crate::macos::start_command(container)?;
     }
     Ok(())
 }
@@ -703,6 +748,9 @@ pub fn stop(container: &Container, timeout: Duration) -> Result<()> {
     crate::proxy::stop_existing(container)?;
     if !active(&vm_state(container)) {
         return Ok(());
+    }
+    if container.os == "darwin" {
+        return crate::macos::stop(container, timeout);
     }
     // The guest service powers the micro-VM off; fall back to a hard stop.
     let _ = daemon_call("shutdown", json!({"id":container.vm_id,"mode":"guest"}));
@@ -750,6 +798,29 @@ pub fn remove(container: &Container, force: bool) -> Result<()> {
 
 /// Run a bounded command in a running container through the guest service.
 pub fn exec(container: &Container, argv: &[String], timeout_ms: u64) -> Result<Value> {
+    // The guest service comes up a few seconds after boot. QEMU's daemon refuses
+    // with "not ready yet"; Apple Virtualization refuses before its socket exists
+    // (invalid_state) or fails the vsock connect (guest_unavailable). None of
+    // these dispatched anything, so wait and retry while the VM is still up.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let retryable = |e: &anyhow::Error| {
+        let text = e.to_string();
+        let refused = text.contains("not ready yet")
+            || (container.backend == "apple-virtualization"
+                && (text.contains("guest_unavailable") || text.contains("invalid_state")));
+        refused && active(&vm_state(container))
+    };
+    loop {
+        match exec_once(container, argv, timeout_ms) {
+            Err(e) if retryable(&e) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            other => return other,
+        }
+    }
+}
+
+fn exec_once(container: &Container, argv: &[String], timeout_ms: u64) -> Result<Value> {
     let owner = random_hex(32);
     let lease = daemon_call(
         "acquire_control",
@@ -776,7 +847,12 @@ pub fn exec(container: &Container, argv: &[String], timeout_ms: u64) -> Result<V
 }
 
 pub fn inspect(container: &Container) -> Result<Value> {
-    let console = read_console(container);
+    let mut console = read_console(container);
+    if container.os == "darwin" {
+        console.ip = crate::macos::guest_ip(container, Duration::ZERO).ok();
+        // VZMacGraphicsDevice always presents Apple's paravirtualized GPU.
+        console.gpu = Some("Apple Paravirtual device (Metal)".into());
+    }
     let (state, status) = status_text(container);
     let vm = daemon_call("status", json!({"id":container.vm_id})).unwrap_or(Value::Null);
     Ok(json!({
@@ -797,8 +873,11 @@ pub fn images_in_use() -> Result<HashSet<String>> {
     Ok(list()?.into_iter().map(|c| c.config_digest).collect())
 }
 
-/// Follow the console log until the IP marker appears.
+/// Follow the console log until the IP marker appears (macOS: DHCP lease).
 pub fn wait_for_ip(container: &Container, timeout: Duration) -> Result<String> {
+    if container.os == "darwin" {
+        return crate::macos::guest_ip(container, timeout);
+    }
     let deadline = Instant::now() + timeout;
     let path = container_dir(&container.id)?.join("console.log");
     let mut position = 0;

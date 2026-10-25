@@ -105,6 +105,15 @@ pub struct Config {
     /// Apple NAT Guest address is reachable from the host directly).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<PortForward>,
+    /// Fixed NIC address (Apple Virtualization), so the host can find the
+    /// Guest's DHCP lease.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mac_address: Option<String>,
+    /// macOS Guest login file ("user\npassword"): the worker serves
+    /// screenshots and input through the Guest's Screen Sharing (RFB) server
+    /// instead of the in-Guest service, so no Guest TCC grants are needed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screen_sharing_login: Option<PathBuf>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -137,6 +146,14 @@ fn loopback() -> std::net::Ipv4Addr {
 }
 fn tcp() -> String {
     "tcp".into()
+}
+fn valid_local_mac(mac: &str) -> bool {
+    let octets: Vec<_> = mac.split(':').collect();
+    octets.len() == 6
+        && octets
+            .iter()
+            .all(|o| o.len() == 2 && o.bytes().all(|b| b.is_ascii_hexdigit()))
+        && u8::from_str_radix(octets[0], 16).is_ok_and(|first| first & 0b11 == 0b10)
 }
 fn is_false(value: &bool) -> bool {
     !*value
@@ -194,6 +211,21 @@ impl Config {
         if let Some(shared) = &self.shared_dir {
             if !shared.is_absolute() || !shared.is_dir() {
                 bail!("shared_dir must exist at an absolute path")
+            }
+        }
+        if let Some(mac) = &self.mac_address {
+            if self.backend != Backend::AppleVirtualization || !valid_local_mac(mac) {
+                bail!("mac_address must be a locally administered unicast address (Apple Virtualization)")
+            }
+        }
+        if let Some(login) = &self.screen_sharing_login {
+            if self.backend != Backend::AppleVirtualization
+                || self.guest != "macos"
+                || self.mac_address.is_none()
+                || !login.is_absolute()
+                || !login.is_file()
+            {
+                bail!("screen_sharing_login needs an Apple macOS Guest with mac_address and an existing absolute login file")
             }
         }
         if self.extra_disks.len() > 4 || self.shares.len() > 8 || self.ports.len() > 32 {
@@ -2209,6 +2241,11 @@ impl Manager {
                     .filter(|e| *e > 0 && *e <= 9007199254740991)
                     .context("execution scope epoch invalid")?;
                 if method == "exec_start" {
+                    // Nothing has been dispatched yet: refusing here records no scope,
+                    // so a booting Guest is not terminated to confirm cleanup.
+                    if run.state.lock().unwrap()["guest_integration_state"] != "ready" {
+                        bail!("guest execution service is not ready yet; retry after the Guest finishes starting")
+                    }
                     self.exec_retirements
                         .lock()
                         .unwrap()
@@ -2404,7 +2441,7 @@ fn tools_with_input(lifecycle: bool, execute: bool, files: bool, input: bool) ->
     let id = json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false});
     let mut tools = vec![
         json!({"name":"vm_list","description":"List registered VMs and actual backend process state.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}),
-        json!({"name":"vm_screenshot","description":"Capture the same console at full source resolution: QEMU PNG or opted-in macOS Guest JPEG. Returns actual MIME, frame id, dimensions, scale and capture timing. macOS requires existing Guest Screen Recording permission; never requests it automatically.","inputSchema":id}),
+        json!({"name":"vm_screenshot","description":"Capture the same console at full source resolution: QEMU PNG or macOS Guest JPEG. Returns actual MIME, frame id, dimensions, scale and capture timing. veynodevm macOS containers are captured through the Guest's Screen Sharing server (no Guest permission grants); other macOS Guests need the opted-in Guest service with existing Screen Recording permission, never requested automatically.","inputSchema":id}),
         json!({"name":"vm_windows","description":"Read macOS Guest on-screen application window metadata with existing Screen Recording permission and --allow-observe. No titles, focus, stacking order, Accessibility tree or input authority. Coordinates are Guest desktop-global points; this enumeration is not an atomic screenshot. Other Guest/backend combinations are unsupported.","inputSchema":id}),
         json!({"name":"vm_guest_info","description":"Query the real Guest service: Apple host-only vsock or QEMU private virtio-serial (default observer-only; explicit v2 permits rootless cgroup execution). Reports actual capabilities; fails if unavailable.","inputSchema":id}),
         json!({"name":"vm_status","description":"Get VM configuration and process state; running does not assert guest health.","inputSchema":id}),
@@ -2504,7 +2541,7 @@ fn tools_with_input(lifecycle: bool, execute: bool, files: bool, input: bool) ->
             tools.push(json!({"name":format!("vm_{name}"),"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false}}));
         }
     }
-    tools.extend(container_tools::tools(lifecycle));
+    tools.extend(container_tools::tools(lifecycle, execute));
     json!({"tools":tools})
 }
 fn rpc_error(id: Value, code: i64, message: impl ToString) -> Value {
@@ -2682,7 +2719,7 @@ pub fn mcp_with_input(
                     )
                 } else {
                     initialized = true;
-                    json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":VERSION,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"veynode-vm","version":env!("CARGO_PKG_VERSION")},"instructions":"Local trusted-user daemon. Observe is default; lifecycle access requires server --allow-lifecycle. Command execution requires --allow-execute and enabled Linux Guest async jobs; macOS legacy execution is not exposed by this MCP API. File transfer independently requires --allow-files and an enabled Guest files root: a dedicated Linux files account, or macOS --allow-files --files-root with a private directory owned by the service UID. macOS files are not isolated from other same-UID programs. Query vm_guest_info for actual files capability and file_policy; Guest denial is an error, not permission to use another path. Screenshot observation requires QEMU capture or macOS Guest --allow-observe with existing Guest Screen Recording permission. vm_windows uses macOS Guest observation only and returns no titles or input authority; other backends are unsupported. Physical desktop input always requires server --allow-input. Its backend must provide QEMU persistent capture, or macOS Guest --allow-observe --allow-input with existing Guest Screen Recording and Accessibility permissions. Apple Linux desktop input is unsupported. Query vm_guest_info for macOS permission availability and supported physical keys; Unicode text and keyboard-layout translation are unsupported. Input requires a matching screenshot younger than 5 seconds and current control. Acquire control before input or command execution; leases last 60 seconds and must be renewed. Backend input acknowledgement does not prove application acceptance. VM start returns before guest readiness."}})
+                    json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":VERSION,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"veynode-vm","version":env!("CARGO_PKG_VERSION")},"instructions":"Local trusted-user daemon. Observe is default; lifecycle access requires server --allow-lifecycle. Command execution requires --allow-execute and enabled Linux Guest async jobs; macOS legacy execution is not exposed by vm_exec, but container_exec runs commands in veynodevm macOS containers over SSH. File transfer independently requires --allow-files and an enabled Guest files root: a dedicated Linux files account, or macOS --allow-files --files-root with a private directory owned by the service UID. macOS files are not isolated from other same-UID programs. Query vm_guest_info for actual files capability and file_policy; Guest denial is an error, not permission to use another path. Screenshot observation requires QEMU capture, a veynodevm macOS container (Guest Screen Sharing; no Guest permission grants) or macOS Guest --allow-observe with existing Guest Screen Recording permission. vm_windows uses macOS Guest observation only and returns no titles or input authority; other backends are unsupported. Physical desktop input always requires server --allow-input. Its backend must provide QEMU persistent capture, a veynodevm macOS container (Guest Screen Sharing), or macOS Guest --allow-observe --allow-input with existing Guest Screen Recording and Accessibility permissions. Apple Linux desktop input is unsupported. Query vm_guest_info for macOS permission availability and supported physical keys; Unicode text and keyboard-layout translation are unsupported. Input requires a matching screenshot younger than 5 seconds and current control. Acquire control before input or command execution; leases last 60 seconds and must be renewed. Backend input acknowledgement does not prove application acceptance. VM start returns before guest readiness."}})
                 }
             } else if method == "ping" {
                 json!({"jsonrpc":"2.0","id":id,"result":{}})
@@ -3178,6 +3215,17 @@ mod tests {
         assert_eq!(linux["input"], false);
         assert_eq!(linux["command_execution"], true);
         assert_eq!(linux["async_commands"], true);
+    }
+    #[test]
+    fn mac_address_must_be_local_unicast() {
+        assert!(valid_local_mac("72:76:f4:5e:d8:14"));
+        assert!(!valid_local_mac("73:76:f4:5e:d8:14"), "multicast");
+        assert!(
+            !valid_local_mac("00:1c:42:00:00:01"),
+            "universally administered"
+        );
+        assert!(!valid_local_mac("72:76:f4:5e:d8"));
+        assert!(!valid_local_mac("72:76:f4:5e:d8:1g"));
     }
     #[test]
     fn guest_stream_bridge_is_strict_local_macos_only() {

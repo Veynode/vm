@@ -1,11 +1,16 @@
 #!/bin/sh
-# Container entrypoint: device discovery, Xorg on the virtio-gpu scanout,
-# then an XFCE session. Reports the GL renderer on stdout (container logs).
+# Container entrypoint shared by the desktop images: device discovery, Xorg on
+# the virtio-gpu scanout, then an XFCE session. Reports the GL and Vulkan
+# renderers on stdout (container logs).
 set -u
 mkdir -p /run/udev /tmp/.X11-unix "$XDG_RUNTIME_DIR"
 chmod 1777 /tmp/.X11-unix
 chmod 0700 "$XDG_RUNTIME_DIR"
-udevd --daemon
+# eudev (Alpine) installs udevd on PATH; systemd distributions keep it private.
+for udevd in udevd /lib/systemd/systemd-udevd /usr/lib/systemd/systemd-udevd; do
+    command -v "$udevd" >/dev/null 2>&1 && break
+done
+"$udevd" --daemon
 udevadm trigger --action=add
 udevadm settle --timeout=10
 if [ ! -e /dev/dri/card0 ]; then

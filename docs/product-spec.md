@@ -17,7 +17,9 @@ Both modes need: registry pull (`linux/arm64`), `-p` port publishing, read-write
 
 ### Guests
 
-The architecture keeps three guest operating systems: Linux ARM, macOS ARM and Windows ARM. **Only Linux is implemented in the current phase.** macOS and Windows stay in the config/capability model and must fail with an explicit unsupported error. Existing macOS guest integration code (`native/guest-macos`, `native/guest-launcher`) is kept but is not on the main path.
+The architecture keeps three guest operating systems: Linux ARM, macOS ARM and Windows ARM. **Linux and macOS are implemented; Windows is not.** Windows, and macOS on QEMU, stay in the config/capability model and must fail with an explicit unsupported error.
+
+macOS containers use Tart-compatible OCI images (config, LZ4 disk chunks, NVRAM) on Apple Virtualization with Apple's paravirtualized Metal GPU. They follow the Linux container lifecycle: the pulled disk is a read-only base, each `run` gets an APFS clone with a fresh machine identity, and `rm` discards it. `exec` and `cp` use SSH with a per-home key installed on first use; `run IMAGE COMMAND` runs COMMAND over SSH (in the foreground, or with `-d` in the background with `logs`); `-v` uses virtiofs mounted by the CLI; `-p` uses the host TCP proxy; `--disk-size` grows the clone and the guest's APFS container on first boot. The macOS GPU is verified at game load (see known issues for numbers). MCP screenshots and input use the guest's own Screen Sharing (RFB with Apple authentication) from the worker, so the guest needs no Screen Recording or Accessibility grant. The signed-in Guest service (`native/guest-macos`, `native/guest-launcher`) is kept but is not on the main path.
 
 ### User interfaces
 

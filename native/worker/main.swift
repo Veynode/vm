@@ -36,6 +36,8 @@ struct Config: Decodable {
     var height: Int?
     var extra_disks: [ExtraDisk]?
     var shares: [Share]?
+    var mac_address: String?
+    var screen_sharing_login: String?
 }
 struct ExtraDisk: Decodable { let path: String; let read_only: Bool }
 struct Share: Decodable { let tag: String; let path: String; var read_only: Bool? }
@@ -77,6 +79,10 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
     var guestStreamBridge: GuestStreamBridge?
     var guestStreamBinding:(worker:String,bridge:String)?
     var diskLock: Int32?
+    lazy var screenSharing: ScreenSharingGuest? = {
+        guard config.guest == "macos", let mac = config.mac_address, let login = config.screen_sharing_login else { return nil }
+        return ScreenSharingGuest(mac: mac, loginFile: login)
+    }()
     init(_ config: Config) { self.config = config }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     var lockedDiskDescriptor: Int32?
@@ -168,6 +174,10 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
                 try platform.hardwareModel.dataRepresentation.write(to:hardwareURL, options:.atomic)
                 try platform.machineIdentifier.dataRepresentation.write(to:machineURL, options:.atomic)
             } else {
+                // A clone of an image without machine-id.bin gets its own identity.
+                if !FileManager.default.fileExists(atPath: machineURL.path) {
+                    try VZMacMachineIdentifier().dataRepresentation.write(to:machineURL, options:.atomic)
+                }
                 guard let hardware = VZMacHardwareModel(dataRepresentation:try Data(contentsOf:hardwareURL)), hardware.isSupported,
                       let machine = VZMacMachineIdentifier(dataRepresentation:try Data(contentsOf:machineURL)) else { throw NativeError(message:"Invalid or unsupported macOS machine identity") }
                 guard FileManager.default.fileExists(atPath: auxiliaryURL.path) else { throw NativeError(message:"Missing auxiliary storage") }
@@ -185,6 +195,10 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
         } else { throw NativeError(message:"Unsupported guest: \(config.guest)") }
         let network = VZVirtioNetworkDeviceConfiguration()
         network.attachment = VZNATNetworkDeviceAttachment()
+        if let mac = config.mac_address {
+            guard let address = VZMACAddress(string:mac) else { throw NativeError(message:"Invalid mac_address") }
+            network.macAddress = address
+        }
         c.networkDevices = [network]
         c.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         c.socketDevices = [VZVirtioSocketDeviceConfiguration()]
@@ -351,6 +365,10 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
         let id = object["id"] ?? NSNull()
         func reject(_ code: String, _ message: String) { emit(["id":id,"error":["code":code,"message":message]]) }
         guard vm.state == .running, let socket = vm.socketDevices.first as? VZVirtioSocketDevice else { reject("invalid_state","VM must be running with a virtio socket"); return }
+        if let sharing = screenSharing, let request = object["request"] as? [String:Any], let method = request["method"] as? String, ScreenSharingGuest.handles(method) {
+            sharing.handle(request) { envelope in emit(["id":id,"result":envelope]) }
+            return
+        }
         guard guestRequests.count < 16 else { reject("busy","Too many concurrent guest requests"); return }
         guard let request = object["request"] as? [String:Any], let requestID = request["id"], request["method"] is String,
               let data = guestRequestData(request) else { reject("invalid_request","Expected guest request with id/method within a 64 KiB line including newline"); return }
@@ -534,7 +552,7 @@ switch args[1] {
 case "framing-test": jsonFramingSelfTest()
 #endif
 case "probe":
-    emit(["backend":"apple-virtualization","protocol_version":1,"architecture":"arm64","virtualization_supported":VZVirtualMachine.isSupported,"host_os":ProcessInfo.processInfo.operatingSystemVersionString,"memory_bytes":ProcessInfo.processInfo.physicalMemory,"logical_cpus":ProcessInfo.processInfo.processorCount,"limits":["min_cpus":VZVirtualMachineConfiguration.minimumAllowedCPUCount,"max_cpus":VZVirtualMachineConfiguration.maximumAllowedCPUCount,"min_memory_bytes":VZVirtualMachineConfiguration.minimumAllowedMemorySize,"max_memory_bytes":VZVirtualMachineConfiguration.maximumAllowedMemorySize],"guests":["linux":["boot":"direct-kernel","display":"VZVirtioGraphicsDevice + VZVirtualMachineView","gpu_3d":"unverified; virtio scanout is not a 3D claim","headless_lifecycle":true],"macos":["boot":"VZMacOSBootLoader","install":"VZMacOSInstaller","display":"VZMacGraphicsDevice + VZVirtualMachineView","gpu_3d":"unverified in guest","headless_lifecycle":true],"windows":["supported":false]],"remote_capture":false,"snapshot_restore":"unverified","native_display":true,"guest_transport":"virtio-vsock","entitlement_required":"com.apple.security.virtualization"])
+    emit(["backend":"apple-virtualization","protocol_version":1,"architecture":"arm64","virtualization_supported":VZVirtualMachine.isSupported,"host_os":ProcessInfo.processInfo.operatingSystemVersionString,"memory_bytes":ProcessInfo.processInfo.physicalMemory,"logical_cpus":ProcessInfo.processInfo.processorCount,"limits":["min_cpus":VZVirtualMachineConfiguration.minimumAllowedCPUCount,"max_cpus":VZVirtualMachineConfiguration.maximumAllowedCPUCount,"min_memory_bytes":VZVirtualMachineConfiguration.minimumAllowedMemorySize,"max_memory_bytes":VZVirtualMachineConfiguration.maximumAllowedMemorySize],"guests":["linux":["boot":"direct-kernel","display":"VZVirtioGraphicsDevice + VZVirtualMachineView","gpu_3d":"unverified; virtio scanout is not a 3D claim","headless_lifecycle":true],"macos":["boot":"VZMacOSBootLoader","install":"VZMacOSInstaller","display":"VZMacGraphicsDevice + VZVirtualMachineView","gpu_3d":"paravirtualized Metal (AppleParavirtGPU); compute and game-like rendering verified in a macOS 26.6 guest; 60 Hz display","headless_lifecycle":true],"windows":["supported":false]],"remote_capture":false,"snapshot_restore":"unverified","native_display":true,"guest_transport":"virtio-vsock","entitlement_required":"com.apple.security.virtualization"])
 case "latest-restore":
     VZMacOSRestoreImage.fetchLatestSupported { result in
         switch result {

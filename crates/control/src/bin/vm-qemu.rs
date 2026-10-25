@@ -1395,6 +1395,11 @@ fn run() -> Result<()> {
                     updated["qmp_error"] = json!(error.to_string());
                 }
             }
+            if let Some(exec) = &guest_exec {
+                // Lets the daemon refuse execution before recording a scope that
+                // an unready transport could only retire by terminating QEMU.
+                updated["guest_integration_state"] = json!(exec.state());
+            }
             if updated != state {
                 emit(updated.clone())?;
                 state = updated;

@@ -17,7 +17,43 @@ fn fixture_launch(f: &mut FilePipeFixture) -> exec_witness::Witness {
         .unwrap()
         .launch(w.identity.clone())
         .unwrap();
+    // The worker reports its serial execution transport as connected.
+    f.manager.running.get_mut("mac").unwrap().state.lock().unwrap()["guest_integration_state"] =
+        json!("ready");
     w
+}
+#[test]
+fn unready_serial_transport_refuses_start_without_recording_scope() {
+    let mut f = FilePipeFixture::macos();
+    let _witness = fixture_launch(&mut f);
+    {
+        let config = f.manager.configs.get_mut("mac").unwrap();
+        config.backend = Backend::QemuHvf;
+        config.guest = "linux".into();
+        config.qemu_guest_exec = true;
+    }
+    f.manager.running.get_mut("mac").unwrap().state.lock().unwrap()["guest_integration_state"] =
+        json!("connecting");
+    let owner = "a".repeat(64);
+    let epoch = f
+        .manager
+        .leases
+        .lock()
+        .unwrap()
+        .acquire("mac", &owner, std::time::Instant::now())
+        .unwrap();
+    let mut pending = None;
+    let error = f.manager.dispatch(json!({"method":"exec_start","arguments":{"id":"mac","owner":owner,"epoch":epoch,"argv":["/bin/true"],"timeout_ms":1000}}),&mut pending).unwrap_err();
+    assert!(error.to_string().contains("not ready"));
+    assert!(pending.is_none());
+    // No scope means release has nothing to retire, so the Guest is never terminated.
+    assert!(f
+        .manager
+        .exec_retirements
+        .lock()
+        .unwrap()
+        .records(None, Some("mac"))
+        .is_empty());
 }
 #[test]
 fn serial_start_registers_original_scope_before_any_job_ack_and_fences_reacquire() {

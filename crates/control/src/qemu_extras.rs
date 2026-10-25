@@ -46,8 +46,16 @@ pub fn arguments(config: &Config) -> Result<Vec<String>> {
     }
     for share in &config.shares {
         let path = option_value(share.path.to_str().unwrap_or(","))?;
+        // Writable shares keep guest ownership/mode in xattrs, so a guest chown
+        // (docker creating a missing bind source) succeeds without changing
+        // real host ownership; QEMU runs unprivileged and could not chown.
+        let model = if share.read_only {
+            "none"
+        } else {
+            "mapped-xattr"
+        };
         let mut value = format!(
-            "local,path={path},mount_tag={},security_model=none,id=veynode-share-{}",
+            "local,path={path},mount_tag={},security_model={model},id=veynode-share-{}",
             share.tag, share.tag
         );
         if share.read_only {
