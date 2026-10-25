@@ -101,7 +101,7 @@ Setup Assistant remains interactive after installation.
 
 The worker opens each writable disk and verifies a regular file, then holds an
 exclusive advisory lock on a private key derived from the opened `(device,inode)`
-under `~/Library/Application Support/Veynode/locks/`. This directory is shared by
+under `~/Library/Application Support/VeynodeVM/locks/`. This directory is shared by
 all checkouts for the current user; directories and files are checked for safe
 ownership/permissions and opened without following final-component symlinks.
 Hard links converge on the same key. The disk descriptor and lock remain open

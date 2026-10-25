@@ -34,7 +34,11 @@ struct Config: Decodable {
     var shared_dir: String?
     var width: Int?
     var height: Int?
+    var extra_disks: [ExtraDisk]?
+    var shares: [Share]?
 }
+struct ExtraDisk: Decodable { let path: String; let read_only: Bool }
+struct Share: Decodable { let tag: String; let path: String; var read_only: Bool? }
 struct NativeError: LocalizedError {
     let message: String
     var errorDescription: String? { message }
@@ -108,7 +112,7 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
             }
             return fd
         }
-        let productFD = try directory(supportFD,"Veynode",privateOnly:false)
+        let productFD = try directory(supportFD,"VeynodeVM",privateOnly:false)
         defer { close(productFD) }
         let locksFD = try directory(productFD,"locks",privateOnly:true)
         defer { close(locksFD) }
@@ -184,14 +188,23 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
         c.networkDevices = [network]
         c.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         c.socketDevices = [VZVirtioSocketDeviceConfiguration()]
-        if let directory = config.shared_dir {
-            let url = URL(fileURLWithPath:directory).standardizedFileURL.resolvingSymlinksInPath()
-            var isDirectory:ObjCBool = false
-            guard FileManager.default.fileExists(atPath:url.path,isDirectory:&isDirectory), isDirectory.boolValue else { throw NativeError(message:"shared_dir must be an existing directory") }
-            let filesystem = VZVirtioFileSystemDeviceConfiguration(tag:"veynode")
-            filesystem.share = VZSingleDirectoryShare(directory:VZSharedDirectory(url:url,readOnly:true))
-            c.directorySharingDevices = [filesystem]
+        var shares:[(tag:String,path:String,readOnly:Bool)] = []
+        if let directory = config.shared_dir { shares.append((tag:"veynode",path:directory,readOnly:true)) }
+        for share in config.shares ?? [] {
+            guard share.tag != "veynode" else { throw NativeError(message:"share tag veynode is reserved") }
+            shares.append((tag:share.tag,path:share.path,readOnly:share.read_only ?? false))
         }
+        var sharingDevices:[VZDirectorySharingDeviceConfiguration] = []
+        for share in shares {
+            let url = URL(fileURLWithPath:share.path).standardizedFileURL.resolvingSymlinksInPath()
+            var isDirectory:ObjCBool = false
+            guard FileManager.default.fileExists(atPath:url.path,isDirectory:&isDirectory), isDirectory.boolValue else { throw NativeError(message:"shared directories must exist") }
+            try VZVirtioFileSystemDeviceConfiguration.validateTag(share.tag)
+            let filesystem = VZVirtioFileSystemDeviceConfiguration(tag:share.tag)
+            filesystem.share = VZSingleDirectoryShare(directory:VZSharedDirectory(url:url,readOnly:share.readOnly))
+            sharingDevices.append(filesystem)
+        }
+        c.directorySharingDevices = sharingDevices
         if let disk = config.disk {
             var lockedMetadata = stat(),pathMetadata = stat()
             guard let descriptor = lockedDiskDescriptor,fstat(descriptor,&lockedMetadata) == 0,
@@ -201,6 +214,12 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
             let attachment = try VZDiskImageStorageDeviceAttachment(url: URL(fileURLWithPath:disk), readOnly:false)
             c.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment:attachment)]
         } else if config.guest == "macos" { throw NativeError(message:"macOS requires disk") }
+        for extra in config.extra_disks ?? [] {
+            // Only read-only extras are accepted: writable images need the primary disk lock.
+            guard extra.read_only else { throw NativeError(message:"extra disks must be read-only") }
+            let attachment = try VZDiskImageStorageDeviceAttachment(url: URL(fileURLWithPath:extra.path), readOnly:true)
+            c.storageDevices.append(VZVirtioBlockDeviceConfiguration(attachment:attachment))
+        }
         if let log = config.serial_log {
             let url = URL(fileURLWithPath:log)
             if !FileManager.default.fileExists(atPath:log) { guard FileManager.default.createFile(atPath:log, contents:nil, attributes:[.posixPermissions:0o600]) else { throw NativeError(message:"Cannot create serial log") } }

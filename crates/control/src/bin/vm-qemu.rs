@@ -1077,8 +1077,8 @@ fn run() -> Result<()> {
             "-serial",
             "stdio",
             "-nic",
-            "user,model=virtio-net-pci",
         ])
+        .arg(vm_control::qemu_extras::nic(&config))
         .arg("-device")
         .arg(
             config
@@ -1136,6 +1136,7 @@ fn run() -> Result<()> {
     if let Some(disk) = &disk_guard {
         disk.configure_command(&mut command)?;
     }
+    command.args(vm_control::qemu_extras::arguments(&config)?);
     if let Some(witness) = &witness {
         witness.configure_qemu(&mut command)?;
     }

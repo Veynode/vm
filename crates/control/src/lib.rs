@@ -1,8 +1,10 @@
 pub mod backend;
 pub mod bridge;
+pub mod container_tools;
 mod exec_journal;
 pub mod exec_scope;
 pub mod exec_witness;
+pub mod home;
 mod input_retirement;
 use input_retirement::InputRetirement;
 pub mod input;
@@ -11,6 +13,7 @@ mod lease;
 mod native_control;
 pub mod native_input;
 pub mod qemu_disk;
+pub mod qemu_extras;
 pub mod qemu_graphics;
 mod resources;
 mod windows;
@@ -92,6 +95,48 @@ pub struct Config {
     pub height: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shared_dir: Option<PathBuf>,
+    /// Additional read-only block devices, attached after `disk` in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_disks: Vec<ExtraDisk>,
+    /// Host directories exposed by tag: virtiofs on Apple, 9p on QEMU.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shares: Vec<Share>,
+    /// Host listener → Guest port forwards (QEMU user networking only; the
+    /// Apple NAT Guest address is reachable from the host directly).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<PortForward>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtraDisk {
+    pub path: PathBuf,
+    /// Must be true: writable disks need the cooperating-worker lock that only
+    /// the primary `disk` carries.
+    pub read_only: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Share {
+    pub tag: String,
+    pub path: PathBuf,
+    #[serde(default)]
+    pub read_only: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortForward {
+    #[serde(default = "loopback")]
+    pub host_address: std::net::Ipv4Addr,
+    pub host_port: u16,
+    pub guest_port: u16,
+    #[serde(default = "tcp")]
+    pub protocol: String,
+}
+fn loopback() -> std::net::Ipv4Addr {
+    std::net::Ipv4Addr::LOCALHOST
+}
+fn tcp() -> String {
+    "tcp".into()
 }
 fn is_false(value: &bool) -> bool {
     !*value
@@ -149,6 +194,49 @@ impl Config {
         if let Some(shared) = &self.shared_dir {
             if !shared.is_absolute() || !shared.is_dir() {
                 bail!("shared_dir must exist at an absolute path")
+            }
+        }
+        if self.extra_disks.len() > 4 || self.shares.len() > 8 || self.ports.len() > 32 {
+            bail!("too many extra disks, shares or ports")
+        }
+        for disk in &self.extra_disks {
+            if !disk.read_only {
+                bail!("extra disks must be read-only; only the primary disk is writable")
+            }
+            if !disk.path.is_absolute() || !disk.path.is_file() {
+                bail!("extra disk must exist at an absolute path")
+            }
+        }
+        let mut tags = BTreeSet::new();
+        for share in &self.shares {
+            if share.tag.is_empty()
+                || share.tag.len() > 32
+                || !share
+                    .tag
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+                || share.tag == "veynode"
+                || !tags.insert(share.tag.as_str())
+            {
+                bail!("share tags must be unique [a-z0-9_-]{{1,32}} and not \"veynode\"")
+            }
+            if !share.path.is_absolute() || !share.path.is_dir() {
+                bail!("share path must be an existing absolute directory")
+            }
+        }
+        let mut listeners = BTreeSet::new();
+        for port in &self.ports {
+            if self.backend != Backend::QemuHvf {
+                bail!("port forwards are QEMU user-network options; Apple NAT Guests are reachable directly")
+            }
+            if port.host_port == 0
+                || port.guest_port == 0
+                || !["tcp", "udp"].contains(&port.protocol.as_str())
+            {
+                bail!("port forwards need nonzero ports and tcp or udp")
+            }
+            if !listeners.insert((port.host_address, port.host_port, port.protocol.clone())) {
+                bail!("duplicate host port forward")
             }
         }
         for dimension in [self.width, self.height].into_iter().flatten() {
@@ -1376,6 +1464,31 @@ impl Manager {
         if !self.configs.contains_key(id) {
             bail!("VM not found")
         }
+        if method == "delete" {
+            if args["confirm"].as_str() != Some(id) {
+                bail!("delete requires confirm equal to the VM id")
+            }
+            if let Some(run) = self.running.get_mut(id) {
+                if run.poll_exit()?.is_none() {
+                    bail!("VM is running; stop it before delete")
+                }
+            }
+            if self
+                .exec_retirements
+                .lock()
+                .unwrap()
+                .recovery_required(None, Some(id))
+            {
+                bail!("execution recovery required; original scope cleanup unconfirmed")
+            }
+            let mut next = self.configs.clone();
+            let removed = next.remove(id).context("VM not found")?;
+            atomic_json(&self.dir.join("registry.json"), &next)?;
+            self.configs = next;
+            self.running.remove(id);
+            // Disks are owned by the image store, not the registry; report them for collection.
+            return Ok(json!({"deleted":true,"id":id,"disk":removed.disk,"disk_removed":false}));
+        }
         if method == "windows" {
             if self.configs[id].backend != Backend::AppleVirtualization
                 || self.configs[id].guest != "macos"
@@ -2391,6 +2504,7 @@ fn tools_with_input(lifecycle: bool, execute: bool, files: bool, input: bool) ->
             tools.push(json!({"name":format!("vm_{name}"),"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false}}));
         }
     }
+    tools.extend(container_tools::tools(lifecycle));
     json!({"tools":tools})
 }
 fn rpc_error(id: Value, code: i64, message: impl ToString) -> Value {
@@ -2649,6 +2763,8 @@ pub fn mcp_with_input(
                             Err(anyhow::anyhow!(
                                 "MCP session job capacity reached; unresolved jobs require terminal proof"
                             ))
+                        } else if name.starts_with("container_") || name.starts_with("image_") {
+                            container_tools::call(dir, name, &args)
                         } else {
                             call(dir, name.strip_prefix("vm_").unwrap(), args)
                         };
@@ -3479,7 +3595,8 @@ mod tests {
     #[test]
     fn tool_permissions() {
         let list = tools_list(false, false);
-        assert_eq!(list["tools"].as_array().unwrap().len(), 6);
+        // 6 observe vm_* tools plus 4 read-only container/image tools.
+        assert_eq!(list["tools"].as_array().unwrap().len(), 10);
         assert!(list.to_string().contains("vm_screenshot"));
         assert!(!list.to_string().contains("vm_start"));
         assert!(tools_list(true, false).to_string().contains("vm_start"));

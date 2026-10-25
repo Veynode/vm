@@ -65,8 +65,9 @@ func configureCommandContainment(identity executionIdentity, legacy bool) (bound
 	if legacy {
 		return legacyBoundary, "legacy-process-group-not-contained", nil
 	}
-	if os.Geteuid() != 0 || identity.credential == nil || identity.UID == 0 || identity.GID == 0 {
-		return nil, "unavailable", fmt.Errorf("cgroup containment requires root service and fixed non-root --exec-user")
+	containerRoot := identity.Mode == "container-root" && identity.Chroot != ""
+	if os.Geteuid() != 0 || (!containerRoot && (identity.credential == nil || identity.UID == 0 || identity.GID == 0)) {
+		return nil, "unavailable", fmt.Errorf("cgroup containment requires root service and fixed non-root --exec-user or a container root")
 	}
 	var fs syscall.Statfs_t
 	if err := syscall.Statfs("/sys/fs/cgroup", &fs); err != nil {
@@ -147,7 +148,12 @@ func configureCommandContainment(identity executionIdentity, legacy bool) (bound
 	}
 	// Real clone3/credential/cgroup.kill probe; no fallback after unsupported kernels.
 	probe := exec.Command("/bin/true")
-	identity.configure(probe)
+	probeIdentity := identity
+	if containerRoot {
+		// Arbitrary images need not contain /bin/true; probe from the service root.
+		probeIdentity.Chroot, probeIdentity.env = "", nil
+	}
+	probeIdentity.configure(probe)
 	boundary, err := factory(probe)
 	if err != nil {
 		return nil, "unavailable", err

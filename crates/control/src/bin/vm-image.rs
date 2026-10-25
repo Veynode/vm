@@ -84,7 +84,7 @@ fn global_disk_lock(source: &File) -> Result<File> {
         bail!("cannot resolve user home for VM disk lock")
     }
     let home = PathBuf::from(unsafe { CStr::from_ptr((*entry).pw_dir) }.to_str()?);
-    let root = home.join("Library/Application Support/Veynode");
+    let root = home.join("Library/Application Support/VeynodeVM");
     // Existing product directory may be 0755, but must not be group/other writable.
     if !root.exists() {
         DirBuilder::new().mode(0o700).create(&root)?;

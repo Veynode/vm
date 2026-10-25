@@ -8,7 +8,7 @@ fn main() {
 }
 fn run() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let action=args.next().context("usage: vm-control daemon|mcp|call --state-dir PATH [--backend PATH] [--memory-budget-mib MIB] [--allow-lifecycle] [--allow-execute] [--allow-files] [METHOD JSON]")?;
+    let action=args.next().context("usage: vm-control daemon|mcp|call [--state-dir PATH] [--backend PATH] [--memory-budget-mib MIB] [--allow-lifecycle] [--allow-execute] [--allow-files] [METHOD JSON]")?;
     let mut dir = None;
     let mut backend = None;
     let mut memory_budget_mib = None;
@@ -66,17 +66,45 @@ fn run() -> Result<()> {
     if action == "call" && positional.len() > 2 {
         bail!("call accepts exactly METHOD and optional JSON")
     }
-    let dir = dir
-        .context("--state-dir is required (use a private directory with a short absolute path)")?;
+    let dir = match dir {
+        Some(dir) => dir,
+        None => vm_control::home::state_dir()?,
+    };
     if !dir.is_absolute() {
         bail!("state directory must be absolute")
     }
     match action.as_str() {
         "daemon" => {
+            // Explicit flags override the locally registered runtime.json.
+            let runtime = vm_control::home::Runtime::load()?;
+            let memory_budget_mib = memory_budget_mib.or(runtime.memory_budget_mib);
             let backend = backend
-                .context("daemon requires --backend pointing to vm-apple executable")?
+                .or(runtime.backend)
+                .context("daemon requires --backend or runtime.json \"backend\" pointing to the vm-apple executable")?
                 .canonicalize()
                 .context("backend executable not found")?;
+            if qemu_options.is_empty() {
+                if let Some(q) = runtime.qemu {
+                    for (flag, path) in [
+                        ("--qemu-worker", Some(q.worker)),
+                        ("--qemu-launcher", Some(q.launcher)),
+                        ("--qemu-library", Some(q.library)),
+                        ("--qemu-resources", Some(q.resources)),
+                        ("--qemu-spice-library", q.spice_library),
+                        ("--qemu-screenshot-helper", q.screenshot_helper),
+                        ("--qemu-console-broker", q.console_broker),
+                        ("--qemu-console-helper", q.console_helper),
+                        ("--qemu-venus-runtime", q.venus_runtime),
+                    ] {
+                        if let Some(path) = path {
+                            let path = path
+                                .canonicalize()
+                                .with_context(|| format!("runtime.json {flag} path not found"))?;
+                            qemu_options.insert(flag.to_owned(), path);
+                        }
+                    }
+                }
+            }
             let qemu = if qemu_options.is_empty() {
                 None
             } else {

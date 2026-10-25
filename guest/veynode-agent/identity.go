@@ -22,7 +22,11 @@ type executionIdentity struct {
 	Rootless            bool     `json:"rootless"`
 	SupplementaryGroups []uint32 `json:"supplementary_groups"`
 	Mode                string   `json:"mode"`
-	credential          *syscall.Credential
+	// Chroot is the container root for OCI micro-VMs; commands run as the
+	// container's root inside it, contained by the same cgroup boundary.
+	Chroot     string `json:"chroot,omitempty"`
+	env        []string
+	credential *syscall.Credential
 }
 
 func currentExecutionIdentity() executionIdentity {
@@ -88,22 +92,51 @@ func resolveExecutionIdentity(name string) (executionIdentity, error) {
 	return identity, nil
 }
 func (identity executionIdentity) configure(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Credential: identity.credential}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Credential: identity.credential, Chroot: identity.Chroot}
 	cmd.Env = []string{"PATH=" + executionPath, "LANG=C.UTF-8", "HOME=" + identity.Home, "USER=" + identity.User, "LOGNAME=" + identity.User}
+	if identity.env != nil {
+		cmd.Env = append([]string(nil), identity.env...)
+	}
 	cmd.Dir = identity.CWD
 }
 
+// containerIdentity runs commands as root inside an OCI container root with
+// the image environment, like `docker exec`.
+func containerIdentity(root string, env []string, workdir string) executionIdentity {
+	if workdir == "" {
+		workdir = "/"
+	}
+	return executionIdentity{User: "root", UID: 0, GID: 0, Home: "/root", CWD: workdir, Rootless: false, SupplementaryGroups: []uint32{}, Mode: "container-root", Chroot: root, env: env}
+}
+
+func (identity executionIdentity) searchPath() string {
+	for _, entry := range identity.env {
+		if strings.HasPrefix(entry, "PATH=") {
+			return strings.TrimPrefix(entry, "PATH=")
+		}
+	}
+	return executionPath
+}
+
 // exec.Command normally resolves bare names using the service process PATH,
-// before cmd.Env is applied. Resolve against our fixed command PATH instead.
-func commandExecutable(name string) (string, error) {
+// before cmd.Env is applied. Resolve against the identity PATH (inside its
+// chroot, if any) instead. Returned paths are as seen by the child.
+func (identity executionIdentity) executable(name string) (string, error) {
 	if strings.ContainsRune(name, '/') {
 		return name, nil
 	}
-	for _, directory := range strings.Split(executionPath, ":") {
+	for _, directory := range strings.Split(identity.searchPath(), ":") {
+		if !filepath.IsAbs(directory) {
+			continue
+		}
 		candidate := filepath.Join(directory, name)
-		if info, err := os.Stat(candidate); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+		if info, err := os.Stat(filepath.Join(identity.Chroot, candidate)); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
 			return candidate, nil
 		}
 	}
-	return "", fmt.Errorf("executable not found in fixed PATH")
+	return "", fmt.Errorf("executable not found in PATH")
+}
+
+func commandExecutable(name string) (string, error) {
+	return executionIdentity{}.executable(name)
 }

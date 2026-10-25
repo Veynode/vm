@@ -166,7 +166,21 @@ func main() {
 	filesUser := flag.String("files-user", "", "fixed non-root file worker account")
 	filesRoot := flag.String("files-root", "", "explicit file transfer directory")
 	fileWorker := flag.Bool("file-worker", false, "internal non-root worker")
+	containerRoot := flag.String("container-root", "", "OCI micro-VM (set by container-init): run commands as root inside this root")
+	containerEnv := flag.String("container-env", "", "OCI micro-VM: JSON file with the image env and workdir")
+	if len(os.Args) > 1 && os.Args[1] == "container-init" {
+		os.Exit(containerInit())
+	}
 	flag.Parse()
+	resolveIdentity := func() (executionIdentity, error) {
+		if *containerRoot != "" {
+			if *execUser != "" {
+				return executionIdentity{}, fmt.Errorf("--container-root and --exec-user are exclusive")
+			}
+			return loadContainerIdentity(*containerRoot, *containerEnv)
+		}
+		return resolveExecutionIdentity(*execUser)
+	}
 	if *serial {
 		if *serialExec || *allowExec || *allowShutdown || *allowFiles || *legacyExec || *execUser != "" || *filesUser != "" || *filesRoot != "" || *fileWorker {
 			fmt.Fprintln(os.Stderr, "virtio-serial is observer-only; privilege options rejected")
@@ -179,11 +193,11 @@ func main() {
 		return
 	}
 	if *serialExec {
-		if !*allowExec || *execUser == "" || *allowShutdown || *allowFiles || *legacyExec || *filesUser != "" || *filesRoot != "" || *fileWorker {
-			fmt.Fprintln(os.Stderr, "serial v2 requires --allow-execute and fixed --exec-user; files/shutdown/legacy forbidden")
+		if !*allowExec || (*execUser == "" && *containerRoot == "") || *allowShutdown || *allowFiles || *legacyExec || *filesUser != "" || *filesRoot != "" || *fileWorker {
+			fmt.Fprintln(os.Stderr, "serial v2 requires --allow-execute and fixed --exec-user or --container-root; files/shutdown/legacy forbidden")
 			os.Exit(1)
 		}
-		identity, err := resolveExecutionIdentity(*execUser)
+		identity, err := resolveIdentity()
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "serial v2 execution identity unavailable:", err)
 			os.Exit(1)
@@ -222,7 +236,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "files settings require --allow-files")
 		os.Exit(1)
 	}
-	identity, err := resolveExecutionIdentity(*execUser)
+	identity, err := resolveIdentity()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

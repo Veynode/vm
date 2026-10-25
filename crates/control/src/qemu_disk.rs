@@ -261,7 +261,7 @@ impl DiskGuard {
         let mut pins = Pins::default();
         let disk = raw_file(path, &mut pins)?;
         let support = pins.directory(&home()?.join("Library/Application Support"))?;
-        let product = pins.child_directory(support, c"Veynode", true, Some(0o022))?;
+        let product = pins.child_directory(support, c"VeynodeVM", true, Some(0o022))?;
         let locks = pins.child_directory(product, c"locks", true, Some(0o077))?;
         Self::finish(path, disk, pins, locks)
     }

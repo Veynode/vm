@@ -10,6 +10,7 @@ cargo build --locked --bins
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 go -C guest/veynode-agent test -race ./...
+GOOS=linux GOARCH=arm64 go -C guest/veynode-agent vet ./...
 python3 -m unittest discover -s tests -v
 npm --prefix browser test
 if [[ "${1:-}" == "--real" ]]; then
@@ -18,4 +19,6 @@ if [[ "${1:-}" == "--real" ]]; then
   python3 scripts/test-control.py --config .local/run/linux-agent.json --require-guest --output .local/evidence/control-guest-smoke.json
   python3 scripts/test-multivm.py
   python3 scripts/test-control-http.py --config .local/run/linux-agent.json
+  python3 guest/kernel/build.py
+  python3 scripts/test-containers.py
 fi
