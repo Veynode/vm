@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-BASE="$ROOT/.local/windows-gpu"
+BASE="$ROOT/.local/runtime/utm"
 HEADERS="$BASE/CocoaSpice-127033fa3e59cd49678f49ed54f8adfc060afb56/Sources/CocoaSpice/ExternalHeaders"
 FRAMEWORKS="$BASE/UTM.app/Contents/Frameworks"
 [[ -d "$HEADERS" && -d "$FRAMEWORKS" ]] || { echo 'Run verified SPICE prerequisites first' >&2; exit 1; }

@@ -114,5 +114,5 @@ edit('server/dcc-send.c','''    if (scanout != NULL) {
 edit('server/dcc.c','#include "dcc-private.h"','#include "dcc-private.h"\n#include "red-qxl.h"')
 edit('server/dcc.c','    dcc_stop(dcc); // TODO: start/stop -> connect/disconnect?','    red_qxl_release_scanout_client(display->priv->qxl, rcc);\n    dcc_stop(dcc); // TODO: start/stop -> connect/disconnect?')
 patch=''.join(''.join(difflib.unified_diff(old.splitlines(True),(SRC/name).read_text().splitlines(True),fromfile='a/'+name,tofile='b/'+name,n=0)) for name,old in changes.items())
-(ROOT/'docs/evidence/apple-spice-reconnect-fresh-client.patch').write_text(patch)
+(ROOT/'archive/docs-evidence/apple-spice-reconnect-fresh-client.patch').write_text(patch)
 marker.touch();print('Applied only to '+str(SRC))

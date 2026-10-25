@@ -10,7 +10,7 @@ W=load('mesa25_wsi',ROOT/'scripts/linux-vulkan-wsi-prepare.py');C=W.C
 Q=load('mesa25_rootfs',ROOT/'scripts/test-control-qemu.py')
 SOURCE=ROOT/'.local/linux-vulkan-mesa25-source/mesa-25.2.7.tar.xz'
 SHA512='87dd815e0d11d6ec0eb969ee93d3f376103bb899d90599e0b7902394e41c58139384df79f89633e132ca969348d3320f55308a74651d409b454d51f1bcda27bc'
-GLAMOR=ROOT/'.local/windows-gpu/glamor-causal-artifacts/modules-fixed/libglamoregl.so'
+GLAMOR=ROOT/'.local/runtime/utm/glamor-causal-artifacts/modules-fixed/libglamoregl.so'
 BUILT=ROOT/'.local/linux-vulkan-mesa25-built-v1/venus25.tgz'
 BUILT_SHA='007f0f4f2e59f4b25c836a1d48c5b32557c1f515766ff6ba353419f3b7dea668'
 GLAMOR_SHA='ba64c24cb70c953d26ac032633b6bca98577ea415f7abdc32f7f451d9a115f67'

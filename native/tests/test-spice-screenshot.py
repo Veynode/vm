@@ -87,11 +87,11 @@ if args.output.exists():
     raise SystemExit('Refusing to overwrite evidence')
 subprocess.run([str(ROOT/'native/tools/build-spice-screenshot.sh')], check=True)
 os.environ['VEYNODE_SPICE_LIBRARY'] = str(ROOT/'.local/spice-reconnect-build/runtime/libspice-server-fixed.dylib')
-spec = importlib.util.spec_from_file_location('desktop', ROOT/'scripts/windows-probe-linux-desktop.py')
+spec = importlib.util.spec_from_file_location('desktop', ROOT/'scripts/qemu-linux-desktop-probe.py')
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 module.BASE = ROOT/'.local/spice-reconnect-build/runtime'
-blob = (ROOT/'.local/windows-gpu/glamor-causal-artifacts/modules-fixed/libglamoregl.so').read_bytes()
+blob = (ROOT/'.local/runtime/utm/glamor-causal-artifacts/modules-fixed/libglamoregl.so').read_bytes()
 digest = hashlib.sha256(blob).hexdigest()
 if digest != 'ba64c24cb70c953d26ac032633b6bca98577ea415f7abdc32f7f451d9a115f67':
     raise SystemExit('Wrong validated Guest module')

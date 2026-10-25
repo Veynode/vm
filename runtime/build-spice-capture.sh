@@ -2,7 +2,7 @@
 # Developer-only consumer; does not modify or re-sign upstream dependencies.
 set -eu
 cd "$(dirname "$0")/.."
-base="$PWD/.local/windows-gpu"
+base="$PWD/.local/runtime/utm"
 revision=127033fa3e59cd49678f49ed54f8adfc060afb56
 archive="$base/cocoaspice.tar.gz"
 expected=4e9f787d6edc21287f5648570ecd7fca07640c559b00c269503798f592783373
@@ -20,4 +20,4 @@ clang -fobjc-arc -Wall -Wextra -Wno-unused-parameter \
   -F"$frameworks" -Wl,-rpath,"$frameworks" \
   -framework Foundation -framework Metal -framework CoreImage -framework ImageIO -framework IOSurface -framework CoreGraphics \
   -framework spice-client-glib-2.0.8 -framework glib-2.0.0 -framework gobject-2.0.0 -framework gio-2.0.0 \
-  scripts/windows-spice-capture.m -o "$base/spice-capture"
+  runtime/spice-capture.m -o "$base/spice-capture"

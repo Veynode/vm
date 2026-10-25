@@ -123,7 +123,7 @@ not a promise that every account operation is harmless. MCP session loss is a
 separate host cancellation policy, not the Guest service's SIGTERM handler.
 
 Real kernel/installed acceptance and reproduction commands are recorded in
-[`docs/evidence/linux-cgroup-2026-10-08`](../../docs/evidence/linux-cgroup-2026-10-08/README.md).
+[`archive/docs-evidence/linux-cgroup-2026-10-08`](../../archive/docs-evidence/linux-cgroup-2026-10-08/README.md).
 
 ## Explicit Linux file directory
 

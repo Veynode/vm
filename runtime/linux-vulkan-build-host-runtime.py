@@ -44,7 +44,7 @@ def main():
     p.add_argument('--source-cache', type=Path, default=ROOT/'.local/linux-vulkan-source-review')
     p.add_argument('--output-dir', type=Path, required=True)
     a = p.parse_args(); out = a.output_dir.absolute()
-    frameworks = ROOT/'.local/windows-gpu/UTM.app/Contents/Frameworks'
+    frameworks = ROOT/'.local/runtime/utm/UTM.app/Contents/Frameworks'
     for name, expected in FRAMEWORKS.items():
         if sha(frameworks/(name+'.framework')/'Versions/A'/name) != expected:
             raise ValueError('vendor framework pin mismatch')
@@ -68,7 +68,7 @@ def main():
         subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, check=True, env=env)
     for name in ['gl','gl_angle_ext','egl','egl_angle_ext']:
         run(['python3',epoxy/'src/gen_dispatch.py','--header','--no-source','--outputdir='+str(inc),epoxy/'registry'/f'{name}.xml'])
-    frameworks = ROOT/'.local/windows-gpu/UTM.app/Contents/Frameworks'
+    frameworks = ROOT/'.local/runtime/utm/UTM.app/Contents/Frameworks'
     pc = out/'pkgconfig'; pc.mkdir()
     for name, version, lib in [('epoxy','1.5.10','epoxy.0'),('vulkan','1.4.0','vulkan.1')]:
         (pc/f'{name}.pc').write_text(f'Name: {name}\nDescription: pinned UTM framework build dependency\nVersion: {version}\nLibs: {frameworks}/{lib}.framework/Versions/A/{lib} -Wl,-rpath,{frameworks}\nCflags: -I{out}/include\nepoxy_has_egl=1\n')
@@ -82,7 +82,7 @@ def main():
     run(['install_name_tool','-id','@rpath/virglrenderer.1.framework/Versions/A/virglrenderer.1',library])
     run(['codesign','--force','--sign','-',library])
     run(['codesign','--verify','--strict',library])
-    loader_source=ROOT/'scripts/linux-vulkan-host-loader.c'
+    loader_source=ROOT/'runtime/linux-vulkan-host-loader.c'
     shutil.copyfile(loader_source,out/'loader.c')
     loader=out/'probe-loader'
     run(['clang','-Wall','-Wextra','-Werror',out/'loader.c','-Wl,-rpath,'+str(frameworks),'-o',loader])

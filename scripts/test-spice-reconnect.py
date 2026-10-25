@@ -65,7 +65,7 @@ output=args.output.resolve();output.parent.mkdir(parents=True,exist_ok=True)
 if output.exists():raise SystemExit('Refusing to overwrite evidence')
 subprocess.run([str(ROOT/'native/tools/build-spice-reconnect.sh')],check=True)
 fixture=output.with_suffix('.fixture.json');prefix=str(fixture.with_suffix(''))
-run=subprocess.run(['python3',str(ROOT/'scripts/windows-probe-linux-desktop.py'),'--output',str(fixture),'--capture-cycles','0','--extra-consumer',str(pathlib.Path(__file__).resolve())],capture_output=True,text=True,timeout=270)
+run=subprocess.run(['python3',str(ROOT/'scripts/qemu-linux-desktop-probe.py'),'--output',str(fixture),'--capture-cycles','0','--extra-consumer',str(pathlib.Path(__file__).resolve())],capture_output=True,text=True,timeout=270)
 pathlib.Path(prefix+'.runner.log').write_text(run.stdout+run.stderr)
 report={'timestamp_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),'fixture_exit_code':run.returncode,'reconnect_passed':False}
 if fixture.exists():report['fixture']=json.loads(fixture.read_text())

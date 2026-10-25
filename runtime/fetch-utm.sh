@@ -2,7 +2,7 @@
 # Fetch an upstream GPU evaluation candidate without modifying /Applications.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-dest="$PWD/.local/windows-gpu"
+dest="$PWD/.local/runtime/utm"
 mkdir -p "$dest"
 archive="$dest/UTM-5.0.5.dmg"
 if [[ ! -f "$archive" ]]; then

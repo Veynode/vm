@@ -1,10 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-BASE="$ROOT/.local/windows-gpu"
+BASE="$ROOT/.local/runtime/utm"
 HEADERS="$BASE/CocoaSpice-127033fa3e59cd49678f49ed54f8adfc060afb56/Sources/CocoaSpice/ExternalHeaders"
 FRAMEWORKS="$BASE/UTM.app/Contents/Frameworks"
-[[ -d "$HEADERS" && -d "$FRAMEWORKS" ]] || { echo 'Run the verified windows-build-spice-capture.sh prerequisites first' >&2;exit 1; }
+[[ -d "$HEADERS" && -d "$FRAMEWORKS" ]] || { echo 'Run the verified build-spice-capture.sh prerequisites first' >&2;exit 1; }
 mkdir -p "$ROOT/.local/bin"
 clang -fobjc-arc -Wall -Wextra -Wno-unused-parameter \
  -I"$HEADERS" -I"$HEADERS/glib-2.0" -I"$HEADERS/spice-client-glib-2.0" -I"$HEADERS/spice-1" \

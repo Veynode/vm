@@ -27,7 +27,7 @@ def sha(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=ROOT / "docs/evidence/control-enospc.json")
+    parser.add_argument("--output", type=Path, default=ROOT / "archive/docs-evidence/control-enospc.json")
     args = parser.parse_args()
     result = {"started_at_unix": time.time(), "checks": [], "image_capacity_bytes": LIMIT,
               "scope": "Host APFS image publication and registry; no Guest, power-loss or crash-consistency acceptance"}

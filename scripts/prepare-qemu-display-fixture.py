@@ -20,7 +20,7 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     output = args.output.absolute()
-    glamor = ROOT / '.local/windows-gpu/glamor-causal-artifacts/modules-fixed/libglamoregl.so'
+    glamor = ROOT / '.local/runtime/utm/glamor-causal-artifacts/modules-fixed/libglamoregl.so'
     module_bytes = glamor.read_bytes()
     if hashlib.sha256(module_bytes).hexdigest() != GLAMOR_SHA:
         raise ValueError('wrong pinned fixed-glamor module')

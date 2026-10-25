@@ -16,13 +16,13 @@ mod receiver_loss;
 mod rtcp_forwarder;
 mod shutdown_signal;
 mod source_status;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use axum::{
-    Json, Router,
     extract::{DefaultBodyLimit, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
+    Json, Router,
 };
 use rtc::{
     interceptor::Registry,
@@ -39,25 +39,25 @@ use rtc::{
     },
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
     path::PathBuf,
     process::Stdio,
     sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        Arc,
     },
     time::{Duration, Instant},
 };
 #[cfg(test)]
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{watch, Mutex};
 use webrtc::{
     data_channel::DataChannel,
     media_stream::{
+        track_local::{static_rtp::TrackLocalStaticRTP, TrackLocal},
         Track,
-        track_local::{TrackLocal, static_rtp::TrackLocalStaticRTP},
     },
     peer_connection::{
         PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCIceGatheringState,
@@ -794,12 +794,12 @@ async fn run_session(
     }
     // Keep library error text private: it can contain transport details. The
     // fixed outcome distinguishes an actual close error from our deadline.
-    let peer_close_outcome =
-        match tokio::time::timeout(Duration::from_secs(2), peer.close()).await {
-            Ok(Ok(())) => "closed",
-            Ok(Err(_)) => "close_error",
-            Err(_) => "timeout",
-        };
+    let peer_close_outcome = match tokio::time::timeout(Duration::from_secs(2), peer.close()).await
+    {
+        Ok(Ok(())) => "closed",
+        Ok(Err(_)) => "close_error",
+        Err(_) => "timeout",
+    };
     eprintln!(
         "{}",
         serde_json::json!({"version":1,"event":"peer_cleanup_outcome","fence_id":fence_id,"elapsed_ms":session_started.elapsed().as_millis(),"outcome":peer_close_outcome})
@@ -943,8 +943,14 @@ fn nack_budget_value(s: &webrtc::bounded_nack::Snapshot) -> Value {
             "repair_suppressed_packets".into(),
             json!(s.counters.repair_suppressed_packets),
         ),
-        ("repair_expired_before_enqueue".into(), json!(s.counters.repair_expired_before_enqueue)),
-        ("repair_expired_before_dequeue".into(), json!(s.counters.repair_expired_before_dequeue)),
+        (
+            "repair_expired_before_enqueue".into(),
+            json!(s.counters.repair_expired_before_enqueue),
+        ),
+        (
+            "repair_expired_before_dequeue".into(),
+            json!(s.counters.repair_expired_before_dequeue),
+        ),
         (
             "nack_budget_exhaustions".into(),
             json!(s.counters.nack_budget_exhaustions),
@@ -1532,19 +1538,17 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        assert!(
-            serve_with_shutdown(
-                listener,
-                Router::new(),
-                &app,
-                async { Ok(()) },
-                Duration::from_millis(100)
-            )
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("unresolved earlier cleanup")
-        );
+        assert!(serve_with_shutdown(
+            listener,
+            Router::new(),
+            &app,
+            async { Ok(()) },
+            Duration::from_millis(100)
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("unresolved earlier cleanup"));
         assert!(tokio::net::TcpStream::connect(address).await.is_err());
     }
     #[test]
@@ -1706,31 +1710,25 @@ mod tests {
             .unwrap();
         drop(done);
         let (done, finished) = watch::channel(Some(false));
-        assert!(
-            await_shutdown_cleanup(Some(finished), deadline)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("unconfirmed")
-        );
+        assert!(await_shutdown_cleanup(Some(finished), deadline)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unconfirmed"));
         drop(done);
         let (done, finished) = watch::channel(None);
         drop(done);
-        assert!(
-            await_shutdown_cleanup(Some(finished), deadline)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("unconfirmed")
-        );
+        assert!(await_shutdown_cleanup(Some(finished), deadline)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unconfirmed"));
         let (_done, finished) = watch::channel(None);
-        assert!(
-            await_shutdown_cleanup(Some(finished), deadline)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("deadline")
-        );
+        assert!(await_shutdown_cleanup(Some(finished), deadline)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("deadline"));
     }
     #[tokio::test]
     async fn shutdown_stops_real_listener_and_bounds_partial_body_handler() {
@@ -1778,12 +1776,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("HTTP shutdown drain deadline")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("HTTP shutdown drain deadline"));
         assert!(app.active.lock().await.stopping);
         assert!(tokio::net::TcpStream::connect(address).await.is_err());
         drop(client);
@@ -1811,12 +1807,10 @@ mod tests {
             Duration::from_millis(50),
         )
         .await;
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("cleanup unconfirmed")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("cleanup unconfirmed"));
         assert!(*cancelled.borrow());
     }
 

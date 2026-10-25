@@ -1,6 +1,6 @@
 #[test]
 fn actual_https_subprocess_signals_and_cleanup_outcomes() {
-    let output = std::process::Command::new("python3")
+    let output = std::process::Command::new(python())
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/http_shutdown.py"
@@ -23,7 +23,7 @@ fn actual_https_subprocess_signals_and_cleanup_outcomes() {
 
 #[test]
 fn actual_https_graphics_creation_remains_denied() {
-    let output = std::process::Command::new("python3")
+    let output = std::process::Command::new(python())
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/http_shutdown.py"
@@ -43,4 +43,9 @@ fn actual_https_graphics_creation_remains_denied() {
     assert_eq!(evidence["passed"], true);
     assert_eq!(evidence["checks"].as_array().unwrap().len(), 1);
     println!("{}", String::from_utf8_lossy(&output.stdout));
+}
+
+// TLS 1.3 needs a modern OpenSSL; the macOS system python3 links LibreSSL 2.8.
+fn python() -> String {
+    std::env::var("VEYNODE_PYTHON").unwrap_or_else(|_| "python3".into())
 }

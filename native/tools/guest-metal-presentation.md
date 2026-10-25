@@ -42,4 +42,4 @@ not disk durability, smoothness or meeting60fps. Final stdout additionally repor
 `log_write_confirmed`; require it and exit0 before treating the run as complete.
 Serialization/write/fsync failures cannot silently pass. Retain failed runs. The
 collector does not supply the full comparison manifest, host resources or input
-latency. See benchmarks/README.md for those separate requirements.
+latency. See archive/benchmarks/README.md for those separate requirements.

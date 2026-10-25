@@ -30,7 +30,7 @@ import tarfile
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-BASE = ROOT / '.local/windows-gpu'
+BASE = ROOT / '.local/runtime/utm'
 MEDIA = ROOT / '.local/media/alpine-3.24.2'
 ROOTFS_SHA = 'b17a57958e29735ff0e6e64254d958e65903687a70ca30cc430b33a965ad49d7'
 INIT = '''#!/bin/sh
@@ -191,7 +191,7 @@ poweroff -f
         if args.gl_font_api == 'gles':
             init = init.replace('-lX11 -lXrender -lGL', '-DUSE_GLES -lEGL -lGLESv2')
             init = init.replace('/veynode/xrender-probe /veynode/xrender', 'EGL_PLATFORM=surfaceless /veynode/xrender-probe /veynode/xrender')
-    for name, data, mode in [('gpu-init', init.replace('\"glamor\"', '\"' + args.xorg_accel + '\"').encode(), 0o100755), ('dhcp', DHCP.encode(), 0o100755), ('egl-test.c', (ROOT / 'scripts/windows-linux-egl-test.c').read_bytes(), 0o100644), ('xrender-probe.c', (ROOT / 'scripts/linux-xrender-probe.c').read_bytes(), 0o100644), ('gl-font-probe.c', (ROOT / 'scripts/linux-gl-font-probe.c').read_bytes(), 0o100644)]:
+    for name, data, mode in [('gpu-init', init.replace('\"glamor\"', '\"' + args.xorg_accel + '\"').encode(), 0o100755), ('dhcp', DHCP.encode(), 0o100755), ('egl-test.c', (ROOT / 'scripts/linux-egl-test.c').read_bytes(), 0o100644), ('xrender-probe.c', (ROOT / 'scripts/linux-xrender-probe.c').read_bytes(), 0o100644), ('gl-font-probe.c', (ROOT / 'scripts/linux-gl-font-probe.c').read_bytes(), 0o100644)]:
         entries.append(fixture.entry('veynode/' + name, data, mode))
     entries.append(fixture.entry('TRAILER!!!', b''))
     app = BASE / 'UTM.app/Contents'
@@ -202,7 +202,7 @@ poweroff -f
         export_utm(args.export_utm, initrd_bytes)
         return 0
     if not args.xrender_probe and not (BASE / 'spice-capture').is_file():
-        raise SystemExit('Run scripts/windows-build-spice-capture.sh first')
+        raise SystemExit('Run runtime/build-spice-capture.sh first')
     result = {'timestamp_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
               'backend': 'UTM 5.0.5 QEMU 10.0.12 HVF virtio-gpu-gl ANGLE Metal',
               'kernel_sha256': digest(MEDIA / 'Image'), 'rootfs_sha256': ROOTFS_SHA,

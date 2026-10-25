@@ -35,7 +35,7 @@ def main():
     fd = os.open(disk, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     os.ftruncate(fd, 16 * 1024**3)
     os.close(fd)
-    rootfs = ROOT / '.local/windows-gpu/alpine-minirootfs-3.23.6-aarch64.tar.gz'
+    rootfs = ROOT / '.local/runtime/utm/alpine-minirootfs-3.23.6-aarch64.tar.gz'
     if hashlib.sha256(rootfs.read_bytes()).hexdigest() != ROOTFS_SHA:
         raise ValueError('rootfs hash mismatch')
     spec = importlib.util.spec_from_file_location('cpio', ROOT / 'scripts/build-linux-fixture.py')
@@ -64,7 +64,7 @@ def main():
         'desktop-boot.sh': (ROOT / 'scripts/installed-qemu-desktop-boot.sh').read_bytes(),
         'boot-marker.py': (ROOT / 'scripts/installed-qemu-boot-marker.py').read_bytes(),
         'install.sh': (ROOT / 'scripts/installed-qemu-desktop-install.sh').read_bytes(),
-        'libglamoregl.so': (ROOT / '.local/windows-gpu/glamor-causal-artifacts/modules-fixed/libglamoregl.so').read_bytes(),
+        'libglamoregl.so': (ROOT / '.local/runtime/utm/glamor-causal-artifacts/modules-fixed/libglamoregl.so').read_bytes(),
         'xrender-probe.c': (ROOT / 'scripts/linux-xrender-probe.c').read_bytes(),
     }
     if payload['agent'][:6] != b'\x7fELF\x02\x01' or int.from_bytes(payload['agent'][18:20], 'little') != 183:
@@ -100,7 +100,7 @@ def main():
             ['unsquashfs', '-cat', str(modloop), f'modules/{version}/{name}'])))
     provision = (ROOT / 'scripts/installed-qemu-desktop-provision.sh').read_bytes()
     subprocess.run(['/bin/sh', '-n'], input=provision, check=True)
-    desktop_spec = importlib.util.spec_from_file_location('desktop', ROOT / 'scripts/windows-probe-linux-desktop.py')
+    desktop_spec = importlib.util.spec_from_file_location('desktop', ROOT / 'scripts/qemu-linux-desktop-probe.py')
     desktop = importlib.util.module_from_spec(desktop_spec)
     desktop_spec.loader.exec_module(desktop)
     entries.extend([cpio.entry('veynode/rootfs.tar.gz', rootfs.read_bytes()),

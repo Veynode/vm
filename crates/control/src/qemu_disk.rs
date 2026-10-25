@@ -503,7 +503,8 @@ mod tests {
         let witness_dir = witness_temp.path().canonicalize().unwrap();
         fs::set_permissions(&witness_dir, fs::Permissions::from_mode(0o700)).unwrap();
         let unrelated =
-            crate::exec_witness::Witness::create(&witness_dir, "unrelated", &"a".repeat(64)).unwrap();
+            crate::exec_witness::Witness::create(&witness_dir, "unrelated", &"a".repeat(64))
+                .unwrap();
         let unrelated_id = unrelated.identity.clone();
         let guard = f.open().unwrap();
         assert_ne!(
@@ -557,7 +558,9 @@ mod tests {
             "fork unexpectedly did not inherit unrelated witness"
         );
         crate::exec_witness::ReconciliationGuard::acquire(&witness_dir, &unrelated_id).unwrap();
-        println!("unrelated witness: busy while inherited; exact child reaped; exclusive proof succeeds");
+        println!(
+            "unrelated witness: busy while inherited; exact child reaped; exclusive proof succeeds"
+        );
         await_available(&f.disk, &f.locks);
     }
     #[test]

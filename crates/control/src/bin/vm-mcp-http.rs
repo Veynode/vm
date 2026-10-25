@@ -693,6 +693,8 @@ async fn dispatch(
 }
 #[tokio::main]
 async fn main() {
+    // Workspace feature unification can enable both rustls providers; pick one explicitly.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     if let Err(e) = run().await {
         eprintln!("vm-mcp-http: {e:#}");
         std::process::exit(1)
@@ -880,7 +882,11 @@ mod tests {
             let request = json!({"method":"tools/call","params":{"name":"vm_create","arguments":{"id":"allowed","backend":"qemu-hvf","qemu_graphics_profile":profile}}});
             assert!(!remote_authorized(&p, &request));
         }
-        let reply = filter_reply(&p, &json!({"method":"tools/list"}), json!({"result":{"tools":[{"name":"vm_create","inputSchema":{"properties":{"qemu_graphics_profile":{"enum":["virgl","venus-moltenvk-experimental"]}}}},{"name":"vm_status"}]}}));
+        let reply = filter_reply(
+            &p,
+            &json!({"method":"tools/list"}),
+            json!({"result":{"tools":[{"name":"vm_create","inputSchema":{"properties":{"qemu_graphics_profile":{"enum":["virgl","venus-moltenvk-experimental"]}}}},{"name":"vm_status"}]}}),
+        );
         assert_eq!(reply["result"]["tools"], json!([{"name":"vm_status"}]));
     }
     #[test]

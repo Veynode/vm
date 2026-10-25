@@ -7,12 +7,12 @@ import argparse, base64, concurrent.futures, gzip, hashlib, importlib.util, json
 from pathlib import Path
 import select, signal, socket, stat, subprocess, sys, tarfile, tempfile, time
 ROOT=Path(__file__).resolve().parents[1]
-BASE=ROOT/'.local/windows-gpu'; MEDIA=ROOT/'.local/media/alpine-3.24.2'
+BASE=ROOT/'.local/runtime/utm'; MEDIA=ROOT/'.local/media/alpine-3.24.2'
 def load(path,name):
     spec=importlib.util.spec_from_file_location(name,path); module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module); return module
 def fixture(directory,static=False,input_oracle=None,input_oracle_seconds=180,init_transform=None):
     if type(input_oracle_seconds) is not int or not 30 <= input_oracle_seconds <= 3600: raise ValueError("invalid input oracle lifetime")
-    desktop=load(ROOT/'scripts/windows-probe-linux-desktop.py','qemu_desktop')
+    desktop=load(ROOT/'scripts/qemu-linux-desktop-probe.py','qemu_desktop')
     archive=BASE/'alpine-minirootfs-3.23.6-aarch64.tar.gz'
     assert hashlib.sha256(archive.read_bytes()).hexdigest()==desktop.ROOTFS_SHA
     cpio=load(ROOT/'scripts/build-linux-fixture.py','qemu_cpio'); entries=[]

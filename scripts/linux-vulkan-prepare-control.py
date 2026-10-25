@@ -39,7 +39,7 @@ def pinned(path,expected,limit=128*1024*1024):
  return {'path':str(path),'sha256':expected}
 
 def registration(runtime,catalog):
- app=(ROOT/'.local/windows-gpu/UTM.app/Contents').resolve();frameworks=app/'Frameworks'
+ app=(ROOT/'.local/runtime/utm/UTM.app/Contents').resolve();frameworks=app/'Frameworks'
  roles={'loader':Path(runtime['loader']),'host_library':Path(runtime['host_library']),
  'render_server':Path(runtime['binary']), 'qemu_library':frameworks/'qemu-aarch64-softmmu.framework/Versions/A/qemu-aarch64-softmmu',
  'spice_library':ROOT/'.local/spice-reconnect-build/runtime/libspice-server-fixed.dylib',

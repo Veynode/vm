@@ -4,7 +4,7 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 [[ $# == 2 && "$1" == --output-app && "$2" == /*.app ]] || { echo 'Usage: build.sh --output-app NEW_ABSOLUTE.app' >&2; exit 2; }
 OUTPUT="$2"
 [[ ! -e "$OUTPUT" && ! -L "$OUTPUT" ]] || { echo 'Refusing existing app' >&2;exit 2; }
-BASE="$ROOT/.local/windows-gpu"
+BASE="$ROOT/.local/runtime/utm"
 HEADERS="$BASE/CocoaSpice-127033fa3e59cd49678f49ed54f8adfc060afb56/Sources/CocoaSpice/ExternalHeaders"
 FRAMEWORKS="$BASE/UTM.app/Contents/Frameworks"
 mkdir -p "$(dirname "$OUTPUT")"

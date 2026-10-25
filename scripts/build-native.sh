@@ -9,7 +9,7 @@ if [[ $# -gt 0 ]]; then
   mkdir -p "$ROOT/.local"
   STAGE="$(mktemp -d "$ROOT/.local/native-build.XXXXXX")"
   trap 'rm -rf "$STAGE"' EXIT
-  xcrun swiftc -swift-version 5 -O -target arm64-apple-macosx14.0 -framework Virtualization -framework AppKit "$ROOT/native/Sources/main.swift" "$ROOT/native/Sources/GuestStreamBridge.swift" -o "$STAGE/vm-apple"
+  xcrun swiftc -swift-version 5 -O -target arm64-apple-macosx14.0 -framework Virtualization -framework AppKit "$ROOT/native/worker/main.swift" "$ROOT/native/worker/GuestStreamBridge.swift" -o "$STAGE/vm-apple"
   "$ROOT/native/tools/package-app.sh" "$STAGE/vm-apple" "$APP"
   "$APP/Contents/MacOS/vm-apple" probe
   exit 0
@@ -20,7 +20,7 @@ if pgrep -x vm-apple >/dev/null; then
   exit 1
 fi
 mkdir -p "$ROOT/native/.build" "$ROOT/.local/bin"
-xcrun swiftc -swift-version 5 -O -target arm64-apple-macosx14.0 -framework Virtualization -framework AppKit "$ROOT/native/Sources/main.swift" "$ROOT/native/Sources/GuestStreamBridge.swift" -o "$ROOT/native/.build/vm-apple"
+xcrun swiftc -swift-version 5 -O -target arm64-apple-macosx14.0 -framework Virtualization -framework AppKit "$ROOT/native/worker/main.swift" "$ROOT/native/worker/GuestStreamBridge.swift" -o "$ROOT/native/.build/vm-apple"
 codesign --force --sign - --entitlements "$ROOT/native/entitlements.plist" "$ROOT/native/.build/vm-apple"
 ln -sf ../../native/.build/vm-apple "$ROOT/.local/bin/vm-apple"
 "$ROOT/native/tools/package-app.sh"

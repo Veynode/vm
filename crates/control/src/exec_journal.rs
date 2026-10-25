@@ -638,7 +638,15 @@ mod tests {
             })
             .unwrap();
         drop(w);
-        journal.reconcile(dir, &vm, &instance).unwrap();
+        // A concurrently forking test can briefly inherit the witness OFD before exec.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while let Err(error) = journal.reconcile(dir, &vm, &instance) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "witness stayed locked: {error}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         id
     }
     #[test]

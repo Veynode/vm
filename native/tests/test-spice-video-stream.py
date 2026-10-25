@@ -107,8 +107,8 @@ if args.output.exists():raise SystemExit('Refusing to overwrite evidence')
 subprocess.run([str(ROOT/'native/tools/build-spice-video-stream.sh')],check=True)
 # Real fixed server permits successive fresh clients; no cached surface IDs.
 os.environ['VEYNODE_SPICE_LIBRARY']=str(ROOT/'.local/spice-reconnect-build/runtime/libspice-server-fixed.dylib')
-spec=importlib.util.spec_from_file_location('desktop',ROOT/'scripts/windows-probe-linux-desktop.py');module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);module.BASE=ROOT/'.local/spice-reconnect-build/runtime'
-path=ROOT/'.local/windows-gpu/glamor-causal-artifacts/modules-fixed/libglamoregl.so';blob=path.read_bytes();digest=hashlib.sha256(blob).hexdigest()
+spec=importlib.util.spec_from_file_location('desktop',ROOT/'scripts/qemu-linux-desktop-probe.py');module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);module.BASE=ROOT/'.local/spice-reconnect-build/runtime'
+path=ROOT/'.local/runtime/utm/glamor-causal-artifacts/modules-fixed/libglamoregl.so';blob=path.read_bytes();digest=hashlib.sha256(blob).hexdigest()
 if digest!='ba64c24cb70c953d26ac032633b6bca98577ea415f7abdc32f7f451d9a115f67':raise SystemExit('Wrong validated Guest module')
 assert module.INIT.count('udevd --daemon')==1 and module.INIT.count('Xorg :0 vt1')==1
 inject="mkdir -p /veynode/modules-fixed\nprintf '%s' '"+base64.b64encode(blob).decode()+"' | base64 -d > /veynode/modules-fixed/libglamoregl.so\nprintf '%s\\n' '"+digest+"  /veynode/modules-fixed/libglamoregl.so' | sha256sum -c -\n"

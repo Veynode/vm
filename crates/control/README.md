@@ -357,8 +357,8 @@ A local diagnostic registration using the already built SPICE reconnect fix is:
   --backend "$PWD/.local/bin/vm-apple" \
   --qemu-worker "$PWD/target/debug/vm-qemu" \
   --qemu-launcher "$PWD/.local/spice-reconnect-build/runtime/probe-loader" \
-  --qemu-library "$PWD/.local/windows-gpu/UTM.app/Contents/Frameworks/qemu-aarch64-softmmu.framework/Versions/A/qemu-aarch64-softmmu" \
-  --qemu-resources "$PWD/.local/windows-gpu/UTM.app/Contents/Resources/qemu" \
+  --qemu-library "$PWD/.local/runtime/utm/UTM.app/Contents/Frameworks/qemu-aarch64-softmmu.framework/Versions/A/qemu-aarch64-softmmu" \
+  --qemu-resources "$PWD/.local/runtime/utm/UTM.app/Contents/Resources/qemu" \
   --qemu-spice-library "$PWD/.local/spice-reconnect-build/runtime/libspice-server-fixed.dylib" \
   --qemu-screenshot-helper "$PWD/.local/bin/spice-screenshot"
 ```
@@ -422,7 +422,7 @@ python3 scripts/test-control-qemu.py --output .local/evidence/control-qemu-new.j
 The 1536MiB QEMU fixture and 512MiB VZ isolation fixture never attach a disk. The
 stock graphics stack in this test retains known 2D/text rendering defects. The
 controller test is not pixel correctness, Windows GPU, native-window, performance,
-release packaging or licensing acceptance. See `docs/evidence/control-qemu.md`.
+release packaging or licensing acceptance. See `archive/docs-evidence/control-qemu.md`.
 
 
 ### Persistent console registration
@@ -451,7 +451,7 @@ transitions, a server ESTALE publication race, and a Darwin zombie-only process-
 cleanup edge. Static MCP screenshots across new clients and the browser-adapter
 lifetime now pass. Separate actual Chromium154 reports now verify HEVC and H264 decoding and
 confirmed disconnect from this static source; those reports are independent of
-the controller pass. Internet operation is not validated. See `docs/evidence/control-qemu-persistent.md`.
+the controller pass. Internet operation is not validated. See `archive/docs-evidence/control-qemu-persistent.md`.
 
 The explicit static integration command is:
 

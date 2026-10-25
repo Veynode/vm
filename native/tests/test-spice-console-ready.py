@@ -4,10 +4,10 @@ import importlib.util,json,os,pathlib,subprocess,sys,tempfile,time,threading
 ROOT=pathlib.Path(__file__).resolve().parents[2]
 spec=importlib.util.spec_from_file_location('console_test',ROOT/'native/tests/test-spice-console.py')
 console_test=importlib.util.module_from_spec(spec);spec.loader.exec_module(console_test)
-spec=importlib.util.spec_from_file_location('desktop',ROOT/'scripts/windows-probe-linux-desktop.py');module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+spec=importlib.util.spec_from_file_location('desktop',ROOT/'scripts/qemu-linux-desktop-probe.py');module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
 os.umask(0o077);prefix=pathlib.Path(sys.argv[1]).resolve();prefix.parent.mkdir(parents=True,exist_ok=True);report={'passed':False,'guest_executed':False};client=None;proc=None
 with tempfile.TemporaryDirectory(prefix='veynode-console-ready-') as folder:
- folder=pathlib.Path(folder);app=ROOT/'.local/windows-gpu/UTM.app/Contents';runtime=ROOT/'.local/spice-reconnect-build/runtime';sock=folder/'spice.sock';qmp=folder/'qmp.sock';env=os.environ.copy();env['VEYNODE_SPICE_LIBRARY']=str(runtime/'libspice-server-fixed.dylib');env['ANGLE_DEFAULT_PLATFORM']='metal'
+ folder=pathlib.Path(folder);app=ROOT/'.local/runtime/utm/UTM.app/Contents';runtime=ROOT/'.local/spice-reconnect-build/runtime';sock=folder/'spice.sock';qmp=folder/'qmp.sock';env=os.environ.copy();env['VEYNODE_SPICE_LIBRARY']=str(runtime/'libspice-server-fixed.dylib');env['ANGLE_DEFAULT_PLATFORM']='metal'
  command=[str(runtime/'probe-loader'),str(app/'Frameworks/qemu-aarch64-softmmu.framework/Versions/A/qemu-aarch64-softmmu'),'-L',str(app/'Resources/qemu'),'-machine','virt,accel=hvf','-cpu','host','-m','512M','-smp','1','-nodefaults','-display','none','-serial','none','-monitor','none','-S','-qmp',f'unix:{qmp},server=on,wait=off','-spice',f'unix=on,addr={sock},disable-ticketing=on,gl=es','-device','virtio-gpu-gl-pci']
  with open(str(prefix)+'.qemu.log','x') as log:
   try:

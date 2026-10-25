@@ -3,8 +3,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 export PATH="/opt/homebrew/bin:$PATH"
+export VEYNODE_PYTHON="${VEYNODE_PYTHON:-$(command -v python3.13 || command -v python3.12 || command -v python3)}"
 ./scripts/build-native.sh
-./scripts/check-manager.sh
 cargo fmt --check
 cargo build --locked --bins
 cargo test --locked

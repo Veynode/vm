@@ -32,8 +32,8 @@ class Control(unittest.TestCase):
   r=subprocess.run(['/bin/sh'],input=P.guest_script(),text=True,capture_output=True,timeout=2)
   self.assertEqual(r.returncode,90);self.assertEqual(r.stdout,'');self.assertEqual(r.stderr,'')
  def test_actual_archived_output_parser_and_failures(self):
-  triangle=(ROOT/'docs/evidence/linux-vulkan-investigation/pixel-selected.log').read_text()
-  vkmark=(ROOT/'docs/evidence/linux-vulkan-application/v2/selected.log').read_text()
+  triangle=(ROOT/'archive/docs-evidence/linux-vulkan-investigation/pixel-selected.log').read_text()
+  vkmark=(ROOT/'archive/docs-evidence/linux-vulkan-application/v2/selected.log').read_text()
   portion=vkmark[vkmark.index('VKMARK_FEATURES_BEGIN'):vkmark.index('VKMARK_APPLICATION_DONE')+len('VKMARK_APPLICATION_DONE')]
   data=(triangle+'\n'+portion+'\nVEYNODE_CONTROL_VENUS_READY\n').encode()
   self.assertTrue(T.workload(data)['vkmark']['workload_completed'])

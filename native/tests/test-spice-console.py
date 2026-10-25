@@ -146,9 +146,9 @@ def main():
  if len(sys.argv)==3 and not sys.argv[1].startswith('--'):raise SystemExit((death_consumer if os.environ.get('VEYNODE_CONSOLE_DEATH_TEST')=='1' else consumer)(*sys.argv[1:]))
  parser=argparse.ArgumentParser();parser.add_argument('--output',required=True,type=pathlib.Path);parser.add_argument('--death-test',action='store_true');parser.add_argument('--extra-consumer',type=pathlib.Path);args=parser.parse_args()
  if args.death_test:os.environ['VEYNODE_CONSOLE_DEATH_TEST']='1'
- spec=importlib.util.spec_from_file_location('desktop',ROOT/'scripts/windows-probe-linux-desktop.py');module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+ spec=importlib.util.spec_from_file_location('desktop',ROOT/'scripts/qemu-linux-desktop-probe.py');module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
  module.BASE=ROOT/'.local/spice-reconnect-build/runtime';os.environ['VEYNODE_SPICE_LIBRARY']=str(module.BASE/'libspice-server-fixed.dylib')
- module_file=ROOT/'.local/windows-gpu/glamor-causal-artifacts/modules-fixed/libglamoregl.so';blob=module_file.read_bytes();digest=hashlib.sha256(blob).hexdigest();assert digest=='ba64c24cb70c953d26ac032633b6bca98577ea415f7abdc32f7f451d9a115f67'
+ module_file=ROOT/'.local/runtime/utm/glamor-causal-artifacts/modules-fixed/libglamoregl.so';blob=module_file.read_bytes();digest=hashlib.sha256(blob).hexdigest();assert digest=='ba64c24cb70c953d26ac032633b6bca98577ea415f7abdc32f7f451d9a115f67'
  inject="mkdir -p /veynode/modules-fixed\nprintf '%s' '"+base64.b64encode(blob).decode()+"' | base64 -d > /veynode/modules-fixed/libglamoregl.so\necho '"+digest+"  /veynode/modules-fixed/libglamoregl.so' | sha256sum -c -\n"
  module.INIT=module.INIT.replace('udevd --daemon',inject+'udevd --daemon').replace('Xorg :0 vt1','Xorg :0 vt1 -modulepath /veynode/modules-fixed,/usr/lib/xorg/modules')
  module.INIT=module.INIT.replace('echo VEYNODE_DESKTOP_READY','( sleep 10; pids="$(pidof Xorg glxgears xterm)"; kill -STOP $pids; echo VEYNODE_STATIC_DESKTOP_READY; for pid in $pids; do cat /proc/$pid/stat; done ) &\necho VEYNODE_DESKTOP_READY')

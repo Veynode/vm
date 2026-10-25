@@ -8,7 +8,7 @@ clang -fobjc-arc -fblocks -Wall -Wextra -Werror -framework Foundation "$ROOT/nat
 "$TEMP/writer"
 clang -fobjc-arc -fblocks -Wall -Wextra -Werror -DVEYNODE_SCREENSHOT_TESTING -framework Foundation -framework CoreVideo -framework CoreGraphics -framework ImageIO -framework IOSurface "$ROOT/native/console/FramePool.m" "$ROOT/native/console/AsyncScreenshot.m" "$ROOT/native/console/AsyncScreenshotTests.m" -o "$TEMP/screenshot"
 "$TEMP/screenshot"
-BASE="$ROOT/.local/windows-gpu"
+BASE="$ROOT/.local/runtime/utm"
 HEADERS="$BASE/CocoaSpice-127033fa3e59cd49678f49ed54f8adfc060afb56/Sources/CocoaSpice/ExternalHeaders"
 FRAMEWORKS="$BASE/UTM.app/Contents/Frameworks"
 clang -fobjc-arc -fblocks -Wall -Wextra -Wno-unused-parameter -DVEYNODE_NATIVE_DISPLAY -DVEYNODE_SCREENSHOT_TESTING \

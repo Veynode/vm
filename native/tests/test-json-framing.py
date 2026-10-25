@@ -12,8 +12,8 @@ with tempfile.TemporaryDirectory(prefix="veynode-json-framing-") as temporary:
     subprocess.run([
         "xcrun", "swiftc", "-swift-version", "5", "-O", "-D", "JSON_FRAMING_TESTS",
         "-target", "arm64-apple-macosx14.0", "-framework", "Virtualization", "-framework", "AppKit",
-        str(ROOT / "native/Sources/main.swift"),
-        str(ROOT / "native/Sources/GuestStreamBridge.swift"),
+        str(ROOT / "native/worker/main.swift"),
+        str(ROOT / "native/worker/GuestStreamBridge.swift"),
         str(ROOT / "native/tests/json-framing-tests.swift"), "-o", str(binary),
     ], check=True, timeout=120)
     completed = subprocess.run([str(binary), "framing-test"], check=True,

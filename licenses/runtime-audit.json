@@ -21,31 +21,31 @@
     }
   },
   "evidence_files": {
-    "scripts/windows-fetch-utm.sh": {
+    "runtime/fetch-utm.sh": {
       "bytes": 1189,
       "sha256": "675b87ccb54d04d3d39e79af1b9227217d0a5ccc314f9cd342ed3ef21465d874"
     },
-    ".local/windows-gpu/UTM-5.0.5/LICENSE": {
+    ".local/runtime/utm/UTM-5.0.5/LICENSE": {
       "bytes": 11358,
       "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
     },
-    ".local/windows-gpu/UTM-5.0.5/Renderer/LICENSE.txt": {
+    ".local/runtime/utm/UTM-5.0.5/Renderer/LICENSE.txt": {
       "bytes": 1055,
       "sha256": "85bb2db51c99fe47c7466378aacff03b771c20a2271b7ad58f9c47b0bd9e0de0"
     },
-    ".local/windows-gpu/UTM-5.0.5/patches/sources": {
+    ".local/runtime/utm/UTM-5.0.5/patches/sources": {
       "bytes": 3988,
       "sha256": "adac6e4b89af52dbf721989e282605e8a53638462959f33abfdd9f0e75b07cae"
     },
-    ".local/windows-gpu/UTM-5.0.5/patches/spice-0.14.3.patch": {
+    ".local/runtime/utm/UTM-5.0.5/patches/spice-0.14.3.patch": {
       "bytes": 21344,
       "sha256": "f4ab372d6bfcfcf80e46944bb9371bfd2b064d319f02272523743a14f81136d0"
     },
-    ".local/windows-gpu/UTM.app/Contents/Frameworks/D3DMetal.framework/Versions/A/Resources/LICENSE": {
+    ".local/runtime/utm/UTM.app/Contents/Frameworks/D3DMetal.framework/Versions/A/Resources/LICENSE": {
       "bytes": 1389,
       "sha256": "553d0035773ddd1590045f8fdc3a4c6ead31e36336721aeca8421e88ed1c9f80"
     },
-    ".local/windows-gpu/UTM.app/Contents/Resources/qemu/edk2-licenses.txt": {
+    ".local/runtime/utm/UTM.app/Contents/Resources/qemu/edk2-licenses.txt": {
       "bytes": 42903,
       "sha256": "1ddeaed2e7d2e9ecb960bdfc1b8ee45387aff70d056d985d145949af3951657c"
     },
@@ -61,23 +61,23 @@
       "bytes": 1859,
       "sha256": "144b108ce0cc0c2b991c77d5cfc2d85d83c887f61330bef967c3a90dc561ed58"
     },
-    "scripts/prepare-spice-reconnect-build.py": {
+    "runtime/prepare-spice-reconnect-build.py": {
       "bytes": 3724,
       "sha256": "29ea06beacb6acffed2cf1cbf493fe052e3c5e578ff97464c6447ec89c5c0caa"
     },
-    "scripts/configure-spice-reconnect-build.py": {
+    "runtime/configure-spice-reconnect-build.py": {
       "bytes": 2226,
       "sha256": "eada0a0778fb401f5ad5b6087622eb3cc006f40aa5dcdbf42106ffe91adef704"
     },
-    "scripts/build-spice-reconnect-server.py": {
+    "runtime/build-spice-reconnect-server.py": {
       "bytes": 4731,
       "sha256": "4b28419298e2d0ca53679396d99b240426fe09985496fc0d264e671f4424a57a"
     },
-    "scripts/apply-spice-reconnect-fix.py": {
+    "runtime/apply-spice-reconnect-fix.py": {
       "bytes": 6579,
       "sha256": "acf862f7264b43aa80f200d0a2987af1ba8a6d5d3438d12618e920f97522008d"
     },
-    "scripts/apply-spice-retired-publication-fix.py": {
+    "runtime/apply-spice-retired-publication-fix.py": {
       "bytes": 1727,
       "sha256": "fce9eabb1e8f30c30355bc8174324623ef99e16a3cdf6144c33e41181c070008"
     },

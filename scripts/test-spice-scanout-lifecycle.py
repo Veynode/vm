@@ -56,7 +56,7 @@ def consumer(socket, prefix):
  return 0 if passed else 1
 
 def fixture(scenario,output):
- spec=importlib.util.spec_from_file_location('desktop_fixture',ROOT/'scripts/windows-probe-linux-desktop.py');module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);module.BASE=RUNTIME
+ spec=importlib.util.spec_from_file_location('desktop_fixture',ROOT/'scripts/qemu-linux-desktop-probe.py');module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);module.BASE=RUNTIME
  if scenario=='resize':
   assert module.INIT.count('apk add --no-cache --no-progress ')==1
   assert module.INIT.count('echo VEYNODE_DESKTOP_READY')==1

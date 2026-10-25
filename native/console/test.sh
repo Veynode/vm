@@ -28,7 +28,7 @@ clang -fobjc-arc -Wall -Wextra -framework Foundation "$ROOT/native/console/Displ
 "$APP/Contents/MacOS/spice-console" --display-metal-self-test
 codesign --verify --strict "$APP"
 "$APP/Contents/MacOS/spice-console" --probe-capabilities > "$TEMP/display.json"
-BASE="$ROOT/.local/windows-gpu"
+BASE="$ROOT/.local/runtime/utm"
 HEADERS="$BASE/CocoaSpice-127033fa3e59cd49678f49ed54f8adfc060afb56/Sources/CocoaSpice/ExternalHeaders"
 FRAMEWORKS="$BASE/UTM.app/Contents/Frameworks"
 clang -fobjc-arc -Wall -Wextra -Wno-unused-parameter \

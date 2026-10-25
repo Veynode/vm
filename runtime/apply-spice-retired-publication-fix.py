@@ -22,7 +22,7 @@ text=SOURCE.read_text()
 if text.count(old)==1:
  changed=text.replace(old,new);SOURCE.write_text(changed)
  patch=''.join(difflib.unified_diff(text.splitlines(True),changed.splitlines(True),fromfile='a/server/dcc-send.c',tofile='b/server/dcc-send.c',n=0))
- (ROOT/'docs/evidence/apple-spice-retired-publication.patch').write_text(patch)
+ (ROOT/'archive/docs-evidence/apple-spice-retired-publication.patch').write_text(patch)
  print('Applied retired-publication fix to isolated SPICE source')
 elif text.count(new)==1:print('Retired-publication fix already present')
 else:raise SystemExit('Unexpected isolated SPICE source; refusing ambiguous edit')

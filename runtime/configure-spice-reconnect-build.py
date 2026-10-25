@@ -2,7 +2,7 @@
 """Selective source build using exact UTM source headers and unchanged official libraries."""
 import os,pathlib,subprocess
 ROOT=pathlib.Path(__file__).resolve().parents[1];BASE=ROOT/'.local/spice-reconnect-build';PC=BASE/'pkgconfig';PC.mkdir(exist_ok=True)
-FRAMEWORKS=ROOT/'.local/windows-gpu/UTM.app/Contents/Frameworks'
+FRAMEWORKS=ROOT/'.local/runtime/utm/UTM.app/Contents/Frameworks'
 framework=lambda name:f'-F{FRAMEWORKS} -framework {name} -Wl,-rpath,{FRAMEWORKS}'
 glib=[BASE/'glib-2.83.0',BASE/'glib-2.83.0/glib',BASE/'glib-config',BASE/'glib-config/glib',BASE/'glib-2.83.0/gmodule',BASE/'glib-config/gmodule']
 def pc(name,version,includes,libs,requires=''):

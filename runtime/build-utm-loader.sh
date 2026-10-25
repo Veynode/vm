@@ -2,10 +2,10 @@
 # Build only our own developer diagnostic; bundled upstream code stays untouched.
 set -eu
 cd "$(dirname "$0")/.."
-base="$PWD/.local/windows-gpu"
+base="$PWD/.local/runtime/utm"
 frameworks="$base/UTM.app/Contents/Frameworks"
-test -d "$frameworks" || { echo 'Run scripts/windows-fetch-utm.sh first' >&2; exit 1; }
-clang -Wall -Wextra -Werror -Wl,-rpath,"$frameworks" scripts/windows-utm-loader.c -o "$base/probe-loader"
+test -d "$frameworks" || { echo 'Run runtime/fetch-utm.sh first' >&2; exit 1; }
+clang -Wall -Wextra -Werror -Wl,-rpath,"$frameworks" runtime/utm-loader.c -o "$base/probe-loader"
 cat > "$base/loader.entitlements" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

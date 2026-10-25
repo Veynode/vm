@@ -20,7 +20,7 @@ import tarfile
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-BASE = ROOT / '.local/windows-gpu'
+BASE = ROOT / '.local/runtime/utm'
 MEDIA = ROOT / '.local/media/alpine-3.24.2'
 ROOTFS_SHA = '9bf70a7f18ea44094cbb5f70c58f9af129c8214745743db0e68e5502cc2ce773'
 INIT = '''#!/bin/sh

@@ -5,7 +5,7 @@
   "roots": [
     {
       "id": "utm-5-0-5",
-      "path": ".local/windows-gpu/UTM.app",
+      "path": ".local/runtime/utm/UTM.app",
       "tree_sha256": "1414edb421021f84d9b748decad05160989a08904df2c8079da15cdb3cdf62e3"
     },
     {

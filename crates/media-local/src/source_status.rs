@@ -446,11 +446,9 @@ mod tests {
             .await;
             assert_eq!(report.failure.unwrap().code, "guest_capture_failed");
             assert!(matches!(report.diagnostic, Diagnostic::InvalidTerminal));
-            assert!(
-                !serde_json::to_string(&report.diagnostic)
-                    .unwrap()
-                    .contains("SECRET")
-            );
+            assert!(!serde_json::to_string(&report.diagnostic)
+                .unwrap()
+                .contains("SECRET"));
         }
         let bytes = String::from_utf8(final_record(
             json!({"code":"console_identity_verification_stale",
@@ -537,11 +535,9 @@ mod tests {
                 matches!(report.diagnostic, Diagnostic::InvalidTerminal),
                 "{bytes}"
             );
-            assert!(
-                !serde_json::to_string(&report.diagnostic)
-                    .unwrap()
-                    .contains("SECRET")
-            );
+            assert!(!serde_json::to_string(&report.diagnostic)
+                .unwrap()
+                .contains("SECRET"));
         }
         for bytes in [
             valid.replace("\"source_sequence\":0", "\"source_sequence\":-1"),
@@ -636,11 +632,9 @@ mod tests {
             collect(bytes.as_slice()).await.unwrap().code,
             "guest_capture_no_frames"
         );
-        assert!(
-            collect(final_record(Value::Null).as_slice())
-                .await
-                .is_none()
-        );
+        assert!(collect(final_record(Value::Null).as_slice())
+            .await
+            .is_none());
     }
     #[tokio::test]
     async fn malformed_truncated_duplicate_and_excessive_diagnostics_fail_closed() {

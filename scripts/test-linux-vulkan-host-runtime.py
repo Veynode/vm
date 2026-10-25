@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import unittest
 ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location('host_runtime', ROOT/'scripts/linux-vulkan-build-host-runtime.py')
+spec = importlib.util.spec_from_file_location('host_runtime', ROOT/'runtime/linux-vulkan-build-host-runtime.py')
 B = importlib.util.module_from_spec(spec); spec.loader.exec_module(B)
 class PatchBoundary(unittest.TestCase):
     @classmethod
@@ -47,7 +47,7 @@ class PatchBoundary(unittest.TestCase):
                 r=subprocess.run([str(path/'probe')],start_new_session=True,check=True,capture_output=True,text=True,timeout=3)
                 self.assertEqual(r.stdout,f'same_group={int(patched)} reaped=1\n')
     def test_vendor_inputs_pinned(self):
-        fw=ROOT/'.local/windows-gpu/UTM.app/Contents/Frameworks'
+        fw=ROOT/'.local/runtime/utm/UTM.app/Contents/Frameworks'
         for name,digest in B.FRAMEWORKS.items():
             self.assertEqual(B.sha(fw/(name+'.framework')/'Versions/A'/name),digest)
 if __name__=='__main__':unittest.main()

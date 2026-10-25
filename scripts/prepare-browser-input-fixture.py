@@ -13,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 GLAMOR_SHA = 'ba64c24cb70c953d26ac032633b6bca98577ea415f7abdc32f7f451d9a115f67'
-GLAMOR = ROOT / '.local/windows-gpu/glamor-causal-artifacts/modules-fixed/libglamoregl.so'
+GLAMOR = ROOT / '.local/runtime/utm/glamor-causal-artifacts/modules-fixed/libglamoregl.so'
 PROBE = ROOT / 'scripts/linux-xrender-probe.c'
 XORG = 'Xorg :0 vt1 -config /veynode/xorg.conf -ac -noreset -nolisten tcp -logfile /veynode/Xorg.log &'
 

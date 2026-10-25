@@ -6,7 +6,7 @@ Guest X11 oracle independently checks real events and resulting window pixels.
 """
 import argparse,base64,hashlib,importlib.util,json,os,pathlib,shlex,subprocess,sys,tempfile,time
 ROOT=pathlib.Path(__file__).resolve().parents[1]
-BASE=ROOT/'.local/windows-gpu'
+BASE=ROOT/'.local/runtime/utm'
 def load(path,name):
  spec=importlib.util.spec_from_file_location(name,path);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
 def main():
@@ -19,7 +19,7 @@ def main():
  if output.exists():raise SystemExit('Refusing evidence overwrite')
  headers=BASE/'CocoaSpice-127033fa3e59cd49678f49ed54f8adfc060afb56/Sources/CocoaSpice/ExternalHeaders';frameworks=BASE/'UTM.app/Contents/Frameworks';binary=BASE/('spice-coordinate-probe' if a.coordinates else 'spice-input-probe')
  subprocess.run(['clang','-Wall','-Wextra',*[f'-I{headers/s}' for s in ['', 'glib-2.0','spice-client-glib-2.0','spice-1']],f'-F{frameworks}',f'-Wl,-rpath,{frameworks}','-framework','spice-client-glib-2.0.8','-framework','glib-2.0.0','-framework','gobject-2.0.0','-framework','gio-2.0.0',str(host_source),'-o',str(binary)],check=True)
- fixture=load(ROOT/'scripts/windows-probe-linux-desktop.py','input_fixture')
+ fixture=load(ROOT/'scripts/qemu-linux-desktop-probe.py','input_fixture')
  modloop=ROOT/'.local/media/alpine-3.24.2/modloop-virt';version='6.18.52-0-virt'
  deps=dict(line.split(':',1) for line in subprocess.check_output(['unsquashfs','-cat',str(modloop),f'modules/{version}/modules.dep'],text=True).splitlines());modules=set()
  def include(name):

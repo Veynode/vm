@@ -15,7 +15,7 @@ def load(name):
     return module
 
 prepare = load('prepare-browser-input-fixture')
-desktop = load('windows-probe-linux-desktop')
+desktop = load('qemu-linux-desktop-probe')
 
 class Tests(unittest.TestCase):
     @classmethod

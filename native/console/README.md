@@ -279,7 +279,7 @@ No VM or window was started by this implementation task.
 
 ## Stage8: immutable displayed-frame precursor
 
-See [component schema, mapping and verification](../../docs/evidence/qemu-displayed-frame-component.md).
+See [component schema, mapping and verification](../../archive/docs-evidence/qemu-displayed-frame-component.md).
 Stage8r3 adds read-only actual-presented provenance and pure backing-to-Guest
 coordinate conversion. No native input/authority RPC is implemented or enabled.
 

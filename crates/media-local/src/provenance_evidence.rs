@@ -1,7 +1,7 @@
 //! Host-local ownership evidence. Counts are not receiver delivery or total RSS.
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::time::Instant;
-use webrtc::peer_connection::media_egress::{ProvenanceSnapshot, provenance_caps};
+use webrtc::peer_connection::media_egress::{provenance_caps, ProvenanceSnapshot};
 
 fn value(s: &ProvenanceSnapshot) -> Value {
     let (proofs, attempts, attempt_bytes) = provenance_caps();

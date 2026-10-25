@@ -9,7 +9,7 @@ os.umask(0o077)
 ROOT=pathlib.Path(__file__).resolve().parent.parent
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--codec',choices=['h264','hevc'],default='h264')
-parser.add_argument('--fixture-script',type=pathlib.Path,default=ROOT/'scripts/windows-probe-linux-desktop.py',help='Compatible real desktop fixture entry point')
+parser.add_argument('--fixture-script',type=pathlib.Path,default=ROOT/'scripts/qemu-linux-desktop-probe.py',help='Compatible real desktop fixture entry point')
 parser.add_argument('--fixture-arg',action='append',default=[],help='Extra single argument passed to fixture (use = for flags)')
 parser.add_argument('--output',type=pathlib.Path,default=ROOT/'.local/evidence'/('spice-h264-'+datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'.json'))
 a=parser.parse_args();output=a.output.resolve();output.parent.mkdir(parents=True,exist_ok=True)
