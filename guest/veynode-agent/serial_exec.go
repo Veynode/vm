@@ -162,7 +162,10 @@ func validateSerialV2(e serialEnvelope, hello bool) error {
 // return is delayed until scope descendants are confirmed gone or cleanup fails.
 // Guest time pauses with QEMU: host guardian termination remains mandatory.
 func serveSerialExec(s deadlineStream, manager *jobManager) (returned error) {
-	if manager.containmentMode != "cgroup-v2-clone3-kill" || !manager.identity.Rootless || manager.identity.UID == 0 {
+	// OCI micro-VMs run commands as the image user inside the container root; the
+	// VM itself is the isolation boundary, as on the vsock transport.
+	containerRoot := manager.identity.Mode == "container-root" && manager.identity.Chroot != ""
+	if manager.containmentMode != "cgroup-v2-clone3-kill" || (!containerRoot && (!manager.identity.Rootless || manager.identity.UID == 0)) {
 		s.Close()
 		return fmt.Errorf("serial execution requires verified rootless cgroup containment")
 	}

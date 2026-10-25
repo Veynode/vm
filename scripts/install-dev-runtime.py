@@ -5,7 +5,8 @@ Writes <VEYNODEVM_HOME or ~/Library/Application Support/VeynodeVM>/runtime.json:
   backend   .local/bin/vm-apple            (scripts/build-native.sh)
   boot      .local/boot/{Image,initramfs.gz,modloop}  (guest/kernel/build.py)
   qemu      UTM-derived QEMU/HVF GPU runtime, only with --qemu and when present
-            (runtime/fetch-utm.sh, runtime/build-utm-loader.sh, spice builds)
+            (runtime/fetch-utm.sh, runtime/build-utm-loader.sh; the SPICE reconnect
+            build's loader is preferred when present)
   web       web/server.mjs when web/dist is built (cd web && npm ci && npm run build)
 
 Only paths that exist are written; the daemon reads this file when started
@@ -33,7 +34,8 @@ def require(path):
 def qemu_paths():
     paths = {
         'worker': ROOT / 'target/debug/vm-qemu',
-        'launcher': ROOT / '.local/spice-reconnect-build/runtime/probe-loader',
+        'launcher': next((p for p in (ROOT / '.local/spice-reconnect-build/runtime/probe-loader', UTM / 'probe-loader') if p.exists()),
+                         UTM / 'probe-loader'),
         'library': UTM / 'UTM.app/Contents/Frameworks/qemu-aarch64-softmmu.framework/Versions/A/qemu-aarch64-softmmu',
         'resources': UTM / 'UTM.app/Contents/Resources/qemu',
     }
@@ -42,13 +44,18 @@ def qemu_paths():
         'screenshot_helper': ROOT / '.local/bin/spice-screenshot',
         'console_broker': ROOT / 'target/debug/vm-console',
         'console_helper': ROOT / '.local/bin/spice-console',
-        'venus_runtime': ROOT / '.local/runtime/venus',
+        'venus_runtime': ROOT / '.local/runtime/venus/registration.json',
     }
     missing = [str(p) for p in paths.values() if not p.exists()]
     if missing:
         raise SystemExit('QEMU runtime incomplete; run runtime/fetch-utm.sh and runtime/build-utm-loader.sh first:\n  ' + '\n  '.join(missing))
     result = {k: str(v.resolve()) for k, v in paths.items()}
-    result.update({k: str(v.resolve()) for k, v in optional.items() if v.exists()})
+    present = {k: v for k, v in optional.items() if v.exists()}
+    if not ('console_broker' in present and 'console_helper' in present):
+        # The daemon accepts the console broker and native helper only as a pair.
+        present.pop('console_broker', None)
+        present.pop('console_helper', None)
+    result.update({k: str(v.resolve()) for k, v in present.items()})
     return result
 
 

@@ -209,6 +209,8 @@ fn private_file(path: &Path) -> Result<File> {
 /// Daemon VM state: "running", "stopped", "missing", ...
 pub fn vm_state(container: &Container) -> String {
     match daemon_call("status", json!({"id":container.vm_id})) {
+        // QEMU exec bookkeeping can outlive the VM process; without a pid it is stopped.
+        Ok(v) if v["state"] == "recovery_required" && v["pid"].is_null() => "stopped".to_owned(),
         Ok(v) => v["state"].as_str().unwrap_or("unknown").to_owned(),
         Err(e) if e.to_string().contains("VM not found") => "missing".to_owned(),
         Err(_) => "unknown".to_owned(),
@@ -275,6 +277,9 @@ pub fn status_text(container: &Container) -> (String, String) {
         format!("Exited ({code})")
     } else if !console.errors.is_empty() {
         format!("Failed: {}", console.errors.last().unwrap())
+    } else if console.started {
+        // Stopped from outside before the entrypoint reported its exit.
+        "Exited".to_owned()
     } else {
         "Created".to_owned()
     };
@@ -328,9 +333,11 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
             eprintln!("{m}")
         }
     })?;
-    let qemu = options.gpus.is_some() || options.desktop;
+    // GPU acceleration is the QEMU/HVF path; a desktop without --gpus uses the
+    // Apple Virtualization 2D virtio-gpu display and AppKit window.
+    let qemu = options.gpus.is_some();
     if qemu && runtime.qemu.is_none() {
-        bail!("--gpus/--desktop need the QEMU/HVF GPU runtime: run runtime/fetch-utm.sh and scripts/install-dev-runtime.py --qemu")
+        bail!("--gpus needs the QEMU/HVF GPU runtime: run runtime/fetch-utm.sh and scripts/install-dev-runtime.py --qemu")
     }
     let id = random_hex(6);
     let name = match &options.name {
@@ -468,6 +475,7 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
             "engine": options.engine,
             "dns": dns,
             "mtu": mtu,
+            "desktop": options.desktop,
         });
         let mut body = CONFIG_MAGIC.to_vec();
         body.extend(serde_json::to_vec(&guest_config)?);
@@ -482,7 +490,11 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
         let memory_mib =
             options
                 .memory_mib
-                .unwrap_or(if qemu || options.engine { 2048 } else { 512 });
+                .unwrap_or(if qemu || options.engine || options.desktop {
+                    2048
+                } else {
+                    512
+                });
         let cpus = options.cpus.unwrap_or(2);
         let vm_id = format!("c-{id}");
         let mut vm = json!({
@@ -503,15 +515,15 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
             "serial_log": dir.join("console.log"),
             "shares": volumes.iter().enumerate().map(|(i, v)| json!({"tag":format!("v{i}"),"path":v.host,"read_only":v.read_only})).collect::<Vec<_>>(),
         });
+        if options.desktop {
+            vm["width"] = json!(1280);
+            vm["height"] = json!(800);
+        }
         if qemu {
             vm["ports"] = json!(ports);
             vm["qemu_guest_exec"] = json!(true);
             if let Some(profile) = gpu_profile {
                 vm["qemu_graphics_profile"] = json!(profile);
-            }
-            if options.desktop {
-                vm["width"] = json!(1280);
-                vm["height"] = json!(800);
             }
         }
         let container = Container {
@@ -645,6 +657,30 @@ pub fn wait_stopped(container: &Container, timeout: Duration) -> bool {
     false
 }
 
+/// A QEMU micro-VM stopped by force keeps its exec incarnation pending in the
+/// daemon journal. The VM, and with it every guest scope, is gone, so release
+/// it; the daemon still verifies the original worker witness before agreeing.
+fn reconcile_execution(container: &Container) -> Result<()> {
+    if container.backend != "qemu-hvf" {
+        return Ok(());
+    }
+    let status = daemon_call("status", json!({"id":container.vm_id}))?;
+    if !status["pid"].is_null() || status["execution_reconciliation_required"] != true {
+        return Ok(());
+    }
+    for incarnation in status["execution_incarnations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        daemon_call(
+            "reconcile_execution",
+            json!({"id":container.vm_id,"worker_instance":incarnation["worker_instance"]}),
+        )?;
+    }
+    Ok(())
+}
+
 /// Start a stopped container again. The previous run's console is kept as
 /// `console.prev.log` so markers (ip, exit) always describe the current run.
 pub fn start(container: &Container) -> Result<()> {
@@ -655,6 +691,7 @@ pub fn start(container: &Container) -> Result<()> {
     if dir.join("console.log").exists() {
         fs::rename(dir.join("console.log"), dir.join("console.prev.log"))?;
     }
+    reconcile_execution(container)?;
     daemon_call("start", json!({"id":container.vm_id}))?;
     if !container.ports.is_empty() && container.backend == "apple-virtualization" {
         crate::proxy::spawn(container)?;
@@ -672,7 +709,10 @@ pub fn stop(container: &Container, timeout: Duration) -> Result<()> {
     if wait_stopped(container, timeout) {
         return Ok(());
     }
-    daemon_call("force_stop", json!({"id":container.vm_id}))?;
+    daemon_call(
+        "force_stop",
+        json!({"id":container.vm_id,"confirm":container.vm_id}),
+    )?;
     if !wait_stopped(container, Duration::from_secs(15)) {
         bail!("container {} did not stop", container.name)
     }
@@ -688,6 +728,10 @@ pub fn remove(container: &Container, force: bool) -> Result<()> {
             )
         }
         stop(container, Duration::from_secs(5))?;
+    }
+    match reconcile_execution(container) {
+        Err(e) if !e.to_string().contains("VM not found") => return Err(e),
+        _ => {}
     }
     match daemon_call(
         "delete",

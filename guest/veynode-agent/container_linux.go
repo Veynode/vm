@@ -55,6 +55,7 @@ type containerConfig struct {
 	Transport        string            `json:"transport"`
 	GPU              bool              `json:"gpu"`
 	Engine           bool              `json:"engine"`
+	Desktop          bool              `json:"desktop,omitempty"`
 	DNS              []string          `json:"dns,omitempty"`
 	MTU              int               `json:"mtu,omitempty"`
 }
@@ -269,6 +270,9 @@ esac
 
 func configureNetwork(config containerConfig) string {
 	_ = exec.Command("/bin/busybox", "ifconfig", "lo", "127.0.0.1", "up").Run()
+	// Packetization-layer PMTU discovery: recover from paths that drop large
+	// segments without ICMP (observed behind some host networks on Apple NAT).
+	_ = os.WriteFile("/proc/sys/net/ipv4/tcp_mtu_probing", []byte("1"), 0o644)
 	if err := os.WriteFile(containerRunDir+"/udhcpc.script", []byte(udhcpcScript), 0o755); err != nil {
 		marker("warning", "network script: "+err.Error())
 		return ""
@@ -324,8 +328,12 @@ func prepareRoot(config containerConfig) error {
 		return err
 	}
 	modprobe("ext4", "vsock", "vmw_vsock_virtio_transport", "virtiofs", "9pnet_virtio", "9p", "fuse", "tun")
-	if config.GPU {
+	if config.GPU || config.Desktop {
 		modprobe("virtio-gpu")
+	}
+	if config.Desktop {
+		// Apple Virtualization attaches USB keyboard and pointer; QEMU uses virtio input.
+		modprobe("xhci-pci", "usbhid", "hid-generic", "evdev", "virtio-input")
 	}
 	if config.Engine {
 		modprobe("bridge", "br_netfilter", "veth", "nf_tables", "nft_chain_nat", "nft_compat", "ip_tables", "iptable_nat", "iptable_filter", "xt_MASQUERADE", "xt_conntrack", "xt_addrtype", "nf_nat", "nf_conntrack", "ipt_REJECT", "xt_nat")
@@ -498,6 +506,7 @@ func containerInit() int {
 	_ = os.WriteFile(containerRunDir+"/env.json", envJSON, 0o600)
 	agentArgs := []string{"--allow-execute", "--container-root", containerRootDir, "--container-env", containerRunDir + "/env.json"}
 	if config.Transport == "virtio-serial-exec" {
+		linkVirtioPorts()
 		agentArgs = append([]string{"--virtio-serial-exec"}, agentArgs...)
 	} else {
 		agentArgs = append(agentArgs, "--allow-shutdown")
@@ -605,4 +614,22 @@ func powerOff(code int) {
 	syscall.Sync()
 	_ = code
 	_ = syscall.Reboot(syscall.LINUX_REBOOT_CMD_POWER_OFF)
+}
+
+// linkVirtioPorts creates the /dev/virtio-ports/<name> links udev would make;
+// container-init runs without udev, so devtmpfs only has /dev/vportNpM.
+func linkVirtioPorts() {
+	ports, _ := filepath.Glob("/sys/class/virtio-ports/vport*")
+	if len(ports) == 0 {
+		return
+	}
+	_ = os.MkdirAll("/dev/virtio-ports", 0o755)
+	for _, port := range ports {
+		name, err := os.ReadFile(port + "/name")
+		trimmed := strings.TrimSpace(string(name))
+		if err != nil || trimmed == "" || strings.ContainsRune(trimmed, '/') {
+			continue
+		}
+		_ = os.Symlink("../"+filepath.Base(port), "/dev/virtio-ports/"+trimmed)
+	}
 }

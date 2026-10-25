@@ -16,8 +16,11 @@ impl Drop for Daemon {
         let _ = self.child.wait();
     }
 }
+/// Each test daemon gets its own VEYNODEVM_HOME so a developer or user
+/// runtime.json (QEMU/Venus registration) never leaks into its behaviour.
 fn daemon(path: &Path) -> Daemon {
     let child = Command::new(env!("CARGO_BIN_EXE_vm-control"))
+        .env("VEYNODEVM_HOME", path.parent().unwrap())
         .args(["daemon", "--state-dir"])
         .arg(path)
         .args(["--backend", "/usr/bin/false"])
@@ -128,6 +131,7 @@ fn registry_protocol_and_permissions() {
     .unwrap();
     assert!(next["epoch"].as_u64().unwrap() > epoch);
     let duplicate = Command::new(env!("CARGO_BIN_EXE_vm-control"))
+        .env("VEYNODEVM_HOME", dir.parent().unwrap())
         .args(["daemon", "--state-dir"])
         .arg(&dir)
         .args(["--backend", "/usr/bin/false"])
@@ -153,6 +157,7 @@ fn stdio_actual_client_lifecycle() {
     let dir = tmp.path().join("state");
     let _d = daemon(&dir);
     let mut child = Command::new(env!("CARGO_BIN_EXE_vm-control"))
+        .env("VEYNODEVM_HOME", dir.parent().unwrap())
         .args(["mcp", "--state-dir"])
         .arg(&dir)
         .stdin(Stdio::piped())
@@ -237,6 +242,7 @@ fn stdio_graphics_profile_schema_and_fail_closed_registration() {
     let dir = tmp.path().join("state");
     let _daemon = daemon(&dir);
     let mut child = Command::new(env!("CARGO_BIN_EXE_vm-control"))
+        .env("VEYNODEVM_HOME", dir.parent().unwrap())
         .args(["mcp", "--allow-lifecycle", "--state-dir"])
         .arg(&dir)
         .stdin(Stdio::piped())

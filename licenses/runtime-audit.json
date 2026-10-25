@@ -133,8 +133,8 @@
     "sha256": "713afe73c711f01344b8766654be531cd391ed2e30931206f43b5159f143764f"
   },
   "modified_spice_dylib": {
-    "bytes": 1753936,
-    "sha256": "689882d91be47e37b5b6c5fdf571b96bdcc718696572f7a167a46054582f3b0a",
+    "bytes": 1736368,
+    "sha256": "4d635851b2e388240995d21670eab6696890908f35bd4839cc7020b2834a37d7",
     "dynamic_dependencies": [
       "\t@rpath/spice-server.1.framework/Versions/A/spice-server.1 (compatibility version 1.0.0, current version 1.0.0)",
       "\t@rpath/glib-2.0.0.framework/glib-2.0.0 (compatibility version 8301.0.0, current version 8301.0.0)",

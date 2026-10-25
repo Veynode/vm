@@ -1,6 +1,6 @@
 # Product and release acceptance
 
-Status: pre-product engineering validation. Product direction updated by the user on 2026-10-25; the original 2026-10-08 requirements that still apply are kept under "Inherited requirements".
+Status: engineering preview (phases 0–5 of the reorganization implemented; see README for what is verified). Product direction updated by the user on 2026-10-25; the original 2026-10-08 requirements that still apply are kept under "Inherited requirements".
 
 ## Product: VeynodeVM
 
@@ -10,7 +10,7 @@ CLI and product name: `veynodevm`.
 
 ### Run modes (both required)
 
-1. **Micro-VM mode** (`veynodevm run IMAGE`): one lightweight VM per container. The image layers are converted once per digest into a read-only root disk; each container gets a private APFS clone as its writable layer; a pinned Veynode kernel and the guest agent as PID 1 start the OCI entrypoint. This mode gives strong isolation, and each container has its own GPU, desktop, MCP observation/input/exec/files and control lease. `--gpus` or `--desktop` selects QEMU/HVF; otherwise Apple Virtualization.framework is used.
+1. **Micro-VM mode** (`veynodevm run IMAGE`): one lightweight VM per container. The image layers are converted once per digest into a read-only root disk; each container gets a private APFS clone as its writable layer; a pinned Veynode kernel and the guest agent as PID 1 start the OCI entrypoint. This mode gives strong isolation, and each container has its own GPU, desktop, MCP observation/input/exec/files and control lease. `--gpus` selects QEMU/HVF; otherwise Apple Virtualization.framework is used, including for `--desktop` (2D virtio-gpu scanout, software rendering).
 2. **Shared-VM mode** (`veynodevm run --shared`, or the stock `docker` CLI through `docker context veynodevm`): one long-running engine Linux VM runs containerd/dockerd. Containers share its GPU through a CDI device (`veynodevm.dev/gpu=all`). This mode aims for the broadest OCI and docker CLI compatibility.
 
 Both modes need: registry pull (`linux/arm64`), `-p` port publishing, read-write `-v` volumes, streaming `logs`/`attach`/`exec -it`, `rm` and image garbage collection. If an image has no GPU userspace driver, the product must report that it fell back to software rendering (llvmpipe); it must never fall back silently.

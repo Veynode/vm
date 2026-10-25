@@ -204,11 +204,11 @@ fn catalog_pins_actual_owned_group_not_manifest_attestation() {
     let c = catalog();
     assert_eq!(
         c.roles["host_library"],
-        "471cffbff498c5048d54246ee1efd106455a8c1a5d0613bd391f195cb0abc1b3"
+        "0c415eb2cef97d1c17127ee20628196383b637d86e9769856f34237c67d7b9a7"
     );
     assert_eq!(
         c.roles["loader"],
-        "2533628fb78ec7eed058c63ecb1deca406ec73c1614c3411fda5174350e827d6"
+        "ee9a5ee7b351f5c4c3d9046e7c235c5b469619d61536e4570e3c4501ae5921be"
     );
     assert_eq!(c.frameworks.len(), 27);
     assert!(!c.frameworks.keys().any(|k| k.contains("D3DMetal")));

@@ -314,6 +314,65 @@ fn shared_args(rest: &[String], spec: &[(&str, Option<char>, bool)]) -> Vec<Stri
     args
 }
 
+/// `veynodevm build -t TAG [--file F] CONTEXT`: build with the engine's
+/// BuildKit-capable dockerd, then import the result into the micro-VM image
+/// store (`docker save` archive), so it runs with `veynodevm run`.
+pub fn build(rest: &[String]) -> Result<i32> {
+    let p = crate::args::parse(
+        rest,
+        &[
+            ("tag", Some('t'), true),
+            ("file", Some('f'), true),
+            ("build-arg", None, true),
+        ],
+        false,
+    )?;
+    let tag = p.value("tag").context("build requires -t TAG")?;
+    let context = p
+        .positional
+        .first()
+        .context("build requires a CONTEXT directory")?;
+    let docker = docker_cli().context("build needs the docker CLI on PATH")?;
+    let env = env()?;
+    let mut args = vec!["build".to_owned(), "-t".into(), tag.into()];
+    if let Some(file) = p.value("file") {
+        args.extend(["-f".into(), file.into()]);
+    }
+    for arg in p.values("build-arg") {
+        args.extend(["--build-arg".into(), arg.clone()]);
+    }
+    args.push(context.clone());
+    if !Command::new(&docker)
+        .args(&args)
+        .envs(env.clone())
+        .status()?
+        .success()
+    {
+        bail!("docker build failed")
+    }
+    let store = veynodevm_oci::Store::open(&home::images_dir()?)?;
+    let archive = home::images_dir()?
+        .join("tmp")
+        .join(format!("build-{}.tar", crate::random_hex(8)));
+    let saved = Command::new(&docker)
+        .args(["save", "-o"])
+        .arg(&archive)
+        .arg(tag)
+        .envs(env)
+        .status()?;
+    let loaded = if saved.success() {
+        store.load(&archive)
+    } else {
+        Err(anyhow::anyhow!("docker save failed"))
+    };
+    let _ = std::fs::remove_file(&archive);
+    for image in loaded? {
+        let root = store.rootfs(&image, &mut |m| eprintln!("{m}"))?;
+        println!("Loaded image: {} ({})", image.reference, root.display());
+    }
+    Ok(0)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

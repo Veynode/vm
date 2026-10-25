@@ -1,0 +1,28 @@
+#!/bin/sh
+# Container entrypoint: device discovery, Xorg on the virtio-gpu scanout,
+# then an XFCE session. Reports the GL renderer on stdout (container logs).
+set -u
+mkdir -p /run/udev /tmp/.X11-unix "$XDG_RUNTIME_DIR"
+chmod 1777 /tmp/.X11-unix
+chmod 0700 "$XDG_RUNTIME_DIR"
+udevd --daemon
+udevadm trigger --action=add
+udevadm settle --timeout=10
+if [ ! -e /dev/dri/card0 ]; then
+    echo "veynodevm-desktop: no /dev/dri/card0 (run with --desktop)" >&2
+    exit 1
+fi
+mkdir -p /var/lib/dbus
+dbus-uuidgen --ensure
+Xorg :0 vt1 -nolisten tcp -noreset -logfile /tmp/Xorg.0.log &
+xorg=$!
+for _ in $(seq 100); do
+    [ -S /tmp/.X11-unix/X0 ] && break
+    kill -0 "$xorg" 2>/dev/null || { echo "Xorg exited; see /tmp/Xorg.0.log" >&2; tail -20 /tmp/Xorg.0.log >&2; exit 1; }
+    sleep 0.1
+done
+export DISPLAY=:0
+glxinfo -B 2>/dev/null | grep -E "OpenGL (renderer|version) string" | sed 's/^/desktop: /'
+vulkaninfo --summary 2>/dev/null | grep -E "deviceName|driverName" | sed 's/^ */desktop: vulkan /'
+echo "desktop: XFCE session starting on :0"
+exec dbus-run-session startxfce4

@@ -2,11 +2,11 @@
   "schema": 1,
   "profile_revision": "owned-group-v1",
   "roles": {
-    "loader": "2533628fb78ec7eed058c63ecb1deca406ec73c1614c3411fda5174350e827d6",
-    "host_library": "471cffbff498c5048d54246ee1efd106455a8c1a5d0613bd391f195cb0abc1b3",
-    "render_server": "a2a48a0fa033853b338161616c21ce667f91066b822ed75b3628b1a7f92f3a71",
+    "loader": "ee9a5ee7b351f5c4c3d9046e7c235c5b469619d61536e4570e3c4501ae5921be",
+    "host_library": "0c415eb2cef97d1c17127ee20628196383b637d86e9769856f34237c67d7b9a7",
+    "render_server": "032f4c2579c42a1ac50acd0f42ac43f95d620fe28867fb96976f8f9da7e58888",
     "qemu_library": "b815ecc84f47c2c13d4368089207f09124cc4c36eee2ea705f08ccacc7965b24",
-    "spice_library": "689882d91be47e37b5b6c5fdf571b96bdcc718696572f7a167a46054582f3b0a",
+    "spice_library": "4d635851b2e388240995d21670eab6696890908f35bd4839cc7020b2834a37d7",
     "icd": "c266d6b7e729aa35e6f548b6a1dac74c71b9e2e8eab3f5d769352f599198f349",
     "firmware": "ee769c4bf42a5350d33345fc1b16d00156fe0c25fb3c68debd003bd844e4e3fa"
   },

@@ -29,6 +29,7 @@ Containers:
       -v, --volume /HOST:/PATH[:ro]  -e, --env KEY[=VALUE]  -w, --workdir DIR
       -u, --user USER  --entrypoint CMD  --cpus N  -m, --memory SIZE
       --disk-size GiB  --dns IP  --mtu N  --gpus all|virgl|venus  --desktop  --shared
+      (--gpus selects QEMU/HVF; otherwise Apple Virtualization)
   ps [-a] [-q]                       List containers
   logs [-f] CONTAINER                Show container output
   exec CONTAINER COMMAND...          Run a command (bounded, 30 s max)
@@ -36,11 +37,12 @@ Containers:
   stop [-t SECONDS] CONTAINER...     Stop containers
   rm [-f] CONTAINER...               Remove containers
   inspect CONTAINER|IMAGE            Show low-level details
-  desktop CONTAINER|VM               Open the native desktop console window
+  desktop [--close] CONTAINER|VM     Open (or close) the native desktop window
 
 Images:
   pull IMAGE        images [-q]       rmi IMAGE...
-  load -i ARCHIVE   (docker save / OCI layout tar)
+  load -i ARCHIVE   (docker save archive)
+  build -t TAG [-f FILE] CONTEXT    Build in the engine, import for micro-VMs
   image gc          Delete unreferenced blobs and image roots
 
 Shared engine (docker CLI compatible):
@@ -252,14 +254,12 @@ fn ps(rest: &[String], json_output: bool) -> Result<i32> {
     );
     for (c, _, status) in rows {
         let mut command = format!("\"{}\"", c.argv.join(" "));
-        if command.len() > 22 {
-            command = format!(
-                "{}…\"",
-                &command[..command
-                    .char_indices()
-                    .nth(20)
-                    .map_or(command.len(), |(i, _)| i)]
-            );
+        if command.chars().count() > 22 {
+            command = format!("{}…\"", command.chars().take(20).collect::<String>());
+        }
+        let mut image = c.image.clone();
+        if image.chars().count() > 22 {
+            image = format!("{}…", image.chars().take(21).collect::<String>());
         }
         let ports: Vec<String> = c
             .ports
@@ -279,7 +279,7 @@ fn ps(rest: &[String], json_output: bool) -> Result<i32> {
         println!(
             "{:<14}{:<24}{:<26}{:<16}{:<24}{:<26}{}",
             c.id,
-            c.image,
+            image,
             command,
             age(c.created_at),
             format!("{status}{gpu}"),
@@ -343,7 +343,10 @@ fn vm(rest: &[String]) -> Result<i32> {
         }
         "start" => daemon_call("start", json!({"id":need()?}))?,
         "stop" => daemon_call("shutdown", json!({"id":need()?}))?,
-        "kill" => daemon_call("force_stop", json!({"id":need()?}))?,
+        "kill" => {
+            let id = need()?;
+            daemon_call("force_stop", json!({"id":id,"confirm":id}))?
+        }
         "rm" => daemon_call("delete", json!({"id":need()?,"confirm":need()?}))?,
         "inspect" | "status" => daemon_call("status", json!({"id":need()?}))?,
         other => bail!("unknown vm command: {other}"),
@@ -551,11 +554,13 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
             }
             Ok(0)
         }
-        "desktop" => desktop::open(
-            rest.first()
-                .context("desktop requires a CONTAINER or VM id")?,
-        ),
+        "desktop" => match rest {
+            [close, name] if close == "--close" => desktop::close(name),
+            [name] => desktop::open(name),
+            _ => bail!("usage: veynodevm desktop [--close] CONTAINER|VM"),
+        },
         "engine" => engine::command(rest, json_output),
+        "build" => engine::build(rest),
         "vm" => vm(rest),
         "daemon" => daemon::command(rest),
         "mcp" => {

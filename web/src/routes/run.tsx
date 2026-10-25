@@ -109,9 +109,11 @@ function Run() {
           <span className="muted">
             {form.shared
               ? 'Runs with docker run in the shared engine VM.'
-              : form.gpus || form.desktop
+              : form.gpus
                 ? 'Boots a QEMU/HVF micro-VM with a virtio-gpu device.'
-                : 'Boots an Apple Virtualization micro-VM.'}
+                : form.desktop
+                  ? 'Boots an Apple Virtualization micro-VM with a 2D display (software rendering).'
+                  : 'Boots an Apple Virtualization micro-VM.'}
           </span>
         </div>
         {run.error && <p className="error full">{run.error}</p>}
