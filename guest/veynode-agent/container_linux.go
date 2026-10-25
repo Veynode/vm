@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -54,6 +55,8 @@ type containerConfig struct {
 	Transport        string            `json:"transport"`
 	GPU              bool              `json:"gpu"`
 	Engine           bool              `json:"engine"`
+	DNS              []string          `json:"dns,omitempty"`
+	MTU              int               `json:"mtu,omitempty"`
 }
 
 type containerEnvFile struct {
@@ -88,6 +91,17 @@ func parseContainerConfig(raw []byte) (containerConfig, error) {
 	for _, path := range append([]string{config.Workdir}, config.AnonymousVolumes...) {
 		if path != "" && !filepath.IsAbs(path) {
 			return config, fmt.Errorf("container paths must be absolute: %q", path)
+		}
+	}
+	if config.MTU != 0 && (config.MTU < 576 || config.MTU > 9000) {
+		return config, errors.New("mtu must be 576..9000")
+	}
+	if len(config.DNS) > 3 {
+		return config, errors.New("at most 3 DNS servers")
+	}
+	for _, server := range config.DNS {
+		if net.ParseIP(server) == nil {
+			return config, fmt.Errorf("invalid DNS server %q", server)
 		}
 	}
 	for _, v := range config.Volumes {
@@ -258,6 +272,11 @@ func configureNetwork(config containerConfig) string {
 	if err := os.WriteFile(containerRunDir+"/udhcpc.script", []byte(udhcpcScript), 0o755); err != nil {
 		marker("warning", "network script: "+err.Error())
 		return ""
+	}
+	if config.MTU > 0 {
+		if out, err := exec.Command("/bin/busybox", "ifconfig", "eth0", "mtu", strconv.Itoa(config.MTU)).CombinedOutput(); err != nil {
+			marker("warning", "mtu: "+strings.TrimSpace(string(out)))
+		}
 	}
 	if out, err := exec.Command("/bin/busybox", "udhcpc", "-i", "eth0", "-n", "-q", "-t", "10", "-T", "1", "-s", containerRunDir+"/udhcpc.script").CombinedOutput(); err != nil {
 		marker("warning", "dhcp: "+strings.TrimSpace(string(out)))
@@ -446,7 +465,14 @@ func containerInit() int {
 	}
 	_ = os.WriteFile(containerRunDir+"/hostname", []byte(hostname+"\n"), 0o644)
 	_ = os.WriteFile(containerRunDir+"/hosts", []byte("127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n127.0.1.1\t"+hostname+"\n"), 0o644)
-	if _, err := os.Stat(containerRunDir + "/resolv.conf"); err != nil {
+	if len(config.DNS) > 0 {
+		// Explicit servers replace the DHCP-provided gateway forwarder.
+		var resolv strings.Builder
+		for _, server := range config.DNS {
+			resolv.WriteString("nameserver " + server + "\n")
+		}
+		_ = os.WriteFile(containerRunDir+"/resolv.conf", []byte(resolv.String()), 0o644)
+	} else if _, err := os.Stat(containerRunDir + "/resolv.conf"); err != nil {
 		_ = os.WriteFile(containerRunDir+"/resolv.conf", []byte("nameserver 1.1.1.1\n"), 0o644)
 	}
 	for _, name := range []string{"resolv.conf", "hosts", "hostname"} {

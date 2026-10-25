@@ -56,6 +56,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--qemu', action='store_true', help='also register the QEMU/HVF GPU runtime')
     parser.add_argument('--memory-budget-mib', type=int)
+    parser.add_argument('--dns', action='append', help='default container DNS server (repeatable); needed when host resolvers listen only on loopback')
     args = parser.parse_args()
     root = home()
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -70,6 +71,8 @@ def main():
     web = ROOT / 'web/.output/server/index.mjs'
     if web.exists():
         runtime['web'] = str(web.resolve())
+    if args.dns:
+        runtime['dns'] = args.dns
     if args.memory_budget_mib:
         runtime['memory_budget_mib'] = args.memory_budget_mib
     tmp = path.with_suffix('.tmp')

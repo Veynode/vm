@@ -98,6 +98,13 @@ pub struct Runtime {
     pub qemu: Option<QemuPaths>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_budget_mib: Option<u64>,
+    /// Default container DNS servers. Empty: the NAT gateway forwarder from
+    /// DHCP, which cannot reach host resolvers bound only to loopback.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns: Vec<std::net::IpAddr>,
+    /// Default container NIC MTU (576..9000); unset keeps 1500.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u16>,
     /// Built web UI server entry (`web/.output/server/index.mjs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web: Option<PathBuf>,

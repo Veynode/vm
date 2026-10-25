@@ -90,6 +90,8 @@ pub struct RunOptions {
     pub gpus: Option<String>,
     pub desktop: bool,
     pub engine: bool,
+    pub dns: Vec<String>,
+    pub mtu: Option<u16>,
     pub quiet: bool,
 }
 
@@ -424,6 +426,26 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
         Some("venus" | "vulkan") => Some("venus-moltenvk-experimental"),
         Some(other) => bail!("--gpus accepts all|virgl|venus, got {other}"),
     };
+    let dns: Vec<String> = if options.dns.is_empty() {
+        runtime.dns.iter().map(ToString::to_string).collect()
+    } else {
+        options
+            .dns
+            .iter()
+            .map(|d| {
+                d.parse::<std::net::IpAddr>()
+                    .map(|ip| ip.to_string())
+                    .with_context(|| format!("invalid --dns {d}"))
+            })
+            .collect::<Result<_>>()?
+    };
+    if dns.len() > 3 {
+        bail!("at most 3 DNS servers")
+    }
+    let mtu = options.mtu.or(runtime.mtu);
+    if mtu.is_some_and(|m| !(576..=9000).contains(&m)) {
+        bail!("--mtu must be 576..9000")
+    }
     let dir = container_dir(&id)?;
     fs::create_dir(&dir)?;
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
@@ -444,6 +466,8 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
             "transport": transport,
             "gpu": gpu_profile.is_some(),
             "engine": options.engine,
+            "dns": dns,
+            "mtu": mtu,
         });
         let mut body = CONFIG_MAGIC.to_vec();
         body.extend(serde_json::to_vec(&guest_config)?);

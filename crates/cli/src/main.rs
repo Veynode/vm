@@ -28,7 +28,7 @@ Containers:
       -d, --detach  --rm  --name NAME  -p, --publish [IP:]HOST:GUEST[/udp]
       -v, --volume /HOST:/PATH[:ro]  -e, --env KEY[=VALUE]  -w, --workdir DIR
       -u, --user USER  --entrypoint CMD  --cpus N  -m, --memory SIZE
-      --disk-size GiB  --gpus all|virgl|venus  --desktop  --shared
+      --disk-size GiB  --dns IP  --mtu N  --gpus all|virgl|venus  --desktop  --shared
   ps [-a] [-q]                       List containers
   logs [-f] CONTAINER                Show container output
   exec CONTAINER COMMAND...          Run a command (bounded, 30 s max)
@@ -121,6 +121,8 @@ const RUN_SPEC: &[(&str, Option<char>, bool)] = &[
     ("gpus", None, true),
     ("desktop", None, false),
     ("shared", None, false),
+    ("dns", None, true),
+    ("mtu", None, true),
     ("quiet", Some('q'), false),
 ];
 
@@ -133,7 +135,7 @@ fn run(rest: &[String], json_output: bool) -> Result<i32> {
         .clone();
     let command: Vec<String> = p.positional[1..].to_vec();
     if p.has("shared") {
-        return engine::run_shared(rest);
+        return engine::run_shared(rest, RUN_SPEC);
     }
     if p.has("interactive") || p.has("tty") {
         eprintln!("veynodevm: -i/-t are accepted but interactive stdin is not wired to micro-VMs yet; output is streamed");
@@ -170,6 +172,12 @@ fn run(rest: &[String], json_output: bool) -> Result<i32> {
         gpus: p.value("gpus").map(str::to_owned),
         desktop: p.has("desktop"),
         engine: false,
+        dns: p.values("dns").to_vec(),
+        mtu: p
+            .value("mtu")
+            .map(str::parse)
+            .transpose()
+            .context("invalid --mtu")?,
         quiet: p.has("quiet") || json_output,
     };
     container::install_interrupt_handler();

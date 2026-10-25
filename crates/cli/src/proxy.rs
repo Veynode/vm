@@ -7,11 +7,16 @@
 use crate::container::{self, Container};
 use anyhow::{Context, Result};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs::OpenOptions,
     io::{Read, Write},
-    net::{Shutdown, TcpListener, TcpStream},
+    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     os::unix::{fs::OpenOptionsExt, process::CommandExt},
     process::{Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     thread,
     time::Duration,
 };
@@ -84,6 +89,76 @@ fn splice(mut from: TcpStream, mut to: TcpStream) {
     let _ = from.shutdown(Shutdown::Read);
 }
 
+/// Accept on `listener` until `stop` is set, splicing to `ip:guest_port`.
+fn serve(listener: TcpListener, ip: String, guest_port: u16, stop: Arc<AtomicBool>) {
+    let _ = listener.set_nonblocking(true);
+    let target = match format!("{ip}:{guest_port}").parse::<SocketAddr>() {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    while !stop.load(Ordering::SeqCst) {
+        let client = match listener.accept() {
+            Ok((client, _)) => client,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Err(_) => continue,
+        };
+        let _ = client.set_nonblocking(false);
+        match TcpStream::connect_timeout(&target, Duration::from_secs(5)) {
+            Ok(upstream) => {
+                let (a, b) = match (client.try_clone(), upstream.try_clone()) {
+                    (Ok(a), Ok(b)) => (a, b),
+                    _ => continue,
+                };
+                thread::spawn(move || splice(client, upstream));
+                thread::spawn(move || splice(b, a));
+            }
+            Err(e) => {
+                eprintln!("connect {target}: {e}");
+                let _ = client.shutdown(Shutdown::Both);
+            }
+        }
+    }
+}
+
+/// Parse `docker ps --format {{.Ports}}` output into published TCP host
+/// ports: `0.0.0.0:8080->80/tcp, [::]:8080->80/tcp, 127.0.0.1:9000->9000/tcp`.
+pub fn docker_published(ports: &str) -> BTreeSet<u16> {
+    let mut out = BTreeSet::new();
+    for entry in ports.split([',', '\n']).map(str::trim) {
+        let Some((host, rest)) = entry.split_once("->") else {
+            continue;
+        };
+        if !rest.ends_with("/tcp") {
+            continue;
+        }
+        let host_port = host.rsplit(':').next().unwrap_or_default();
+        if let Some((a, b)) = host_port.split_once('-') {
+            if let (Ok(a), Ok(b)) = (a.parse::<u16>(), b.parse::<u16>()) {
+                out.extend((a..=b).take(64));
+            }
+        } else if let Ok(p) = host_port.parse() {
+            out.insert(p);
+        }
+    }
+    out
+}
+
+fn engine_ports() -> Option<BTreeSet<u16>> {
+    let docker = veynodevm_oci::store::which("docker")?;
+    let output = Command::new(docker)
+        .args(["ps", "--format", "{{.Ports}}"])
+        .envs(crate::engine::env().ok()?)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| docker_published(&String::from_utf8_lossy(&output.stdout)))
+}
+
 pub fn run(id: &str) -> Result<()> {
     let container = container::find(id)?;
     let mut listeners = Vec::new();
@@ -96,32 +171,13 @@ pub fn run(id: &str) -> Result<()> {
     eprintln!("publishing {} port(s) to {ip}", listeners.len());
     for (listener, guest_port) in listeners {
         let ip = ip.clone();
-        thread::spawn(move || {
-            for client in listener.incoming().flatten() {
-                let target = (ip.as_str(), guest_port);
-                match TcpStream::connect_timeout(
-                    &std::net::ToSocketAddrs::to_socket_addrs(&target)
-                        .ok()
-                        .and_then(|mut a| a.next())
-                        .unwrap(),
-                    Duration::from_secs(5),
-                ) {
-                    Ok(upstream) => {
-                        let (a, b) = match (client.try_clone(), upstream.try_clone()) {
-                            (Ok(a), Ok(b)) => (a, b),
-                            _ => continue,
-                        };
-                        thread::spawn(move || splice(client, upstream));
-                        thread::spawn(move || splice(b, a));
-                    }
-                    Err(e) => {
-                        eprintln!("connect {ip}:{guest_port}: {e}");
-                        let _ = client.shutdown(Shutdown::Both);
-                    }
-                }
-            }
-        });
+        let never = Arc::new(AtomicBool::new(false));
+        thread::spawn(move || serve(listener, ip, guest_port, never));
     }
+    // The engine also follows ports published by its inner containers
+    // (`docker run -p`), always on host loopback.
+    let reserved: BTreeSet<u16> = container.ports.iter().map(|p| p.host_port).collect();
+    let mut dynamic: BTreeMap<u16, Arc<AtomicBool>> = BTreeMap::new();
     // Exit with the VM; a missing record (container removed) also ends it.
     loop {
         thread::sleep(Duration::from_secs(2));
@@ -133,5 +189,49 @@ pub fn run(id: &str) -> Result<()> {
         if matches!(state.as_str(), "stopped" | "crashed" | "missing") {
             return Ok(());
         }
+        if !container.engine {
+            continue;
+        }
+        let Some(wanted) = engine_ports() else {
+            continue;
+        };
+        for (port, stop) in &dynamic {
+            if !wanted.contains(port) {
+                stop.store(true, Ordering::SeqCst);
+                eprintln!("unpublished {port}");
+            }
+        }
+        dynamic.retain(|port, _| wanted.contains(port));
+        for port in wanted {
+            if dynamic.contains_key(&port) || reserved.contains(&port) {
+                continue;
+            }
+            match TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
+                Ok(listener) => {
+                    let stop = Arc::new(AtomicBool::new(false));
+                    dynamic.insert(port, stop.clone());
+                    let ip = ip.clone();
+                    thread::spawn(move || serve(listener, ip, port, stop));
+                    eprintln!("published engine port 127.0.0.1:{port}");
+                }
+                Err(e) => {
+                    // Not retried until the inner container stops publishing it.
+                    dynamic.insert(port, Arc::new(AtomicBool::new(true)));
+                    eprintln!("cannot publish engine port {port}: {e}");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn docker_ports() {
+        let p = super::docker_published("0.0.0.0:8080->80/tcp, [::]:8080->80/tcp, 127.0.0.1:9000->9000/tcp, 0.0.0.0:53->53/udp\n0.0.0.0:7000-7002->7000-7002/tcp, 6379/tcp");
+        assert_eq!(
+            p.into_iter().collect::<Vec<_>>(),
+            [7000, 7001, 7002, 8080, 9000]
+        );
     }
 }

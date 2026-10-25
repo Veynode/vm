@@ -3,6 +3,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -75,5 +76,15 @@ func TestContainerIdentityResolvesInsideRoot(t *testing.T) {
 	}
 	if identity.CWD != "/" || identity.Mode != "container-root" {
 		t.Fatalf("%+v", identity)
+	}
+}
+
+func TestContainerConfigDNS(t *testing.T) {
+	base := `{"version":1,"id":"x","argv":["/bin/true"],"transport":"vsock","dns":%s}`
+	if _, err := parseContainerConfig([]byte(containerConfigMagic + fmt.Sprintf(base, `["1.1.1.1","2606:4700:4700::1111"]`))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseContainerConfig([]byte(containerConfigMagic + fmt.Sprintf(base, `["not-an-ip"]`))); err == nil {
+		t.Fatal("invalid DNS server accepted")
 	}
 }

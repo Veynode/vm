@@ -21,4 +21,5 @@ if [[ "${1:-}" == "--real" ]]; then
   python3 scripts/test-control-http.py --config .local/run/linux-agent.json
   python3 guest/kernel/build.py
   python3 scripts/test-containers.py
+  if command -v docker >/dev/null; then python3 scripts/test-engine.py; fi
 fi
