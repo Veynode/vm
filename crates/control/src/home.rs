@@ -105,7 +105,7 @@ pub struct Runtime {
     /// Default container NIC MTU (576..9000); unset keeps 1500.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtu: Option<u16>,
-    /// Built web UI server entry (`web/.output/server/index.mjs`).
+    /// Web UI Node host (`web/server.mjs`, next to its built `dist/`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web: Option<PathBuf>,
 }

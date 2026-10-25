@@ -6,7 +6,7 @@ Writes <VEYNODEVM_HOME or ~/Library/Application Support/VeynodeVM>/runtime.json:
   boot      .local/boot/{Image,initramfs.gz,modloop}  (guest/kernel/build.py)
   qemu      UTM-derived QEMU/HVF GPU runtime, only with --qemu and when present
             (runtime/fetch-utm.sh, runtime/build-utm-loader.sh, spice builds)
-  web       web/.output/server/index.mjs when built (cd web && npm run build)
+  web       web/server.mjs when web/dist is built (cd web && npm ci && npm run build)
 
 Only paths that exist are written; the daemon reads this file when started
 without flags. Existing keys not managed here (memory_budget_mib) are kept.
@@ -68,8 +68,8 @@ def main():
                        (('kernel', 'Image'), ('initrd', 'initramfs.gz'), ('modloop', 'modloop'))}
     if args.qemu:
         runtime['qemu'] = qemu_paths()
-    web = ROOT / 'web/.output/server/index.mjs'
-    if web.exists():
+    web = ROOT / 'web/server.mjs'
+    if (ROOT / 'web/dist/server/server.js').exists():
         runtime['web'] = str(web.resolve())
     if args.dns:
         runtime['dns'] = args.dns

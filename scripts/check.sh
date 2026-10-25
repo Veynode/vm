@@ -13,6 +13,10 @@ go -C guest/veynode-agent test -race ./...
 GOOS=linux GOARCH=arm64 go -C guest/veynode-agent vet ./...
 python3 -m unittest discover -s tests -v
 npm --prefix browser test
+npm --prefix web ci --no-audit --no-fund
+npm --prefix web run typecheck
+npm --prefix web run build
+npm --prefix web test
 if [[ "${1:-}" == "--real" ]]; then
   python3 scripts/prepare-linux.py
   python3 scripts/build-linux-fixture.py
