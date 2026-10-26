@@ -10,9 +10,15 @@
 //!   vsock 5001 bridge to the guest agent's DRM scanout capture.
 //!
 //! stdout records: `u32 big-endian length, u8 kind, payload`; kind 1 is a JSON
-//! event, kind 2 is `u64 pts_us, u8 keyframe, Annex B`.
-//! stdin: JSON lines, `{"events":[...]}` (see `vm_control::desktop_input`) or
-//! `{"keyframe":true}`. EOF stops the stream and releases held keys/buttons.
+//! event, kind 2 is `u64 pts_us, u8 keyframe, Annex B`. With `--tracks`
+//! (remote desktop's shared encoder) an Apple Virtualization encoder runs
+//! with crop tracks and its frames come as kind 10, `u8 track, u64 pts_us,
+//! u8 keyframe, Annex B`; QEMU has one track and keeps kind 2.
+//! stdin: JSON lines, `{"events":[...]}` (see `vm_control::desktop_input`),
+//! `{"keyframe":true}`, or `{"encoder":"LINE"}`, one encoder command from
+//! docs/browser-desktop.md (`[@T ]keyframe|bitrate|crop|scale`, `track add|remove T`;
+//! QEMU takes `crop`, `scale` and `keyframe` only). EOF stops the stream and
+//! releases held keys/buttons.
 use crate::{container, daemon_call, random_hex, sibling};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -56,7 +62,7 @@ struct Session {
 }
 
 impl Session {
-    fn start(name: &str, codec: &str) -> Result<Self> {
+    fn start(name: &str, codec: &str, tracks: bool) -> Result<Self> {
         let vm = match container::find(name) {
             Ok(c) => c.vm_id,
             Err(_) => name.to_owned(),
@@ -114,6 +120,9 @@ impl Session {
                 }
                 command = Command::new(encoder);
                 command.arg(&socket).args(["--codec", codec]);
+                if tracks {
+                    command.arg("--tracks");
+                }
                 Backend::Apple { bridge_dir }
             }
             _ => bail!(
@@ -162,11 +171,13 @@ fn close_bridge(vm: &str, backend: &Backend) {
     }
 }
 
-/// Forward the encoder's access units as kind-2 records.
-fn pump_video(mut from: impl Read, out: Out) -> Result<()> {
-    let mut header = [0u8; 13];
+/// Forward the encoder's access units as kind-2 records, or kind 10 with
+/// the track byte when the encoder runs with `--tracks`.
+fn pump_video(mut from: impl Read, out: Out, tracks: bool) -> Result<()> {
+    let mut header = [0u8; 14];
+    let header_len = if tracks { 14 } else { 13 };
     loop {
-        if let Err(error) = from.read_exact(&mut header) {
+        if let Err(error) = from.read_exact(&mut header[..header_len]) {
             if error.kind() == std::io::ErrorKind::UnexpectedEof {
                 return Ok(());
             }
@@ -176,10 +187,18 @@ fn pump_video(mut from: impl Read, out: Out) -> Result<()> {
         if size == 0 || size > MAX_AU {
             bail!("encoder access unit size {size} outside bound")
         }
-        let mut payload = vec![0u8; 9 + size];
-        payload[..9].copy_from_slice(&header[4..]);
-        from.read_exact(&mut payload[9..])?;
-        record(&out, 2, &payload)?;
+        if tracks {
+            let mut payload = vec![0u8; 10 + size];
+            payload[0] = header[13];
+            payload[1..10].copy_from_slice(&header[4..13]);
+            from.read_exact(&mut payload[10..])?;
+            record(&out, 10, &payload)?;
+        } else {
+            let mut payload = vec![0u8; 9 + size];
+            payload[..9].copy_from_slice(&header[4..13]);
+            from.read_exact(&mut payload[9..])?;
+            record(&out, 2, &payload)?;
+        }
     }
 }
 
@@ -233,12 +252,47 @@ impl serde::Serialize for EventWire<'_> {
     }
 }
 
-pub fn run(name: &str, codec: &str) -> Result<i32> {
+/// An encoder command line the relay passes through, or `None` when the
+/// encoder would not accept it (a malformed line ends the VZ helper).
+pub fn encoder_line(line: &str, qemu: bool) -> Option<&str> {
+    let allowed =
+        |(i, b): (usize, u8)| b == b' ' || b.is_ascii_alphanumeric() || (i == 0 && b == b'@');
+    if line.is_empty() || line.len() > 96 || !line.bytes().enumerate().all(allowed) {
+        return None;
+    }
+    let mut words = line.split(' ');
+    let mut word = words.next()?;
+    let rest: Vec<&str> = if let Some(track) = word.strip_prefix('@') {
+        if qemu || !matches!(track.parse::<u8>(), Ok(0..=7)) {
+            return None;
+        }
+        word = words.next()?;
+        words.collect()
+    } else {
+        words.collect()
+    };
+    let numbers = |n: usize| rest.len() == n && rest.iter().all(|w| w.parse::<u32>().is_ok());
+    let ok = match word {
+        "keyframe" => rest.is_empty(),
+        "crop" => numbers(4),
+        "scale" => numbers(2),
+        "bitrate" => !qemu && numbers(1),
+        "track" if !qemu && !line.starts_with('@') => {
+            rest.len() == 2
+                && matches!(rest[0], "add" | "remove")
+                && matches!(rest[1].parse::<u8>(), Ok(1..=7))
+        }
+        _ => false,
+    };
+    ok.then_some(line)
+}
+
+pub fn run(name: &str, codec: &str, tracks: bool) -> Result<i32> {
     if !matches!(codec, "hevc" | "h264") {
         bail!("--codec must be hevc or h264")
     }
     let out: Out = Arc::new(Mutex::new(std::io::stdout()));
-    let mut session = match Session::start(name, codec) {
+    let mut session = match Session::start(name, codec, tracks) {
         Ok(session) => session,
         Err(error) => {
             event(
@@ -257,7 +311,8 @@ pub fn run(name: &str, codec: &str) -> Result<i32> {
     let diagnostics = session.child.stderr.take().unwrap();
     let input = Arc::new(Mutex::new(session.child.stdin.take().unwrap()));
     let video_out = out.clone();
-    let video_thread = thread::spawn(move || pump_video(video, video_out));
+    let multi_track = tracks && !qemu;
+    let video_thread = thread::spawn(move || pump_video(video, video_out, multi_track));
     let diag_out = out.clone();
     thread::spawn(move || pump_diagnostics(diagnostics, diag_out));
 
@@ -275,6 +330,23 @@ pub fn run(name: &str, codec: &str) -> Result<i32> {
             };
             if message["keyframe"] == true {
                 let _ = control.lock().unwrap().write_all(b"keyframe\n");
+                continue;
+            }
+            if let Some(line) = message["encoder"].as_str() {
+                match encoder_line(line, qemu) {
+                    Some(line) => {
+                        let _ = control
+                            .lock()
+                            .unwrap()
+                            .write_all(format!("{line}\n").as_bytes());
+                    }
+                    None => {
+                        let _ = event(
+                            &input_out,
+                            json!({"event":"encoder","detail":{"event":"rate","command":line,"error":"not passed to this encoder"}}),
+                        );
+                    }
+                }
                 continue;
             }
             let result = desktop_input::parse(&message["events"]).and_then(|events| {
@@ -315,6 +387,47 @@ pub fn run(name: &str, codec: &str) -> Result<i32> {
             event(&out, json!({"event":"error","message":message}))?;
             session.stop(&input);
             return Ok(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encoder_lines_follow_each_encoders_grammar() {
+        for ok in [
+            "keyframe",
+            "@3 keyframe",
+            "bitrate 4000000",
+            "@1 crop 0 0 960 540",
+            "scale 1280 720",
+            "track add 2",
+            "track remove 7",
+        ] {
+            assert_eq!(encoder_line(ok, false), Some(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "stop",
+            "@8 keyframe",
+            "@1 track add 2",
+            "track add 0",
+            "crop 1 2 3",
+            "bitrate -1",
+            "keyframe\nstop",
+            "{\"input\":[]}",
+            "scale 1 2 3",
+        ] {
+            assert_eq!(encoder_line(bad, false), None, "{bad:?}");
+        }
+        assert_eq!(
+            encoder_line("crop 0 0 960 540", true),
+            Some("crop 0 0 960 540")
+        );
+        for qemu_bad in ["bitrate 1000000", "@1 keyframe", "track add 1"] {
+            assert_eq!(encoder_line(qemu_bad, true), None, "{qemu_bad}");
         }
     }
 }

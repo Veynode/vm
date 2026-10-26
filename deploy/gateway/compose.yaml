@@ -1,0 +1,18 @@
+# vm-gateway plus coturn on one Linux host. Host networking keeps QUIC and
+# TURN relay ports simple; open 80/tcp, 443/tcp+udp, 7443/udp, 3478/udp+tcp
+# and 49152-49999/udp in the security group.
+services:
+  gateway:
+    build:
+      context: ../..
+      dockerfile: deploy/gateway/Dockerfile
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
+  coturn:
+    image: coturn/coturn:4.6
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro

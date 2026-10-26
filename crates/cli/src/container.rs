@@ -860,7 +860,7 @@ pub fn stop(container: &Container, timeout: Duration) -> Result<()> {
     // so ask systemd through the guest service there.
     let asked = container.init.is_some()
         && container.backend == "qemu-hvf"
-        && exec_once(container, &systemd_poweroff(), 10_000)
+        && exec_once(container, &systemd_poweroff(), 10_000, &json!({}))
             .is_ok_and(|r| r["exit_code"].as_i64() == Some(0));
     if !asked {
         let _ = daemon_call("shutdown", json!({"id":container.vm_id,"mode":"guest"}));
@@ -905,6 +905,16 @@ pub fn remove(container: &Container, force: bool) -> Result<()> {
 
 /// Run a bounded command in a running container through the guest service.
 pub fn exec(container: &Container, argv: &[String], timeout_ms: u64) -> Result<Value> {
+    exec_as(container, argv, timeout_ms, &json!({}))
+}
+
+/// `exec` with `{user, env, workdir}` (`exec -u -e -w`), applied by the Guest.
+pub fn exec_as(
+    container: &Container,
+    argv: &[String],
+    timeout_ms: u64,
+    identity: &Value,
+) -> Result<Value> {
     // The guest service comes up a few seconds after boot. QEMU's daemon refuses
     // with "not ready yet"; Apple Virtualization refuses before its socket exists
     // (invalid_state) or fails the vsock connect (guest_unavailable). None of
@@ -918,7 +928,7 @@ pub fn exec(container: &Container, argv: &[String], timeout_ms: u64) -> Result<V
         refused && active(&vm_state(container))
     };
     loop {
-        match exec_once(container, argv, timeout_ms) {
+        match exec_once(container, argv, timeout_ms, identity) {
             Err(e) if retryable(&e) && Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(500));
             }
@@ -927,12 +937,20 @@ pub fn exec(container: &Container, argv: &[String], timeout_ms: u64) -> Result<V
     }
 }
 
-fn exec_once(container: &Container, argv: &[String], timeout_ms: u64) -> Result<Value> {
+fn exec_once(
+    container: &Container,
+    argv: &[String],
+    timeout_ms: u64,
+    identity: &Value,
+) -> Result<Value> {
     // The guest kills the command's process group at the timeout.
-    let reply = daemon_call(
-        "exec",
-        json!({"id":container.vm_id,"argv":argv,"timeout_ms":timeout_ms}),
-    )?;
+    let mut arguments = json!({"id":container.vm_id,"argv":argv,"timeout_ms":timeout_ms});
+    for key in ["user", "env", "workdir"] {
+        if !identity[key].is_null() {
+            arguments[key] = identity[key].clone();
+        }
+    }
+    let reply = daemon_call("exec", arguments)?;
     Ok(if reply["result"].is_object() {
         reply["result"].clone()
     } else {

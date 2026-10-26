@@ -195,7 +195,7 @@ cancels that session's unfinished async jobs and file sessions and replies
 Permissions decide which tools a session may call; tool groups only narrow which
 of them it lists, so an agent's context carries the tools its task needs. A group
 never adds a tool its permissions withhold. Without `--tools` a session lists
-every permitted tool, as before.
+every permitted tool except the opt-in `cua` group.
 
 ```sh
 ./target/debug/vm-control mcp --state-dir /absolute/private/state --allow-input --tools core,screen,input
@@ -211,6 +211,7 @@ veynodevm mcp --input --tools core,screen,input
 | `input` | `vm_input_*` | input |
 | `desktop` | `vm_desktop_state`, `vm_desktop_apps`, `vm_windows`, `vm_accessibility_tree`/`find`; with input also `vm_window_action`, `vm_app_launch`, `vm_accessibility_action` | observe, input |
 | `snapshots` | `vm_snapshot_list`/`status`; with lifecycle also create, restore, delete, reconcile, resume_source | observe, lifecycle |
+| `cua` | `cua_*`: cua-driver in Linux desktops, Windows machines and macOS containers ([below](#cua-driver-tools)); hidden unless named, `all` or `vm_tools_enable` | observe, input, browser, clipboard, execute |
 
 `all` names every group. The mapping lives in
 [`src/tool_groups.rs`](src/tool_groups.rs), apart from the tool definitions: a new
@@ -249,6 +250,110 @@ schemas and key enum), desktop 6.8 KB, snapshots 4.0 KB, screen 3.1 KB, exec
 cut description text from 12,937 to 11,909 bytes (8%) and the `initialize`
 instructions from 2,559 to 1,797 bytes (30%), keeping every permission,
 confirmation, timeout and does-not-prove statement.
+
+## cua-driver tools
+
+[cua-driver](../../docs/computer-use.md) runs invisibly in the Guest: on Linux
+images that ship it as a stdio MCP child of the guest agent (AT-SPI and CDP), on
+Windows machines as a hidden logon task the daemon installs on first use, in macOS
+containers embedded over SSH. It is reachable two ways, through one bridge
+([`src/cua_bridge.rs`](src/cua_bridge.rs)) in the daemon:
+
+- **The `cua` group** on the main MCP: about 24 everyday driver tools as
+  `cua_<tool>` (`cua_get_window_state`, `cua_click`, `cua_verify_state`,
+  `cua_run_steps`, ...) with short schemas and a `vm` argument (a `vm_id` from
+  `container_list`). Hidden by default: `--tools cua` (or `all`) lists it, or
+  `vm_tools_enable` adds it mid-session. Arguments beyond the listed ones pass
+  through to the driver, which validates them.
+- **A per-VM endpoint**: `vm-control mcp --vm ID` (`veynodevm mcp --vm ID`) on
+  stdio, `/vm/{id}/mcp` over HTTPS. It serves the driver's own tool names and
+  schemas (its `tools/list`, cached per VM and worker), filtered by scope, plus
+  that VM's checkpoint and snapshot tools with the VM argument removed
+  (`container_checkpoint`, `container_checkpoint_list` and `container_rollback`
+  for containers, `vm_snapshot_*`). An agent or skill written for cua-driver
+  works unchanged. Every call is bound to that VM; the endpoint has no
+  resources, groups or other VM tools. If the driver cannot answer (VM stopped,
+  image without cua-driver) it lists only the VM-level tools.
+
+Scopes are checked by the bridge before the driver sees a call (the driver's own
+`bounded` profile is a second fence). Unknown tools are refused, so a newer driver
+adds nothing until it is mapped:
+
+| Scope | Flag | Driver tools |
+|---|---|---|
+| observe | always | `list_apps`, `list_windows`, `get_window_state`, `get_accessibility_tree`, `get_desktop_state`, `zoom`, `verify_state`, `get_browser_state`, and reads of the driver's own state and sessions |
+| input | `--allow-input` | click, type, key, scroll and drag tools, `set_value`, `invoke_menu`, `set_window_frame`, `bring_to_front`, `run_steps` (each step's tool is checked too), agent cursor settings |
+| browser | `--allow-browser` | `browser_*` |
+| clipboard | `--allow-clipboard` | `clipboard_read`, `clipboard_write` |
+| execute | `--allow-execute` | `run_script`, `launch_app`, `kill_app`, `page`, recordings and replays |
+| never | — | `install_extension`, `check_for_update`, `install_ffmpeg`, `set_config` |
+
+Bridge policies (phase 0 findings), applied while no viewer is open on the VM
+(a person watching would lose the window to foreground delivery):
+- `type_text` with non-ASCII text and no `delivery_mode` goes `foreground`,
+  also inside `run_steps`: the background AT-SPI insert truncates multibyte text
+  (upstream #4754). Not `set_value`, which replaces the whole value.
+- `browser_click` with neither `delivery_mode` nor `input_route` goes
+  `foreground`: Chromium's trusted background route is refused on Linux.
+- `list_apps` keeps running apps with a window or desktop entry and installed
+  apps; the driver otherwise lists every Guest process, kernel threads included.
+
+A policy that changed a call is named in the result's
+`_meta["veynode/bridge_policy"]`. Otherwise the driver's result passes through
+unchanged: `effect:"unverifiable"`, `unknown` and refusals are never reported as
+success. Bridge refusals use the driver's error shape: `isError`, and
+`structuredContent.code` `scope_not_granted`, `tool_not_exposed`,
+`deadline_exceeds_limit` or `request_too_large`. A failure the guest agent reports (on QEMU a JSON-RPC
+error with `data.veynode_code`: `deadline_exceeded`, `driver_exited`,
+`unsupported`, ...) keeps that code; on Apple Virtualization it is the call's error.
+
+Deadlines are per call: 30 s by default; `verify_state`, `wait_for` and
+`run_script` their `timeout_ms` plus 10 s (never under 30 s); `type_text` and `set_value` 100 ms
+more per character; `run_steps` per step 2 s plus its pause, target timeout
+(3 s), `wait_for` (5 s) and `expect` timeouts (2 s each), plus 5 s for `observe`
+and a 10 s margin. A call that would need more than 10 minutes is refused.
+Requests are at most 1 MiB less 4 KiB, replies 1 MiB.
+
+Transport: on Apple Virtualization the worker's `guest_request` sends the guest
+agent's `driver_rpc` method over vsock 5000 (`{"frame","deadline_ms"}`, reply
+`{"frame"}`; this method alone gets a 1 MiB request and its own deadline up to
+10 minutes, others keep 64 KiB and 35 s). On QEMU the worker adds a second
+virtio-serial port `veynode.driver` (`<runtime>/driver.sock`) to Linux Guests and
+keeps one connection on it for newline-delimited JSON-RPC frames, with its own ids
+so replies may arrive in any order, a deadline per call and no fence: a stall
+there only delays driver replies, never the serial-v2 exec channel.
+
+Windows machines and macOS containers use a persistent link per VM and worker
+([`src/driver_link.rs`](src/driver_link.rs)): one stdio MCP connection that the
+daemon owns (handshake, request ids, start_session replayed after a reconnect),
+reconnected on demand with at most 5 starts a minute and closed with the worker.
+- **Windows** ([`src/windows_driver.rs`](src/windows_driver.rs),
+  [`guest/windows/cua.ps1`](../../guest/windows/cua.ps1)): the first connect checks
+  `C:\Program Files\VeynodeVM\cua\cua-driver.exe` against the pin, copies it
+  over SCP when it differs, writes the telemetry opt-out to the desktop user's
+  profile and registers `\VeynodeVM\cua-driver`, a hidden logon task with the
+  desktop user's elevated interactive token (`conhost --headless`, no overlay)
+  that serves `\\.\pipe\cua-driver`. The link is the driver's own
+  `mcp --socket` proxy over one SSH session. A user must be logged on to the
+  console.
+- **macOS containers**: `veynodevm __driver VM` copies the pinned darwin binary to
+  `~/.veynodevm/cua-driver-<sha>` when missing and runs it with
+  `CUA_DRIVER_EMBEDDED=1` over SSH.
+
+The pinned binaries come from `runtime/fetch-cua-driver.sh` (registered as
+`cua_driver` by `scripts/install-dev-runtime.py`); a missing or altered one is
+refused before anything is copied.
+
+A Guest without a driver (no cua-driver in the image, one that will not start)
+still answers `cua_get_window_state` on the main MCP: the host reads the screen's
+text (`vm-vision`) and returns its lines as rows with tokens `ocr<N>:<row>`,
+marked `trusted:false`, `source:"host_ocr"`. `cua_verify_state` on such a token
+is `unknown` with reason `untrusted_source`; an action on one is refused with
+`next_call` `vm_input_click` at the row's center in the frame it was read from
+(`vm_input_batch` takes the token as a click ref).
+
+Over HTTPS a call is still bounded by the transport's 40 s exchange and 45 s
+request limit, so long `run_steps` batches need stdio.
 
 ## Bounded asynchronous commands
 
@@ -604,6 +709,12 @@ No token, operation body or guest output is written to service logs.
 ```
 
 Every remote principal has an explicit VM-id allowlist (omission grants none).
+Scopes are `observe` (required), `lifecycle`, `execute`, `files`, `input`,
+`browser` and `clipboard`; the last two grant only the matching
+[cua-driver tools](#cua-driver-tools), whose `vm` argument must be allowlisted.
+`/vm/{id}/mcp` opens a per-VM cua-driver session: the path's VM must be in the
+allowlist, the session's child serves only that VM, and the session answers on
+that path only.
 Optional `tools` lists the [tool groups](#tool-groups) its sessions see (omission
 lists every permitted tool); it grants nothing beyond `scopes`. `vm_tools_enable`
 needs no VM id. JSON POST replies carry no server notifications, so this
@@ -980,6 +1091,34 @@ The action has already happened when an observation fails, so a failure is
 reported in `observed.error` and the call is not an error. The input reply drops
 its dispatch note; `guest_delivery_confirmed` stays false, and the observation is
 the evidence of acceptance.
+
+Every input reply carries `action`, an `ActionResult` in cua-driver's shape
+([`src/action_result.rs`](src/action_result.rs)) with `route:"virtual_hid"`, so
+host input and driver input read the same. `effect` comes from what the observation
+saw and never from the dispatch: `confirmed` only with evidence (a changed region
+that contains the click, scroll or drag-end point, or for keys and text any
+change), `unverifiable` when the screen changed elsewhere or the change cannot be
+placed (QEMU reports no regions), `suspected_noop` when it settled unchanged, and
+`unverifiable` without `observe`. Each unconfirmed result names a `next_call`
+(`vm_screenshot`).
+
+**Control lease** ([`src/control_lease.rs`](src/control_lease.rs)). A person's
+input always wins. While a console window is open on an Apple Virtualization VM
+and its person typed, clicked or scrolled in the last 5 s, agent input
+(`vm_input_*`, window and accessibility actions, `cua_*` input and browser tools,
+on either MCP face) is refused before anything is sent: host tools fail with
+`person_in_control: <ms> ms ...`, which the adapter returns as a refused
+`ActionResult` with `escalation {target:"lease", reason:"person_in_control"}` and
+`next_call` `vm_control_lease`; driver calls get the driver's error shape with code
+`person_in_control`. Closing the window hands control back at once. While a
+window is open the bridge keeps to background delivery. `vm_control_lease`
+(input permission) reports `holder` (`person`, `agent`, `none`), `viewers` and
+`agent_may_act_in_ms`; `release` gives the agent's lease back. Changes are
+`control` events (`state` `person` or `agent`) on the VM's subscribed status
+resource. The worker
+reports the window and the person's input (`window_opened`, `window_closed`,
+`person_input` at most once a second); the QEMU console and browser desktops do
+not report yet, so they never pause the agent.
 
 The adapter also re-anchors frames on Apple Virtualization Linux desktops and
 macOS Guests, whose services keep the 5 s window: input bound to a frame this

@@ -3,7 +3,7 @@ use anyhow::{bail, Context, Result};
 use axum::{
     body::Bytes,
     extract::Request,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Path as UrlPath, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -80,6 +80,8 @@ fn default_ttl() -> u64 {
 }
 struct Session {
     principal: String,
+    /// The VM of a `/vm/{id}/mcp` session; None for `/mcp`.
+    vm: Option<String>,
     created: Instant,
     touched: Instant,
     io: Arc<Mutex<Bridge>>,
@@ -439,7 +441,15 @@ fn mime_list(header: Option<&HeaderValue>, mime: &str) -> bool {
             .any(|x| x.trim().split(';').next() == Some(mime))
     })
 }
-fn remote_authorized(principal: &Principal, request: &Value) -> bool {
+/// `vm` is the VM of a per-VM session, whose child serves that VM only.
+fn remote_authorized(principal: &Principal, vm: Option<&str>, request: &Value) -> bool {
+    if let Some(vm) = vm {
+        // The child has no resources and binds every call to its VM.
+        return principal.vm_ids.iter().any(|allowed| allowed == vm)
+            && !request["method"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("resources/"));
+    }
     if [
         "resources/read",
         "resources/subscribe",
@@ -459,6 +469,10 @@ fn remote_authorized(principal: &Principal, request: &Value) -> bool {
     match request["params"]["name"].as_str().unwrap_or("") {
         "vm_create" => false,
         "vm_list" | "vm_capabilities" | "vm_tools_enable" => true,
+        name if name.starts_with(vm_control::cua_bridge::PREFIX) => request["params"]["arguments"]
+            ["vm"]
+            .as_str()
+            .is_some_and(|id| principal.vm_ids.iter().any(|allowed| allowed == id)),
         _ => request["params"]["arguments"]["id"]
             .as_str()
             .is_some_and(|id| principal.vm_ids.iter().any(|allowed| allowed == id)),
@@ -691,6 +705,25 @@ async fn endpoint(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    serve(app, None, method, headers, body).await
+}
+/// `/vm/{id}/mcp`: one VM's cua-driver tools under their own names (`vm-control mcp --vm`).
+async fn vm_endpoint(
+    State(app): State<Arc<App>>,
+    UrlPath(vm): UrlPath<String>,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    serve(app, Some(vm), method, headers, body).await
+}
+async fn serve(
+    app: Arc<App>,
+    vm: Option<String>,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let origin = headers.get("origin").and_then(|h| h.to_str().ok());
     if headers.contains_key("origin")
         && origin.is_none_or(|o| {
@@ -723,7 +756,17 @@ async fn endpoint(
             r
         }
     } else if let Some(principal) = authenticate(&app, &headers) {
-        dispatch(&app, &principal, &method, &headers, &body).await
+        if vm
+            .as_ref()
+            .is_some_and(|vm| !principal.vm_ids.iter().any(|allowed| allowed == vm))
+        {
+            error(
+                StatusCode::NOT_FOUND,
+                "VM is not authorized for this principal",
+            )
+        } else {
+            dispatch(&app, &principal, vm.as_deref(), &method, &headers, &body).await
+        }
     } else {
         let mut r = error(StatusCode::UNAUTHORIZED, "Bearer authentication required");
         r.headers_mut().insert(
@@ -758,6 +801,7 @@ async fn endpoint(
 async fn dispatch(
     app: &Arc<App>,
     principal: &Principal,
+    vm: Option<&str>,
     method: &Method,
     headers: &HeaderMap,
     body: &[u8],
@@ -860,6 +904,15 @@ async fn dispatch(
         if principal.scopes.iter().any(|s| s == "files") {
             command.arg("--allow-files");
         }
+        if principal.scopes.iter().any(|s| s == "browser") {
+            command.arg("--allow-browser");
+        }
+        if principal.scopes.iter().any(|s| s == "clipboard") {
+            command.arg("--allow-clipboard");
+        }
+        if let Some(vm) = vm {
+            command.arg("--vm").arg(vm);
+        }
         if !principal.tools.is_empty() {
             command.arg("--tools").arg(principal.tools.join(","));
         }
@@ -877,6 +930,7 @@ async fn dispatch(
             session_id.clone(),
             Session {
                 principal: principal.name.clone(),
+                vm: vm.map(str::to_owned),
                 created: Instant::now(),
                 touched: Instant::now(),
                 lifecycle: lifecycle.clone(),
@@ -933,8 +987,10 @@ async fn dispatch(
     };
     let mut sessions = app.sessions.lock().await;
     let session = match sessions.get_mut(session_id) {
+        // A session answers only on the path it was created on.
         Some(s)
             if s.principal == principal.name
+                && s.vm.as_deref() == vm
                 && !s.lifecycle.retired.load(Ordering::Acquire)
                 && !app.closing.load(Ordering::Acquire) =>
         {
@@ -981,7 +1037,7 @@ async fn dispatch(
     if request.get("method").is_none() {
         return StatusCode::ACCEPTED.into_response();
     }
-    if !remote_authorized(principal, &request) {
+    if !remote_authorized(principal, vm, &request) {
         return Json(json!({"jsonrpc":"2.0","id":request.get("id").cloned().unwrap_or(Value::Null),"error":{"code":-32602,"message":"Tool or VM is not authorized for this principal"}})).into_response();
     }
     let screen = screen_subscription(&request);
@@ -1231,7 +1287,16 @@ async fn run() -> Result<()> {
                 .any(|id| vm_control::validate_id(id).is_err())
             || !p.scopes.iter().any(|s| s == "observe")
             || p.scopes.iter().any(|s| {
-                !["observe", "lifecycle", "execute", "files", "input"].contains(&s.as_str())
+                ![
+                    "observe",
+                    "lifecycle",
+                    "execute",
+                    "files",
+                    "input",
+                    "browser",
+                    "clipboard",
+                ]
+                .contains(&s.as_str())
             })
             || (!p.tools.is_empty() && vm_control::tool_groups::parse(&p.tools.join(",")).is_err())
         {
@@ -1288,6 +1353,7 @@ async fn run() -> Result<()> {
     });
     let router = Router::new()
         .route("/mcp", any(endpoint))
+        .route("/vm/{id}/mcp", any(vm_endpoint))
         .layer(DefaultBodyLimit::max(vm_control::MAX_MESSAGE))
         .layer(middleware::from_fn_with_state(app.clone(), admission))
         .layer(tower_http::timeout::TimeoutLayer::with_status_code(
@@ -1362,10 +1428,10 @@ mod tests {
         ] {
             let request =
                 json!({"method":"tools/call","params":{"name":tool,"arguments":{"id":"allowed"}}});
-            assert!(remote_authorized(&p, &request));
+            assert!(remote_authorized(&p, None, &request));
             let denied =
                 json!({"method":"tools/call","params":{"name":tool,"arguments":{"id":"other"}}});
-            assert!(!remote_authorized(&p, &denied));
+            assert!(!remote_authorized(&p, None, &denied));
             let private = json!({"vm":"allowed","name":"checkpoint","operation_id":"abc","state":"failed","error":"secret /private/disk.raw","compatibility":{"backend_sha256":"secret"},"result":{"capture_verified":true,"disk":"/private/disk.raw"}});
             let reply = filter_reply(
                 &p,
@@ -1418,14 +1484,17 @@ mod tests {
         let p = principal();
         assert!(!remote_authorized(
             &p,
+            None,
             &json!({"method":"tools/call","params":{"name":"vm_create","arguments":{"id":"allowed","disk":"/host/private-file"}}})
         ));
         assert!(!remote_authorized(
             &p,
+            None,
             &json!({"method":"tools/call","params":{"name":"vm_start","arguments":{"id":"not-allowed"}}})
         ));
         assert!(remote_authorized(
             &p,
+            None,
             &json!({"method":"tools/call","params":{"name":"vm_start","arguments":{"id":"allowed"}}})
         ));
     }
@@ -1434,7 +1503,7 @@ mod tests {
         let p = principal();
         for profile in ["virgl", "venus-moltenvk-experimental", "unknown"] {
             let request = json!({"method":"tools/call","params":{"name":"vm_create","arguments":{"id":"allowed","backend":"qemu-hvf","qemu_graphics_profile":profile}}});
-            assert!(!remote_authorized(&p, &request));
+            assert!(!remote_authorized(&p, None, &request));
         }
         let reply = filter_reply(
             &p,
@@ -1447,7 +1516,7 @@ mod tests {
     fn tool_groups_enable_needs_no_vm_and_never_names_remote_create() {
         let p = principal();
         let request = json!({"method":"tools/call","params":{"name":"vm_tools_enable","arguments":{"groups":["core"]}}});
-        assert!(remote_authorized(&p, &request));
+        assert!(remote_authorized(&p, None, &request));
         let result = json!({"enabled":["core"],"added_tools":["vm_start","vm_create"]});
         let reply = filter_reply(
             &p,
@@ -1474,12 +1543,29 @@ mod tests {
         p.scopes = vec!["observe".into()];
         assert!(remote_authorized(
             &p,
+            None,
             &json!({"method":"tools/call","params":{"name":"vm_windows","arguments":{"id":"allowed"}}})
         ));
         assert!(!remote_authorized(
             &p,
+            None,
             &json!({"method":"tools/call","params":{"name":"vm_windows","arguments":{"id":"other"}}})
         ));
+    }
+    #[test]
+    fn cua_tools_and_per_vm_sessions_are_vm_allowlisted() {
+        let p = principal();
+        let cua = |vm: &str| json!({"method":"tools/call","params":{"name":"cua_click","arguments":{"vm":vm,"id":"allowed"}}});
+        assert!(remote_authorized(&p, None, &cua("allowed")));
+        // The VM is the `vm` argument; an allowed `id` beside it does not count.
+        assert!(!remote_authorized(&p, None, &cua("other")));
+        let click = json!({"method":"tools/call","params":{"name":"click","arguments":{"pid":1}}});
+        assert!(remote_authorized(&p, Some("allowed"), &click));
+        assert!(!remote_authorized(&p, Some("other"), &click));
+        // A per-VM session has no resources, not even its own VM's.
+        let screen =
+            json!({"method":"resources/read","params":{"uri":"veynode://vm/allowed/screen"}});
+        assert!(!remote_authorized(&p, Some("allowed"), &screen));
     }
     #[test]
     fn observations_filter_vm_ids_and_host_diagnostics() {
@@ -1523,19 +1609,30 @@ mod event_tests {
             let request = |uri: &str| json!({"method":method,"params":{"uri":uri}});
             assert!(remote_authorized(
                 &p,
+                None,
                 &request("veynode://vm/allowed/status")
             ));
             assert!(!remote_authorized(
                 &p,
+                None,
                 &request("veynode://vm/other/screen")
             ));
-            assert!(!remote_authorized(&p, &request("veynode://vm/../status")));
             assert!(!remote_authorized(
                 &p,
+                None,
+                &request("veynode://vm/../status")
+            ));
+            assert!(!remote_authorized(
+                &p,
+                None,
                 &json!({"method":method,"params":{}})
             ));
         }
-        assert!(remote_authorized(&p, &json!({"method":"resources/list"})));
+        assert!(remote_authorized(
+            &p,
+            None,
+            &json!({"method":"resources/list"})
+        ));
         let updated = |uri: &str| json!({"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":uri}});
         assert!(observable(&p, &updated("veynode://vm/allowed/log/worker")));
         assert!(!observable(&p, &updated("veynode://vm/other/status")));

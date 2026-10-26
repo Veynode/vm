@@ -1,0 +1,56 @@
+# vm-gateway configuration (docs/remote-desktop.md).
+# One file serves both deployments; the host reads only [host].
+#
+# EC2 / any Linux: tls.mode = "acme", listen.udp set (WebTransport).
+# Cloudflare Tunnel: tls.mode = "external", listen.tcp on 127.0.0.1, no udp.
+
+[listen]
+tcp = "0.0.0.0:443"            # wss, /v1/capabilities, static UI
+udp = "0.0.0.0:443"            # WebTransport; omit to disable (Cloudflare mode)
+http = "0.0.0.0:80"            # ACME HTTP-01 answers and redirect to https
+allowed_origins = ["https://desk.example.com"]
+# ui = "/srv/veynode-ui"        # optional static web UI
+
+[tls]
+mode = "acme"                  # acme | files | self-signed | external
+domains = ["desk.example.com"]
+email = "ops@example.com"
+state_dir = "/data/acme"
+staging = true                 # flip to false once a staging issue works
+# mode = "files"; cert = "/data/fullchain.pem"; key = "/data/privkey.pem"   (SIGHUP reloads)
+# mode = "self-signed"; names = ["192.168.1.20"]   (LAN; WebTransport pins the 13-day leaf)
+
+[tunnel]
+listen = "0.0.0.0:7443"        # UDP; hosts dial out to it
+key = "/data/tunnel.key"       # created 0600 on first start; `vm-gateway pin` prints its pin
+hosts = [
+  # The host prints its tunnel key pin at startup.
+  { id = "sha256:0000000000000000000000000000000000000000000000000000000000000000", name = "studio-mac" },
+]
+
+# Read by `vm-media-local remote` on the Mac, not by the gateway.
+# [host]
+# connect = "desk.example.com:7443"
+# gateway_spki_sha256 = "sha256:…"   # `vm-gateway pin` on the gateway
+# key = "/Users/me/Library/Application Support/VeynodeVM/remote/tunnel.key"
+# name = "studio-mac"
+
+# TURN for the WebRTC fallback, minted per session on the host. Env overrides:
+# VEYNODE_GATEWAY_TURN_KEY_ID / _TURN_KEY_API_TOKEN (Cloudflare),
+# VEYNODE_GATEWAY_TURN_URLS / _TURN_SECRET (coturn shared secret),
+# VEYNODE_GATEWAY_TURN_URLS / _TURN_USERNAME / _TURN_CREDENTIAL (static).
+[turn]
+kind = "shared-secret"
+urls = ["turn:desk.example.com:3478?transport=udp", "turn:desk.example.com:3478?transport=tcp"]
+secret = "replace-with-the-coturn-static-auth-secret"
+
+[limits]
+conn_per_ip_per_min = 30
+handshakes_per_device_per_min = 8
+sessions_max = 32
+viewers_per_vm = 8
+tracks_per_vm = 4
+
+[video]
+mode = "stream"                # stream (one QUIC stream per frame) | datagram
+start_bps = 4000000

@@ -115,6 +115,69 @@ impl Ssh {
         command
     }
 
+    /// An SSH command running `remote` in the SSH user's shell with this
+    /// process's stdio (the cua-driver link, `windows_driver.rs`).
+    pub fn stdio(&self, remote: &str) -> Command {
+        self.command(remote)
+    }
+
+    /// Copies a host file to `remote` (`C:/...`) in the Guest with scp.
+    pub fn copy(&self, local: &Path, remote: &str, timeout: Duration) -> Result<()> {
+        let mut child = Command::new("/usr/bin/scp")
+            .arg("-q")
+            .arg("-i")
+            .arg(&self.key)
+            .arg("-P")
+            .arg(self.port.to_string())
+            .arg("-o")
+            .arg(format!("UserKnownHostsFile={}", self.known_hosts.display()))
+            .args([
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "LogLevel=ERROR",
+            ])
+            .arg(local)
+            .arg(format!("{}@{}:{remote}", self.user, self.address))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("cannot run scp")?;
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!(
+                    "copying {} to the Windows guest took over {} s",
+                    local.display(),
+                    timeout.as_secs()
+                )
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        if !status.success() {
+            let mut err = String::new();
+            let _ = child.stderr.take().unwrap().read_to_string(&mut err);
+            bail!(
+                "copying {} to the Windows guest failed: {}",
+                local.display(),
+                err.trim()
+            )
+        }
+        Ok(())
+    }
+
     /// Runs a PowerShell script (the SSH user's default shell runs it) with
     /// `stdin`, returning (status, stdout, stderr); 255 is an SSH failure.
     pub fn powershell(
@@ -177,13 +240,21 @@ impl Ssh {
 }
 
 /// A command line for the SSH user's PowerShell that runs `script`, given as
-/// base64 so no quoting reaches PowerShell's parser.
+/// base64 so no quoting reaches PowerShell's parser, and gzipped: Windows
+/// OpenSSH refuses an exec request a little over 17 KB ("exec request failed
+/// on channel 0"), which cua.ps1 alone exceeded as UTF-16 base64.
 fn encoded(script: &str) -> String {
-    let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    format!(
-        "$ProgressPreference='SilentlyContinue'; iex ([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{}')))",
-        base64::engine::general_purpose::STANDARD.encode(utf16)
-    )
+    use std::io::Write as _;
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    gzip.write_all(script.as_bytes())
+        .and_then(|_| gzip.finish())
+        .map(|bytes| {
+            format!(
+                "$ProgressPreference='SilentlyContinue'; $veynodeScript=New-Object IO.Compression.GZipStream((New-Object IO.MemoryStream(,[Convert]::FromBase64String('{}'))),([IO.Compression.CompressionMode]::Decompress)); iex (New-Object IO.StreamReader($veynodeScript)).ReadToEnd()",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            )
+        })
+        .expect("gzip into memory")
 }
 
 /// The Windows command line for arguments, quoted so CommandLineToArgvW and
@@ -664,11 +735,22 @@ mod tests {
 
     #[test]
     fn scripts_travel_as_base64_powershell() {
+        use base64::Engine as _;
+        use std::io::Read as _;
         let line = encoded("Write-Output 'x'");
-        assert!(line.starts_with("$ProgressPreference='SilentlyContinue'; iex"));
+        assert!(line.starts_with("$ProgressPreference='SilentlyContinue'; $veynodeScript="));
         assert!(!line.contains("Write-Output"));
-        // UTF-16LE of "W" then "r".
-        assert!(line.contains("VwByAGkAdABlAC0A"));
+        let payload = line.split('\'').nth(3).unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .unwrap();
+        let mut script = String::new();
+        flate2::read::GzDecoder::new(&bytes[..])
+            .read_to_string(&mut script)
+            .unwrap();
+        assert_eq!(script, "Write-Output 'x'");
+        // cua.ps1 stays well under Windows OpenSSH's exec request limit.
+        assert!(encoded(include_str!("../../../guest/windows/cua.ps1")).len() < 8000);
     }
 
     fn fixture() -> (tempfile::TempDir, PathBuf) {

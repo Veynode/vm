@@ -313,6 +313,19 @@ pub(crate) fn remote(
     ))
 }
 
+/// Replaces this process with an SSH session running `script` in the Guest
+/// on this process's stdio; returns only when that cannot start.
+pub(crate) fn exec_remote(container: &Container, ip: &str, script: &str) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let (user, _) = login(container)?;
+    let error = ssh_base("/usr/bin/ssh", container)?
+        .args(["-o", "BatchMode=yes", "-T"])
+        .arg(format!("{user}@{ip}"))
+        .arg(script)
+        .exec();
+    Err(error.into())
+}
+
 /// `sudo` with the login password on stdin (Tart images also allow NOPASSWD).
 fn sudo(container: &Container, ip: &str, script: &str) -> Result<()> {
     let (_, password) = login(container)?;

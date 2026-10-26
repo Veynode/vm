@@ -35,7 +35,7 @@ fn version(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
-fn container_of(vm: &str) -> Result<Container> {
+pub(crate) fn container_of(vm: &str) -> Result<Container> {
     container::list()?
         .into_iter()
         .find(|c| c.vm_id == vm && c.os == "darwin")

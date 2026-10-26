@@ -16,6 +16,7 @@ mod media_egress_tests;
 mod pinned_client;
 mod provenance_evidence;
 mod receiver_loss;
+mod remote;
 mod rtcp_forwarder;
 mod shutdown_signal;
 mod source_status;
@@ -1403,6 +1404,9 @@ async fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).is_some_and(|v| v == "--pair") {
         return vm_session_auth::cli::run_cli(&args[2..]);
+    }
+    if args.get(1).is_some_and(|v| v == "remote") {
+        return remote::run(&args[2..]).await;
     }
     if args
         .get(1)

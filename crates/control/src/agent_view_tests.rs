@@ -1635,3 +1635,79 @@ fn measure_form_fill_before_and_after() {
         );
     }
 }
+
+#[test]
+fn host_input_reports_an_action_result_from_what_it_saw() {
+    let mut d = Fixture::new(true);
+    let mut session = Session::default();
+    let shot = session
+        .call(&mut d, "vm_screenshot", json!({"id":QEMU}))
+        .unwrap();
+    let shot: Value = serde_json::from_str(content_text(&shot).as_str()).unwrap();
+    let frame = json!({"id":QEMU,"frame_id":shot["frame_id"],"width":1920,"height":1080,"source_generation":1});
+    let mut click = frame.clone();
+    click["x"] = json!(10);
+    click["y"] = json!(10);
+    click["observe"] = json!({"return":"none"});
+    let reply = session.call(&mut d, "vm_input_click", click).unwrap();
+    let head: Value = serde_json::from_str(reply["content"][0]["text"].as_str().unwrap()).unwrap();
+    crate::action_result::check(&head["action"]).unwrap();
+    assert_eq!(head["action"]["route"], "virtual_hid");
+    // QEMU's wait cannot place the change, so a click is not confirmed.
+    assert_eq!(head["action"]["effect"], "unverifiable");
+    assert_eq!(head["action"]["evidence"][0]["kind"], "window_change");
+    // Without observe nothing was checked.
+    let mut key = head["frame"].clone();
+    key["id"] = json!(QEMU);
+    key["keys"] = json!(["Return"]);
+    let reply = session.call(&mut d, "vm_input_key", key).unwrap();
+    let head: Value = serde_json::from_str(reply["content"][0]["text"].as_str().unwrap()).unwrap();
+    crate::action_result::check(&head["action"]).unwrap();
+    assert_eq!(head["action"]["effect"], "unverifiable");
+    assert!(head["action"].get("evidence").is_none());
+}
+
+#[test]
+fn a_guest_without_its_driver_gets_untrusted_ocr_rows() {
+    let mut d = Fixture::new(true);
+    let mut session = Session::default();
+    let state = session.ocr_window_state(&mut d, QEMU).unwrap();
+    let structured = &state["structuredContent"];
+    assert_eq!(structured["trusted"], false);
+    assert_eq!(structured["source"], "host_ocr");
+    let save = structured["elements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["text"] == "Saved")
+        .unwrap();
+    let token = save["element_token"].as_str().unwrap();
+    assert!(structured["tree_markdown"]
+        .as_str()
+        .unwrap()
+        .contains("\"Saved\" @930,510"));
+    let verify = session
+        .ocr_token_call(
+            QEMU,
+            "verify_state",
+            &json!({"expect":[{"element_token":token,"exists":true}]}),
+        )
+        .unwrap();
+    assert_eq!(verify["structuredContent"]["status"], "unknown");
+    assert_eq!(verify["structuredContent"]["reason"], "untrusted_source");
+    let click = session
+        .ocr_token_call(QEMU, "click", &json!({"element_token":token}))
+        .unwrap();
+    let refusal = &click["structuredContent"];
+    crate::action_result::check(refusal).unwrap();
+    assert_eq!(refusal["next_call"]["tool"], "vm_input_click");
+    assert_eq!(refusal["next_call"]["arguments"]["x"], 930);
+    assert_eq!(
+        refusal["next_call"]["arguments"]["frame_id"],
+        structured["frame"]["frame_id"]
+    );
+    // Driver tokens are left to the driver.
+    assert!(session
+        .ocr_token_call(QEMU, "click", &json!({"element_token":"s3:12"}))
+        .is_none());
+}

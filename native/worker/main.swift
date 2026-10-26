@@ -34,9 +34,15 @@ func emit(_ object: [String: Any]) {
 }
 // Compact standard JSON preserves the full 32 KiB binary chunk contract without
 // spending the 64 KiB line budget on optional escaping of base64 slash bytes.
-func guestRequestData(_ request: [String: Any]) -> Data? {
+// driver_rpc carries cua-driver JSON-RPC frames whose user text (type_text, set_value,
+// clipboard_write) can exceed 64 KiB, so it gets 1 MiB like replies.
+let guestRequestLimit = 65536
+let driverRequestLimit = 1024 * 1024
+let guestRequestSeconds = 35
+let driverMaxDeadlineMilliseconds = 600_000
+func guestRequestData(_ request: [String: Any], limit: Int = guestRequestLimit) -> Data? {
     guard var data = try? JSONSerialization.data(withJSONObject: request, options: [.withoutEscapingSlashes]),
-          data.count < 65536 else { return nil }
+          data.count < limit else { return nil }
     data.append(10)
     return data
 }
@@ -212,6 +218,10 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
     let keyEventLog: KeyEventLogQueue?
     var vm: VZVirtualMachine!
     var window: NSWindow?
+    // A person's input in the window, for the daemon's control lease: at most one
+    // person_input event a second, none for synthetic events.
+    var personInputMonitor: Any?
+    var lastPersonInput = Date.distantPast
     var serialInput: Pipe?
     var serialOutput: FileHandle?
     let serialWriteQueue = DispatchQueue(label:"veynode.serial.write")
@@ -535,6 +545,17 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
         window.delegate = self
         self.window = window
         window.center()
+        if personInputMonitor == nil {
+            let kinds: NSEvent.EventTypeMask = [.keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel, .leftMouseDragged]
+            personInputMonitor = NSEvent.addLocalMonitorForEvents(matching: kinds) { [weak self] event in
+                if let self, let window = self.window, event.window === window, Date().timeIntervalSince(self.lastPersonInput) >= 1 {
+                    self.lastPersonInput = Date()
+                    emit(["event":"person_input","vm_id":self.config.id])
+                }
+                return event
+            }
+        }
+        emit(["event":"window_opened","vm_id":config.id])
         focusWindow(window)
     }
     func focusWindow(_ window: NSWindow) {
@@ -626,17 +647,31 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
             return
         }
         guard guestRequests.count < 16 else { reject("busy","Too many concurrent guest requests"); return }
-        guard let request = object["request"] as? [String:Any], let requestID = request["id"], request["method"] is String,
-              let data = guestRequestData(request) else { reject("invalid_request","Expected guest request with id/method within a 64 KiB line including newline"); return }
+        guard let request = object["request"] as? [String:Any], let requestID = request["id"], let method = request["method"] as? String else {
+            reject("invalid_request","Expected guest request with id/method"); return
+        }
+        let driver = method == "driver_rpc"
+        var milliseconds = guestRequestSeconds * 1000
+        if driver {
+            guard let arguments = request["arguments"] as? [String:Any], arguments["frame"] is [String:Any],
+                  let requested = (arguments["deadline_ms"] as? NSNumber)?.intValue, requested > 0 else {
+                reject("invalid_request","driver_rpc needs arguments.frame and a positive arguments.deadline_ms"); return
+            }
+            // A little over the agent's own deadline so the agent's error reply wins the race.
+            milliseconds = min(requested, driverMaxDeadlineMilliseconds) + 2000
+        }
+        guard let data = guestRequestData(request, limit: driver ? driverRequestLimit : guestRequestLimit) else {
+            reject("invalid_request", driver ? "driver_rpc request exceeds 1 MiB" : "Expected guest request within a 64 KiB line including newline"); return
+        }
         let key = UUID()
         guestRequests.insert(key)
         guestIOActive += 1
-        let deadline = DispatchTime.now() + .seconds(35)
+        let deadline = DispatchTime.now() + .milliseconds(milliseconds)
         func finish(_ response:[String:Any]) {
             guard self.guestRequests.remove(key) != nil else { return }
             emit(response)
         }
-        DispatchQueue.main.asyncAfter(deadline:deadline) { finish(["id":id,"error":["code":"timeout","message":"Guest request exceeded 35 seconds"]]) }
+        DispatchQueue.main.asyncAfter(deadline:deadline) { finish(["id":id,"error":["code":"timeout","message":"Guest request exceeded \(milliseconds / 1000) seconds"]]) }
         socket.connect(toPort:5000) { result in
             guard self.guestRequests.contains(key) else {
                 if case .success(let connection) = result { connection.close() }

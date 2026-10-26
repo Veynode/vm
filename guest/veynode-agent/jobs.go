@@ -305,6 +305,10 @@ type runningCommand struct {
 }
 
 func startCommand(req request, identity executionIdentity, factory boundaryFactory) (*runningCommand, error) {
+	identity, err := identity.withRequest(req)
+	if err != nil {
+		return nil, err
+	}
 	executable, err := identity.executable(req.Argv[0])
 	if err != nil {
 		return nil, err

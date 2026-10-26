@@ -16,6 +16,8 @@ Writes <VEYNODEVM_HOME or ~/Library/Application Support/VeynodeVM>/runtime.json:
             (native/tools/build-vm-vision.sh)
   macos_desktop  .local/bin/vm-macos-desktop, the desktop and accessibility helper
             macOS containers run over SSH (native/tools/build-vm-macos-desktop.sh)
+  cua_driver  .local/runtime/cua-driver, the pinned cua-driver binaries the daemon
+            copies into Windows and macOS Guests (runtime/fetch-cua-driver.sh)
 
 Only paths that exist are written; the daemon reads this file when started
 without flags. Existing keys not managed here (memory_budget_mib) are kept.
@@ -98,6 +100,9 @@ def main():
     macos_desktop = ROOT / '.local/bin/vm-macos-desktop'
     if macos_desktop.exists():
         runtime['macos_desktop'] = str(macos_desktop.resolve())
+    cua_driver = ROOT / '.local/runtime/cua-driver'
+    if cua_driver.exists():
+        runtime['cua_driver'] = str(cua_driver.resolve())
     if args.dns:
         runtime['dns'] = args.dns
     if args.memory_budget_mib:

@@ -148,6 +148,20 @@ fn strings(args: &Value, key: &str) -> Result<Vec<String>> {
     }
 }
 
+/// The cua-driver link of a macOS container: the CLI runs the driver in the
+/// Guest over SSH on its stdio (`veynodevm __driver`).
+pub fn macos_driver(dir: &Path, vm: &str) -> crate::driver_link::Link {
+    let (dir, vm) = (dir.to_path_buf(), vm.to_owned());
+    crate::driver_link::Link::new(Box::new(move || {
+        let mut command = Command::new(cli()?);
+        command.args(["__driver", &vm]);
+        if dir.file_name().is_some_and(|n| n == "state") {
+            command.env("VEYNODEVM_HOME", dir.parent().unwrap());
+        }
+        Ok(command)
+    }))
+}
+
 /// A desktop or accessibility method of a macOS container: the CLI runs its
 /// helper in the Guest over SSH (`veynodevm __desktop`).
 pub fn desktop(dir: &Path, vm: &str, method: &str, arguments: &Value) -> Result<Value> {

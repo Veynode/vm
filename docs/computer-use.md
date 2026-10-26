@@ -1,9 +1,9 @@
 # Computer use: cua's driver on VeynodeVM's system-level VM
 
-Status: **proposed plan**, not implemented. It follows [where agent capabilities live](architecture.md#where-agent-capabilities-live).
+Status: **proposed plan**, not implemented. It follows [where agent capabilities live](architecture.md#where-agent-capabilities-live). The Linux part of phase 0 has run; see [Phase 0 findings (Linux)](#phase-0-findings-linux).
 
 Sources:
-- github.com/trycua/cua at `de783ee0a6` (2026-10-26), driver workspace 0.38.0, contract 0.8.0. Read statically; nothing was built or run.
+- github.com/trycua/cua at `de783ee0a6` (2026-10-26), driver workspace 0.38.0, contract 0.8.0. The plan was written from a static read. Phase 0 then built the driver for Linux arm64 and ran it in live Guests.
 - This repo's `main` at `46126aec`, plus the unmerged MCP branches `goofy-moser` (agent view), `elated-meninsky` (events), `upbeat-sanderson` (tool groups) and `elated-faraday` (checkpoints and forks).
 
 ## Goal
@@ -71,8 +71,9 @@ cua-driver runs as a **stdio MCP child process** in the console user's session. 
 **Invisible-helper rules:**
 - The image (Linux), the answer file (Windows) or first boot (macOS) installs the driver. Nothing is installed by hand.
 - No window, tray icon, prompt or console flash. The driver's agent-cursor overlay stays off unless a person is watching.
-- Linux needs `libx11-6 libxi6 libxtst6 libxext6 libwayland-client0 libxkbcommon0`, `at-spi-bus-launcher`, and `/dev/uinput` with a udev rule plus group `input`. Without uinput only foreground delivery works, which is fine in a VM.
-- The driver runs as the desktop user, never root. It is pinned to a release built from source, its checksum is recorded in `runtime/`, and it is updated on purpose.
+- Linux needs `libx11-6 libxi6 libxext6 libxkbcommon0` (the build links no libXtst or libwayland), `at-spi2-core`, and `/dev/uinput` with a udev rule plus group `input`. Without uinput only foreground delivery works, which is fine in a VM. A browser also needs `chromium-sandbox`. The full list is in [phase 0](#what-a-linux-image-needs).
+- The driver starts with `--no-overlay` and `DO_NOT_TRACK=1 CUA_DRIVER_RS_UPDATE_CHECK=0`. The cursor overlay is on by default, and the binary contains a PostHog telemetry sender.
+- The driver runs as the desktop user, never root. `ubuntu-desktop` runs its XFCE session as root today, so the image must move the session to a user. It is pinned to an official release, which cua's release job builds from the tagged commit and attests with sigstore. [`runtime/cua-driver.json`](../runtime/cua-driver.json) records the tag, commit and the archive and binary checksums per platform; the image and `runtime/fetch-cua-driver.sh` check them, and the pin is updated on purpose.
 - Idle CPU and memory are measured in phase 0 and are part of acceptance.
 
 ### Two MCP faces
@@ -143,6 +144,278 @@ Report pass@k, steps, tokens and wall time beside cua's published numbers, and s
 | 5. Recording and gaps | `turn-NNNNN` recording, ATIF export, clipboard scope, `set_resolution`, init flags | Recorded runs replay; gaps above closed |
 
 Phases 0 and 1 also merge the four MCP branches first, because the bridge builds on tool groups, events and the agent view.
+
+## Progress (phases 1–3)
+
+Implemented with static, unit and fixture evidence, and run live on Linux, Windows and macOS (below).
+The decision is [0024](decisions/0024-computer-use-cua-driver-and-control-lease.md).
+
+**Guest half (phase 1):**
+- **Pin:** cua-driver 0.38.0 (`85e2b1318b`), one official release for Linux, Windows and macOS (`runtime/cua-driver.json`;
+  `runtime/fetch-cua-driver.sh` fetches and checks a platform). Telemetry stays off through the environment, which every
+  start sets.
+- **Supervisor** (`guest/veynode-agent/driver.go`): started on the first call as the desktop session's user with the
+  session's groups and environment, never as root; outside every command cgroup; restarted after an exit (at most 5 starts
+  a minute). It owns the MCP handshake and rewrites request ids, so the host sends only `tools/*`, `resources/*` and `ping`.
+- **Contract with the host:**
+  - Apple Virtualization: agent method `driver_rpc {frame, deadline_ms}` on vsock 5000, through the worker's
+    `guest_request`; the reply is `{frame}`. This method alone takes up to 1 MiB per request and a deadline up to 10
+    minutes; replies are at most 1 MiB.
+  - QEMU: newline JSON-RPC frames, without an envelope, on the virtio port `veynode.driver`; failures are JSON-RPC errors
+    with `data.veynode_code`.
+  - Error codes: `unsupported`, `deadline_exceeded`, `driver_exited`, `driver_unavailable`, `reply_too_large`,
+    `invalid_request`, `busy`.
+- **Image** (`ubuntu-desktop`): XFCE runs as `veynode` (uid 1000, groups `input video render`); `at-spi2-core`, the
+  uinput udev rule and the pinned driver are installed. Chromium stays out of the base image.
+- **Fixed on the way:** the `virtio_balloon`/`virtio_rng` blacklist is written for every container, and
+  `veynodevm exec -u/-e/-w` now applies without `-i`/`-t`.
+
+**Host half (phase 1):** the worker limits, the QEMU driver port, the bridge with its scope mapping and policies, the
+`cua` group and the per-VM endpoint. See [cua-driver tools](../crates/control/README.md#cua-driver-tools).
+
+**Windows and macOS (phase 2):** a persistent link per VM (`driver_link`): on Windows the driver's own `mcp --socket`
+proxy over one SSH session, after `guest/windows/cua.ps1` installed the pinned binary and a hidden logon task serving
+`\\.\pipe\cua-driver`; in macOS containers the embedded driver over SSH. Both install on first use and need no step
+from the user beyond a logged-on Windows console. Not done yet: routing the Windows `vm_desktop_*`/`vm_accessibility_*`
+tools through the driver (they still use `desktop.ps1`), and the XAML keyboard policy (host input for keys without an
+element token).
+
+**One contract (phase 3):**
+- `ActionResult` on host input (`action_result.rs`): route `virtual_hid`, effect from the observation only. Contract
+  invariants are unit tested (`confirmed` needs evidence, `refused` says why, an unconfirmed effect names what to do next).
+- OCR rows for Guests without the driver (`cua_get_window_state`), untrusted.
+- Agent view: the compact rows and `+ ~ -` deltas were already the driver's shape; `vm_input_batch` keeps its 50 steps
+  and `wait` steps, and takes OCR tokens as click refs. Not done: `invalidated_snapshot_ids` and `stale_element_token`
+  for the host's own trees, and routing `vm_window*`/`vm_accessibility_*` on QEMU Linux through the driver (QEMU still
+  refuses them; the `cua_*` tools are the path there).
+- Control lease (`control_lease.rs`), `vm_control_lease`, and `control` events. The Apple Virtualization console window
+  reports the person's input; the QEMU console and browser desktops do not yet.
+
+### Live acceptance (2026-10-26)
+
+`ubuntu-desktop` built with the pinned driver and run from a disposable `VEYNODEVM_HOME` by a foreground daemon; evidence
+in `.local/evidence/computer-use-live/` (`*.jsonl` frames, `*.txt` summaries). Live VM evidence for Linux only.
+
+| Check | Apple Virtualization | QEMU/Venus |
+|---|---|---|
+| Session: Xorg root, XFCE and the driver as `veynode`, no oops | passed | passed |
+| `cua_launch_app` → `list_windows` → `get_window_state` (tokens) → `type_text` → `verify_state` in xfce4-terminal | passed; the typed command ran | passed; the typed command ran |
+| `set_window_frame`, `set_value` | confirmed by readback | not run |
+| Chromium: `browser_prepare` (isolated) → `navigate` → `browser_type` `Zoë 世界` → `browser_click` → page reads `clicked:Zoë 世界` | passed | not run |
+| Per-VM endpoint: the driver's own schemas (47 tools, 160 KB at observe+input), refusals before the driver | — | passed |
+| Driver network use: one loopback socket, the CDP connection to its own Chromium | passed | — |
+| `vm_input_click` `ActionResult` (`virtual_hid`, `unverifiable` with `next_call`) | — | passed |
+| OCR fallback with the driver removed: `ocr1:N` rows `trusted:false`; token click refused with the pixel `next_call`; `verify_state` unknown; the driver back on the next call once restored | — | passed |
+| `exec -u veynode id` with supplementary groups, `-w`, `-e` | — | passed after the fixes below |
+
+Found and fixed during the run:
+- **QEMU killed the VM on `exec -u/-e/-w`.** The serial v2 preflight allowed only `argv` and `timeout_ms` on
+  `exec_start`, so the identity fields were a protocol violation that fenced the incarnation. It now takes them.
+- **QEMU killed the VM on `vm_input_text` in any container.** The host's `info` contract required a rootless service,
+  while an OCI micro-VM runs as its container root (which the Guest admits since `a1bf1521`). The host now accepts either.
+  Text input itself is then refused honestly: container-init does not start the service with `--allow-text-input`, so
+  on QEMU desktop containers `cua_type_text` is the way to type.
+- A fenced incarnation now writes its reason to the worker's stderr; it was discarded.
+- `exec -u` set only the primary group; it now adds the user's `/etc/group` memberships, like `docker exec -u`.
+- The curated `cua_browser_prepare` schema took `strategy` as a string and had no `profile`.
+- `cua_verify_state` on a Guest without the driver was an error; it is now `unknown` with `driver_unavailable`.
+
+Findings that stand:
+- **Non-ASCII through an element token is lost even in the foreground.** `type_text` with `element_token` and
+  `Zoë 世界` typed `Zoë ` (the bridge's foreground policy applied), and `verify_state` correctly reported unsatisfied.
+  Without a token the foreground route is exact; `set_value` and `browser_type` are exact. Upstream #4754 reaches the token
+  path; the policy should send token plus non-ASCII to `set_value`.
+- **Attaching to the user's Chromium profile** (`browser_prepare` `existing_profile`) is refused with
+  `browser_consent_required` unless the driver runs with `--grant existing-profile`; the bridge does not grant it. A
+  driver-owned isolated browser (`allow_launch`, `profile.mode: isolated_new`) needs no grant and ends with the session.
+- The QEMU console window registers no lease viewer, so only the Apple Virtualization window pauses the agent; the lease
+  read `holder: agent` with the QEMU window open. Pausing on a person's typing was not run live (it needs real input in the
+  console window); the unit tests cover it.
+- The first host OCR call after `vm-vision` is built takes about 17 s (Vision's first run); later calls take 0.4 s.
+- `veynodevm daemon start` with a custom `VEYNODEVM_HOME` reuses the fixed launchd label, so it replaces the default
+  daemon's agent and points it at that home.
+
+**Windows and macOS** (same day, APFS clones of the `win11v` machine and of the `macos-tahoe-vanilla` image in a
+disposable home, so neither original was touched):
+
+| Check | Windows 11 ARM (win11v, QEMU) | macOS Tahoe container |
+|---|---|---|
+| Install on the first call, from nothing | passed: 10.4 s (copy, telemetry off, hidden logon task, start); later calls 16 ms over the link | passed: about 1 s (copy to `~/.veynodevm`, embedded start) |
+| Invisible | passed: daemon in the console session and SSH proxy in session 0, no window handle, task `Hidden`, nothing on the desktop screenshot | passed: one process as `admin`, no window |
+| Network | no TCP or UDP endpoint | no socket |
+| Tree with tokens | Notepad (32 elements), Explorer | TextEdit, Finder |
+| Typing `Zoë 世界` into an element | `confirmed` by UIA value readback, exact | delivered complete through the foreground policy; TextEdit auto-capitalized the first letter and `verify_state` reported `unsatisfied` |
+| Element actions | Notepad's Add New Tab invoked; selecting an Explorer tree item `unverifiable` (it selects, it does not navigate) | `invoke_menu` File > New; a Finder sidebar click `confirmed` as the row selection it was, without navigating |
+| `verify_state` | window and element predicates satisfied; a Document's `value_equals` is `unknown` (`untrusted_source`) | window predicates satisfied; elements of an incomplete tree are `unknown` (`observation_unavailable`) |
+
+Found and fixed:
+- **Windows install could never start.** `cua.ps1` queried the not-yet-registered task with stderr redirected, which
+  Windows PowerShell turns into a terminating error under `Stop`. `schtasks` now runs through one helper that trusts only
+  its exit code.
+- **Windows OpenSSH refused the script** ("exec request failed on channel 0") once it passed about 17 KB as UTF-16
+  base64. Every SSH PowerShell script now travels gzipped (cua.ps1: 18 KB → 4 KB).
+- **The macOS driver exited at once**: embedded, `mcp` requires a host-provided service socket. It now runs
+  `mcp --direct`, owning its runtime in the SSH session that holds the Accessibility grant.
+- The curated `cua_launch_app` offers `bundle_id`, which macOS needs (it has no `launch_path`).
+
+Limits seen on macOS: the driver's own screenshots fail, because the SSH session has no Screen Recording grant (host
+screenshots go through Screen Sharing, as before); `launch_app` with a folder URL times out handing the folder to Finder.
+
+Not run: a console with real person input (the lease pause); Chromium on QEMU and Windows; Edge on Windows.
+
+## Phase 0 findings (Linux)
+
+Run on 2026-10-26 on an M3 Pro (11 cores, macOS 27). VeynodeVM was built from `main` at `d78b5843` with a private `VEYNODEVM_HOME` and its own boot assets. No product code changed.
+
+**Kinds of evidence:**
+- **Live:** one run per backend unless a row says otherwise. The backends are Apple Virtualization (`--desktop`, llvmpipe) and QEMU/HVF (`--gpus venus`, GL on virgl, Vulkan on Venus).
+- **Static:** reading the cua source or the binary.
+
+Raw logs, the harness and the spike image are in `.local/evidence/cua-spike-linux/` of the main checkout (not tracked).
+
+**Setup:**
+- The Guest image was `veynodevm/ubuntu-desktop`, built from `guest/images/ubuntu-desktop`, with one spike layer on top:
+  - `at-spi2-core`
+  - a user `veynode` (uid 1000, groups `input video render`) that runs the XFCE session
+  - the uinput udev rule
+  - Mousepad (GTK3), FeatherPad (Qt5) and deb Chromium 156 from the xtradeb PPA
+- The driver ran as `veynode` through `veynodevm exec -i CONTAINER runuser -u veynode -- cua-driver mcp --no-overlay`. It had the session's `DISPLAY`, `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR`.
+- A host-side harness spoke newline-delimited JSON-RPC to it and logged every frame's size and latency. On QEMU, `exec -i` runs over the serial-v2 exec channel, so the QEMU run also exercised a serial transport.
+
+### Binary
+
+- **Build (live):** built from source with `cargo build --locked -p cua-driver --release --features cua-driver/portal-input --target aarch64-unknown-linux-gnu`, in `debian:11` arm64. This is the same base, flags and Rust 1.97.1 as cua's release job.
+  - The build took about 4 minutes on 11 cores.
+  - The sparse checkout also needs `libs/cua/crates/cua-telemetry`, `libs/cua/crates/cua-teleport/src/ux` and `libs/images`, because the telemetry crate embeds two JSON files at build time.
+  - No release download was needed.
+- **Size and sha256:** 56.6 MB as built, 40.6 MB stripped, 16.1 MB with `gzip -9`. The sha256 is `546c051c…f7d`; the full hash is in the evidence directory.
+- **Dynamic libraries (`ldd`):** libX11, libXi, libxkbcommon, libXext, libxcb (with libXau, libXdmcp, libbsd, libmd) and glibc 2.31 or newer.
+  - It does not link libXtst or libwayland-client: XTEST and Wayland go through pure-Rust protocol crates.
+  - It names libgtk-3 and libgtk-4 as strings, apparently for an optional `dlopen`.
+- **Telemetry (static and live):** the binary contains the PostHog sender (`eu.i.posthog.com`), even though `cua-driver` depends on `cua-telemetry` with `default-features = false`. Telemetry defaults to on. With `DO_NOT_TRACK=1 CUA_TELEMETRY=0 CUA_DRIVER_RS_UPDATE_CHECK=0`, the running driver held only Unix sockets: no TCP or UDP. The driver was not run without these variables.
+
+### Tool matrix
+
+`tools/list` returns 66 tools. Cells give the result and its latency in ms (VZ / QEMU). The route and effect are as the driver reported them.
+
+| Tool | Case | VZ | QEMU/Venus | Notes |
+|---|---|---|---|---|
+| `list_apps` | all | degraded 10 | degraded 13 | Lists every process in the Guest, kernel threads included (107 rows, 30 KB), because the container sees the agent's PID space |
+| `list_windows` | all | works 4 | works 5 | Correct bounds and z-order |
+| `get_desktop_state` | 1280×800 screenshot and windows | works 15 | works 42 | `agent_overlay_capture: not_present` |
+| `get_window_state` | Mousepad, markdown | works 45 | works 93 | 19 elements, menus with item counts. **#4874 did not reproduce**: GTK3, Qt5 and Chromium trees were complete |
+| `get_window_state` | xfce4-terminal | works 40 | works 75 | 20 elements. **Degraded:** the VTE terminal's text is not in the tree, so host OCR is the readback |
+| `get_window_state` | FeatherPad (Qt5) | works 185 | works 378 | 21 elements. **#4894 (Qt hang) did not reproduce** |
+| `get_window_state` | `elements`, `both`, with screenshot | works 47 | works 81 | PNG of the window; `since:"latest"` diffs (`+ ~ -`) and `invalidated_snapshot_ids` behave as documented |
+| `click` | `element_token` (GTK3 and Qt) | works 335 | works 371 | Route `accessibility`, effect `unverifiable`; the next read shows the change. It also dismissed a Mousepad modal dialog |
+| `type_text` | ASCII, by token, background | works 7 | works 13 | AT-SPI; effect `confirmed` by value readback |
+| `type_text` | non-ASCII, by token, background | **fails** 6 | **fails** 9 | **#4754 reproduces.** The AT-SPI insert keeps as many bytes as the text has characters: `héllo 世界 ✓ naïve` (16 characters) reads back `héllo 世界 ` (16 bytes). The driver reports `unverifiable` and says the readback differs |
+| `type_text` | non-ASCII, `delivery_mode:"foreground"` | works ~1050 (3 of 3, fresh container) | works 1426 | Real key events are exact (`kb ✓ naïve 世界`). See the foreground row below |
+| `type_text` / `press_key` | terminal by token, then `return` | works 1263 / 304 | works 1300 / 314 | Route `global_input`; the command ran |
+| `hotkey` / `press_key` | `ctrl+a`, `backspace` in a field | works 266 / 234 | works 488 / 303 | Route `global_input` (virtual master keyboard) |
+| `scroll` | by `element_token` | works | works | The vertical scrollbar went from 0 to 764 (VZ) and to 528 (QEMU) |
+| `scroll` | by window x,y | degraded 502 | works 1463 | On VZ the point was covered by the terminal, so the background pointer scrolled the window on top |
+| `set_value` | 300-line document; empty a field | works 7 | works 12 | Effect `confirmed` by readback |
+| `invoke_menu` | Mousepad `File > New` | works 743 | works 1256 | A tab was added |
+| `verify_state` | element exists; window bounds | works 234 / 110 | works 330 / 114 | `satisfied after 2 sample(s)` |
+| `run_steps` | Qt `type_text` with `expect` and `observe` | works 542 | works 1147 | An `expect` without `role`, `name` or `text` is refused before anything runs (`invalid_batch`) |
+| `clipboard_write` / `clipboard_read` | `clip ✓ 世界` | works 56 / 161 | works 63 / 108 | Exact round trip |
+| `set_window_frame` | FeatherPad to 600×400 | works 8 | works 22 | Route `system_api`, effect `confirmed` |
+| `launch_app`, `bring_to_front` | FeatherPad, Mousepad | works | — | The launched app is the driver's child, so it dies with the driver |
+| foreground delivery | any tool with `delivery_mode:"foreground"` | **degraded** | works | When xfwm4 publishes no `_NET_ACTIVE_WINDOW`, the driver refuses with `foreground_unavailable` and sends nothing; `xdotool windowactivate` could not set one either. That happened on VZ after the session's apps were killed and restarted; a fresh VZ boot worked 3 of 3 times. The WM is the cause, not the backend |
+| `browser_prepare` | `isolated_new`, `allow_launch` | works 605 | works 1603 | Without `chromium-sandbox` it **fails** with `browser_route_unavailable` (Chromium exits). The container root is a chroot, so the kernel refuses unprivileged user namespaces (`unshare -U` gets EPERM) |
+| `get_browser_state` | bind; `dom_refs_v1`; `semantic_v2` | works 10 / 6 / 6 | works 11 / 10 / 14 | Exact CDP binding to the native window |
+| `browser_navigate` | local page; Wikipedia | works 26 / 776 | works 67 / 702 | |
+| `browser_type` | `Zoë 世界` | works 22 | works 30 | CDP `insertText` is exact, so it works around #4754 inside browsers |
+| `browser_click` | default (trusted, background) | refused 9 | refused 16 | `browser_input_trust_unavailable` by design on Linux: trusted CDP input would activate the window |
+| `browser_click` | `foreground` or `input_route:"dom_event"` | works 44 | works 447 | The page showed `clicked:Zoë 世界` |
+
+Not tried: `drag`, `zoom`, recording, `run_script`, Wayland, and the uinput background pointer under load. The uinput device node and group were in place, but nothing proved which pointer route each click took beyond the reported `route`.
+
+**The VZ desktop crash:**
+- In the first VZ run, Xorg died mid-session with a guest kernel oops ("Undefined instruction" in `drm_atomic_check_only`, from a DIRTYFB ioctl).
+- `virtio_balloon` and `virtio_rng` were loaded at the time. The desktop entrypoint's `udevadm trigger` loads them.
+- These are the two modules [known issues](known-issues.md) blames for guest memory corruption on Apple Virtualization. The agent writes the blacklist only for `--init systemd` containers.
+- With the same blacklist in the container's `/etc/modprobe.d`, the later VZ runs showed no oops, including foreground typing three times.
+- This is a product bug in the desktop images, independent of the driver.
+
+### Numbers
+
+| | VZ | QEMU/Venus |
+|---|---|---|
+| Spawn to first `tools/list`, inside the Guest (5 runs) | 100–134 ms | 108–114 ms |
+| The same through `veynodevm exec -i` from the host | 0.34 s | 0.34 s |
+| RSS when fresh | 27 MB | 27 MB |
+| RSS after the desktop matrix | 48 MB, 11 threads | — |
+| RSS after Chromium/Wikipedia reads | — | 268 MB; it plateaus and does not grow over 6 more reads |
+| Idle CPU over 60 s with no calls | 0 ticks (under 0.02 % of one core) | 0 ticks |
+| `get_window_state`, Mousepad with 300 lines (5 runs) | 53–83 ms | 100–112 ms |
+| `get_window_state`, Chromium on Wikipedia "Linux", default 250 elements | 545–564 ms, 71 KB | 1.03–1.19 s, 64–71 KB |
+| The same with `max_elements: 2000` | 1.03 s, 479 elements, 157 KB | — |
+| `get_browser_state` `semantic_v2`, Wikipedia | 4.85 s, 53 KB | 5.0 s, 53 KB |
+
+**Token cost of `tree_markdown`** (characters ÷ 4, an estimate):
+- A typical small window costs 370–560 tokens: Mousepad 2,244 characters, the terminal 1,468, FeatherPad 1,835.
+- A text widget's content appears twice (label and `value`), so a 300-line document costs about 2,000 tokens.
+- Chromium on Wikipedia costs about 8,200 tokens at the default cap and 18,500 at 2,000 elements.
+
+### Transport sizes
+
+Measured over 300 calls; the full table is `vz-frames.txt` and `qm-frames.txt`.
+- The largest request was 3 KB: `set_value` with 300 lines. Every other request was under 350 B.
+- `tools/list` is 230 KB.
+
+The largest replies:
+
+| Reply | Size |
+|---|---|
+| `get_window_state`, 2,000 elements | 157 KB |
+| `get_desktop_state`, 1280×800 PNG | 118–157 KB |
+| `get_window_state` with screenshot | up to 119 KB |
+| `get_browser_state` `semantic_v2` | 53 KB |
+
+The slowest calls: a foreground timeout took 12.5 s, `get_browser_state` took 5 s, and `verify_state` can be told to wait 10 s.
+
+Against today's vsock limits:
+- **1 MiB per reply:** every observed reply fits, `tools/list` included. A desktop screenshot is scaled to at most 1,568 px (`max_image_dimension`), which keeps it in the low hundreds of KB.
+- **64 KiB per request:** typical calls fit. But `type_text`, `set_value` and `clipboard_write` carry user text, and above 64 KiB they would be refused by our transport rather than by the driver. The bridge needs a larger request limit for `driver_rpc` (1 MiB, like replies), or it must refuse with the driver's own error shape.
+- **35 s per call:** this fits single calls. A `run_steps` batch can exceed it (64 steps, up to 2 s of delay each, plus `wait_for` and `expect` timeouts). The bridge should derive the deadline from the call, or cap `run_steps` and say so.
+
+On QEMU, a full driver session ran over `exec -i` on the serial-v2 channel: 230 KB `tools/list` frames and screenshots, with no fence. The dedicated `veynode.driver` port is still the right design:
+- It keeps driver traffic out of the fenced exec protocol and its heartbeat.
+- That heartbeat ([decision 0015](decisions/0015-qemu-serial-execution-v2.md), 500 ms with a 1 s budget) is fenced, and QEMU is killed, when a long stall on QEMU's main thread delays it. The parallel Zink session saw this during virgl shader compiles. The driver channel must not share that failure mode.
+
+### What a Linux image needs
+
+To make the driver invisible and automatic in `ubuntu-desktop`:
+- **Packages:** `at-spi2-core` and `chromium-sandbox` (with deb Chromium, not snap). The X libraries the binary links are already in the image; `libxtst6` and `libwayland-client0` are not needed by this build.
+- **Session:** XFCE runs as a desktop user (uid 1000, groups `input video render`) instead of root. Xorg stays root, as today. `at-spi-bus-launcher` starts from XFCE's autostart and publishes `AT_SPI_BUS` on the root window, which the driver found without extra environment.
+- **uinput:** the rule `KERNEL=="uinput", GROUP="input", MODE="0660"` gave `/dev/uinput` mode `root:input 0660` on both backends. `uinput.ko` is in the modloop.
+- **Agent spawn:** the Go agent starts `/usr/local/bin/cua-driver mcp --no-overlay` as that user once the session is up. It passes:
+  - the session's `DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR` and `HOME`, read from the `xfce4-session` process
+  - `DO_NOT_TRACK=1 CUA_TELEMETRY=0 CUA_DRIVER_RS_UPDATE_CHECK=0`
+
+  It keeps the driver outside per-exec cgroup kill, so `exec` timeouts don't take the driver and its launched apps with them. It restarts the driver if it exits.
+- **Visible footprint:** none from the driver. There was no window owned by its pid, no overlay or notification, and the screenshot showed nothing extra. The isolated Chromium window that `browser_prepare` launches is visible, as any app the agent opens would be.
+- **Separate fix:** write the `virtio_balloon`/`virtio_rng` blacklist for every Apple Virtualization container that runs udev, not only for systemd ones.
+
+### What changes in the plan
+
+- **Phase 0 (Linux) is done.**
+  - Idle cost is zero CPU and 27–50 MB, rising to about 270 MB after heavy browser reads.
+  - The semantic tools work on both backends.
+  - No blocker was found for phase 1.
+- **#4754 is real on the AT-SPI typing route.** Until upstream fixes it, the bridge should:
+  - send non-ASCII `type_text` with `delivery_mode:"foreground"` when no person is attached, which matches the delivery policy above
+  - or use `set_value`, or `browser_type` in browsers
+  - otherwise rely on the driver's `unverifiable` readback rather than reporting success
+- **Foreground and trusted browser input depend on the window manager's active-window state.** The host `virtual_hid` route stays the last fallback, as planned. With no person attached, the bridge should pass `delivery_mode:"foreground"` to `browser_click`, because the background trusted route is refused on Linux.
+- **`list_apps` should be filtered by the bridge** to the desktop user's processes, or left out of the `cua` group. Today it returns the whole Guest's process table.
+- **Transport:** raise the `driver_rpc` request limit and derive per-call deadlines, as described under transport sizes.
+- **Other follow-ups found on the way:**
+  - `veynodevm exec -u USER` ran as root in a Linux container.
+  - The desktop images run XFCE as root.
+  - The VZ module blacklist covers systemd containers only.
 
 ## Decisions needed
 

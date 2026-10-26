@@ -1,0 +1,12 @@
+# Context is the repository root; send only what the gateway build needs.
+target
+.local
+archive
+**/node_modules
+web
+browser
+native
+runtime
+guest
+docs
+.git

@@ -1,10 +1,14 @@
+pub mod action_result;
 pub mod agent_view;
 pub mod backend;
 pub mod bridge;
 mod container_state;
 pub mod container_tools;
+pub mod control_lease;
+pub mod cua_bridge;
 pub mod desktop_input;
 pub mod desktop_tools;
+pub mod driver_link;
 mod events;
 pub mod home;
 pub mod input;
@@ -13,6 +17,7 @@ pub mod mcp_events;
 mod native_control;
 pub mod native_input;
 pub mod qemu_disk;
+pub mod qemu_driver_channel;
 pub mod qemu_extras;
 pub mod qemu_graphics;
 pub mod qemu_snapshot;
@@ -26,6 +31,7 @@ mod snapshot_control;
 mod snapshot_restore;
 pub mod tool_groups;
 mod windows;
+pub mod windows_driver;
 pub mod windows_guest;
 use anyhow::{bail, Context, Result};
 use backend::{Backend, QemuRegistration};
@@ -62,7 +68,8 @@ const ASYNC_EXEC_MAX_TIMEOUT_MS: u64 = 120_000;
 pub const MAX_SCREENSHOT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_SCREENSHOT_RESPONSE: usize = 12 * 1024 * 1024;
 pub fn response_limit(method: &str) -> usize {
-    if method == "screenshot" {
+    // A 1 MiB driver frame inside the worker's and the guest agent's envelopes.
+    if method == "screenshot" || method == "driver_rpc" {
         MAX_SCREENSHOT_RESPONSE
     } else {
         MAX_MESSAGE
@@ -70,8 +77,11 @@ pub fn response_limit(method: &str) -> usize {
 }
 pub fn mcp_response_limit(request: &Value) -> usize {
     // An observing input call or a subscribed screen resource may carry a screenshot too.
+    let name = request["params"]["name"].as_str().unwrap_or("");
+    let driver = name.starts_with(cua_bridge::PREFIX) || cua_bridge::scope(name).is_some();
     if request["method"] == "tools/call"
-        && (request["params"]["name"] == "vm_screenshot"
+        && (name == "vm_screenshot"
+            || driver
             || request["params"]["arguments"]["observe"]["return"] == "screenshot")
         || request["method"] == "resources/read"
             && request["params"]["uri"]
@@ -1178,6 +1188,22 @@ struct Pending {
     timeout: Duration,
     post: Option<JobPost>,
 }
+type DriverTools = Arc<Mutex<BTreeMap<String, (u32, Value)>>>;
+/// A Windows or macOS Guest's persistent cua-driver link (phase 2) and its cached
+/// `tools/list`. Kept per VM with the worker pid it belongs to; a new worker gets a new one.
+struct DriverLink {
+    link: driver_link::Link,
+    tools: Mutex<Option<Value>>,
+}
+type DriverLinks = Arc<Mutex<BTreeMap<String, (u32, Arc<DriverLink>)>>>;
+/// The error agent input gets while a person controls the VM. The MCP adapter reads
+/// the `person_in_control: <ms>` prefix back into an `ActionResult` refusal.
+fn lease_refusal(wait: Duration) -> String {
+    format!(
+        "person_in_control: {} ms until agent input resumes; a person is using this VM and their input always wins",
+        wait.as_millis()
+    )
+}
 enum JobPost {
     Windows,
     GuestStreamStatus,
@@ -1211,6 +1237,15 @@ enum JobPost {
     },
     /// A guest agent reply `{"id","result"}` returned as its result.
     GuestResult,
+    /// A cua-driver reply frame: inside the guest agent's envelope on Apple Virtualization
+    /// (`wrapped`), as the QEMU worker's `{"frame"}` result otherwise.
+    Driver {
+        wrapped: bool,
+        finish: cua_bridge::Finish,
+        cache: DriverTools,
+        vm: String,
+        pid: u32,
+    },
     Start {
         reservation: jobs::Reservation,
         vm: String,
@@ -1246,6 +1281,13 @@ enum Completion {
         vm: String,
         method: String,
         arguments: Value,
+    },
+    /// A cua-driver request over a Windows or macOS Guest's driver link.
+    Driver {
+        link: Arc<DriverLink>,
+        request: cua_bridge::Request,
+        scopes: cua_bridge::Scopes,
+        desktop: cua_bridge::Desktop,
     },
     /// A Windows guest's command, file or desktop call over its SSH server.
     Windows {
@@ -1325,6 +1367,17 @@ impl Completion {
                 method,
                 arguments,
             } => container_tools::desktop(&dir, &vm, &method, &arguments),
+            Self::Driver {
+                link,
+                request,
+                scopes,
+                desktop,
+            } => {
+                let mut cache = link.tools.lock().unwrap().clone();
+                let reply = cua_bridge::run(&link.link, request, scopes, desktop, &mut cache);
+                *link.tools.lock().unwrap() = cache;
+                reply
+            }
             Self::Windows { ssh, call } => call.run(&ssh),
             Self::CancelJobs {
                 dir,
@@ -1583,6 +1636,47 @@ fn desktop_input(
         json!({"dispatched":true,"steps":sent,"guest_delivery_confirmed":false,"note":"Backend dispatch acknowledgement is not application acceptance; physical keys use Guest layout."}),
     )
 }
+
+/// The optional `user`, `env` and `workdir` of an exec (`veynodevm exec -u -e -w`),
+/// checked here and applied by the Linux Guest inside the container root.
+fn exec_identity(args: &Value) -> Result<Vec<(&'static str, Value)>> {
+    let mut fields = Vec::new();
+    if let Some(user) = args.get("user").filter(|v| !v.is_null()) {
+        let user = user.as_str().context("user must be a string")?;
+        if user.is_empty() || user.len() > 256 || user.contains(['\0', '\n']) {
+            bail!("user must be 1..256 bytes")
+        }
+        fields.push(("user", json!(user)));
+    }
+    if let Some(env) = args.get("env").filter(|v| !v.is_null()) {
+        let env = env
+            .as_array()
+            .context("env must be an array of KEY=VALUE")?;
+        if env.len() > 128
+            || env.iter().any(|entry| {
+                entry.as_str().is_none_or(|e| {
+                    e.len() > 8192
+                        || e.contains('\0')
+                        || e.split_once('=').is_none_or(|(k, _)| k.is_empty())
+                })
+            })
+        {
+            bail!("env must be up to 128 KEY=VALUE strings")
+        }
+        if !env.is_empty() {
+            fields.push(("env", json!(env)));
+        }
+    }
+    if let Some(workdir) = args.get("workdir").filter(|v| !v.is_null()) {
+        let workdir = workdir.as_str().context("workdir must be a string")?;
+        if !workdir.starts_with('/') || workdir.len() > 4096 || workdir.contains('\0') {
+            bail!("workdir must be an absolute path")
+        }
+        fields.push(("workdir", json!(workdir)));
+    }
+    Ok(fields)
+}
+
 fn exec_timeout_ms(arguments: &Value, maximum: u64) -> Result<u64> {
     let timeout = arguments
         .get("timeout_ms")
@@ -1807,6 +1901,26 @@ impl Pending {
                             .get("result")
                             .cloned()
                             .context("guest reply missing result")?;
+                    }
+                    Some(JobPost::Driver {
+                        wrapped,
+                        finish,
+                        cache,
+                        vm,
+                        pid,
+                    }) => {
+                        let frame = if wrapped {
+                            result["result"].get("frame")
+                        } else {
+                            result.get("frame")
+                        }
+                        .context("driver reply missing frame")?;
+                        if finish.list {
+                            if let Some(list) = frame.get("result") {
+                                cache.lock().unwrap().insert(vm, (pid, list.clone()));
+                            }
+                        }
+                        result = finish.result(frame)?;
                     }
                     Some(JobPost::GuestText) => {
                         // Counts and codes only: the Guest's per-key diagnostics never leave the daemon.
@@ -2079,6 +2193,11 @@ struct Manager {
     file_sessions: FileSessionRoutes,
     /// Staged transfers of Windows guests, which go over SSH, not a worker.
     windows_files: Arc<Mutex<windows_guest::Files>>,
+    /// Each VM's cua-driver `tools/list` result, with the worker pid it came from.
+    driver_tools: DriverTools,
+    driver_links: DriverLinks,
+    /// Who controls each VM's input: a person at a viewer, or the agent (`control_lease`).
+    leases: Arc<control_lease::Leases>,
     baselines: Arc<Mutex<screen_wait::Baselines>>,
     running: BTreeMap<String, Running>,
     /// Lifecycle events for MCP adapters (`events`).
@@ -2126,6 +2245,141 @@ fn spawn_exit_monitor(manager: &Arc<Mutex<Manager>>) {
     manager.lock().unwrap().exit_monitor = Some(handle.thread().clone());
 }
 impl Manager {
+    /// One cua-driver request (`cua_bridge`). Refusals and the cached tool list are
+    /// answered here; anything else goes to the worker, and its reply is awaited off the
+    /// manager lock: Apple Virtualization through the guest agent's `driver_rpc` method
+    /// (vsock), QEMU through the worker's `veynode.driver` port. Windows and macOS Guests
+    /// use a persistent link instead (`driver_link`): the driver's own socket proxy over
+    /// SSH on Windows, the embedded driver over SSH in a macOS container.
+    fn driver_rpc(
+        &mut self,
+        id: &str,
+        args: &Value,
+        deferred: &mut Option<Completion>,
+    ) -> Result<Value> {
+        let config = &self.configs[id];
+        let linked = match (config.backend, config.guest.as_str()) {
+            (Backend::QemuHvf, "windows") | (Backend::AppleVirtualization, "macos") => true,
+            (_, "linux") => false,
+            _ => bail!("unsupported: the cua-driver bridge serves Linux Guests, Windows machines and macOS containers"),
+        };
+        let wrapped = config.backend == Backend::AppleVirtualization;
+        let request = cua_bridge::Request::from_args(args)?;
+        if let cua_bridge::Request::Call { tool, .. } = &request {
+            let acts = matches!(
+                cua_bridge::scope(tool),
+                Some(cua_bridge::Scope::Input | cua_bridge::Scope::Browser)
+            );
+            if acts {
+                if let Err(wait) = self.leases.acquire(id, std::time::Instant::now()) {
+                    return Ok(cua_bridge::refusal(
+                        "person_in_control",
+                        &lease_refusal(wait),
+                    ));
+                }
+            }
+        }
+        let scopes = cua_bridge::Scopes::from_value(&args["scopes"]);
+        let desktop = cua_bridge::Desktop {
+            person_attached: self.native_connections.contains_key(id) || self.leases.watched(id),
+        };
+        let run = self.running.get_mut(id).context("VM process not active")?;
+        if run.poll_exit()?.is_some() {
+            bail!("VM process has exited")
+        }
+        let pid = run.child.id();
+        if linked {
+            let link = self.driver_link(id, pid)?;
+            *deferred = Some(Completion::Driver {
+                link,
+                request,
+                scopes,
+                desktop,
+            });
+            return Ok(Value::Null);
+        }
+        let cached = self
+            .driver_tools
+            .lock()
+            .unwrap()
+            .get(id)
+            .filter(|(from, _)| *from == pid)
+            .map(|(_, list)| list.clone());
+        let outgoing = match cua_bridge::prepare(request, scopes, desktop, cached.as_ref()) {
+            cua_bridge::Prepared::Reply(reply) => return Ok(reply),
+            cua_bridge::Prepared::Send(outgoing) => outgoing,
+        };
+        let number = run.next;
+        run.next += 1;
+        let mut frame = outgoing.frame;
+        frame["id"] = json!(number);
+        let deadline_ms = outgoing.deadline.as_millis() as u64;
+        let command = if wrapped {
+            json!({"id":number,"method":"guest_request","request":{"id":number.to_string(),"method":"driver_rpc","arguments":{"frame":frame,"deadline_ms":deadline_ms}}})
+        } else {
+            json!({"id":number,"method":"driver_rpc","frame":frame,"deadline_ms":deadline_ms})
+        };
+        let (tx, rx) = mpsc::channel();
+        run.pending.lock().unwrap().insert(
+            number,
+            PendingReply {
+                sender: tx,
+                limit: response_limit("driver_rpc"),
+            },
+        );
+        if let Err(e) = write_json(&mut run.stdin, &command) {
+            run.pending.lock().unwrap().remove(&number);
+            return Err(e);
+        }
+        *deferred = Some(Completion::Backend(Pending {
+            receiver: rx,
+            number,
+            pending: run.pending.clone(),
+            // Past the worker's own deadline, so its timeout reply is the one seen.
+            timeout: outgoing.deadline + Duration::from_secs(5),
+            post: Some(JobPost::Driver {
+                wrapped,
+                finish: outgoing.finish,
+                cache: self.driver_tools.clone(),
+                vm: id.into(),
+                pid,
+            }),
+        }));
+        Ok(Value::Null)
+    }
+    /// `control_lease {action}`: `status` (the default) reports who controls input;
+    /// `release` gives the agent's lease back until its next input.
+    fn control_lease(&mut self, id: &str, args: &Value) -> Result<Value> {
+        let now = std::time::Instant::now();
+        match args["action"].as_str().unwrap_or("status") {
+            "status" => {}
+            "release" => self.leases.release(id, now),
+            other => bail!("control_lease action must be status or release, not {other}"),
+        }
+        Ok(self.leases.status(id, now))
+    }
+    /// The VM's driver link for this worker, made on first use; the driver is installed
+    /// and started when the link first connects, off the manager lock.
+    fn driver_link(&mut self, id: &str, pid: u32) -> Result<Arc<DriverLink>> {
+        let mut links = self.driver_links.lock().unwrap();
+        if let Some((from, link)) = links.get(id) {
+            if *from == pid {
+                return Ok(link.clone());
+            }
+        }
+        let link = if self.configs[id].guest == "windows" {
+            windows_driver::link(windows_guest::Ssh::locate(&self.dir, &self.configs[id])?)
+        } else {
+            container_tools::macos_driver(&self.dir, id)
+        };
+        let link = Arc::new(DriverLink {
+            link,
+            tools: Mutex::new(None),
+        });
+        // Replacing an old worker's link drops it, which closes its connection.
+        links.insert(id.into(), (pid, link.clone()));
+        Ok(link)
+    }
     /// A deferred call to a running Windows guest over its SSH server.
     fn windows_call(&mut self, id: &str, call: WindowsCall) -> Result<Completion> {
         let run = self.running.get_mut(id).context("VM process not active")?;
@@ -2223,6 +2477,9 @@ impl Manager {
             jobs: Arc::new(Mutex::new(jobs::Jobs::default())),
             file_sessions: BTreeMap::new(),
             windows_files: Arc::default(),
+            driver_tools: Arc::default(),
+            driver_links: Arc::default(),
+            leases: Arc::default(),
             baselines: Arc::new(Mutex::new(screen_wait::Baselines::default())),
             running: BTreeMap::new(),
             events: Arc::new(events::Log::default()),
@@ -2574,6 +2831,17 @@ impl Manager {
         if method == "log_read" {
             return self.log_read(id, args);
         }
+        if method == "control_lease" {
+            return self.control_lease(id, args);
+        }
+        if method.starts_with("input_") || desktop_tools::acts(method) {
+            if let Err(wait) = self.leases.acquire(id, std::time::Instant::now()) {
+                bail!("{}", lease_refusal(wait))
+            }
+        }
+        if method == "driver_rpc" {
+            return self.driver_rpc(id, args, deferred);
+        }
         if method == "delete" {
             if args["confirm"].as_str() != Some(id) {
                 bail!("delete requires confirm equal to the VM id")
@@ -2589,6 +2857,8 @@ impl Manager {
             atomic_json(&self.dir.join("registry.json"), &next)?;
             self.configs = next;
             self.running.remove(id);
+            self.driver_links.lock().unwrap().remove(id);
+            self.leases.forget(id);
             // Disks are owned by the image store, not the registry; report them for collection.
             return Ok(json!({"deleted":true,"id":id,"disk":removed.disk,"disk_removed":false}));
         }
@@ -2684,6 +2954,9 @@ impl Manager {
         }
         if method == "exec" && windows_vm {
             exec_timeout_ms(args, SYNC_EXEC_MAX_TIMEOUT_MS)?;
+            if !exec_identity(args)?.is_empty() {
+                bail!("unsupported: user, env and workdir apply to Linux container commands")
+            }
             let argv = args["argv"].as_array().map_or(0, Vec::len);
             if !(1..=128).contains(&argv) {
                 bail!("argv must have 1..128 items")
@@ -2767,7 +3040,7 @@ impl Manager {
             if self.configs[id].backend != Backend::AppleVirtualization
                 || !(macos || self.configs[id].guest == "linux")
             {
-                bail!("unsupported: desktop window and application tools require an Apple Virtualization Linux desktop, a macOS container or a Windows machine with SSH")
+                bail!("unsupported: desktop window and application tools require an Apple Virtualization Linux desktop, a macOS container or a Windows machine with SSH; on a QEMU Linux desktop whose image ships cua-driver use the cua tools (cua_list_windows, cua_get_window_state)")
             }
             let arguments = desktop_tools::arguments(method, args)?;
             if macos {
@@ -2975,6 +3248,7 @@ impl Manager {
             let output_async_timeout = guest_async_timeout.clone();
             let output_pending = pending.clone();
             let output_events = (self.events.clone(), id.to_string());
+            let output_leases = self.leases.clone();
             let restore_expected = restore_plan.as_ref().map(|plan| {
                 (
                     plan.config.id.clone(),
@@ -3040,6 +3314,28 @@ impl Manager {
                                     if let Some(receipt) = &restored_receipt {
                                         observed_state["snapshot_restore"] = receipt.clone();
                                     }
+                                }
+                                if let Some(change) = match value["event"].as_str() {
+                                    Some("window_opened" | "window_closed") => output_leases
+                                        .viewer(
+                                            &output_events.1,
+                                            "window",
+                                            value["event"] == "window_opened",
+                                            std::time::Instant::now(),
+                                        ),
+                                    Some("person_input") => output_leases
+                                        .human_input(&output_events.1, std::time::Instant::now()),
+                                    _ => None,
+                                } {
+                                    let holder = match change {
+                                        control_lease::Change::PersonTookControl => "person",
+                                        control_lease::Change::AgentMayAct => "agent",
+                                    };
+                                    output_events.0.publish(
+                                        &output_events.1,
+                                        "control",
+                                        json!({"state":holder}),
+                                    );
                                 }
                                 if value["event"] == "screenshot_timing" {
                                     let stages = SHOT_WORKER_STAGES
@@ -3339,6 +3635,9 @@ impl Manager {
                 let timeout = exec_timeout_ms(args, ASYNC_EXEC_MAX_TIMEOUT_MS)?;
                 command["method"] = json!("guest_request");
                 command["request"] = json!({"id":number.to_string(),"method":method,"argv":argv,"timeout_ms":timeout});
+                for (key, value) in exec_identity(args)? {
+                    command["request"][key] = value;
+                }
             }
             if ["exec_poll", "exec_cancel"].contains(&method) {
                 command["method"] = json!("guest_request");
@@ -4017,13 +4316,16 @@ fn call_reply(dir: &Path, method: &str, args: Value) -> Result<std::result::Resu
     // Saving a large Guest's memory can outlast the usual reply deadline.
     let read_timeout = if method == container_state::SAVE {
         container_state::SAVE_TIMEOUT_SECONDS + 10
+    } else if method == "driver_rpc" {
+        // The daemon ends the call at its own derived deadline.
+        cua_bridge::MAX_DEADLINE.as_secs() + 20
     } else {
         40
     };
     socket.set_read_timeout(Some(Duration::from_secs(read_timeout)))?;
     socket.set_write_timeout(Some(Duration::from_secs(5)))?;
     write_json(&mut socket, &json!({"method":method,"arguments":args}))?;
-    let capacity = if method == "screenshot" {
+    let capacity = if method == "screenshot" || method == "driver_rpc" {
         LARGE_REPLY_READ_BUFFER
     } else {
         8192
@@ -4155,6 +4457,7 @@ fn tools_with_input(lifecycle: bool, execute: bool, files: bool, input: bool) ->
             tools.push(json!({"name":format!("vm_{name}"),"description":if name == "input_text" { "Type Unicode text into the focused application of a Linux Guest on QEMU through the Guest service (XTEST with temporary keycodes), not physical key codes. Needs a screenshot younger than 5 s (or of an unchanged screen), qemu_guest_exec and a Guest service started with --allow-text-input, else fails as unsupported. A failure reports how many characters were delivered. The Guest X server acknowledges key events; application acceptance is not observed." } else { "Bounded physical input to a QEMU console, Apple Virtualization Linux desktop or opted-in macOS Guest. Needs a screenshot of this VM with matching generation and dimensions, younger than 5 s or of a screen unchanged since (digest or console draw sequence). Pass observe to get the result and a fresh frame for the next input in one call. Dispatch does not prove app acceptance; no Unicode/layout translation; vm_guest_info lists supported keys." },"inputSchema":input::coordinate_tool_schema(name, json!({"type":"object","properties":properties,"required":required,"additionalProperties":false}))}));
         }
         tools.push(agent_view::batch_tool());
+        tools.push(json!({"name":"vm_control_lease","description":"Who controls this VM's input. A person typing or clicking in an open console window holds it, and agent input (vm_input_*, window and accessibility actions, cua_* input) is refused with person_in_control until they have been quiet for quiet_ms or close the window; their input always wins. action status (default) reports holder (person, agent or none), viewers and agent_may_act_in_ms; release gives the agent's lease back until its next input.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"action":{"type":"string","enum":["status","release"]}},"required":["id"],"additionalProperties":false}}));
     }
     if files {
         for (name, description, extra, required) in [
@@ -4256,25 +4559,117 @@ pub fn mcp_with_input(
     files: bool,
     input: bool,
 ) -> Result<()> {
-    mcp_with_tools(dir, lifecycle, execute, files, input, tool_groups::all())
+    mcp_with_tools(
+        dir,
+        lifecycle,
+        execute,
+        files,
+        input,
+        tool_groups::default(),
+    )
 }
-/// The stdio MCP server. `groups` narrows the listed tools within the permissions;
-/// `vm_tools_enable` widens it again up to them.
 pub fn mcp_with_tools(
     dir: &Path,
     lifecycle: bool,
     execute: bool,
     files: bool,
     input: bool,
+    groups: BTreeSet<&'static str>,
+) -> Result<()> {
+    let options = McpOptions {
+        lifecycle,
+        execute,
+        files,
+        input,
+        ..McpOptions::default()
+    };
+    mcp_serve(dir, &options, groups)
+}
+/// What one stdio MCP session may call (`--allow-*`), and the VM a per-VM endpoint serves.
+#[derive(Clone, Debug, Default)]
+pub struct McpOptions {
+    pub lifecycle: bool,
+    pub execute: bool,
+    pub files: bool,
+    pub input: bool,
+    /// cua-driver `browser_*` tools that act on pages.
+    pub browser: bool,
+    /// cua-driver clipboard tools.
+    pub clipboard: bool,
+    /// `--vm ID`: serve that VM's cua-driver tools under their own names, plus its
+    /// checkpoint and snapshot tools, instead of the VM tools.
+    pub vm: Option<String>,
+}
+impl McpOptions {
+    pub fn scopes(&self) -> cua_bridge::Scopes {
+        cua_bridge::Scopes {
+            input: self.input,
+            browser: self.browser,
+            clipboard: self.clipboard,
+            execute: self.execute,
+        }
+    }
+}
+/// Every tool these permissions grant on the main MCP: the VM tools and the `cua` group.
+pub fn tools_for(options: &McpOptions) -> Vec<Value> {
+    let mut tools = tools_with_input(
+        options.lifecycle,
+        options.execute,
+        options.files,
+        options.input,
+    )["tools"]
+        .as_array()
+        .unwrap()
+        .clone();
+    tools.extend(cua_bridge::curated_tools(options.scopes()));
+    tools
+}
+/// The per-VM endpoint's tools: the driver's own (scope-filtered by the bridge) and the
+/// VM-level ones. A driver that cannot answer (VM stopped, image without cua-driver)
+/// leaves the VM-level tools.
+fn endpoint_tools(dir: &Path, vm: &str, options: &McpOptions) -> Vec<Value> {
+    let mut tools = call(
+        dir,
+        "driver_rpc",
+        json!({"id":vm,"list":true,"scopes":options.scopes().to_value()}),
+    )
+    .ok()
+    .and_then(|list| list["tools"].as_array().cloned())
+    .unwrap_or_default();
+    tools.extend(cua_bridge::vm_level_tools(&tools_for(options), vm));
+    tools
+}
+/// A VM tool's result as MCP text content.
+fn text_content(result: Result<Value>) -> Result<Value> {
+    Ok(match result {
+        Ok(v) => {
+            json!({"content":[{"type":"text","text":serde_json::to_string(&v)?}],"isError":false})
+        }
+        Err(e) => json!({"content":[{"type":"text","text":e.to_string()}],"isError":true}),
+    })
+}
+/// A driver result is already MCP content; a failed exchange becomes an error result.
+fn driver_content(result: Result<Value>) -> Value {
+    result.unwrap_or_else(
+        |e| json!({"content":[{"type":"text","text":e.to_string()}],"isError":true}),
+    )
+}
+/// The stdio MCP server. `groups` narrows the listed tools within the permissions;
+/// `vm_tools_enable` widens it again up to them. With `options.vm` it is that VM's
+/// endpoint instead: no groups, resources or VM tools beyond the VM-level ones.
+pub fn mcp_serve(
+    dir: &Path,
+    options: &McpOptions,
     mut groups: BTreeSet<&'static str>,
 ) -> Result<()> {
-    let permitted = || {
-        tools_with_input(lifecycle, execute, files, input)["tools"]
-            .as_array()
-            .unwrap()
-            .clone()
-    };
-    let list_changed = !tool_groups::hidden(&permitted(), &groups).is_empty();
+    let permitted = || tools_for(options);
+    let endpoint = options.vm.as_deref();
+    if let Some(vm) = endpoint {
+        validate_id(vm)?;
+    }
+    let scopes = options.scopes();
+    let execute = options.execute;
+    let list_changed = endpoint.is_none() && !tool_groups::hidden(&permitted(), &groups).is_empty();
     let stdin = std::io::stdin();
     let mut reader = stdin.lock();
     let out = mcp_events::Out::new(std::io::stdout());
@@ -4368,6 +4763,11 @@ pub fn mcp_with_tools(
                     )
                 } else {
                     initialized = true;
+                    if let Some(vm) = endpoint {
+                        let reply = json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":VERSION,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"veynode-vm-cua","version":env!("CARGO_PKG_VERSION")},"instructions":format!("cua-driver in the Linux Guest desktop of VM {vm}, with its own tool names and schemas, limited to this session's scopes (observe by default; input, browser, clipboard and execute are granted separately), plus this VM's checkpoint and snapshot tools. install_extension, check_for_update, install_ffmpeg and set_config are never available. `effect:\"unverifiable\"` and `unknown` are not success. A Guest image without cua-driver lists only the VM-level tools.")}});
+                        out.send(&reply)?;
+                        continue;
+                    }
                     let mut reply = json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":VERSION,"capabilities":{"tools":{"listChanged":list_changed}},"serverInfo":{"name":"veynode-vm","version":env!("CARGO_PKG_VERSION")},"instructions":"Local trusted-user daemon. Observe is default; server --allow-lifecycle, --allow-execute, --allow-files and --allow-input each add their own tools, and --tools lists only some tool groups (vm_tools_enable, when listed, adds the rest). Commands need enabled Linux Guest async jobs; macOS legacy execution is not exposed by vm_exec, but container_exec runs commands in veynodevm macOS containers over SSH. Commands run under a guest timeout; the guest kills a command's process group when it times out, is cancelled or this MCP session ends. File transfer needs an enabled Guest files root: a dedicated Linux files account, or macOS --allow-files --files-root with a private directory owned by the service UID, not isolated from other same-UID programs. Query vm_guest_info for actual capabilities, file_policy, macOS permission availability and supported physical keys; Guest denial is an error, not permission to use another path. Screenshots need QEMU capture, an Apple Virtualization Linux desktop container (--desktop; captured and driven by the guest agent with no Guest setup), a veynodevm macOS container (Guest Screen Sharing; no Guest permission grants) or macOS Guest --allow-observe with existing Screen Recording permission. On Linux desktop and macOS containers the desktop and accessibility tools read windows, applications and the accessibility tree without a screenshot; acting on them needs input permission. Physical input needs one of those screenshot backends (macOS Guests also --allow-input with existing Accessibility permission) and a matching screenshot younger than 5 seconds or of an unchanged screen; pass observe on input and accessibility actions to get what changed and a fresh frame in the same call. Accessibility trees default to compact lines with short refs (eN) valid for this session. Physical keys carry no Unicode text or keyboard-layout translation. Backend input acknowledgement does not prove application acceptance. VM start returns before guest readiness."}});
                     mcp_events::initialize(&mut reply);
                     reply
@@ -4380,6 +4780,40 @@ pub fn mcp_with_tools(
                     -32000,
                     "Initialize and send notifications/initialized first",
                 )
+            } else if let Some(vm) = endpoint {
+                match method {
+                    "tools/list" => {
+                        json!({"jsonrpc":"2.0","id":id,"result":{"tools":endpoint_tools(dir, vm, options)}})
+                    }
+                    "tools/call" => {
+                        let name = request["params"]["name"].as_str().unwrap_or("");
+                        let args = request["params"]
+                            .get("arguments")
+                            .cloned()
+                            .unwrap_or(json!({}));
+                        if !args.is_object() {
+                            rpc_error(id, -32602, "Invalid tool arguments")
+                        } else {
+                            let vm_tools = cua_bridge::vm_level_tools(&permitted(), vm);
+                            let content = match cua_bridge::endpoint_call(
+                                name, args, vm, scopes, &vm_tools,
+                            ) {
+                                cua_bridge::EndpointCall::Vm(name, args) => {
+                                    text_content(if name.starts_with("container_") {
+                                        container_tools::call(dir, &name, &args)
+                                    } else {
+                                        call(dir, name.strip_prefix("vm_").unwrap(), args)
+                                    })?
+                                }
+                                cua_bridge::EndpointCall::Driver(rpc) => {
+                                    driver_content(call(dir, "driver_rpc", rpc))
+                                }
+                            };
+                            json!({"jsonrpc":"2.0","id":id,"result":content})
+                        }
+                    }
+                    _ => rpc_error(id, -32601, "Method not found"),
+                }
             } else if let Some(result) = events.handle(method, &request["params"]) {
                 match result {
                     Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
@@ -4404,12 +4838,13 @@ pub fn mcp_with_tools(
                         .cloned()
                         .unwrap_or(json!({}));
                     let schema = known.map_or(Value::Null, |t| t["inputSchema"].clone());
-                    let valid = args
-                        .as_object()
-                        .is_some_and(|a| a.keys().all(|k| schema["properties"].get(k).is_some()))
-                        && schema["required"].as_array().is_none_or(|r| {
-                            r.iter().all(|k| args.get(k.as_str().unwrap()).is_some())
-                        });
+                    // cua tools list their main arguments only; the driver validates the rest.
+                    let open = schema["additionalProperties"] == true;
+                    let valid = args.as_object().is_some_and(|a| {
+                        open || a.keys().all(|k| schema["properties"].get(k).is_some())
+                    }) && schema["required"]
+                        .as_array()
+                        .is_none_or(|r| r.iter().all(|k| args.get(k.as_str().unwrap()).is_some()));
                     if !valid {
                         rpc_error(id, -32602, "Invalid tool arguments")
                     } else if name == tool_groups::ENABLE_TOOL {
@@ -4451,6 +4886,41 @@ pub fn mcp_with_tools(
                         }
                         let result = if agent_view::handles(name) {
                             agent.call(&mut agent_view::Live(dir), name, args)
+                        } else if name.starts_with(cua_bridge::PREFIX) {
+                            let tool = name.strip_prefix(cua_bridge::PREFIX).unwrap();
+                            let vm = args["vm"].as_str().unwrap_or_default().to_owned();
+                            match agent.ocr_token_call(&vm, tool, &args) {
+                                Some(answer) => Ok(answer),
+                                None => {
+                                    let outcome = cua_bridge::curated_call(name, args, scopes)
+                                        .and_then(|rpc| call(dir, "driver_rpc", rpc));
+                                    // No driver in this Guest: the host reads the screen.
+                                    if tool == "get_window_state"
+                                        && cua_bridge::helperless(&outcome)
+                                    {
+                                        match agent
+                                            .ocr_window_state(&mut agent_view::Live(dir), &vm)
+                                        {
+                                            Ok(answer) => Ok(answer),
+                                            Err(ocr) => Ok(driver_content(outcome.map(|mut r| {
+                                                r["_meta"]["veynode/host_ocr_error"] =
+                                                    json!(ocr.to_string());
+                                                r
+                                            }))),
+                                        }
+                                    } else if tool == "verify_state"
+                                        && cua_bridge::helperless(&outcome)
+                                    {
+                                        // Nothing in the Guest can check a predicate: unknown, never an error.
+                                        let structured = json!({"status":"unknown","reason":"driver_unavailable","hint":"This Guest has no cua-driver; read the screen with cua_get_window_state (host OCR) or vm_screen_text and compare yourself."});
+                                        Ok(
+                                            json!({"content":[{"type":"text","text":structured.to_string()}],"structuredContent":structured,"isError":false}),
+                                        )
+                                    } else {
+                                        Ok(driver_content(outcome))
+                                    }
+                                }
+                            }
                         } else if name.starts_with("container_") || name.starts_with("image_") {
                             container_tools::call(dir, name, &args)
                         } else if name == "vm_exec_poll" && args.get("wait_ms").is_some() {
@@ -4460,7 +4930,12 @@ pub fn mcp_with_tools(
                         };
                         let content = match result {
                             // Already MCP content.
-                            Ok(v) if agent_view::handles(name) => v,
+                            Ok(v)
+                                if agent_view::handles(name)
+                                    || name.starts_with(cua_bridge::PREFIX) =>
+                            {
+                                v
+                            }
                             Ok(v) => {
                                 json!({"content":[{"type":"text","text":serde_json::to_string(&v)?}],"isError":false})
                             }
@@ -4486,6 +4961,8 @@ pub fn mcp_with_tools(
     protocol_result.and(cleanup_result)
 }
 #[cfg(test)]
+mod cua_bridge_tests;
+#[cfg(test)]
 mod mcp_cleanup_tests;
 #[cfg(test)]
 mod registry_load_tests;
@@ -4504,6 +4981,32 @@ pub(crate) fn test_private_state(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exec_identity_passes_only_valid_user_env_and_workdir() {
+        assert!(exec_identity(&json!({"argv":["id"]})).unwrap().is_empty());
+        let fields = exec_identity(
+            &json!({"user":"veynode","env":["A=1","B="],"workdir":"/srv","argv":["id"]}),
+        )
+        .unwrap();
+        assert_eq!(
+            fields,
+            vec![
+                ("user", json!("veynode")),
+                ("env", json!(["A=1", "B="])),
+                ("workdir", json!("/srv")),
+            ]
+        );
+        for bad in [
+            json!({"user":""}),
+            json!({"user":7}),
+            json!({"env":["NOEQUALS"]}),
+            json!({"env":["=value"]}),
+            json!({"env":"A=1"}),
+            json!({"workdir":"relative"}),
+        ] {
+            assert!(exec_identity(&bad).is_err(), "{bad}");
+        }
+    }
     #[test]
     fn stopped_owned_worker_is_not_reaped_and_can_continue_to_real_exit() {
         struct Owned(Running);

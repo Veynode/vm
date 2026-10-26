@@ -247,6 +247,7 @@ fn run() -> Result<()> {
         let mut key = 0u64;
         let mut rate_id = 0u64;
         let mut rate_pending_id = None;
+        let mut view_id = 0u64;
         let mut last_record = Instant::now();
         while Instant::now() < until {
             if media_overflow.load(Ordering::Acquire) {
@@ -293,6 +294,21 @@ fn run() -> Result<()> {
                             rate_pending_id = None;
                             continue;
                         }
+                        // A refused scale or crop leaves the stream as it was.
+                        if value["request_id"]
+                            .as_str()
+                            .is_some_and(|id| id.starts_with("view"))
+                        {
+                            if let Some(error) = value.get("error") {
+                                eprintln!("{}", json!({"event":"rate","track":0,"error":error}));
+                            }
+                            continue;
+                        }
+                        // Same stderr line as vz-desktop-stream's.
+                        if value["event"] == "view" {
+                            eprintln!("{value}");
+                            continue;
+                        }
                         if value.get("error").is_some()
                             || value["event"] == "session-error"
                             || value["event"] == "capture-error"
@@ -307,6 +323,29 @@ fn run() -> Result<()> {
                 Ok(Event::Command(command)) if command == "keyframe" => {
                     key += 1;
                     request(&mut socket, &format!("k{key}"), "keyframe", None)?;
+                }
+                Ok(Event::Command(command))
+                    if command.starts_with("scale ") || command.starts_with("crop ") =>
+                {
+                    let (word, fields) = command.split_once(' ').unwrap();
+                    let fields: Vec<u64> = fields
+                        .split(' ')
+                        .map(str::parse)
+                        .collect::<Result<_, _>>()
+                        .context("invalid view command")?;
+                    view_id += 1;
+                    let id = format!("view{view_id}");
+                    let value = match (word, &fields[..]) {
+                        ("scale", [width, height]) => {
+                            json!({"request_id":id,"method":"set_scale","width":width,"height":height})
+                        }
+                        ("crop", [x, y, width, height]) => {
+                            json!({"request_id":id,"method":"set_crop","x":x,"y":y,"width":width,"height":height})
+                        }
+                        _ => bail!("invalid view command"),
+                    };
+                    serde_json::to_writer(&mut socket, &value)?;
+                    socket.write_all(b"\n")?;
                 }
                 Ok(Event::Command(command)) if command == "stop" => return Ok(()),
                 Err(mpsc::RecvTimeoutError::Timeout)

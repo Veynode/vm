@@ -113,6 +113,12 @@ func (manager *jobManager) validateSerialV2(e serialEnvelope, hello bool) error 
 	case "info", "heartbeat":
 	case "exec_start":
 		keys = append(keys, "argv", "timeout_ms")
+		// `exec -u -e -w`; manager.start applies and checks them like the vsock path.
+		for _, optional := range []string{"user", "env", "workdir"} {
+			if _, ok := fields[optional]; ok {
+				keys = append(keys, optional)
+			}
+		}
 		if manager.validateAsyncCommand(*req) != nil {
 			return fmt.Errorf("invalid start arguments")
 		}

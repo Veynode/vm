@@ -15,6 +15,7 @@ mod gpt;
 mod machine;
 mod macos;
 mod macos_desktop;
+mod macos_driver;
 mod macos_grant;
 mod proxy;
 mod session;
@@ -93,9 +94,11 @@ Virtual machines:
 
 Service:
   daemon run|start|stop|status      Per-user control daemon (launchd agent)
-  mcp [--lifecycle] [--execute] [--files] [--input] [--tools GROUP,...]
+  mcp [--lifecycle] [--execute] [--files] [--input] [--browser] [--clipboard]
+      [--tools GROUP,...] [--vm ID]
                                     MCP over stdio; --tools lists only those groups
-                                    (core exec files screen input desktop snapshots)
+                                    (core exec files screen input desktop snapshots cua);
+                                    --vm serves one VM's cua-driver tools
   ui [--port N] [--open]            Web management UI on localhost
   version
 ";
@@ -589,18 +592,19 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
             if argv.is_empty() && !(tty && interactive) {
                 bail!("exec requires a COMMAND")
             }
+            // `-e KEY` passes the host's value, as Docker does.
+            let mut env: Vec<String> = p
+                .values("env")
+                .iter()
+                .filter_map(|e| {
+                    if e.contains('=') {
+                        Some(e.clone())
+                    } else {
+                        std::env::var(e).ok().map(|v| format!("{e}={v}"))
+                    }
+                })
+                .collect();
             if c.os != "darwin" && (tty || interactive) && !json_output {
-                let mut env: Vec<String> = p
-                    .values("env")
-                    .iter()
-                    .filter_map(|e| {
-                        if e.contains('=') {
-                            Some(e.clone())
-                        } else {
-                            std::env::var(e).ok().map(|v| format!("{e}={v}"))
-                        }
-                    })
-                    .collect();
                 if tty && !env.iter().any(|e| e.starts_with("TERM=")) {
                     env.push(format!(
                         "TERM={}",
@@ -643,7 +647,17 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
                 .transpose()
                 .context("invalid --timeout")?
                 .unwrap_or(30000);
-            let result = container::exec(&c, argv, timeout)?;
+            let mut identity = json!({});
+            if let Some(user) = p.value("user") {
+                identity["user"] = json!(user);
+            }
+            if !env.is_empty() {
+                identity["env"] = json!(env);
+            }
+            if let Some(workdir) = p.value("workdir") {
+                identity["workdir"] = json!(workdir);
+            }
+            let result = container::exec_as(&c, argv, timeout, &identity)?;
             if json_output {
                 print_json(&result)?;
             } else {
@@ -906,9 +920,14 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
         "desktop" => match rest {
             [close, name] if close == "--close" => desktop::close(name),
             [name] => desktop::open(name),
-            [stream, name] if stream == "--stream" => desktop_stream::run(name, "hevc"),
+            [stream, name] if stream == "--stream" => desktop_stream::run(name, "hevc", false),
             [stream, codec, value, name] if stream == "--stream" && codec == "--codec" => {
-                desktop_stream::run(name, value)
+                desktop_stream::run(name, value, false)
+            }
+            [stream, codec, value, tracks, name]
+                if stream == "--stream" && codec == "--codec" && tracks == "--tracks" =>
+            {
+                desktop_stream::run(name, value, true)
             }
             _ => bail!("usage: veynodevm desktop [--close] CONTAINER|VM"),
         },
@@ -926,6 +945,13 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
                     "--execute" | "--allow-execute" => "--allow-execute",
                     "--files" | "--allow-files" => "--allow-files",
                     "--input" | "--allow-input" => "--allow-input",
+                    "--browser" | "--allow-browser" => "--allow-browser",
+                    "--clipboard" | "--allow-clipboard" => "--allow-clipboard",
+                    // One VM's cua-driver endpoint instead of the VM tools.
+                    "--vm" => {
+                        flags.push("--vm");
+                        rest.next().context("--vm needs a VM id")?.as_str()
+                    }
                     // Tool groups narrow the listing; vm-control validates the names.
                     "--tools" => {
                         flags.push("--tools");
@@ -956,6 +982,10 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
                 Ok(0)
             }
             _ => bail!("usage: veynodevm __desktop VM METHOD ARGUMENTS"),
+        },
+        "__driver" => match rest {
+            [vm] => macos_driver::run(vm),
+            _ => bail!("usage: veynodevm __driver VM"),
         },
         other => bail!("unknown command: {other} (see veynodevm --help)"),
     }

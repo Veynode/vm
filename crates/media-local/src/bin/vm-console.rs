@@ -183,6 +183,19 @@ fn receive_native(receive: &Native, pipe: &mut impl Read) -> Result<()> {
             if value["event"] == "capture-error" {
                 bail!("native capture failed")
             }
+            // The encoder's source rectangle and output size, for its owner's video header.
+            if value["event"] == "view" {
+                if let Some(owner) = receive
+                    .owner
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .filter(|o| o.epoch == record.epoch)
+                {
+                    owner.deliver(record);
+                }
+                continue;
+            }
             if value["event"] == "session-error" {
                 if record.epoch == 0 || value["epoch"].as_u64() != Some(record.epoch) {
                     bail!("native session error has inconsistent epoch")
@@ -507,6 +520,19 @@ impl Native {
         };
         self.call(json!({"method":"keyframe","epoch":epoch}))
     }
+    /// `set_scale` or `set_crop`, passed through to the helper, which validates the geometry.
+    fn view(&self, client: u64, mut command: Value) -> Result<Value> {
+        let epoch = {
+            let owner = self.owner.lock().unwrap();
+            owner
+                .as_ref()
+                .filter(|o| o.client == client && !o.native_ended)
+                .context("not encoder owner")?
+                .epoch
+        };
+        command["epoch"] = json!(epoch);
+        self.call(command)
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -530,6 +556,11 @@ struct Request {
     epoch: Option<u64>,
     sequence: Option<u64>,
     target_bps: Option<u64>,
+    // set_scale (width, height) and set_crop (x, y, width, height) only.
+    x: Option<u64>,
+    y: Option<u64>,
+    width: Option<u64>,
+    height: Option<u64>,
     // The scaled-JPEG screenshot form. Only named here so that the request is not refused as unknown; the values
     // are read from the request line by `Scaled::parse`, which refuses a partial or out-of-range set.
     format: Option<Value>,
@@ -790,6 +821,12 @@ fn connection(stream: UnixStream, native: Arc<Native>, client: u64) -> Result<()
             {
                 bail!("unexpected screenshot fields")
             }
+            if (request.method != "set_crop" && (request.x.is_some() || request.y.is_some()))
+                || (!matches!(request.method.as_str(), "set_scale" | "set_crop")
+                    && (request.width.is_some() || request.height.is_some()))
+            {
+                bail!("unexpected view fields")
+            }
             if request.diagnostic_id.is_some() && request.method != "validate_displayed_frame" {
                 bail!("unexpected native diagnostic identity")
             }
@@ -806,6 +843,14 @@ fn connection(stream: UnixStream, native: Arc<Native>, client: u64) -> Result<()
                 ),
                 "stop" => native.close(client),
                 "keyframe" => native.keyframe(client),
+                "set_scale" => native.view(
+                    client,
+                    json!({"method":"set_scale","width":request.width.context("missing width")?,"height":request.height.context("missing height")?}),
+                ),
+                "set_crop" => native.view(
+                    client,
+                    json!({"method":"set_crop","x":request.x.context("missing x")?,"y":request.y.context("missing y")?,"width":request.width.context("missing width")?,"height":request.height.context("missing height")?}),
+                ),
                 "show_window" | "close_window" | "window_status" => {
                     if !vm_control::backend::window_supported(&native.capabilities) {
                         Err(anyhow!("native display-only window unavailable"))

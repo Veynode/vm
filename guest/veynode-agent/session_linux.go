@@ -243,18 +243,7 @@ func startSession(root, envFile string, req sessionRequest) (*exec.Cmd, *os.File
 	if err != nil {
 		return nil, nil, err
 	}
-	env := append([]string(nil), identity.env...)
-	for _, entry := range req.Env {
-		key, _, _ := cutEnv(entry)
-		filtered := env[:0]
-		for _, existing := range env {
-			if k, _, _ := cutEnv(existing); k != key {
-				filtered = append(filtered, existing)
-			}
-		}
-		env = append(filtered, entry)
-	}
-	identity.env = env
+	identity.env = mergeEnv(identity.env, req.Env)
 	if req.Workdir != "" {
 		identity.CWD = req.Workdir
 	}
@@ -264,7 +253,7 @@ func startSession(root, envFile string, req sessionRequest) (*exec.Cmd, *os.File
 		if err != nil {
 			return nil, nil, err
 		}
-		attributes.Credential = &syscall.Credential{Uid: uid, Gid: gid}
+		attributes.Credential = &syscall.Credential{Uid: uid, Gid: gid, Groups: userGroups(root, uid, gid)}
 		identity.env = withDefaultEnv(identity.env, home)
 	}
 	executable, err := identity.executable(req.Argv[0])

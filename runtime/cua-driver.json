@@ -1,0 +1,27 @@
+{
+  "comment": "The cua-driver release VeynodeVM embeds as the Guest's computer-use helper (docs/computer-use.md). Official release assets, built by trycua/cua's release job from the tagged commit and attested with sigstore. Update on purpose: change every field, guest/images/ubuntu-desktop/Dockerfile follows (tests/test_cua_driver_pin.py), then rerun the live acceptance.",
+  "version": "0.38.0",
+  "tag": "cua-driver-rs-v0.38.0",
+  "commit": "85e2b1318bd77ccf3cfa88ccdf875a4bb7eaed19",
+  "license": "MIT",
+  "assets": {
+    "linux-arm64": {
+      "url": "https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.38.0/cua-driver-rs-0.38.0-linux-arm64.tar.gz",
+      "sha256": "ed8a51125ade8807c7717c3dde13d62bd31e6275e6b5e2446cf018d0b01d93b3",
+      "binary": "cua-driver-rs-0.38.0-linux-arm64/cua-driver",
+      "binary_sha256": "26e9eee8165e9ce7b614b5e3d68e5d963231385a82b65236406718b5ce1ff936"
+    },
+    "windows-arm64": {
+      "url": "https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.38.0/cua-driver-rs-0.38.0-windows-arm64.zip",
+      "sha256": "c442872360cbb819e288b9f30daa7e3d2693d5945495d1400bcd90af5bd16402",
+      "binary": "cua-driver-rs-0.38.0-windows-arm64/cua-driver.exe",
+      "binary_sha256": "2d6a0822be887a8a51678f57682d7362d484d4049b769ef964f0c2dffda29de1"
+    },
+    "darwin-arm64": {
+      "url": "https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.38.0/cua-driver-rs-0.38.0-darwin-arm64.tar.gz",
+      "sha256": "5f71191c082ca07c9dfc13b7c9a6eec60a82818c245a93534cc0eb7911471d72",
+      "binary": "cua-driver-rs-0.38.0-darwin-arm64/cua-driver",
+      "binary_sha256": "92067848d0eeb9de76929fbd06a137af801b0ff6caedbb3109bd7a6cc84a1f9f"
+    }
+  }
+}

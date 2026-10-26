@@ -441,7 +441,10 @@ Virtualization (llvmpipe) and on QEMU with `--gpus virgl` (GLX renderer
   unrelated code, squashfs decompression and ext4 directory errors; the image
   blocks read back intact). With both blacklisted, and in one run each with
   only one of them blacklisted, guests ran clean; the root cause is not
-  isolated. The blacklist lives in `/run/modprobe.d/veynodevm.conf`.
+  isolated. The blacklist lives in `/run/modprobe.d/veynodevm.conf` and is
+  written for every container, whatever its init: desktop entrypoints run
+  `udevadm trigger` too, and an `ubuntu-desktop` run with both modules loaded
+  lost Xorg to a guest kernel oops (`docs/computer-use.md`, phase 0).
 - The image's network stack keeps the address container-init obtained: udev
   renames `eth0` (to `enp0s1` on both backends) and NetworkManager
   shows it as "connected (externally)". DNS comes from `--dns`/runtime.json
@@ -527,7 +530,9 @@ Virtualization (llvmpipe) and on QEMU with `--gpus virgl` (GLX renderer
   window). The QEMU window starts view-only; keyboard and pointer input begins
   when the window is focused.
 - The browser desktop ([docs/browser-desktop.md](browser-desktop.md)) on
-  Apple Virtualization serves one viewer per container at a time and does not
+  Apple Virtualization serves one viewer per container at a time (remote
+  desktop shares one encoder among its viewers; see
+  [remote-desktop.md](remote-desktop.md)) and does not
   show the guest cursor (the browser draws its own). Desktop containers created
   before the Apple path existed need a restart to boot the agent that serves
   it. Firefox needs the H.264 option (no HEVC in WebCodecs).

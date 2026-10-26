@@ -82,6 +82,13 @@ const modprobeConf = `blacklist virtio_balloon
 blacklist virtio_rng
 `
 
+// writeModuleBlacklist keeps the image's udev from loading them. Every
+// container gets it, whatever its init: a desktop entrypoint runs udevadm
+// trigger too (docs/computer-use.md, phase 0).
+func writeModuleBlacklist(root string) error {
+	return writeFileUnder(root, "/run/modprobe.d/veynodevm.conf", []byte(modprobeConf), 0o644)
+}
+
 // Units that block or prompt on a first boot without a console user, and
 // login prompts on the console, which is an output-only log here.
 var systemdMasks = []string{"systemd-firstboot.service", "systemd-networkd-wait-online.service", "serial-getty@hvc0.service", "serial-getty@ttyAMA0.service"}
@@ -227,7 +234,7 @@ func prepareSystemdRuntime(root, agentSource string, config containerConfig, env
 			return err
 		}
 	}
-	if err = writeFileUnder(root, "/run/modprobe.d/veynodevm.conf", []byte(modprobeConf), 0o644); err != nil {
+	if err = writeModuleBlacklist(root); err != nil {
 		return err
 	}
 	if err = writeFileUnder(root, "/run/NetworkManager/conf.d/00-veynodevm.conf", []byte(networkManagerConf), 0o644); err != nil {

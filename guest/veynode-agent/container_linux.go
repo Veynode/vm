@@ -232,6 +232,89 @@ func lookupUser(root, spec string) (uid, gid uint32, home string, err error) {
 	return uid, gid, home, nil
 }
 
+// userGroups lists the supplementary groups /etc/group gives the user uid
+// (by its /etc/passwd name), as `docker exec -u` adds them; gid is the
+// primary group, kept first.
+func userGroups(root string, uid, gid uint32) []uint32 {
+	name := ""
+	if passwd, err := os.ReadFile(filepath.Join(root, "etc/passwd")); err == nil {
+		for _, line := range strings.Split(string(passwd), "\n") {
+			fields := strings.Split(line, ":")
+			if len(fields) >= 7 && fields[2] == strconv.FormatUint(uint64(uid), 10) {
+				name = fields[0]
+				break
+			}
+		}
+	}
+	groups := []uint32{gid}
+	if name == "" {
+		return groups
+	}
+	file, _ := os.ReadFile(filepath.Join(root, "etc/group"))
+	for _, line := range strings.Split(string(file), "\n") {
+		fields := strings.Split(line, ":")
+		if len(fields) < 4 {
+			continue
+		}
+		g, err := strconv.ParseUint(fields[2], 10, 32)
+		if err != nil || uint32(g) == gid {
+			continue
+		}
+		for _, member := range strings.Split(fields[3], ",") {
+			if member == name {
+				groups = append(groups, uint32(g))
+				break
+			}
+		}
+	}
+	return groups
+}
+
+// withRequest applies a command's user, environment and working directory,
+// like `docker exec -u -e -w`. Only container roots take them; a fixed
+// --exec-user stays fixed.
+func (identity executionIdentity) withRequest(req request) (executionIdentity, error) {
+	if req.User == "" && len(req.Env) == 0 && req.Workdir == "" {
+		return identity, nil
+	}
+	if identity.Mode != "container-root" {
+		return identity, errors.New("user, env and workdir apply only to container commands")
+	}
+	identity.env = mergeEnv(identity.env, req.Env)
+	if req.Workdir != "" {
+		if !filepath.IsAbs(req.Workdir) {
+			return identity, errors.New("workdir must be absolute")
+		}
+		identity.CWD = req.Workdir
+	}
+	if req.User != "" {
+		uid, gid, home, err := lookupUser(identity.Chroot, req.User)
+		if err != nil {
+			return identity, err
+		}
+		identity.User, identity.UID, identity.GID, identity.Home = req.User, uid, gid, home
+		identity.credential = &syscall.Credential{Uid: uid, Gid: gid, Groups: userGroups(identity.Chroot, uid, gid)}
+		identity.env = withDefaultEnv(identity.env, home)
+	}
+	return identity, nil
+}
+
+// mergeEnv sets each KEY=VALUE of overrides, replacing an earlier KEY.
+func mergeEnv(env, overrides []string) []string {
+	env = append([]string(nil), env...)
+	for _, entry := range overrides {
+		key, _, _ := cutEnv(entry)
+		filtered := env[:0]
+		for _, existing := range env {
+			if k, _, _ := cutEnv(existing); k != key {
+				filtered = append(filtered, existing)
+			}
+		}
+		env = append(filtered, entry)
+	}
+	return env
+}
+
 func withDefaultEnv(env []string, home string) []string {
 	has := func(key string) bool {
 		for _, entry := range env {
@@ -514,6 +597,11 @@ func containerInit() int {
 			}
 		} else {
 			marker("gpu", "unavailable")
+		}
+	}
+	if config.Init != "systemd" {
+		if err := writeModuleBlacklist(containerRootDir); err != nil {
+			marker("warning", "module blacklist: "+err.Error())
 		}
 	}
 	if config.Init == "systemd" {

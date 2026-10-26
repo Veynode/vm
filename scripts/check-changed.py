@@ -23,6 +23,8 @@ CRATES = {
     'control': 'vm-control',
     'media-local': 'vm-media-local',
     'oci': 'veynodevm-oci',
+    'remote-proto': 'vm-remote-proto',
+    'gateway': 'vm-gateway',
     'session-auth': 'vm-session-auth',
 }
 WORKSPACE_FILES = {'Cargo.toml', 'Cargo.lock'}

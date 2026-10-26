@@ -21,7 +21,14 @@ pub const GROUPS: &[(&str, &str)] = &[
         "snapshots",
         "full-state snapshots, container checkpoints, rollback and forks",
     ),
+    (
+        "cua",
+        "cua-driver in Linux desktops, Windows machines and macOS containers: accessibility trees, element actions, browser pages and clipboard",
+    ),
 ];
+
+/// Groups a session lists only when asked (`--tools cua`, `--tools all` or `vm_tools_enable`).
+const HIDDEN_BY_DEFAULT: [&str; 1] = ["cua"];
 
 /// Turns on hidden groups mid-session; listed only while some are hidden.
 pub const ENABLE_TOOL: &str = "vm_tools_enable";
@@ -40,9 +47,11 @@ pub fn group(tool: &str) -> Option<&'static str> {
         ("vm_snapshot_", "snapshots"),
         ("container_", "core"),
         ("image_", "core"),
+        (crate::cua_bridge::PREFIX, "cua"),
     ];
     let named = match tool {
         "container_exec" => Some("exec"),
+        "vm_control_lease" => Some("input"),
         "container_checkpoint"
         | "container_checkpoint_list"
         | "container_checkpoint_delete"
@@ -63,9 +72,18 @@ pub fn group(tool: &str) -> Option<&'static str> {
     })
 }
 
-/// All groups: the default, which keeps a session's listing unchanged.
+/// All groups, as `--tools all` asks.
 pub fn all() -> BTreeSet<&'static str> {
     GROUPS.iter().map(|(name, _)| *name).collect()
+}
+
+/// What a session lists without `--tools`: every group but the opt-in ones.
+pub fn default() -> BTreeSet<&'static str> {
+    let mut groups = all();
+    for hidden in HIDDEN_BY_DEFAULT {
+        groups.remove(hidden);
+    }
+    groups
 }
 
 /// Parses `--tools core,screen` (or `all`) into group names.
@@ -136,10 +154,16 @@ mod tests {
 
     #[test]
     fn every_tool_has_a_group() {
-        for tool in crate::tools_with_input(true, true, true, true)["tools"]
-            .as_array()
-            .unwrap()
-        {
+        let everything = crate::McpOptions {
+            lifecycle: true,
+            execute: true,
+            files: true,
+            input: true,
+            browser: true,
+            clipboard: true,
+            vm: None,
+        };
+        for tool in &crate::tools_for(&everything) {
             let name = tool["name"].as_str().unwrap();
             assert!(
                 group(name).is_some(),
@@ -152,6 +176,23 @@ mod tests {
         assert_eq!(group("container_exec"), Some("exec"));
         assert_eq!(group("container_run"), Some("core"));
         assert_eq!(group("vm_snapshot_restore"), Some("snapshots"));
+        assert_eq!(group("cua_get_window_state"), Some("cua"));
+    }
+
+    #[test]
+    fn cua_is_hidden_by_default_and_offered() {
+        let tools = crate::tools_for(&crate::McpOptions::default());
+        assert!(tools.iter().any(|t| t["name"] == "cua_get_window_state"));
+        let listed = select(tools, &default());
+        assert!(!listed
+            .iter()
+            .any(|t| group(t["name"].as_str().unwrap()) == Some("cua")));
+        let enable = listed.iter().find(|t| t["name"] == ENABLE_TOOL).unwrap();
+        assert_eq!(
+            enable["inputSchema"]["properties"]["groups"]["items"]["enum"],
+            json!(["cua"])
+        );
+        assert!(parse("all").unwrap().contains("cua"));
     }
 
     #[test]

@@ -18,6 +18,22 @@ session's user. `accessibility_tree` and `accessibility_action` read and act on
 the AT-SPI tree over the desktop's accessibility bus (`dbus.go`, `atspi.go`;
 a helper process, `veynode-agent __accessibility`, runs as the session user
 when that is not root).
+`driver_rpc {frame, deadline_ms}` carries one MCP JSON-RPC request to
+cua-driver, the Guest's computer-use helper (`driver.go`, design in
+`docs/computer-use.md`), and returns `{frame}` with the driver's reply. The
+agent starts `/usr/local/bin/cua-driver mcp --no-overlay` on first use as the
+desktop session's user (never root; the session's groups and environment,
+telemetry and update checks off), performs the MCP handshake itself, keeps it
+running, and starts it again after an exit (at most 5 starts a minute). The
+host sends only `tools/*`, `resources/*` and `ping`; request ids are the
+caller's. This method alone takes a request line up to 1 MiB and a deadline up
+to 10 minutes; replies are at most 1 MiB. Errors are `unsupported` (no desktop
+session, a root session, or no driver in the image), `deadline_exceeded`,
+`driver_exited` (with the driver's stderr tail), `driver_unavailable` and
+`reply_too_large`. On QEMU the same frames travel as newline JSON-RPC, without
+an envelope, on the root-only virtio port `/dev/virtio-ports/veynode.driver`,
+which is separate from the fenced serial exec protocol; a failure there is a
+JSON-RPC error whose `data.veynode_code` is one of these codes.
 The integration service has no TCP listener. Separately, container-init starts
 `veynode-agent session-server` in OCI micro-VMs: TCP 52022 for interactive
 `exec -it`, `run -it`, `attach` and the web terminal, gated by the

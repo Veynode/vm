@@ -8,7 +8,7 @@ spec = importlib.util.spec_from_file_location('check_changed', ROOT / 'scripts/c
 check = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(check)
 
-DEPENDENTS = {'cli': set(), 'control': {'cli', 'media-local'}, 'media-local': set(), 'oci': {'cli'}, 'session-auth': {'media-local'}}
+DEPENDENTS = {'cli': set(), 'control': {'cli', 'media-local'}, 'gateway': set(), 'media-local': set(), 'oci': {'cli'}, 'remote-proto': {'gateway', 'media-local'}, 'session-auth': {'media-local'}}
 SCRIPT_TESTS = {'scripts/summarize-benchmark.py': {'test_benchmark.py'}}
 
 

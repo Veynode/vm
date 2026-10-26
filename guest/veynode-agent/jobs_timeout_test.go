@@ -169,3 +169,31 @@ func TestRealContainedLongAsyncImmediateCancel(t *testing.T) {
 		}
 	}
 }
+
+func TestSerialPreflightAcceptsExecIdentity(t *testing.T) {
+	manager := testManager(t)
+	envelope := func(req request) serialEnvelope {
+		e := serialEnvelope{Version: 2, Type: "request", GuestNonce: strings.Repeat("a", 64),
+			HostNonce: strings.Repeat("b", 64), Sequence: 1, Request: &req}
+		wire, err := json.Marshal(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.wire = wire
+		return e
+	}
+	base := request{ID: "start", Method: "exec_start", Argv: []string{"id"}, TimeoutMS: 1000}
+	withIdentity := base
+	withIdentity.User, withIdentity.Env, withIdentity.Workdir = "veynode", []string{"A=1"}, "/tmp"
+	for _, req := range []request{base, withIdentity} {
+		if err := manager.validateSerialV2(envelope(req), false); err != nil {
+			t.Fatal(req, err)
+		}
+	}
+	// Other fields still fence.
+	e := envelope(base)
+	e.wire = []byte(strings.Replace(string(e.wire), `"timeout_ms"`, `"shell":true,"timeout_ms"`, 1))
+	if manager.validateSerialV2(e, false) == nil {
+		t.Fatal("unknown exec_start field accepted")
+	}
+}

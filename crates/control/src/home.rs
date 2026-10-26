@@ -123,6 +123,11 @@ pub struct Runtime {
     /// (`native/tools/vm-macos-desktop.swift`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub macos_desktop: Option<PathBuf>,
+    /// `runtime/fetch-cua-driver.sh` output: `<platform>/<binary>` of the
+    /// pinned cua-driver (`runtime/cua-driver.json`), which the daemon
+    /// copies into Windows and macOS Guests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cua_driver: Option<PathBuf>,
 }
 
 impl Runtime {
@@ -184,6 +189,7 @@ impl Runtime {
         paths.extend(self.vz_desktop_stream.as_deref());
         paths.extend(self.vision.as_deref());
         paths.extend(self.macos_desktop.as_deref());
+        paths.extend(self.cua_driver.as_deref());
         for p in paths {
             if !p.is_absolute() {
                 bail!("runtime paths must be absolute: {}", p.display())

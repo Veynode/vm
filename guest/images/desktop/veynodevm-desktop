@@ -3,12 +3,22 @@
 # the virtio-gpu scanout, then an XFCE session. Reports the GL and Vulkan
 # renderers on stdout (container logs).
 set -u
+# The session runs as VEYNODEVM_DESKTOP_USER when the image has that user
+# (ubuntu-desktop: veynode); Xorg stays root. Without one it runs as root.
+user=${VEYNODEVM_DESKTOP_USER:-}
+if [ -n "$user" ] && uid=$(id -u "$user" 2>/dev/null); then
+    home=$(getent passwd "$user" | cut -d: -f6)
+else
+    user= uid=0 home=/root
+fi
+export XDG_RUNTIME_DIR=/run/user/$uid
 mkdir -p /run/udev /tmp/.X11-unix "$XDG_RUNTIME_DIR"
 # The container is starting, so no X server runs; a lock left by an unclean
 # stop (it lives in the writable layer) would make Xorg refuse to start.
 rm -f /tmp/.X0-lock /tmp/.X11-unix/X0
 chmod 1777 /tmp/.X11-unix
 chmod 0700 "$XDG_RUNTIME_DIR"
+[ -n "$user" ] && chown "$user:" "$XDG_RUNTIME_DIR"
 # The container root is a chroot of the agent's PID 1 root; systemd's udevadm
 # ignores trigger and settle there, leaving input devices unknown to Xorg.
 export SYSTEMD_IGNORE_CHROOT=1
@@ -35,5 +45,8 @@ done
 export DISPLAY=:0
 glxinfo -B 2>/dev/null | grep -E "OpenGL (renderer|version) string" | sed 's/^/desktop: /'
 vulkaninfo --summary 2>/dev/null | grep -E "deviceName|driverName" | sed 's/^ */desktop: vulkan /'
-echo "desktop: XFCE session starting on :0"
+echo "desktop: XFCE session starting on :0${user:+ as $user}"
+if [ -n "$user" ]; then
+    exec runuser -u "$user" -- env HOME="$home" USER="$user" LOGNAME="$user" dbus-run-session startxfce4
+fi
 exec dbus-run-session startxfce4

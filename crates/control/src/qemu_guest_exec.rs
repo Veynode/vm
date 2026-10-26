@@ -366,7 +366,10 @@ impl Transport {
                     }
                 }
             };
-            let _ = run();
+            // The only record of why an incarnation was fenced (and its QEMU terminated).
+            if let Err(error) = run() {
+                eprintln!("vm-qemu: serial execution fenced: {error:#}");
+            }
             stopped.store(true, Ordering::Release);
             *status.lock().unwrap() = "fenced";
             saved.lock().unwrap().stop();
@@ -463,7 +466,12 @@ fn validate_reply(method: &str, response: &Value) -> Result<()> {
         "info"
             if r["transport"] != "virtio-serial-private-exec-v2"
                 || r["execution_containment"] != "cgroup-v2-clone3-kill"
-                || r["execution_identity"]["rootless"] != true
+                // A rootless service, or an OCI micro-VM's container root, as the Guest admits.
+                || !(r["execution_identity"]["rootless"] == true
+                    || (r["execution_identity"]["mode"] == "container-root"
+                        && r["execution_identity"]["chroot"]
+                            .as_str()
+                            .is_some_and(|c| !c.is_empty())))
                 || r["transport_reconnect"] != false
                 || r["capabilities"]["exec"] != true
                 || r["capabilities"]["async_exec"] != true
@@ -681,6 +689,23 @@ mod tests {
     fn heartbeat_requires_exact_proof() {
         assert!(validate_reply("heartbeat", &json!({"result":{}})).is_err());
         assert!(validate_reply("heartbeat", &json!({"error":{"code":"timeout"}})).is_err());
+    }
+    #[test]
+    fn info_accepts_a_rootless_service_or_a_container_root() {
+        let info = |identity: Value| json!({"result":{"transport":"virtio-serial-private-exec-v2","execution_containment":"cgroup-v2-clone3-kill","execution_identity":identity,"transport_reconnect":false,"capabilities":{"exec":true,"async_exec":true,"descendant_containment":true,"files":false,"shutdown":false,"desktop":false}}});
+        assert!(validate_reply("info", &info(json!({"rootless":true}))).is_ok());
+        assert!(validate_reply(
+            "info",
+            &info(json!({"rootless":false,"mode":"container-root","chroot":"/run/veynode/root"}))
+        )
+        .is_ok());
+        for identity in [
+            json!({"rootless":false}),
+            json!({"rootless":false,"mode":"container-root"}),
+            json!({"rootless":false,"mode":"container-root","chroot":""}),
+        ] {
+            assert!(validate_reply("info", &info(identity)).is_err());
+        }
     }
     #[test]
     #[ignore = "requires explicitly built Go test-only interop binary; not real Guest cgroup evidence"]

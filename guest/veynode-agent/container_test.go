@@ -129,6 +129,52 @@ func TestStatInRootFollowsLinksInsideRoot(t *testing.T) {
 	}
 }
 
+func TestExecRequestUserEnvAndWorkdir(t *testing.T) {
+	root := t.TempDir()
+	os.MkdirAll(filepath.Join(root, "etc"), 0o755)
+	os.WriteFile(filepath.Join(root, "etc/passwd"), []byte("root:x:0:0:root:/root:/bin/sh\nveynode:x:1000:1000::/home/veynode:/bin/bash\n"), 0o644)
+	os.WriteFile(filepath.Join(root, "etc/group"), []byte("root:x:0:\nvideo:x:44:veynode\ninput:x:997:other,veynode\nveynode:x:1000:\nstaff:x:50:other\n"), 0o644)
+	base := containerIdentity(root, []string{"PATH=/usr/bin", "LANG=C.UTF-8", "HOME=/root"}, "/")
+	got, err := base.withRequest(request{User: "veynode", Env: []string{"LANG=de_DE.UTF-8", "EXTRA=1"}, Workdir: "/srv"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.credential == nil || got.credential.Uid != 1000 || got.credential.Gid != 1000 || got.CWD != "/srv" {
+		t.Fatalf("identity %+v", got)
+	}
+	if groups := fmt.Sprint(got.credential.Groups); groups != "[1000 44 997]" {
+		t.Fatalf("supplementary groups %s", groups)
+	}
+	if env := strings.Join(got.env, " "); !strings.Contains(env, "LANG=de_DE.UTF-8") || strings.Contains(env, "LANG=C.UTF-8") || !strings.Contains(env, "EXTRA=1") {
+		t.Fatalf("env %s", env)
+	}
+	if unchanged, _ := base.withRequest(request{}); unchanged.credential != nil || unchanged.CWD != "/" {
+		t.Fatal("a plain request changed the identity")
+	}
+	if _, err := base.withRequest(request{User: "nobody-here"}); err == nil {
+		t.Fatal("unknown user accepted")
+	}
+	if _, err := base.withRequest(request{Workdir: "relative"}); err == nil {
+		t.Fatal("relative workdir accepted")
+	}
+	fixed := executionIdentity{Mode: "fixed-user"}
+	if _, err := fixed.withRequest(request{User: "root"}); err == nil {
+		t.Fatal("a fixed --exec-user was overridden")
+	}
+}
+
+func TestModuleBlacklistNeedsOnlyRun(t *testing.T) {
+	root := t.TempDir()
+	os.MkdirAll(filepath.Join(root, "run"), 0o755)
+	if err := writeModuleBlacklist(root); err != nil {
+		t.Fatal(err)
+	}
+	blacklist, _ := os.ReadFile(filepath.Join(root, "run/modprobe.d/veynodevm.conf"))
+	if string(blacklist) != "blacklist virtio_balloon\nblacklist virtio_rng\n" {
+		t.Fatalf("modprobe.d: %q", blacklist)
+	}
+}
+
 func TestPrepareSystemdRuntime(t *testing.T) {
 	root := t.TempDir()
 	for _, dir := range []string{"run", "etc", "sbin"} {

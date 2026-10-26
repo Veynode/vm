@@ -11,12 +11,16 @@ veynodevm build -t veynodevm/ubuntu-gnome guest/images/ubuntu-gnome
 ```
 
 The desktop images share `desktop/veynodevm-desktop` (udev, Xorg on the
-virtio-gpu scanout, XFCE), so their build context is `guest/images`.
+virtio-gpu scanout, XFCE), so their build context is `guest/images`. Xorg runs
+as root; the XFCE session runs as `VEYNODEVM_DESKTOP_USER` when the image has
+that user (`ubuntu-desktop` sets `veynode`, in groups `input video render`),
+and as root otherwise (`alpine-desktop`). The Guest's computer-use helper,
+cua-driver, refuses a root session.
 
 | Image | Contents | Run |
 |---|---|---|
 | `alpine-desktop` | Xorg (modesetting on virtio-gpu), XFCE, Mesa virgl + llvmpipe | `veynodevm run -d --desktop [--gpus virgl] veynodevm/alpine-desktop`, then `veynodevm desktop <name>` |
-| `ubuntu-desktop` | Xorg + XFCE, Mesa virgl (GL) and Venus (Vulkan), vulkan-tools | `veynodevm run -d --desktop --gpus venus veynodevm/ubuntu-desktop` |
+| `ubuntu-desktop` | Xorg + XFCE as user `veynode` (uid 1000), Mesa virgl (GL) and Venus (Vulkan), vulkan-tools, AT-SPI, the pinned cua-driver (`runtime/cua-driver.json`) | `veynodevm run -d --desktop --gpus venus veynodevm/ubuntu-desktop` |
 | `ubuntu-gpu` | Mesa virgl (GL) and Venus (Vulkan virtio ICD), vulkan-tools, mesa-utils | `veynodevm run --rm --gpus venus veynodevm/ubuntu-gpu` |
 | `ubuntu-gnome` | Full Ubuntu 24.04 system: systemd as PID 1, GDM autologin (user `ubuntu`, password `ubuntu`) into GNOME Shell on Xorg, NetworkManager, Mesa | `veynodevm run -d --init systemd --desktop [--gpus virgl] --name gnome veynodevm/ubuntu-gnome`, then `veynodevm desktop gnome` |
 

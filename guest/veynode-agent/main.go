@@ -37,6 +37,10 @@ type request struct {
 	SHA256    string   `json:"sha256,omitempty"`
 	TextHex   string   `json:"text_hex,omitempty"`
 	UnixNS    int64    `json:"unix_ns,omitempty"`
+	// User, Env and Workdir are `exec -u -e -w` for container commands.
+	User    string   `json:"user,omitempty"`
+	Env     []string `json:"env,omitempty"`
+	Workdir string   `json:"workdir,omitempty"`
 	// Arguments carries the daemon's desktop input and wait arguments (observe.go).
 	Arguments json.RawMessage `json:"arguments,omitempty"`
 }
@@ -140,6 +144,9 @@ func handleWithManager(manager *jobManager, req request, allowExec bool, allowSh
 			return failure(req.ID, "accessibility_failed", err.Error())
 		}
 		return response{ID: req.ID, Result: result}
+	case "driver_rpc":
+		// Independent of --desktop-stream: the driver needs a desktop session, which it finds itself.
+		return handleDriverRPC(req)
 	case "clock_sync":
 		return clockSync(req)
 	case "text_input":
@@ -181,10 +188,11 @@ func serve(stream io.ReadWriteCloser, allowExec bool, allowShutdown ...bool) {
 	if f, ok := stream.(*os.File); ok {
 		_ = f.SetDeadline(time.Now().Add(35 * time.Second))
 	}
-	reader := bufio.NewReader(io.LimitReader(stream, maxRequest+1))
+	// driver_rpc alone may carry up to 1 MiB (a driver frame with user text).
+	reader := bufio.NewReader(io.LimitReader(stream, maxDriverRequest+1))
 	line, err := reader.ReadBytes('\n')
 	var reply response
-	if err != nil || len(line) > maxRequest {
+	if err != nil || len(line) > maxDriverRequest {
 		reply = failure("", "invalid_request", "expected newline JSON within 64KiB")
 	} else {
 		var req request
@@ -194,7 +202,13 @@ func serve(stream io.ReadWriteCloser, allowExec bool, allowShutdown ...bool) {
 			reply = failure("", "invalid_request", "invalid JSON request")
 		} else if decoder.Decode(new(any)) != io.EOF {
 			reply = failure(req.ID, "invalid_request", "trailing JSON")
+		} else if len(line) > maxRequest && req.Method != "driver_rpc" {
+			reply = failure(req.ID, "invalid_request", "expected newline JSON within 64KiB")
 		} else {
+			if f, ok := stream.(*os.File); ok && req.Method == "driver_rpc" {
+				// The call's own deadline, plus time to write the reply.
+				_ = f.SetDeadline(time.Now().Add(driverCallDeadline(req) + 5*time.Second))
+			}
 			reply = handle(req, allowExec, allowShutdown...)
 		}
 	}
@@ -332,6 +346,7 @@ func main() {
 		// configureCommandContainment has already killed/drained prior service groups
 		// and verified real clone3 credentials before any fresh challenge is emitted.
 		installSignalCleanup(commands)
+		go serveDriverPort()
 		if err = listenSerialExec(); err != nil {
 			fmt.Fprintln(os.Stderr, "serial v2 incarnation fenced:", err)
 			os.Exit(1)

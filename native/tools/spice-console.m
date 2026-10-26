@@ -42,6 +42,10 @@ static NSDictionary *actualHEVCProfile;
 static BOOL useHEVC,hardwareVerified,hardwareProbe,probeOutput,active,forceKeyframe,mainOpen,displayOpen,readySent,closing,awaitingSource=YES;
 static NSUInteger sourceWidth,sourceHeight,width,height,encoded,keyframes,sourceCopies,resizeCopies,received,idleFrames;
 static uint64_t epoch,lastEpoch,generation,sequence,cachedGeneration,rateSubmitted;
+// set_crop: a zero size is the full source. set_scale: 0x0 is the default codec-fit
+// geometry of the view. carriedBitrate keeps the rate across a rebuild for either.
+static NSUInteger cropX,cropY,cropWidth,cropHeight,scaleWidth,scaleHeight;
+static NSNumber *carriedBitrate;
 static NSUInteger scanoutLogCount,channelLogCount;
 #ifdef VEYNODE_NATIVE_DISPLAY
 static VNFramePacing capturePacing;
@@ -160,7 +164,9 @@ static BOOL createEncoderWith(CVPixelBufferRef pixel,NSDictionary *spec,BOOL rep
      if(encoder){VTCompressionSessionInvalidate(encoder);CFRelease(encoder);encoder=NULL;}
      if(reportFailure)fail(problem);return NO;
     }
-    rateReset();rateSubmitted=0;return YES;
+    // A set_scale rebuild is the same encoder instance to rate control: keep its target and sequence.
+    if(carriedBitrate){if(VTSessionSetProperty(encoder,kVTCompressionPropertyKey_AverageBitRate,(__bridge CFNumberRef)carriedBitrate)!=noErr)rateFenced=YES;carriedBitrate=nil;}
+    else{rateReset();rateSubmitted=0;}return YES;
 }
 static BOOL createEncoder(CVPixelBufferRef pixel){
     return createEncoderWith(pixel,@{(__bridge NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder:@YES},YES);
@@ -177,7 +183,8 @@ static BOOL finishCopyTiming(VNCopyKind kind,double begin,double commit,id<MTLCo
  return success;
 }
 #endif
-static BOOL copyPixels(IOSurfaceRef src,NSUInteger sw,NSUInteger sh,CVPixelBufferRef destination
+// Nearest-sample resize of the source rectangle (rx,ry,rw,rh) into destination.
+static BOOL copyPixels(IOSurfaceRef src,NSUInteger sw,NSUInteger sh,NSUInteger rx,NSUInteger ry,NSUInteger rw,NSUInteger rh,CVPixelBufferRef destination
 #ifdef VEYNODE_NATIVE_DISPLAY
  ,VNCopyKind copyKind
 #endif
@@ -190,14 +197,14 @@ static BOOL copyPixels(IOSurfaceRef src,NSUInteger sw,NSUInteger sh,CVPixelBuffe
 #define COPY_RETURN(value) return (value)
 #endif
  if(!metal){metal=MTLCreateSystemDefaultDevice();queue=[metal newCommandQueue];NSError *error=nil;
-  NSString *shader=@"#include <metal_stdlib>\nusing namespace metal;\nkernel void copy_frame(texture2d<float,access::read> src [[texture(0)]],texture2d<float,access::write> dst [[texture(1)]],uint2 p [[thread_position_in_grid]]){if(p.x>=dst.get_width()||p.y>=dst.get_height())return;uint sx=min(src.get_width()-1,((2*p.x+1)*src.get_width())/(2*dst.get_width()));uint sy=min(src.get_height()-1,((2*p.y+1)*src.get_height())/(2*dst.get_height()));dst.write(src.read(uint2(sx,sy)),p);}";
+  NSString *shader=@"#include <metal_stdlib>\nusing namespace metal;\nkernel void copy_frame(texture2d<float,access::read> src [[texture(0)]],texture2d<float,access::write> dst [[texture(1)]],constant uint4 &r [[buffer(0)]],uint2 p [[thread_position_in_grid]]){if(p.x>=dst.get_width()||p.y>=dst.get_height())return;uint sx=r.x+min(r.z-1,((2*p.x+1)*r.z)/(2*dst.get_width()));uint sy=r.y+min(r.w-1,((2*p.y+1)*r.w)/(2*dst.get_height()));dst.write(src.read(uint2(sx,sy)),p);}";
   id<MTLLibrary> library=[metal newLibraryWithSource:shader options:nil error:&error];if(library)pipeline=[metal newComputePipelineStateWithFunction:[library newFunctionWithName:@"copy_frame"] error:&error];if(!queue||!pipeline)COPY_RETURN(NO);
  }
  NSUInteger dw=CVPixelBufferGetWidth(destination),dh=CVPixelBufferGetHeight(destination);
  MTLTextureDescriptor *d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:sw height:sh mipmapped:NO];d.storageMode=MTLStorageModeShared;d.usage=MTLTextureUsageShaderRead;
  id<MTLTexture> from=[metal newTextureWithDescriptor:d iosurface:src plane:0];d.width=dw;d.height=dh;d.usage=MTLTextureUsageShaderWrite;
  id<MTLTexture> to=[metal newTextureWithDescriptor:d iosurface:CVPixelBufferGetIOSurface(destination) plane:0];command=[queue commandBuffer];id<MTLComputeCommandEncoder> compute=[command computeCommandEncoder];
- if(!from||!to||!compute)COPY_RETURN(NO);[compute setComputePipelineState:pipeline];[compute setTexture:from atIndex:0];[compute setTexture:to atIndex:1];[compute dispatchThreads:MTLSizeMake(dw,dh,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];[compute endEncoding];
+ if(!from||!to||!compute)COPY_RETURN(NO);[compute setComputePipelineState:pipeline];[compute setTexture:from atIndex:0];[compute setTexture:to atIndex:1];uint32_t rect[4]={(uint32_t)rx,(uint32_t)ry,(uint32_t)rw,(uint32_t)rh};[compute setBytes:rect length:sizeof rect atIndex:0];[compute dispatchThreads:MTLSizeMake(dw,dh,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];[compute endEncoding];
 #ifdef VEYNODE_NATIVE_DISPLAY
  commitBegin=g_get_monotonic_time()/1e6;
 #endif
@@ -223,22 +230,40 @@ static void closeEncoder(void){
  if(encoder){if(VTCompressionSessionCompleteFrames(encoder,kCMTimeInvalid)!=noErr)fail(@"Encoder drain failed");VTCompressionSessionInvalidate(encoder);CFRelease(encoder);encoder=NULL;}
  if(scaled){CVPixelBufferRelease(scaled);scaled=NULL;}active=NO;forceKeyframe=NO;
 }
+// Even, within the default geometry, and at least 0.4x it per side.
+static BOOL scaleFits(NSUInteger w,NSUInteger h,size_t fitWidth,size_t fitHeight){
+ if(!w&&!h)return YES;return w&&h&&!(w&1)&&!(h&1)&&w<=fitWidth&&h<=fitHeight&&w*5>=fitWidth*2&&h*5>=fitHeight*2;
+}
+typedef struct{size_t x,y,w,h,fitW,fitH,outW,outH;}View;
+// The crop clamped to the source and kept even (at least 2x2), its codec-fit size,
+// and the output: the scale, never larger than that fit.
+static BOOL resolveView(View *v){
+ if(sourceWidth<2||sourceHeight<2)return NO;
+ if(!cropWidth){v->x=v->y=0;v->w=sourceWidth;v->h=sourceHeight;}
+ else{v->x=MIN(cropX,sourceWidth-2);v->y=MIN(cropY,sourceHeight-2);v->w=MIN(cropWidth,sourceWidth-v->x)&~(size_t)1;v->h=MIN(cropHeight,sourceHeight-v->y)&~(size_t)1;}
+ if(!VNEncodedGeometry(v->w,v->h,useHEVC,&v->fitW,&v->fitH))return NO;
+ v->outW=scaleWidth?MIN(scaleWidth,v->fitW):v->fitW;v->outH=scaleHeight?MIN(scaleHeight,v->fitH):v->fitH;return YES;
+}
+static NSDictionary *viewFields(const View *v){
+ return @{@"event":@"view",@"track":@0,@"x":@(v->x),@"y":@(v->y),@"w":@(v->w),@"h":@(v->h),@"src_w":@(sourceWidth),@"src_h":@(sourceHeight),@"out_w":@(v->outW),@"out_h":@(v->outH),@"default_w":@(v->fitW),@"default_h":@(v->fitH)};
+}
 static void sessionFailure(void){
  if(!failure)return;NSString *message=failure;closeEncoder();failure=nil;
  emit(epoch,@{@"event":@"session-error",@"epoch":@(epoch),@"error":@{@"code":@"encoder_failed",@"message":message}});
 }
+static View view;
 static void encodeLatest(gint64 now,BOOL idle){
  if(!active||!cacheValid())return;
  if(!encoder){
-  size_t selectedWidth=0,selectedHeight=0;
-  if(!VNEncodedGeometry(sourceWidth,sourceHeight,useHEVC,&selectedWidth,&selectedHeight)){fail(@"Source geometry cannot fit even codec bounds");sessionFailure();return;}
-  width=selectedWidth;height=selectedHeight;
-  if(width!=sourceWidth||height!=sourceHeight){scaled=allocatePixel(width,height);if(!scaled){fail(@"Scale buffer unavailable");sessionFailure();return;}}
+  if(!resolveView(&view)){fail(@"Source geometry cannot fit even codec bounds");sessionFailure();return;}
+  width=view.outW;height=view.outH;
+  if(width!=sourceWidth||height!=sourceHeight||view.w!=sourceWidth||view.h!=sourceHeight){scaled=allocatePixel(width,height);if(!scaled){fail(@"Scale buffer unavailable");sessionFailure();return;}}
   if(!createEncoder(scaled?:owned)){sessionFailure();return;}
   emit(epoch,@{@"event":@"encoding",@"codec":codecName,@"hardware_verified":@(hardwareVerified),@"width":@(width),@"height":@(height),@"source_width":@(sourceWidth),@"source_height":@(sourceHeight),@"source_generation":@(generation),@"source_sequence":@(sequence)});
+  emit(epoch,viewFields(&view));
  }
  CVPixelBufferRef pixel=owned;
- if(scaled){if(!copyPixels(CVPixelBufferGetIOSurface(owned),sourceWidth,sourceHeight,scaled
+ if(scaled){if(!copyPixels(CVPixelBufferGetIOSurface(owned),sourceWidth,sourceHeight,view.x,view.y,view.w,view.h,scaled
 #ifdef VEYNODE_NATIVE_DISPLAY
  ,VNCopyEncoderResize
 #endif
@@ -293,13 +318,13 @@ static BOOL captureSource(gint64 now){
  CVPixelBufferRef next=VeynodeDisplayAcquire(sourceWidth,sourceHeight);
  // Pool exhaustion drops this copy without blocking ACK; the flush retries.
  if(!next){capturePoolDrops++;sourceDirty=YES;return NO;}
- if(!copyPixels(surface,sourceWidth,sourceHeight,next,VNCopySource)){VeynodeDisplayRelease(next);captureFail(@"source_copy_failed");return NO;}
+ if(!copyPixels(surface,sourceWidth,sourceHeight,0,0,sourceWidth,sourceHeight,next,VNCopySource)){VeynodeDisplayRelease(next);captureFail(@"source_copy_failed");return NO;}
  if(!surfaceLive()){VeynodeDisplayRelease(next);awaitSource(@"generation_retired_during_copy");return NO;}
  clearCache();owned=next;sourceCopies++;sequence++;cachedGeneration=generation;capturedMono=g_get_monotonic_time();capturedWall=g_get_real_time();lastCapture=now;if(nativeVisible)visibleSourceCopies++;else backgroundSourceCopies++;VeynodeDisplayPublish(owned,generation,sequence,capturedMono);
 #else
  if(lastCapture&&now-lastCapture<encodeInterval){sourceDirty=YES;return NO;}
  cachedGeneration=0;if(!owned)owned=allocatePixel(sourceWidth,sourceHeight);
- if(!owned||!copyPixels(surface,sourceWidth,sourceHeight,owned)){clearCache();captureFail(@"source_copy_failed");return NO;}
+ if(!owned||!copyPixels(surface,sourceWidth,sourceHeight,0,0,sourceWidth,sourceHeight,owned)){clearCache();captureFail(@"source_copy_failed");return NO;}
  if(!surfaceLive()){awaitSource(@"generation_retired_during_copy");return NO;}
  sourceCopies++;sequence++;cachedGeneration=generation;capturedMono=g_get_monotonic_time();capturedWall=g_get_real_time();lastCapture=now;
 #endif
@@ -464,7 +489,7 @@ static void command(NSData *line){
  if([method isEqual:@"start"]){
   if(active){reject(ident,e,@"encoding_busy");return;}if(e<=lastEpoch){reject(ident,e,@"stale_epoch");return;}
   NSString *codec=request[@"codec"];if(![codec isKindOfClass:NSString.class]||(![codec isEqual:@"h264"]&&![codec isEqual:@"hevc"])){reject(ident,e,@"unsupported_codec");return;}
-  epoch=lastEpoch=e;codecName=codec;useHEVC=[codec isEqual:@"hevc"];active=YES;forceKeyframe=YES;firstPTS=lastEncode=0;encoded=keyframes=idleFrames=0;actualH264Profile=nil;actualHEVCProfile=nil;hardwareVerified=NO;failure=nil;
+  epoch=lastEpoch=e;codecName=codec;useHEVC=[codec isEqual:@"hevc"];active=YES;forceKeyframe=YES;cropX=cropY=cropWidth=cropHeight=scaleWidth=scaleHeight=0;carriedBitrate=nil;firstPTS=lastEncode=0;encoded=keyframes=idleFrames=0;actualH264Profile=nil;actualHEVCProfile=nil;hardwareVerified=NO;failure=nil;
   reply(ident,e,@{@"state":cacheValid()?@"encoding":@"waiting-frame",@"epoch":@(epoch),@"frame_available":@(cacheValid())});if(cacheValid())encodeLatest(g_get_monotonic_time(),NO);return;
  }
  if(!active||e!=epoch){reject(ident,e,@"stale_or_inactive_epoch");return;}
@@ -474,6 +499,26 @@ static void command(NSData *line){
   if([method isEqual:@"rate_status"])[q removeObjectForKey:@"epoch"];
   NSDictionary *answer=rateApply(q,encoder,hardwareVerified,epoch,rateSubmitted);
   if(answer[@"error"])reject(ident,e,answer[@"error"][@"code"]);else reply(ident,e,answer[@"result"]);return;
+ }
+ if([method isEqual:@"set_scale"]||[method isEqual:@"set_crop"]){
+  BOOL crop=[method isEqual:@"set_crop"];NSArray *keys=crop?@[@"x",@"y",@"width",@"height"]:@[@"width",@"height"];uint64_t v[4]={0};
+  for(NSUInteger i=0;i<keys.count;i++){if(!rateUInt(request[keys[i]],0,4096)){reject(ident,e,@"invalid_request");return;}v[i]=[request[keys[i]] unsignedLongLongValue];}
+  View before;if(!resolveView(&before)){reject(ident,e,@"frame_unavailable");return;}
+  if(crop){BOOL full=!v[0]&&!v[1]&&!v[2]&&!v[3];if(!full&&(v[2]<2||v[3]<2||v[0]>=sourceWidth||v[1]>=sourceHeight)){reject(ident,e,@"crop_outside_bound");return;}
+   NSUInteger saved[4]={cropX,cropY,cropWidth,cropHeight};cropX=v[0];cropY=v[1];cropWidth=full?0:v[2];cropHeight=full?0:v[3];
+   View probe;if(!resolveView(&probe)){cropX=saved[0];cropY=saved[1];cropWidth=saved[2];cropHeight=saved[3];reject(ident,e,@"crop_outside_bound");return;}}
+  else{if(!scaleFits(v[0],v[1],before.fitW,before.fitH)){reject(ident,e,@"scale_outside_bound");return;}scaleWidth=v[0];scaleHeight=v[1];}
+  // Any change is a new compression session (rebuilt by the next encode) whose first frame is a keyframe.
+  View after;resolveView(&after);
+  if(encoder){
+   CFTypeRef raw=NULL;if(VTSessionCopyProperty(encoder,kVTCompressionPropertyKey_AverageBitRate,NULL,&raw)==noErr)carriedBitrate=CFBridgingRelease(raw);else if(raw)CFRelease(raw);
+   if(VTCompressionSessionCompleteFrames(encoder,kCMTimeInvalid)!=noErr)fail(@"Encoder drain failed");VTCompressionSessionInvalidate(encoder);CFRelease(encoder);encoder=NULL;
+   if(scaled){CVPixelBufferRelease(scaled);scaled=NULL;}forceKeyframe=YES;
+   if(failure){carriedBitrate=nil;sessionFailure();reject(ident,e,@"encoder_drain_failed");return;}
+   if(cacheValid())encodeLatest(g_get_monotonic_time(),NO);
+  }
+  NSMutableDictionary *result=[viewFields(&after) mutableCopy];[result removeObjectForKey:@"event"];result[@"width"]=@(after.outW);result[@"height"]=@(after.outH);result[@"source_width"]=@(sourceWidth);result[@"source_height"]=@(sourceHeight);
+  reply(ident,e,result);return;
  }
  if([method isEqual:@"stop"]){closeEncoder();if(failure){reject(ident,e,@"encoder_drain_failed");failure=nil;return;}reply(ident,e,@{@"state":@"stopped",@"encoded":@(encoded),@"keyframes":@(keyframes),@"idle_frames":@(idleFrames),@"frame_available":@(cacheValid()),@"source_generation":@(generation),@"source_sequence":@(sequence)});return;}
  if([method isEqual:@"keyframe"]){forceKeyframe=YES;reply(ident,e,@{@"requested":@YES});if(cacheValid()&&g_get_monotonic_time()-lastEncode>=33333)encodeLatest(g_get_monotonic_time(),YES);return;}

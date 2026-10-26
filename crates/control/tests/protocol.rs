@@ -801,10 +801,11 @@ fn stdio_tool_groups_and_progressive_disclosure() {
         .iter()
         .find(|t| t["name"] == "vm_tools_enable")
         .unwrap();
-    // Observe-only: groups that need a permission this session lacks are not offered.
+    // Observe-only: groups that need a permission this session lacks are not offered;
+    // cua holds observe tools (cua_get_window_state, ...), so it is.
     assert_eq!(
         enable["inputSchema"]["properties"]["groups"]["items"]["enum"],
-        json!(["screen", "desktop", "snapshots"])
+        json!(["screen", "desktop", "snapshots", "cua"])
     );
     // A permitted but hidden tool is refused with a pointer to the enable tool.
     send(

@@ -82,6 +82,7 @@ impl Drop for RuntimeDirectory {
             "spice.sock",
             "console.sock",
             "agent.sock",
+            "driver.sock",
         ] {
             let _ = fs::remove_file(self.0.join(name));
         }
@@ -1505,6 +1506,7 @@ fn run() -> Result<bool> {
     let spice_path = runtime.0.join("spice.sock");
     let console_path = runtime.0.join("console.sock");
     let agent_path = runtime.0.join("agent.sock");
+    let driver_path = runtime.0.join("driver.sock");
     let uefi = config.boot == vm_control::BootMode::Uefi;
     // Windows ARM hangs in edk2 after an in-process (warm) reset on HVF; QEMU
     // exits on a guest reboot instead and run() returns to start a fresh one.
@@ -1627,6 +1629,20 @@ fn run() -> Result<bool> {
             "-device",
             "virtserialport,bus=veynode-serial.0,chardev=veynode-agent,name=org.veynode.agent.0",
         ]);
+    // cua-driver's own port, so its JSON-RPC traffic stays out of the fenced exec channel.
+    let driver = config.guest == "linux";
+    if driver {
+        command
+            .arg("-chardev")
+            .arg(format!(
+                "socket,id=veynode-driver,path={},server=on,wait=off",
+                driver_path.display()
+            ))
+            .args([
+                "-device",
+                "virtserialport,bus=veynode-serial.0,chardev=veynode-driver,name=veynode.driver",
+            ]);
+    }
     if let Some(spice_library) = options.get("--spice-library") {
         command.env("VEYNODE_SPICE_LIBRARY", spice_library);
     }
@@ -1702,6 +1718,9 @@ fn run() -> Result<bool> {
         })
         .transpose()?;
     let mut exec_pending: Vec<(Value, guest_exec::Pending)> = Vec::new();
+    let driver_channel =
+        driver.then(|| vm_control::qemu_driver_channel::Channel::new(&driver_path));
+    let mut driver_pending: Vec<(Value, vm_control::qemu_driver_channel::Pending)> = Vec::new();
     let mut guest_pending: Option<(Value, guest_transport::Pending)> = None;
     let mut broker = if let Some(binary) = options.get("--console-broker") {
         let broker = ConsoleBroker::start(
@@ -1828,6 +1847,18 @@ fn run() -> Result<bool> {
                 index += 1
             }
         }
+        let mut index = 0;
+        while index < driver_pending.len() {
+            if let Some(result) = driver_pending[index].1.poll() {
+                let (id, _) = driver_pending.remove(index);
+                emit(match result {
+                    Ok(frame) => json!({"id":id,"result":{"frame":frame}}),
+                    Err(error) => json!({"id":id,"error":error.to_string()}),
+                })?;
+            } else {
+                index += 1
+            }
+        }
         if input.until.is_some_and(|until| Instant::now() >= until) {
             input.cleanup(&mut qmp)?;
         }
@@ -1907,6 +1938,7 @@ fn run() -> Result<bool> {
         // state above may get, so it stays at 50 ms while anything in flight is being polled for.
         let request = match rx.recv_timeout(request_wait(
             !exec_pending.is_empty()
+                || !driver_pending.is_empty()
                 || guest_pending.is_some()
                 || capture.is_some()
                 || input.until.is_some()
@@ -1922,6 +1954,7 @@ fn run() -> Result<bool> {
                 request["method"].as_str(),
                 Some(
                     "guest_request"
+                        | "driver_rpc"
                         | "native_begin"
                         | "native_heartbeat"
                         | "native_event"
@@ -1940,6 +1973,18 @@ fn run() -> Result<bool> {
                     match exec.request_before(request["request"].clone(), Instant::now()+Duration::from_secs(1)){Ok(pending)=>{exec_pending.push((id.clone(),pending));continue},Err(error)=>Err(error)}
                 } else if guest_pending.is_some() {Err(anyhow::anyhow!("guest integration busy: one request per VM"))}
                 else {match guest.as_ref().unwrap().request(request["request"].clone()) {Ok(pending)=>{guest_pending=Some((id.clone(),pending));continue},Err(error)=>Err(error)}}
+            },
+            // One cua-driver JSON-RPC frame over the veynode.driver port; replies arrive in any order.
+            Some("driver_rpc") => match &driver_channel {
+                None => Err(anyhow::anyhow!("unsupported: no cua-driver port for this Guest")),
+                Some(_) if driver_pending.len() >= 16 => Err(anyhow::anyhow!("busy: too many driver calls in flight")),
+                Some(channel) => {
+                    let deadline = Duration::from_millis(request["deadline_ms"].as_u64().unwrap_or(30_000));
+                    match channel.request(request["frame"].clone(), deadline) {
+                        Ok(pending) => { driver_pending.push((id.clone(), pending)); continue }
+                        Err(error) => Err(error),
+                    }
+                }
             },
             Some(method @ ("show_window" | "close_window" | "window_status")) => {
                 if !broker.as_ref().is_some_and(|b|vm_control::backend::window_supported(&b.capabilities)) {

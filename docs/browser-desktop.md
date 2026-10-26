@@ -103,5 +103,49 @@ input→frame figure is then meaningless; measure with the tab visible.
   refused with a clear error. The guest cursor is a hardware plane and is not
   in the stream; the browser shows its local cursor.
 - Firefox has no HEVC decoder in WebCodecs; use the **Use H.264** link.
-- The stream is local only (loopback UI with a per-launch token). Remote and
-  multi-viewer sharing remain on the WebRTC path.
+- The guest scanout sets the source resolution; the host cannot change it.
+  Bitrate (default 8 Mbps), output scale and a crop rectangle are
+  runtime-adjustable, but nothing in the browser path drives them yet. Any
+  crop or scale change rebuilds the compression session (the bitrate carries
+  over) and its next frame is a keyframe.
+  - `vz-desktop-stream PRIVATE_UNIX_SOCKET --codec hevc|h264 [--tracks]`,
+    stdin, one command per line (`T` is a track, 0..7, default 0):
+
+    ```text
+    stop
+    {"input":[...]}            forwarded to the guest
+    [@T ]keyframe
+    [@T ]bitrate N             bits/s, clamped to 250000..40000000
+    [@T ]crop X Y W H          source pixels; clamped to the source, W/H made even;
+                               W or H below 2 is refused; crop 0 0 0 0 = full screen
+    [@T ]scale W H             even output size, at least 0.4x the view per side;
+                               never larger than the crop; scale 0 0 = view size
+    track add T                T = 1..7, needs --tracks
+    track remove T             track 0 always exists
+    ```
+
+    Only one helper can hold the guest bridge, so viewers share one process:
+    each track is its own compression session over the same captured frame.
+    With `--tracks` the stdout header is `u32 size, u64 pts_us, u8 keyframe,
+    u8 track`; without it the header stays 13 bytes and only track 0 exists.
+    Stderr gets `{"event":"view","track","x","y","w","h","src_w","src_h",
+    "out_w","out_h","bitrate"}` whenever a track's session is built (start,
+    mode change, crop, scale, track add), `{"event":"rate",...}` for
+    `bitrate`, and `{"event":"rate","track","command","error"}` for a refused
+    command, which leaves the track as it was. A malformed line still ends the
+    helper. On a guest mode change crops and scales carry over, clamped to
+    the new mode.
+  - `spice-console` (QEMU): `set_bitrate`/`rate_status` (rate control
+    version 1), `{"method":"set_scale","epoch":E,"width":W,"height":H}` and
+    `{"method":"set_crop","epoch":E,"x":X,"y":Y,"width":W,"height":H}`, with
+    the same rules against the crop's default codec-fit size (HEVC up to
+    1920x1080, H.264 up to 1280x720). The reply and a `view` event carry the
+    same fields as on Apple VZ. Crop and scale reset with each encoding
+    epoch. The vm-console broker forwards both methods and the `view` event
+    for the encoder owner; `vm-console-stream` accepts `scale W H` and
+    `crop X Y W H` on stdin and prints `view` lines on stderr. QEMU has one
+    track: the broker serves one encoder owner per epoch, so several tracks
+    there would need a broker change.
+- The stream is local only (loopback UI with a per-launch token). Remote
+  viewing, including several viewers of one Apple Virtualization desktop and
+  crop views for phones, is [remote desktop](remote-desktop.md).

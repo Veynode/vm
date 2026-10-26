@@ -63,6 +63,7 @@ async fn cancelled_exchange(initializing: bool) {
             "fixture".into(),
             Session {
                 principal: principal.name.clone(),
+                vm: None,
                 created: Instant::now(),
                 touched: Instant::now(),
                 io,
@@ -78,6 +79,7 @@ async fn cancelled_exchange(initializing: bool) {
         dispatch(
             &copy,
             &principal,
+            None,
             &Method::POST,
             &headers,
             &serde_json::to_vec(&request).unwrap(),
@@ -181,4 +183,109 @@ async fn screenshot_bridge_large_png_is_method_scoped_and_rejects_truncation_and
         }
         assert!(lifecycle.close().await);
     }
+}
+
+// `/vm/{id}/mcp`: the path's VM must be allowlisted, the child is bound to it with
+// `--vm`, and its session answers on that path only. The child is a synthetic MCP
+// fixture that records its arguments, not vm-control.
+#[tokio::test]
+async fn per_vm_sessions_are_bound_to_their_allowlisted_vm() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("stdio-fixture");
+    let argv = dir.path().join("argv");
+    fs::write(&script, format!("#!/usr/bin/env python3\nimport sys,json\nopen({},'w').write(' '.join(sys.argv[1:]))\nfor line in sys.stdin:\n    r=json.loads(line)\n    if 'id' in r:\n        print(json.dumps({{'jsonrpc':'2.0','id':r['id'],'result':{{'capabilities':{{}}}}}}),flush=True)\n", serde_json::to_string(&argv.to_string_lossy()).unwrap())).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let token = "t".repeat(40);
+    let principal = Principal {
+        name: "agent".into(),
+        token_sha256: Sha256::digest(token.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+        scopes: vec!["observe".into(), "input".into(), "browser".into()],
+        vm_ids: vec!["allowed".into()],
+        tools: vec![],
+    };
+    let mut app = fixture_app(dir.path(), script);
+    Arc::get_mut(&mut app).unwrap().config.principals = vec![principal];
+    let headers = |session: Option<&str>| {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert(
+            "accept",
+            HeaderValue::from_static("application/json, text/event-stream"),
+        );
+        headers.insert(
+            "mcp-protocol-version",
+            HeaderValue::from_static(vm_control::VERSION),
+        );
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        if let Some(session) = session {
+            headers.insert("mcp-session-id", HeaderValue::from_str(session).unwrap());
+        }
+        headers
+    };
+    let initialize =
+        Bytes::from(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}).to_string());
+    let refused = serve(
+        app.clone(),
+        Some("other".into()),
+        Method::POST,
+        headers(None),
+        initialize.clone(),
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+    assert!(app.sessions.lock().await.is_empty());
+    let created = serve(
+        app.clone(),
+        Some("allowed".into()),
+        Method::POST,
+        headers(None),
+        initialize,
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let session = created.headers()["mcp-session-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let recorded = fs::read_to_string(&argv).unwrap();
+    assert!(recorded.contains("--vm allowed"), "{recorded}");
+    assert!(recorded.contains("--allow-input") && recorded.contains("--allow-browser"));
+    assert!(!recorded.contains("--allow-clipboard"));
+    let ping = Bytes::from(json!({"jsonrpc":"2.0","id":2,"method":"ping"}).to_string());
+    for vm in [None, Some("other".to_string())] {
+        let reply = serve(
+            app.clone(),
+            vm,
+            Method::POST,
+            headers(Some(&session)),
+            ping.clone(),
+        )
+        .await;
+        assert_eq!(reply.status(), StatusCode::NOT_FOUND);
+    }
+    let reply = serve(
+        app.clone(),
+        Some("allowed".into()),
+        Method::POST,
+        headers(Some(&session)),
+        ping,
+    )
+    .await;
+    assert_eq!(reply.status(), StatusCode::OK);
+    let lifecycle = app
+        .sessions
+        .lock()
+        .await
+        .values()
+        .next()
+        .unwrap()
+        .lifecycle
+        .clone();
+    lifecycle.close().await;
 }

@@ -8,7 +8,7 @@ fn main() {
 }
 fn run() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let action=args.next().context("usage: vm-control daemon|mcp|call [--state-dir PATH] [--backend PATH] [--memory-budget-mib MIB] [--worker-key-event-log-dir DIR] [--allow-lifecycle] [--allow-execute] [--allow-files] [--allow-input] [--tools GROUP,...] [METHOD JSON]")?;
+    let action=args.next().context("usage: vm-control daemon|mcp|call [--state-dir PATH] [--backend PATH] [--memory-budget-mib MIB] [--worker-key-event-log-dir DIR] [--allow-lifecycle] [--allow-execute] [--allow-files] [--allow-input] [--allow-browser] [--allow-clipboard] [--tools GROUP,...] [--vm ID] [METHOD JSON]")?;
     let mut dir = None;
     let mut backend = None;
     let mut memory_budget_mib = None;
@@ -18,7 +18,10 @@ fn run() -> Result<()> {
     let mut execute = false;
     let mut files = false;
     let mut input = false;
-    let mut groups = vm_control::tool_groups::all();
+    let mut browser = false;
+    let mut clipboard = false;
+    let mut vm = None;
+    let mut groups = vm_control::tool_groups::default();
     let mut positional = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -67,6 +70,9 @@ fn run() -> Result<()> {
             "--allow-execute" => execute = true,
             "--allow-files" => files = true,
             "--allow-input" => input = true,
+            "--allow-browser" => browser = true,
+            "--allow-clipboard" => clipboard = true,
+            "--vm" => vm = Some(args.next().context("missing --vm id")?),
             "--tools" => {
                 groups =
                     vm_control::tool_groups::parse(&args.next().context("missing --tools groups")?)?
@@ -159,7 +165,19 @@ fn run() -> Result<()> {
                 worker_key_event_log_dir,
             )
         }
-        "mcp" => vm_control::mcp_with_tools(&dir, lifecycle, execute, files, input, groups),
+        "mcp" => vm_control::mcp_serve(
+            &dir,
+            &vm_control::McpOptions {
+                lifecycle,
+                execute,
+                files,
+                input,
+                browser,
+                clipboard,
+                vm,
+            },
+            groups,
+        ),
         "call" => {
             let method = positional.first().context("call requires METHOD [JSON]")?;
             let payload = positional

@@ -121,6 +121,8 @@ struct Vm {
     accessibility: Option<bool>,
     /// Box centers of elements read in this session, for batch steps that click a ref.
     centers: HashMap<String, (u64, u64)>,
+    /// The frame each OCR snapshot was read from (`ocr_window_state`).
+    ocr_frames: HashMap<String, Value>,
 }
 
 #[derive(Default)]
@@ -129,6 +131,41 @@ pub struct Session {
     next_ref: u64,
     /// Added to every frame age; tests stand in for the time a model's turn takes.
     skew: Duration,
+}
+
+/// Rows of an OCR snapshot, for a Guest without cua-driver.
+const MAX_OCR_ROWS: usize = 200;
+
+/// A host input tool's call, for its `ActionResult` (`action_result`).
+struct Action {
+    tool: String,
+    target: Option<(f64, f64)>,
+}
+impl Action {
+    fn result(&self, vm: &str, wait: Option<&Value>) -> Value {
+        let keyboard = ["vm_input_key", "vm_input_text"].contains(&self.tool.as_str());
+        let observed = crate::action_result::observed_from_wait(wait, self.target, keyboard);
+        let summary = match self.target {
+            Some((x, y)) => format!("{} delivered at {x},{y}", self.tool),
+            None => format!("{} delivered", self.tool),
+        };
+        crate::action_result::host_input(vm, &summary, observed)
+    }
+}
+
+/// The daemon's control-lease refusal as tool content: the input was not sent.
+fn lease_refusal(vm: &str, error: &anyhow::Error) -> Option<Value> {
+    let text = error.to_string();
+    let rest = text.strip_prefix("person_in_control: ")?;
+    let quiet = rest
+        .split(' ')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    let refusal = crate::action_result::person_in_control(vm, quiet);
+    Some(
+        json!({"content":[{"type":"text","text":refusal.to_string()}],"structuredContent":{"action":refusal},"isError":true}),
+    )
 }
 
 pub fn handles(name: &str) -> bool {
@@ -195,7 +232,7 @@ impl Session {
                     result["element_after"] = json!(self.node_line(&vm, &after));
                 }
                 match observe {
-                    Some(observe) => self.observe(d, &vm, baseline, &observe, result),
+                    Some(observe) => self.observe(d, &vm, baseline, &observe, result, None),
                     None => text_content(result),
                 }
             }
@@ -203,19 +240,110 @@ impl Session {
                 let observe = Observe::take(&mut args)?;
                 let reanchored = self.reanchor(d, &vm, &mut args)?;
                 let baseline = args["frame_id"].clone();
-                let mut result = d.call(name.strip_prefix("vm_").unwrap(), args)?;
+                let action = Action {
+                    tool: name.to_string(),
+                    target: crate::action_result::target(name, &args),
+                };
+                let mut result = match d.call(name.strip_prefix("vm_").unwrap(), args) {
+                    Ok(result) => result,
+                    Err(error) => return lease_refusal(&vm, &error).ok_or(error),
+                };
                 if let Some(reanchored) = reanchored {
                     result["reanchored"] = reanchored;
                 }
                 match observe {
                     Some(observe) => {
                         result.as_object_mut().map(|r| r.remove("note"));
-                        self.observe(d, &vm, Some(baseline), &observe, result)
+                        self.observe(d, &vm, Some(baseline), &observe, result, Some(action))
                     }
-                    None => text_content(result),
+                    None => {
+                        result["action"] = action.result(&vm, None);
+                        text_content(result)
+                    }
                 }
             }
         }
+    }
+
+    /// `cua_get_window_state` for a Guest without cua-driver: the text the host reads
+    /// on the screen, as rows with tokens `<snapshot>:N` like the driver's. They are
+    /// not accessibility elements and are marked untrusted: `ocr_token_call` answers
+    /// the cua tools given one, and `vm_input_batch` can click them by ref.
+    pub fn ocr_window_state(&mut self, d: &mut impl Daemon, vm: &str) -> Result<Value> {
+        let shot = self.screenshot(d, vm)?;
+        let image = self.vm(vm).image.as_ref().unwrap().1.clone();
+        let text = d.vision(&["text".into()], &image, None)?;
+        let text = crate::screen_text::result(&shot, text)?;
+        self.next_ref += 1;
+        let snapshot = format!("ocr{}", self.next_ref);
+        let frame = anchor(&shot);
+        let state = self.vm(vm);
+        state.ocr_frames.insert(snapshot.clone(), frame.clone());
+        let mut rows = Vec::new();
+        let mut elements = Vec::new();
+        for (index, line) in text["lines"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(MAX_OCR_ROWS)
+            .enumerate()
+        {
+            let token = format!("{snapshot}:{index}");
+            if let (Some(x), Some(y)) = (line["center_x"].as_u64(), line["center_y"].as_u64()) {
+                state.centers.insert(token.clone(), (x, y));
+            }
+            let words = line["text"].as_str().unwrap_or_default();
+            rows.push(format!(
+                "- [{index}] text {} {}",
+                quoted(words, TEXT_CHARS),
+                box_text(line, true)
+            ));
+            elements.push(json!({"element_token":token,"text":words,"x":line["x"],"y":line["y"],"width":line["width"],"height":line["height"],"center_x":line["center_x"],"center_y":line["center_y"],"confidence":line["confidence"]}));
+        }
+        let tree = rows.join("\n");
+        let structured = json!({
+            "snapshot_id":snapshot,"source":"host_ocr","trusted":false,"frame":frame,
+            "tree_markdown":tree,"elements":elements,
+            "hint":"This Guest has no cua-driver: rows are text the host read on the screen, not accessibility elements. Click one with vm_input_click at its center in this frame; verify_state reports unknown for them."
+        });
+        Ok(
+            json!({"content":[{"type":"text","text":format!("host OCR of {vm} (untrusted, no cua-driver), frame {}:\n{tree}", frame["frame_id"])}],"structuredContent":structured,"isError":false}),
+        )
+    }
+
+    /// A cua tool call that names an OCR token: answered here, never sent to a driver.
+    /// `verify_state` cannot check text the host read, so it is unknown; an action is
+    /// refused with the host pixel input that would do it as `next_call`.
+    pub fn ocr_token_call(&mut self, vm: &str, tool: &str, args: &Value) -> Option<Value> {
+        fn first_token(value: &Value) -> Option<&str> {
+            match value {
+                Value::String(s) if s.starts_with("ocr") && s.contains(':') => Some(s),
+                Value::Array(items) => items.iter().find_map(first_token),
+                Value::Object(map) => map.values().find_map(first_token),
+                _ => None,
+            }
+        }
+        let token = first_token(args)?.to_string();
+        let structured = if tool == "verify_state" {
+            json!({"status":"unknown","reason":"untrusted_source","element_token":token,"hint":"OCR rows are read from pixels; take a new cua_get_window_state or vm_screen_text and compare the text yourself."})
+        } else {
+            let state = self.vm(vm);
+            let snapshot = token.split(':').next().unwrap_or_default();
+            let mut next = json!({"tool":"vm_input_click","arguments":{"id":vm}});
+            if let (Some((x, y)), Some(frame)) =
+                (state.centers.get(&token), state.ocr_frames.get(snapshot))
+            {
+                next["arguments"]["x"] = json!(x);
+                next["arguments"]["y"] = json!(y);
+                for key in ["frame_id", "width", "height", "source_generation"] {
+                    next["arguments"][key] = frame[key].clone();
+                }
+            }
+            json!({"effect":"refused","route":"virtual_hid","error":{"code":"untrusted_element","hint":"An OCR row is not an accessibility element; act on its pixels on the host."},"escalation":{"target":"pixel","reason":"route_unavailable"},"next_call":next})
+        };
+        Some(
+            json!({"content":[{"type":"text","text":structured.to_string()}],"structuredContent":structured,"isError":tool != "verify_state"}),
+        )
     }
 
     /// The Guest's ref for a short ref of this session; a Guest ref as it is.
@@ -416,8 +544,10 @@ impl Session {
         baseline: Option<Value>,
         observe: &Observe,
         mut result: Value,
+        action: Option<Action>,
     ) -> Result<Value> {
         let mut observed = json!({"return":observe.ret});
+        let mut waited = None;
         if observe.timeout_ms > 0 {
             let mut wait =
                 json!({"id":vm,"timeout_ms":observe.timeout_ms,"settle_ms":observe.settle_ms});
@@ -431,9 +561,13 @@ impl Session {
                             observed[key] = wait[key].clone();
                         }
                     }
+                    waited = Some(wait);
                 }
                 Err(error) => observed["wait_error"] = json!(error.to_string()),
             }
+        }
+        if let Some(action) = &action {
+            result["action"] = action.result(vm, waited.as_ref());
         }
         let before = self
             .vm(vm)
@@ -1238,7 +1372,7 @@ impl Session {
                 if let Some(start) = start {
                     self.vm(vm).image = Some(start);
                 }
-                self.observe(d, vm, baseline, &observe, result)?
+                self.observe(d, vm, baseline, &observe, result, None)?
             }
             None => text_content(result)?,
         };

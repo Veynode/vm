@@ -2,6 +2,7 @@
 //! Callers must stop active transports returned by `replace_grants` and enforce expiry.
 pub mod ice;
 pub mod rejection;
+pub mod remote;
 use anyhow::{ensure, Context, Result};
 use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use rand_core::{OsRng, RngCore};
@@ -416,6 +417,8 @@ struct GateState {
     challenges: BTreeMap<String, Challenge>,
     pending: BTreeMap<String, AnswerTranscript>,
     active: BTreeMap<String, AnswerTranscript>,
+    remote_pending: BTreeMap<String, remote::RemoteTranscript>,
+    remote_active: BTreeMap<String, remote::RemoteTranscript>,
 }
 pub struct SessionGate {
     host_id: String,
@@ -469,6 +472,8 @@ impl SessionGate {
                 challenges: BTreeMap::new(),
                 pending: BTreeMap::new(),
                 active: BTreeMap::new(),
+                remote_pending: BTreeMap::new(),
+                remote_active: BTreeMap::new(),
             }),
         };
         gate.replace_grants(host_public, grants)?;
@@ -543,6 +548,16 @@ impl SessionGate {
             }
             keep
         });
+        let st = &mut *state;
+        for map in [&mut st.remote_active, &mut st.remote_pending] {
+            map.retain(|id, t| {
+                let keep = authorized(&current, &t.intent.challenge).is_ok();
+                if !keep {
+                    revoked.push(id.clone())
+                }
+                keep
+            });
+        }
         state
             .challenges
             .retain(|_, c| authorized(&current, c).is_ok());
@@ -601,10 +616,7 @@ impl SessionGate {
         );
         let mut state = self.state.lock().unwrap();
         prune(&mut state, now);
-        ensure!(
-            state.pending.len() + state.active.len() < 256,
-            "session capacity"
-        );
+        ensure!(remote::sessions(&state) < 256, "session capacity");
         ensure!(
             state.challenges.get(&intent.challenge.nonce) == Some(&intent.challenge),
             "challenge expired, replaced or consumed"
@@ -647,9 +659,11 @@ impl SessionGate {
             "challenge expired"
         );
         ensure!(
-            state.pending.len() + state.active.len() < 256
+            remote::sessions(&state) < 256
                 && !state.pending.contains_key(&transcript.session_id)
-                && !state.active.contains_key(&transcript.session_id),
+                && !state.active.contains_key(&transcript.session_id)
+                && !state.remote_pending.contains_key(&transcript.session_id)
+                && !state.remote_active.contains_key(&transcript.session_id),
             "session capacity or duplicate"
         );
         let signature = host.sign(&bytes)?;
@@ -711,6 +725,8 @@ impl SessionGate {
         let mut state = self.state.lock().unwrap();
         state.pending.remove(session_id);
         state.active.remove(session_id);
+        state.remote_pending.remove(session_id);
+        state.remote_active.remove(session_id);
     }
     /// Call before accepting each sensitive operation. Transport owns media termination and lifetime.
     pub fn authorize_active(&self, session_id: &str, scope: &str) -> Result<()> {
@@ -780,6 +796,9 @@ fn prune(state: &mut GateState, now: u64) {
         .retain(|_, c| now < c.expires_at && now >= c.issued_at);
     state
         .pending
+        .retain(|_, t| now < t.intent.challenge.expires_at && now >= t.intent.challenge.issued_at);
+    state
+        .remote_pending
         .retain(|_, t| now < t.intent.challenge.expires_at && now >= t.intent.challenge.issued_at);
 }
 #[cfg(test)]
