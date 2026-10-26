@@ -174,6 +174,16 @@ impl Auth {
         );
         Ok(signed)
     }
+    /// The single teardown for an offer's session. Its signed authority ends first, then its
+    /// admitted credential is released, so the admission slot is free once the session ends.
+    pub fn teardown_session(&self, request_id: &str, session_id: &str) {
+        self.gate.close(session_id);
+        if let Some(source) = &self.ice_config {
+            // A poisoned entry table already refuses every admission and deadline check.
+            let _ = source.release(session_id);
+            let _ = source.release(request_id);
+        }
+    }
 }
 /// Startup and restart construction. Tests call this same helper with an in-memory registry.
 #[cfg(any(test, target_os = "macos"))]
@@ -380,50 +390,72 @@ pub async fn offer(
     })();
     match result {
         Ok(accepted) => {
-            if let Some(source) = &app.guest_binding {
-                // This guard bounds authenticated preflight RPCs/signatures before
-                // the existing session reservation. Busy is not a source failure.
-                let Ok(_preflight) = source.admit_preflight() else {
-                    return denied();
-                };
-                if !rejection_admission(&app, &req.signed_offer.intent.request_id, false).await {
-                    return denied();
-                }
-                if let Err(error) = source.validate().await {
-                    if !rejection_admission(&app, &req.signed_offer.intent.request_id, true).await {
-                        return denied();
-                    }
-                    let code = guest_binding::source_failure(&error).code;
-                    let Some(auth) = &app.auth else {
-                        return denied();
-                    };
-                    let signed = match auth.sign_rejection(req.signed_offer.intent, code) {
-                        Ok(signed) => signed,
-                        Err(_) => return denied(),
-                    };
-                    // The accepted token is dropped here. No reservation, peer,
-                    // input adapter or encoder has been created for this intent.
-                    let mut response = Json(json!({"signed_rejection":signed})).into_response();
-                    response.headers_mut().insert(
-                        header::CACHE_CONTROL,
-                        axum::http::HeaderValue::from_static("no-store"),
-                    );
-                    return response;
-                }
-            }
-            offer_inner(
-                app,
-                Offer {
-                    request_id: req.signed_offer.intent.request_id,
-                    sdp: req.sdp,
-                    r#type: "offer".into(),
-                    codec: req.signed_offer.intent.codec,
-                },
-                Some(accepted),
-            )
-            .await
+            let request = req.signed_offer.intent.request_id.clone();
+            let response = admitted_offer(&app, req, accepted).await;
+            release_unstarted(&app, &request).await;
+            response
         }
         Err(_) => denied(),
+    }
+}
+/// Everything after admission. Each refusal here returns before any session slot exists.
+async fn admitted_offer(
+    app: &App,
+    req: SignedOfferRequest,
+    accepted: protocol::AcceptedOffer,
+) -> Response {
+    if let Some(source) = &app.guest_binding {
+        // This guard bounds authenticated preflight RPCs/signatures before
+        // the existing session reservation. Busy is not a source failure.
+        let Ok(_preflight) = source.admit_preflight() else {
+            return denied();
+        };
+        if !rejection_admission(app, &req.signed_offer.intent.request_id, false).await {
+            return denied();
+        }
+        if let Err(error) = source.validate().await {
+            if !rejection_admission(app, &req.signed_offer.intent.request_id, true).await {
+                return denied();
+            }
+            let code = guest_binding::source_failure(&error).code;
+            let Some(auth) = &app.auth else {
+                return denied();
+            };
+            let signed = match auth.sign_rejection(req.signed_offer.intent, code) {
+                Ok(signed) => signed,
+                Err(_) => return denied(),
+            };
+            // The accepted token is dropped here. No reservation, peer,
+            // input adapter or encoder has been created for this intent.
+            let mut response = Json(json!({"signed_rejection":signed})).into_response();
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            return response;
+        }
+    }
+    offer_inner(
+        app.clone(),
+        Offer {
+            request_id: req.signed_offer.intent.request_id,
+            sdp: req.sdp,
+            r#type: "offer".into(),
+            codec: req.signed_offer.intent.codec,
+        },
+        Some(accepted),
+    )
+    .await
+}
+/// An admitted offer that did not start a session keeps no admission entry. A running
+/// session keeps its entry, and its teardown releases it.
+async fn release_unstarted(app: &App, request: &str) {
+    let Some(source) = app.auth.as_ref().and_then(|a| a.ice_config.as_ref()) else {
+        return;
+    };
+    let book = app.active.lock().await;
+    if !book.active.as_ref().is_some_and(|s| s.request == request) {
+        let _ = source.release(request);
     }
 }
 // A rejection for a new intent must not clear or borrow an existing session's

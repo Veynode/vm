@@ -17,7 +17,7 @@ go -C guest/veynode-agent test -race ./...
 GOOS=linux GOARCH=arm64 go -C guest/veynode-agent vet ./...
 python3 -m unittest discover -s tests -v
 npm --prefix browser test
-npm --prefix web ci --no-audit --no-fund
+if [[ ! web/node_modules/.package-lock.json -nt web/package-lock.json ]]; then npm --prefix web ci --no-audit --no-fund; fi
 npm --prefix web run typecheck
 npm --prefix web run build
 npm --prefix web test

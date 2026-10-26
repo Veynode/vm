@@ -83,7 +83,7 @@ func uniqueSerialJSON(data []byte) bool {
 	_, err := d.Token()
 	return err == io.EOF
 }
-func validateSerialV2(e serialEnvelope, hello bool) error {
+func (manager *jobManager) validateSerialV2(e serialEnvelope, hello bool) error {
 	if !uniqueSerialJSON(e.wire) {
 		return fmt.Errorf("invalid or duplicate serial JSON")
 	}
@@ -113,9 +113,12 @@ func validateSerialV2(e serialEnvelope, hello bool) error {
 	case "info", "heartbeat":
 	case "exec_start":
 		keys = append(keys, "argv", "timeout_ms")
-		if validateCommand(*req) != nil {
+		if manager.validateAsyncCommand(*req) != nil {
 			return fmt.Errorf("invalid start arguments")
 		}
+	case "text_input":
+		// Content errors are answered with invalid_request; they do not fence execution.
+		keys = append(keys, "text_hex")
 	case "exec_poll", "exec_cancel":
 		keys = append(keys, "job_id")
 		if !validJobID(req.JobID) || req.JobID != string(bytes.ToLower([]byte(req.JobID))) {
@@ -175,7 +178,7 @@ func serveSerialExec(s deadlineStream, manager *jobManager) (returned error) {
 	if err != nil {
 		return err
 	}
-	if validateSerialV2(hello, true) != nil || hello.Version != 2 || hello.Type != "hello" || hello.GuestNonce != nonce || !validSerialNonce(hello.HostNonce) || hello.Sequence != 0 || hello.Request != nil || hello.Response != nil {
+	if manager.validateSerialV2(hello, true) != nil || hello.Version != 2 || hello.Type != "hello" || hello.GuestNonce != nonce || !validSerialNonce(hello.HostNonce) || hello.Sequence != 0 || hello.Request != nil || hello.Response != nil {
 		return fmt.Errorf("serial v2 handshake rejected")
 	}
 	if err = serialWrite(s, serialEnvelope{Version: 2, Type: "ready", GuestNonce: nonce, HostNonce: hello.HostNonce}); err != nil {
@@ -255,7 +258,7 @@ func serveSerialExec(s deadlineStream, manager *jobManager) (returned error) {
 				trip(fmt.Errorf("serial request read failed"))
 				return
 			}
-			if validateSerialV2(e, false) != nil || e.Version != 2 || e.Type != "request" || e.GuestNonce != nonce || e.HostNonce != hello.HostNonce || e.Sequence != seq || e.Response != nil {
+			if manager.validateSerialV2(e, false) != nil || e.Version != 2 || e.Type != "request" || e.GuestNonce != nonce || e.HostNonce != hello.HostNonce || e.Sequence != seq || e.Response != nil {
 				trip(fmt.Errorf("serial request binding rejected"))
 				return
 			}
@@ -303,6 +306,8 @@ func serveSerialExec(s deadlineStream, manager *jobManager) (returned error) {
 					reply = manager.poll(req)
 				case "exec_cancel":
 					reply = manager.cancel(req)
+				case "text_input":
+					reply = handleTextInput(req)
 				}
 				// Release the completed operation before publishing its reply. A fast
 				// client may submit its next request as soon as the writer sends it.

@@ -6,6 +6,85 @@ struct GuestStreamBridgeError: LocalizedError {
     var errorDescription: String? { message }
 }
 
+// The connector returns an owned close operation, never a stream to read/write.
+// Late successful connects must still close after the reply deadline has passed.
+final class GuestStreamProbe {
+    typealias Connector = (@escaping (Result<() -> Void, Error>) -> Void) -> Void
+    private let lock = NSLock()
+    private var completion: (([String:Any]) -> Void)?
+    private let deadline: DispatchTime
+
+    static func response(_ error: String? = nil) -> [String:Any] {
+        ["reachable":error == nil,"guest_port":5001,"error":error as Any? ?? NSNull()]
+    }
+    private init(timeoutMilliseconds: Int, completion: @escaping ([String:Any]) -> Void) {
+        self.completion = completion
+        deadline = .now() + .milliseconds(timeoutMilliseconds)
+    }
+    static func run(timeoutMilliseconds: Int = 2000, connector: Connector,
+                    completion: @escaping ([String:Any]) -> Void) {
+        let probe = GuestStreamProbe(timeoutMilliseconds:timeoutMilliseconds, completion:completion)
+        DispatchQueue.main.asyncAfter(deadline:probe.deadline) { probe.finish("timeout") }
+        connector { result in
+            switch result {
+            case .success(let close): close(); probe.finish(nil)
+            case .failure: probe.finish("guest_unavailable")
+            }
+        }
+    }
+    private func finish(_ error: String?) {
+        lock.lock()
+        let callback = completion; completion = nil
+        let code = DispatchTime.now() >= deadline ? "timeout" : error
+        lock.unlock()
+        callback?(Self.response(code))
+    }
+}
+
+// Used on the VM's main queue, including connector callbacks. Reply deadlines
+// and admission bounds are separate because VZ connect cannot be cancelled.
+final class GuestStreamProbeCoordinator {
+    static let pendingLifetimeNanoseconds: UInt64 = 30_000_000_000
+    static let minimumIntervalNanoseconds: UInt64 = 5_000_000_000
+    private let now: () -> UInt64
+    private var generation: UInt64 = 0
+    private var pending: (generation: UInt64, started: UInt64)?
+    private var lastStarted: UInt64?
+    private var lastResult: (response: [String:Any], received: UInt64)?
+
+    init(now: @escaping () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }) { self.now = now }
+    func run(timeoutMilliseconds: Int = 2000, connector: GuestStreamProbe.Connector,
+             completion: @escaping ([String:Any]) -> Void) {
+        let instant = now()
+        if let started = lastStarted, instant - started < Self.minimumIntervalNanoseconds {
+            let cached = lastResult ?? (GuestStreamProbe.response("busy"), started)
+            var response = cached.response
+            response["cached"] = true
+            response["age_ms"] = (instant - cached.received) / 1_000_000
+            completion(response); return
+        }
+        if let pending, instant - pending.started < Self.pendingLifetimeNanoseconds {
+            completion(GuestStreamProbe.response("busy")); return
+        }
+        generation += 1
+        let current = generation
+        pending = (current, instant); lastStarted = instant
+        GuestStreamProbe.run(timeoutMilliseconds:timeoutMilliseconds, connector:{ complete in
+            connector { result in
+                guard self.pending?.generation == current else {
+                    if case .success(let close) = result { close() }
+                    return
+                }
+                self.pending = nil
+                complete(result)
+            }
+        }, completion:{ response in
+            if self.generation == current { self.lastResult = (response, self.now()) }
+            completion(response)
+        })
+    }
+}
+
 // An owned duplicate descriptor. The original VZ connection stays retained until
 // onClose runs on the VM queue; the forwarding loop never calls VZ APIs.
 final class GuestStreamEndpoint {

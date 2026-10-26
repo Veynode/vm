@@ -22,12 +22,32 @@ use vm_session_auth::ice::IceConfig;
 /// admitted session always keeps at least 180 s from its admission.
 pub const SESSION_END_MARGIN_SECONDS: u64 = 30;
 
+/// Hard cap on one connected media session, in seconds. `run_session` (main.rs) ends the stream
+/// when `media_session_cap_elapsed` completes, and `SESSION_END_MARGIN_SECONDS` above is defined
+/// against this value: the 210 s admission minimum (session-auth `ice.rs`, `check_time`) less
+/// the margin equals this cap. Changing it changes the public session lifetime, so it must be
+/// decided on purpose; `remote_bounds_tests` fails on any drift of the value or its wiring.
+pub const MEDIA_SESSION_CAP_SECONDS: u64 = 180;
+
+/// Completes when the media session cap has elapsed. This is the exact future `run_session`
+/// races against the streaming, feedback and authorization futures, so the production cap and
+/// the tested cap are the same code.
+pub async fn media_session_cap_elapsed() {
+    tokio::time::sleep(std::time::Duration::from_secs(MEDIA_SESSION_CAP_SECONDS)).await;
+}
+
 pub struct IceSource {
     path: PathBuf,
     requests: Mutex<BTreeMap<String, Vec<Instant>>>,
-    /// Session deadlines: an admitted offer is keyed by its request id until its
-    /// answer is signed, then by its session id. Expired entries are pruned on admission.
-    deadlines: Mutex<BTreeMap<String, u64>>,
+    /// Admitted offers: keyed by request id until the answer is signed, then by session id.
+    /// Expired entries are pruned on admission.
+    deadlines: Mutex<BTreeMap<String, Admission>>,
+}
+/// What admission recorded for one offer. The credential the peer uses and the session
+/// end derived from it come from the same single read of the file.
+struct Admission {
+    until: u64,
+    config: IceConfig,
 }
 impl IceSource {
     pub fn open(path: PathBuf, now: u64) -> Result<Self> {
@@ -65,7 +85,7 @@ impl IceSource {
     }
     /// Admits an offer under the credential now on disk. `read` refuses expired and
     /// under-minimum credentials, so the refusal happens before any session slot exists.
-    /// The admitted offer then carries that credential's session deadline.
+    /// The admitted offer keeps that credential for its peer and its session deadline.
     pub fn admit_offer(&self, request_id: &str, now: u64) -> Result<()> {
         let config = self.read(now)?;
         let until = config
@@ -73,39 +93,63 @@ impl IceSource {
             .checked_sub(SESSION_END_MARGIN_SECONDS)
             .context("ICE credential too short for the session margin")?;
         let mut deadlines = self.lock_deadlines()?;
-        deadlines.retain(|_, deadline| now < *deadline);
+        deadlines.retain(|_, admission| now < admission.until);
         ensure!(
             !deadlines.contains_key(request_id),
             "ICE offer already admitted"
         );
         ensure!(deadlines.len() < 256, "ICE admission capacity");
-        deadlines.insert(request_id.into(), until);
+        deadlines.insert(request_id.into(), Admission { until, config });
         Ok(())
     }
-    /// Moves an admitted offer's deadline to the session id its answer was signed under.
+    /// Moves an admitted offer's credential and deadline to the session id its answer was
+    /// signed under.
     pub fn bind_session(&self, request_id: &str, session_id: &str) -> Result<()> {
         let mut deadlines = self.lock_deadlines()?;
         ensure!(
             !deadlines.contains_key(session_id),
             "ICE session already bound"
         );
-        let until = deadlines
+        let admission = deadlines
             .remove(request_id)
             .context("admitted offer unavailable")?;
-        deadlines.insert(session_id.into(), until);
+        deadlines.insert(session_id.into(), admission);
         Ok(())
     }
     /// Fails once a session reaches its credential deadline. A session with no
     /// bound deadline fails closed.
     pub fn check_session(&self, session_id: &str, now: u64) -> Result<()> {
         let deadlines = self.lock_deadlines()?;
-        let until = deadlines
+        let admission = deadlines
             .get(session_id)
             .context("session credential unavailable")?;
-        ensure!(now < *until, "ICE credential lifetime reached session end");
+        ensure!(
+            now < admission.until,
+            "ICE credential lifetime reached session end"
+        );
         Ok(())
     }
-    fn lock_deadlines(&self) -> Result<std::sync::MutexGuard<'_, BTreeMap<String, u64>>> {
+    /// The credential an admitted offer's peer must use: the exact one admission read. It is
+    /// looked up by request id, before the answer binds the offer to its session. A missing or
+    /// expired entry fails closed. The file is never read again here.
+    pub fn admitted_config(&self, request_id: &str, now: u64) -> Result<IceConfig> {
+        let deadlines = self.lock_deadlines()?;
+        let admission = deadlines
+            .get(request_id)
+            .context("admitted ICE credential unavailable")?;
+        ensure!(
+            now < admission.until,
+            "admitted ICE credential lifetime reached session end"
+        );
+        Ok(admission.config.clone())
+    }
+    /// Removes a request's or a session's admission. Called from session teardown, and for an
+    /// admitted offer that never started a session.
+    pub fn release(&self, key: &str) -> Result<()> {
+        self.lock_deadlines()?.remove(key);
+        Ok(())
+    }
+    fn lock_deadlines(&self) -> Result<std::sync::MutexGuard<'_, BTreeMap<String, Admission>>> {
         self.deadlines
             .lock()
             .map_err(|_| anyhow::anyhow!("ICE admission unavailable"))
@@ -158,6 +202,18 @@ pub fn configuration(config: Option<&IceConfig>, now: u64) -> Result<RTCConfigur
                 .collect(),
         )
         .build())
+}
+
+/// The ICE credential an admitted offer's peer uses. Without an ICE source the peer keeps the
+/// local default. With one, the admitted credential is required: there is no re-read fallback.
+pub fn peer_credential(
+    source: Option<&IceSource>,
+    request_id: &str,
+    now: u64,
+) -> Result<Option<IceConfig>> {
+    source
+        .map(|source| source.admitted_config(request_id, now))
+        .transpose()
 }
 
 #[cfg(test)]
@@ -270,8 +326,75 @@ mod tests {
         assert!(source.admit_offer("expired", 700).is_err());
         assert!(source.admit_offer("expired-later", 800).is_err());
     }
+    fn credential_file(expires_at: u64, credential: &str) -> Vec<u8> {
+        serde_json::to_vec(&IceConfig {
+            version: 1,
+            transport_policy: "all".into(),
+            issued_at: 100,
+            expires_at,
+            ice_servers: vec![vm_session_auth::ice::IceServer {
+                urls: vec!["turn:127.0.0.1:3478?transport=udp".into()],
+                username: "fixture-user".into(),
+                credential: credential.into(),
+            }],
+        })
+        .unwrap()
+    }
+    /// Synthetic clock only. The file rotates to a shorter-lived credential after admission
+    /// and before the peer's read; the peer and the session deadline keep the admitted one.
+    #[test]
+    fn peer_uses_the_admitted_credential_after_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = private_source(dir.path(), &credential_file(700, "admitted-credential"));
+        source.admit_offer("offer-request", 100).unwrap();
+        std::fs::write(
+            dir.path().join("ice.json"),
+            credential_file(400, "rotated-credential"),
+        )
+        .unwrap();
+        let used = peer_credential(Some(&source), "offer-request", 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            used.ice_servers[0].credential, "admitted-credential",
+            "the peer must not re-read the rotated file"
+        );
+        source.bind_session("offer-request", "session").unwrap();
+        assert!(
+            source
+                .check_session("session", used.expires_at - SESSION_END_MARGIN_SECONDS)
+                .is_err(),
+            "the session must end when the credential the peer used ends"
+        );
+    }
+    /// A peer with no admitted credential for its offer fails closed, never a file fallback.
+    #[test]
+    fn peer_path_fails_closed_without_an_admitted_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = private_source(dir.path(), &bytes());
+        assert!(
+            peer_credential(Some(&source), "never-admitted", 100).is_err(),
+            "an offer that was never admitted has no peer credential"
+        );
+        source.admit_offer("offer", 100).unwrap();
+        source.bind_session("offer", "session").unwrap();
+        assert!(
+            peer_credential(Some(&source), "offer", 100).is_err(),
+            "a bound offer no longer has a request-keyed credential"
+        );
+        assert!(
+            peer_credential(None, "never-admitted", 100)
+                .unwrap()
+                .is_none(),
+            "no ICE configuration keeps the local default"
+        );
+    }
 }
 
 #[cfg(test)]
 #[path = "ice_transport_tests.rs"]
 mod transport_tests;
+
+#[cfg(test)]
+#[path = "remote_bounds_tests.rs"]
+mod remote_bounds_tests;

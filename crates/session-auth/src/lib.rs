@@ -782,3 +782,5 @@ fn prune(state: &mut GateState, now: u64) {
         .pending
         .retain(|_, t| now < t.intent.challenge.expires_at && now >= t.intent.challenge.issued_at);
 }
+#[cfg(test)]
+mod bounds_tests;

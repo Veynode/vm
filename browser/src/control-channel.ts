@@ -8,6 +8,15 @@ export const CONTROL_FRAGMENT_BYTES = 16 * 1024;
 export const CONTROL_MESSAGE_BYTES = 1024 * 1024;
 const HEADER_BYTES = 17, HIGH_WATER = 64 * 1024;
 export class ControlChannelError extends Error { constructor(message: string) { super(message); this.name = 'ControlChannelError'; } }
+/** The typed reply `{"sequence","error":"frame unavailable","reason"}` to an `observe_frame` request: the request
+ * was authentic and in sequence, but the host had no usable control picture this time. It fences nothing: the
+ * channel and the session stay valid and the sequence number is consumed, exactly as on the host.
+ * Deliberately not a ControlChannelError, which always means the channel is closed. */
+export const CONTROL_FRAME_UNAVAILABLE = 'frame unavailable';
+const FRAME_UNAVAILABLE_REASON = /^[a-z_]{1,32}$/;
+export class ControlFrameUnavailableError extends Error {
+  constructor(readonly reason: string) { super(`Control picture unavailable (${reason}); control is not fenced`); this.name = 'ControlFrameUnavailableError'; }
+}
 interface Options {
   isConfirmed: () => boolean;
   onFailure?: (error: Error) => void;
@@ -17,6 +26,8 @@ interface Options {
 }
 interface Pending {
   sequence: number;
+  /** Only an `observe_frame` request may be answered with the typed "frame unavailable" reply. */
+  observeFrame: boolean;
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   sent: boolean;
@@ -69,10 +80,11 @@ export class EncryptedControlChannel {
     const bytes = new TextEncoder().encode(text);
     requireValue(bytes.length > 0 && bytes.length <= CONTROL_MESSAGE_BYTES, 'Control request too large');
     this.lastSequence = sequence;
+    const observeFrame = (signed.request as { action?: { kind?: unknown } }).action?.kind === 'observe_frame';
     const result = new Promise<unknown>((resolve, reject) => {
       const abort = () => this.close('Control request cancelled; outcome may be unknown');
       const pending: Pending = {
-        sequence, resolve, reject, sent: false, received: 0,
+        sequence, observeFrame, resolve, reject, sent: false, received: 0,
         timer: setTimeout(() => this.close('Control response deadline exceeded; outcome may be unknown'), this.requestTimeout),
         watch: setInterval(() => { if (!this.authorized()) this.close('Session authorization ended'); }, 20),
         removeAbort: () => signal?.removeEventListener('abort', abort),
@@ -131,6 +143,13 @@ export class EncryptedControlChannel {
       if (keys.join(',') === 'error,sequence') {
         requireValue(value.error === 'control rejected', 'Invalid control rejection envelope');
         throw new ControlChannelError('Control rejected; session control is fenced');
+      }
+      if (keys.join(',') === 'error,reason,sequence') {
+        // Exactly this shape, exactly this request kind and a bounded fixed-word reason; anything else still fences.
+        const reason = value.reason;
+        requireValue(pending.observeFrame && value.error === CONTROL_FRAME_UNAVAILABLE && typeof reason === 'string' && FRAME_UNAVAILABLE_REASON.test(reason), 'Invalid control response fields');
+        // The reply is complete and the sequence is consumed (lastSequence already advanced); the channel stays open.
+        this.clearPending(); pending.reject(new ControlFrameUnavailableError(reason)); return;
       }
       requireValue(keys.join(',') === 'result,sequence' && value.result !== null && typeof value.result === 'object' && !Array.isArray(value.result), 'Invalid control response fields');
       this.clearPending(); pending.resolve(value);

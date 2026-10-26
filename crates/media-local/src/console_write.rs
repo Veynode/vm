@@ -1,6 +1,6 @@
 //! Bounded Unix-console writes. A failure can leave a partial record on the
 //! wire: the caller must close the connection, never append another record.
-use crate::console_wire::{Record, MAX_BODY};
+use crate::console_wire::{body_limit, Record};
 use anyhow::{bail, Context, Result};
 use std::{
     io,
@@ -23,8 +23,7 @@ pub fn write_record_deadline(
     timeout: Duration,
 ) -> Result<()> {
     if record.body.is_empty()
-        || record.body.len() > MAX_BODY
-        || !matches!(record.kind, 1 | 2)
+        || body_limit(record.kind).is_none_or(|limit| record.body.len() > limit)
         || (record.kind == 2 && (record.epoch == 0 || record.body.len() <= 9 || record.body[8] > 1))
     {
         bail!("invalid console record")

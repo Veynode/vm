@@ -8,15 +8,17 @@ fn main() {
 }
 fn run() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let action=args.next().context("usage: vm-control daemon|mcp|call [--state-dir PATH] [--backend PATH] [--memory-budget-mib MIB] [--allow-lifecycle] [--allow-execute] [--allow-files] [METHOD JSON]")?;
+    let action=args.next().context("usage: vm-control daemon|mcp|call [--state-dir PATH] [--backend PATH] [--memory-budget-mib MIB] [--worker-key-event-log-dir DIR] [--allow-lifecycle] [--allow-execute] [--allow-files] [--allow-input] [--tools GROUP,...] [METHOD JSON]")?;
     let mut dir = None;
     let mut backend = None;
     let mut memory_budget_mib = None;
+    let mut worker_key_event_log_dir = None;
     let mut qemu_options = std::collections::BTreeMap::new();
     let mut lifecycle = false;
     let mut execute = false;
     let mut files = false;
     let mut input = false;
+    let mut groups = vm_control::tool_groups::all();
     let mut positional = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -27,6 +29,17 @@ fn run() -> Result<()> {
             }
             "--backend" => {
                 backend = Some(PathBuf::from(args.next().context("missing backend path")?))
+            }
+            "--worker-key-event-log-dir" => {
+                if worker_key_event_log_dir
+                    .replace(PathBuf::from(
+                        args.next()
+                            .context("missing worker key-event log directory")?,
+                    ))
+                    .is_some()
+                {
+                    bail!("--worker-key-event-log-dir given more than once")
+                }
             }
             "--qemu-worker"
             | "--qemu-launcher"
@@ -54,8 +67,18 @@ fn run() -> Result<()> {
             "--allow-execute" => execute = true,
             "--allow-files" => files = true,
             "--allow-input" => input = true,
+            "--tools" => {
+                groups =
+                    vm_control::tool_groups::parse(&args.next().context("missing --tools groups")?)?
+            }
             _ => positional.push(arg),
         }
+    }
+    if let Some(path) = &worker_key_event_log_dir {
+        if action != "daemon" {
+            bail!("--worker-key-event-log-dir is a local daemon option only")
+        }
+        vm_control::validate_worker_key_event_log_dir(path)?;
     }
     if action != "daemon" && (memory_budget_mib.is_some() || !qemu_options.is_empty()) {
         bail!("--memory-budget-mib is a local daemon option only")
@@ -128,9 +151,15 @@ fn run() -> Result<()> {
                     venus_runtime: qemu_options.remove("--qemu-venus-runtime"),
                 })
             };
-            vm_control::serve_with_qemu(dir, backend, memory_budget_mib, qemu)
+            vm_control::serve_with_worker_key_event_log(
+                dir,
+                backend,
+                memory_budget_mib,
+                qemu,
+                worker_key_event_log_dir,
+            )
         }
-        "mcp" => vm_control::mcp_with_input(&dir, lifecycle, execute, files, input),
+        "mcp" => vm_control::mcp_with_tools(&dir, lifecycle, execute, files, input, groups),
         "call" => {
             let method = positional.first().context("call requires METHOD [JSON]")?;
             let payload = positional

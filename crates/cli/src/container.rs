@@ -30,6 +30,8 @@ use veynodevm_oci::{ImageRecord, Store};
 use vm_control::home;
 
 pub const CONFIG_MAGIC: &[u8] = b"VEYNODEVM-CONFIG-V1\n";
+/// Apple Virtualization generic machine identifier, created by the worker.
+pub const MACHINE_IDENTIFIER_FILE: &str = "vz-machine-id.bin";
 const CONFIG_DISK_BYTES: usize = 1 << 20;
 pub const MARKER: &str = "@@veynodevm ";
 
@@ -85,6 +87,9 @@ pub struct Container {
     pub tty: bool,
     #[serde(default)]
     pub stdin: bool,
+    /// Set on containers made by `fork` (see `checkpoint`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_of: Option<crate::checkpoint::ForkOrigin>,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -240,7 +245,31 @@ pub fn save(container: &Container) -> Result<()> {
     Ok(())
 }
 
-fn private_file(path: &Path) -> Result<File> {
+/// Write the read-only configuration disk (vdc) the guest agent reads at boot.
+pub fn write_config_disk(path: &Path, guest_config: &Value) -> Result<()> {
+    let mut body = CONFIG_MAGIC.to_vec();
+    body.extend(serde_json::to_vec(guest_config)?);
+    body.push(b'\n');
+    if body.len() > CONFIG_DISK_BYTES {
+        bail!("container configuration exceeds 1 MiB")
+    }
+    body.resize(CONFIG_DISK_BYTES, 0);
+    private_file(path)?.write_all(&body)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o400))?;
+    Ok(())
+}
+
+/// The guest configuration stored on a configuration disk.
+pub fn read_config_disk(path: &Path) -> Result<Value> {
+    let body = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let json = body
+        .strip_prefix(CONFIG_MAGIC)
+        .context("not a container configuration disk")?;
+    let end = json.iter().position(|&b| b == b'\n').unwrap_or(json.len());
+    Ok(serde_json::from_slice(&json[..end])?)
+}
+
+pub(crate) fn private_file(path: &Path) -> Result<File> {
     Ok(OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -336,7 +365,7 @@ pub fn status_text(container: &Container) -> (String, String) {
     (state, text)
 }
 
-fn port_free(port: &PortSpec) -> Result<()> {
+pub(crate) fn port_free(port: &PortSpec) -> Result<()> {
     if port.protocol == "tcp" {
         std::net::TcpListener::bind((port.host_address, port.host_port)).with_context(|| {
             format!(
@@ -573,16 +602,8 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
             // Only sent when used: older boot assets reject unknown fields.
             guest_config["init"] = json!("systemd");
         }
-        let mut body = CONFIG_MAGIC.to_vec();
-        body.extend(serde_json::to_vec(&guest_config)?);
-        body.push(b'\n');
-        if body.len() > CONFIG_DISK_BYTES {
-            bail!("container configuration exceeds 1 MiB")
-        }
-        body.resize(CONFIG_DISK_BYTES, 0);
         let config_disk = dir.join("config.img");
-        private_file(&config_disk)?.write_all(&body)?;
-        fs::set_permissions(&config_disk, fs::Permissions::from_mode(0o400))?;
+        write_config_disk(&config_disk, &guest_config)?;
         // A full desktop distribution (GNOME, KDE) needs more than a single app.
         let memory_mib =
             options
@@ -618,6 +639,16 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
             vm["width"] = json!(1280);
             vm["height"] = json!(800);
         }
+        let mac_address = if qemu {
+            None
+        } else {
+            // A fixed MAC and machine identifier make saved machine state
+            // restorable (warm checkpoints, see `checkpoint`).
+            let mac = crate::macos::random_mac();
+            vm["mac_address"] = json!(mac);
+            vm["machine_identifier_file"] = json!(dir.join(MACHINE_IDENTIFIER_FILE));
+            Some(mac)
+        };
         if qemu {
             vm["ports"] = json!(ports);
             if let Some(port) = session_port {
@@ -653,10 +684,11 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
             created_at: now(),
             vm_id: vm_id.clone(),
             os: String::new(),
-            mac_address: None,
+            mac_address,
             session_port,
             tty: options.tty,
             stdin: options.stdin,
+            fork_of: None,
         };
         save(&container)?;
         daemon_call("create", vm)?;
@@ -771,15 +803,25 @@ pub fn wait_stopped(container: &Container, timeout: Duration) -> bool {
 /// Start a stopped container again. The previous run's console is kept as
 /// `console.prev.log` so markers (ip, exit) always describe the current run.
 pub fn start(container: &Container) -> Result<()> {
+    start_from(container, None)
+}
+
+/// `start`, or with `machine_state` resume a saved machine state instead of
+/// booting (`checkpoint`): the run continues, so the console is kept.
+pub fn start_from(container: &Container, machine_state: Option<&Path>) -> Result<()> {
     if active(&vm_state(container)) {
         bail!("container {} is already running", container.name)
     }
     let dir = container_dir(&container.id)?;
-    if dir.join("console.log").exists() {
+    if machine_state.is_none() && dir.join("console.log").exists() {
         fs::rename(dir.join("console.log"), dir.join("console.prev.log"))?;
     }
     crate::session::refresh_forward(container)?;
-    daemon_call("start", json!({"id":container.vm_id}))?;
+    let mut request = json!({"id":container.vm_id});
+    if let Some(path) = machine_state {
+        request["restore_machine_state"] = json!(path);
+    }
+    daemon_call("start", request)?;
     if container.os == "darwin" {
         crate::macos::wait_started(container)?;
     }

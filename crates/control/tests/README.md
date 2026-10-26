@@ -1,6 +1,6 @@
 # HTTPS MCP shutdown verification
 
-The shutdown slice installs SIGINT/SIGTERM handlers before listening. Either signal closes HTTP admission/listening and retires every registered stdio session, including an initializing or already-retiring session. Retirement closes stdin independently of the response reader and drains abandoned stdout with bounded memory. Sessions remain tracked until the owned MCP child exits or bounded forced cleanup finishes. Closing a request future transfers cleanup to a retained task.
+The shutdown slice installs SIGINT/SIGTERM handlers before listening. Either signal closes HTTP admission/listening and retires every registered stdio session, including an initializing or already-retiring session. Retirement closes stdin independently of the response reader; one reader task per session drains the child's stdout for its whole life, routing the in-flight response and bounded notifications and discarding the rest. Sessions remain tracked until the owned MCP child exits or bounded forced cleanup finishes. Closing a request future transfers cleanup to a retained task.
 
 The MCP adapter serializes disconnect-monitor and finalizer cleanup. Its first daemon `session_end` outcome is retained: a second empty outcome cannot overwrite failure evidence. Missing/malformed acknowledgement, failed Guest file cleanup, or an unconfirmed cancellation request makes the child exit nonzero. HTTP DELETE returns502 for unconfirmed cleanup rather than204. Failures from previous DELETE or expiry remain latched for server exit. Use the matching updated `vm-control` executable as the trusted `--control-bin`; arbitrary/older executables do not establish this contract merely by exiting0.
 
@@ -13,8 +13,8 @@ Each child gets at most1second to close stdin and42seconds to finish; forced ter
 Run from repository root with Python3 and OpenSSL available. Tests create only disposable local directories, a temporary explicitly trusted certificate, Unix protocol fixtures and owned subprocesses; they do not start a VM or access a Guest.
 
 ```sh
-cargo test -p vm-control --lib --bin vm-mcp-http --test http_shutdown --target-dir .local/http-shutdown-target -j 2 -- --nocapture
-cargo clippy -p vm-control --lib --bin vm-control --bin vm-mcp-http --tests --target-dir .local/http-shutdown-target -j 2 -- -D warnings
+cargo test -p vm-control --lib --bin vm-mcp-http --test http_shutdown -- --nocapture
+cargo clippy -p vm-control --lib --bin vm-control --bin vm-mcp-http --tests -- -D warnings
 ```
 
 The integration test invokes `http_shutdown.py` with Cargo's actual built binary paths. It uses real TLS verification, real HTTP, the production `vm-control mcp` process, and real OS signals. Its Unix daemon responses are synthetic so failures can be deterministic. The hung-child case instead uses an explicitly synthetic stdio child. This is not Guest or VM acceptance. If a fixture fails before its HTTP parent exits, its dedicated process group is killed while that parent PID remains owned; no live/user process is targeted.
@@ -27,3 +27,7 @@ Verified on macOS26.4.1/Apple Silicon,2026-10-09:
 - Clippy with warnings denied and whitespace validation passed.
 
 The integration JSON printed by the command includes each case's exit code, duration and child-reaping check, with no tokens, private keys or Guest data. Actual macOS Guest partial-upload cleanup and worker-failure validation are separate parent-task evidence.
+
+## Pushed events (`mcp_events.rs`)
+
+`cargo test -p vm-control --test mcp_events` runs `mcp_events.py` twice against a synthetic Unix daemon: once through `vm-control mcp` on stdio, once through `vm-mcp-http` over real TLS with an `observe`+`execute` principal allowlisted to one of two VMs (set `VEYNODE_PYTHON` to a Python with TLS 1.3). Both check the `initialize` capabilities, resources and templates, reads, subscriptions and the `resources/updated` events for status, log, job and screen (changed, settled, unsubscribe), screen rate limiting, `vm_exec_poll` `wait_ms` with progress before the result, and that plain polling still works. HTTPS adds the allowlist on reads, subscriptions, lists and notifications, the status projection, a POST answered as an SSE stream, GET Accept checking, a 400-event burst with no reader (bounded queue and `events_dropped`), and the GET stream ending with its session. A third test starts the real daemon with `/usr/bin/false` as worker and reads `started` then exactly one `crashed` from `events`. This is protocol and fixture evidence: no VM, Guest, screen or real serial log is involved.

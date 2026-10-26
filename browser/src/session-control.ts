@@ -18,6 +18,13 @@ export interface SignedControl { request: ControlRequest; signature: string }
 export interface ControlResponse { sequence: number; result: Record<string, unknown> }
 export const CONTROL_MAX_RESPONSE_BYTES = 1024 * 1024;
 export const SCREENSHOT_MAX_BYTES = 700 * 1024;
+/** A control frame may be an integer box-downscale of the Guest display. `width`/`height` of the anchor stay the
+ * SOURCE geometry (Guest pixels) and are what input coordinates are signed against; `frame_width`/`frame_height`
+ * are the pixels of the image actually shown. Rule, shared with crates/media-local/src/control_frame.rs:
+ *   frame = ceil(source / divisor); source -> frame: floor(s / d); frame -> source: min(f * d + floor(d / 2), source - 1).
+ * frame -> source -> frame is exact; source -> frame -> source moves at most floor(d / 2) source pixels. */
+export const CONTROL_FRAME_MAX_DIVISOR = 16;
+export interface ControlFrameGeometry { source_width: number; source_height: number; frame_width: number; frame_height: number; scale_divisor: number }
 const encoder = new TextEncoder();
 function ensure(value: unknown, message: string): asserts value { if (!value) throw new SessionAuthError(message); }
 function exact(value: unknown, fields: string[]): asserts value is Record<string, unknown> {
@@ -98,6 +105,50 @@ export function screenshotAnchor(result: Record<string, unknown>): FrameAnchor {
   const frame = { frame_id: result.frame_id, source_generation: result.source_generation, width: result.width, height: result.height } as FrameAnchor;
   validateFrame(frame); return frame;
 }
+/** Declared scale of a control frame, checked against the source geometry. A frame with no scale fields is
+ * unscaled (the legacy PNG and the macOS JPEG); a PNG may never declare one. */
+export function controlFrameGeometry(result: Record<string, unknown>): ControlFrameGeometry {
+  const anchor = screenshotAnchor(result), declared = [result.frame_width, result.frame_height, result.scale_divisor];
+  if (declared.every(value => value === undefined)) return { source_width: anchor.width, source_height: anchor.height, frame_width: anchor.width, frame_height: anchor.height, scale_divisor: 1 };
+  ensure(result.mime_type !== 'image/png', 'Unscaled PNG screenshot must not declare a scale');
+  integer(result.scale_divisor, 1, CONTROL_FRAME_MAX_DIVISOR); integer(result.frame_width, 1, 8192); integer(result.frame_height, 1, 8192);
+  ensure(result.frame_width === Math.ceil(anchor.width / result.scale_divisor) && result.frame_height === Math.ceil(anchor.height / result.scale_divisor), 'Control frame scale does not match its source geometry');
+  return { source_width: anchor.width, source_height: anchor.height, frame_width: result.frame_width, frame_height: result.frame_height, scale_divisor: result.scale_divisor };
+}
+/** The decoder's real image size must be the declared frame size before the image may anchor input. */
+export function checkDecodedControlFrame(geometry: ControlFrameGeometry, naturalWidth: number, naturalHeight: number): void {
+  ensure(naturalWidth === geometry.frame_width && naturalHeight === geometry.frame_height, 'Decoded screenshot dimensions do not match its input coordinates.');
+}
+export function sourceToFrame(source: number, divisor: number): number { integer(source); integer(divisor, 1, CONTROL_FRAME_MAX_DIVISOR); return Math.floor(source / divisor); }
+export function frameToSource(frame: number, divisor: number, sourceExtent: number): number {
+  integer(frame); integer(divisor, 1, CONTROL_FRAME_MAX_DIVISOR); integer(sourceExtent, 1, 8192);
+  return Math.min(frame * divisor + Math.floor(divisor / 2), sourceExtent - 1);
+}
+/** Pointer offset inside the displayed frame element -> source pixel, through frame space: the element shows
+ * `frameExtent` equal columns, each standing for `divisor` source pixels (the last block may be partial, hence the
+ * clamp). So the result is always a source pixel of the block drawn under the pointer. Unscaled frames reduce to
+ * floor(offset * source / displayed), the rule used before scaling existed. */
+export function pointerToSource(offset: number, displayedExtent: number, frameExtent: number, divisor: number, sourceExtent: number): number {
+  integer(sourceExtent, 1, 8192); integer(divisor, 1, CONTROL_FRAME_MAX_DIVISOR); integer(frameExtent, 1, 8192);
+  ensure(frameExtent === Math.ceil(sourceExtent / divisor), 'Control frame scale does not match its source geometry');
+  ensure(Number.isFinite(offset) && Number.isFinite(displayedExtent) && displayedExtent > 0 && offset >= 0 && offset < displayedExtent, 'Pointer outside the displayed screenshot');
+  return Math.min(Math.floor(offset * frameExtent * divisor / displayedExtent), sourceExtent - 1);
+}
+/** Width and height from the first JPEG frame header; structural, not a decoder. */
+function jpegDimensions(bytes: Uint8Array): { width: number; height: number } {
+  let at = 2;
+  for (;;) {
+    ensure(at + 4 <= bytes.length && bytes[at] === 0xff, 'JPEG screenshot frame header missing');
+    const marker = bytes[at + 1]!, length = bytes[at + 2]! * 256 + bytes[at + 3]!;
+    ensure(length >= 2 && at + 2 + length <= bytes.length, 'JPEG screenshot segment truncated');
+    if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+      ensure(length >= 7, 'JPEG screenshot frame header truncated');
+      return { height: bytes[at + 5]! * 256 + bytes[at + 6]!, width: bytes[at + 7]! * 256 + bytes[at + 8]! };
+    }
+    ensure(marker !== 0xda && marker !== 0xd9, 'JPEG screenshot frame header missing');
+    at += 2 + length;
+  }
+}
 export function validateControlResponse(value: unknown, sequence: number, action: ControlAction): ControlResponse {
   exact(value, ['sequence', 'result']); integer(value.sequence, 1); ensure(value.sequence === sequence, 'Control response sequence substituted');
   ensure(value.result !== null && typeof value.result === 'object' && !Array.isArray(value.result), 'Invalid control result');
@@ -123,7 +174,10 @@ function screenshotBytes(result: Record<string, unknown>): Uint8Array<ArrayBuffe
   // macOS JPEG responses always carry this hash. Legacy QEMU PNG remains
   // compatible without it; a supplied hash is never silently ignored.
   if (result.mime_type === 'image/jpeg' || result.sha256 !== undefined) text(result.sha256, /^[0-9a-f]{64}$/, 'Invalid screenshot SHA-256');
-  return Uint8Array.from(decoded, c => c.charCodeAt(0));
+  const bytes = Uint8Array.from(decoded, c => c.charCodeAt(0)), geometry = controlFrameGeometry(result);
+  // A declared scale that disagrees with the image's own header never reaches the decoder.
+  if (result.mime_type === 'image/jpeg') { const real = jpegDimensions(bytes); ensure(real.width === geometry.frame_width && real.height === geometry.frame_height, 'Control frame scale does not match its real dimensions'); }
+  return bytes;
 }
 /** Snapshot before awaiting WebCrypto so mutation cannot replace the verified
  * payload with different bytes. A valid hash is integrity, not decoder success. */
@@ -133,4 +187,193 @@ export async function verifiedScreenshotSource(result: Record<string, unknown>):
   const bytes = screenshotBytes(copy);
   if (copy.sha256 !== undefined) ensure(await sha256(bytes) === copy.sha256, 'Screenshot SHA-256 mismatch');
   return `data:${copy.mime_type as string};base64,${copy.data_base64 as string}`;
+}
+
+/** Direct interaction on the displayed control frame, within control v1. Pure state, no DOM, no network, and no
+ * effect on canonical bytes or signing above. It lives in this module because the native service serves a fixed
+ * allowlist of script files (crates/media-local/src/main.rs); a new module would need a server route.
+ *
+ * What control v1 offers: whole `click`, `drag`, `scroll` and `key` actions, each signed against a server-issued
+ * screenshot anchor. It has no pointer move, no button down/up and no key down/up. So:
+ *   - a press-move-release on the surface becomes ONE `drag`; hover and intermediate positions are never sent;
+ *   - a key press becomes ONE `key` chord (modifiers held + the key), pressed and released by the host in one step.
+ *     Nothing stays held in the Guest, so "release all" is purely local: forget modifiers, gestures and the queue;
+ *   - keys are physical positions (KeyboardEvent.code -> QEMU qcode). There is no text, IME or clipboard action.
+ */
+export const INPUT_QUEUE_MAX = 8;
+/** A queued input older than this when its turn comes is refused, visibly, instead of landing late. */
+export const INPUT_MAX_AGE_MS = 6000;
+export const SCROLL_MAX_TICKS = 20;
+export const KEY_CHORD_MAX = 8;
+/** Pointer travel in CSS pixels below which press-release is a click, not a drag. */
+export const DRAG_THRESHOLD_CSS_PX = 5;
+
+export type PointerButton = 'left' | 'middle' | 'right';
+/** Source geometry a pointer coordinate was computed against; a later frame must match it exactly. */
+export interface SourceShape { source_width: number; source_height: number; source_generation: number }
+export type QueuedInput =
+  | { kind: 'click'; at: number; shape: SourceShape; x: number; y: number; button: PointerButton; second: boolean }
+  | { kind: 'drag'; at: number; shape: SourceShape; x: number; y: number; end_x: number; end_y: number; button: PointerButton }
+  | { kind: 'scroll'; at: number; shape: SourceShape; x: number; y: number; direction: 'up' | 'down' | 'left' | 'right'; ticks: number }
+  | { kind: 'key'; at: number; keys: string[]; repeat: boolean };
+
+export function sameShape(a: SourceShape, b: SourceShape): boolean {
+  return a.source_width === b.source_width && a.source_height === b.source_height && a.source_generation === b.source_generation;
+}
+
+/** Strict FIFO of inputs that are waiting; the one in flight has already been shifted out. Only two merges exist,
+ * both into the tail so order is never changed: wheel ticks of the same direction at the same point, and keyboard
+ * auto-repeat of the chord already waiting. Everything else that does not fit is reported as `full`; the caller
+ * must refuse it visibly. Nothing is ever dropped from inside the queue. */
+export class InputQueue {
+  private readonly items: QueuedInput[] = [];
+  constructor(readonly max: number = INPUT_QUEUE_MAX) {}
+  get length(): number { return this.items.length; }
+  get full(): boolean { return this.items.length >= this.max; }
+  peek(): QueuedInput | undefined { return this.items[0]; }
+  shift(): QueuedInput | undefined { return this.items.shift(); }
+  /** Returns how many waiting inputs were removed. */
+  clear(): number { return this.items.splice(0).length; }
+  push(item: QueuedInput): 'queued' | 'merged' | 'capped' | 'full' {
+    const tail = this.items.at(-1);
+    if (tail && tail.kind === 'scroll' && item.kind === 'scroll' && tail.direction === item.direction && tail.x === item.x && tail.y === item.y && sameShape(tail.shape, item.shape)) {
+      const total = tail.ticks + item.ticks;
+      tail.ticks = Math.min(SCROLL_MAX_TICKS, total);
+      return total > SCROLL_MAX_TICKS ? 'capped' : 'merged';
+    }
+    if (tail && tail.kind === 'key' && item.kind === 'key' && item.repeat && tail.keys.length === item.keys.length && tail.keys.every((key, index) => key === item.keys[index])) return 'merged';
+    if (this.items.length >= this.max) return 'full';
+    this.items.push(item); return 'queued';
+  }
+}
+
+export interface Box { left: number; top: number; width: number; height: number }
+/** Where a `frameWidth` x `frameHeight` picture is painted inside an element box under `object-fit: contain`:
+ * scaled uniformly, centred, with bars on one axis when the aspect ratios differ. */
+export function containedBox(box: Box, frameWidth: number, frameHeight: number): Box | null {
+  if (!(box.width > 0) || !(box.height > 0) || !(frameWidth > 0) || !(frameHeight > 0)) return null;
+  const scale = Math.min(box.width / frameWidth, box.height / frameHeight);
+  const width = frameWidth * scale, height = frameHeight * scale;
+  return { left: box.left + (box.width - width) / 2, top: box.top + (box.height - height) / 2, width, height };
+}
+function axis(offset: number, displayed: number, frame: number, divisor: number, source: number, clamp: boolean): number | null {
+  if (!Number.isFinite(offset)) return null;
+  if (offset < 0) return clamp ? 0 : null;
+  if (offset >= displayed) return clamp ? source - 1 : null;
+  return pointerToSource(offset, displayed, frame, divisor, source);
+}
+/** Client (CSS pixel) position -> Guest source pixel through the painted picture, using the existing
+ * `pointerToSource` rule on each axis. `clientX`/`clientY` and the element box are both CSS pixels, so
+ * devicePixelRatio and page zoom cancel; the canvas backing store is never consulted. A position on a letterbox
+ * bar or outside the element is `null` (ignored) unless `clamp` is set, which is used only for the END of a drag
+ * that left the picture: it is pinned to the nearest edge pixel. */
+export function surfaceToSource(clientX: number, clientY: number, box: Box, geometry: ControlFrameGeometry, clamp = false): { x: number; y: number } | null {
+  const painted = containedBox(box, geometry.frame_width, geometry.frame_height);
+  if (!painted) return null;
+  const x = axis(clientX - painted.left, painted.width, geometry.frame_width, geometry.scale_divisor, geometry.source_width, clamp);
+  const y = axis(clientY - painted.top, painted.height, geometry.frame_height, geometry.scale_divisor, geometry.source_height, clamp);
+  return x === null || y === null ? null : { x, y };
+}
+
+const WHEEL_PIXELS_PER_TICK = 100;
+/** Wheel deltas -> whole discrete ticks on the dominant axis. Sub-tick trackpad deltas accumulate; a direction
+ * change discards the remainder. */
+export class WheelAccumulator {
+  private x = 0; private y = 0;
+  reset(): void { this.x = 0; this.y = 0; }
+  add(deltaX: number, deltaY: number, deltaMode = 0): { direction: 'up' | 'down' | 'left' | 'right'; ticks: number } | null {
+    const unit = deltaMode === 1 ? WHEEL_PIXELS_PER_TICK / 3 : deltaMode === 2 ? WHEEL_PIXELS_PER_TICK * 3 : 1;
+    const dx = Number.isFinite(deltaX) ? deltaX * unit : 0, dy = Number.isFinite(deltaY) ? deltaY * unit : 0;
+    if (dx === 0 && dy === 0) return null;
+    if (Math.abs(dy) >= Math.abs(dx)) { this.x = 0; if (Math.sign(dy) !== Math.sign(this.y)) this.y = 0; this.y += dy; }
+    else { this.y = 0; if (Math.sign(dx) !== Math.sign(this.x)) this.x = 0; this.x += dx; }
+    const vertical = this.y !== 0, value = vertical ? this.y : this.x;
+    const ticks = Math.min(SCROLL_MAX_TICKS, Math.floor(Math.abs(value) / WHEEL_PIXELS_PER_TICK));
+    if (ticks < 1) return null;
+    const direction = vertical ? (value > 0 ? 'down' : 'up') : (value > 0 ? 'right' : 'left');
+    this.reset();
+    return { direction, ticks };
+  }
+}
+
+const MODIFIERS: readonly { code: string; qcode: string; flag: 'ctrlKey' | 'altKey' | 'shiftKey' | 'metaKey' }[] = [
+  { code: 'ControlLeft', qcode: 'ctrl', flag: 'ctrlKey' }, { code: 'ControlRight', qcode: 'ctrl_r', flag: 'ctrlKey' },
+  { code: 'AltLeft', qcode: 'alt', flag: 'altKey' }, { code: 'AltRight', qcode: 'alt_r', flag: 'altKey' },
+  { code: 'ShiftLeft', qcode: 'shift', flag: 'shiftKey' }, { code: 'ShiftRight', qcode: 'shift_r', flag: 'shiftKey' },
+  { code: 'MetaLeft', qcode: 'meta_l', flag: 'metaKey' }, { code: 'MetaRight', qcode: 'meta_r', flag: 'metaKey' },
+];
+/** KeyboardEvent.code -> qcode, limited to the controller's allowlist (crates/control/src/input.rs key_names).
+ * Positions only: the Guest's own layout decides which character a position produces. */
+const KEYS: Readonly<Record<string, string>> = (() => {
+  const keys: Record<string, string> = {
+    Enter: 'ret', Escape: 'esc', Tab: 'tab', Space: 'spc', Backspace: 'backspace', Delete: 'delete', Insert: 'insert',
+    Home: 'home', End: 'end', PageUp: 'pgup', PageDown: 'pgdn', ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right',
+    Minus: 'minus', Equal: 'equal', BracketLeft: 'bracket_left', BracketRight: 'bracket_right', Semicolon: 'semicolon',
+    Quote: 'apostrophe', Backquote: 'grave_accent', Backslash: 'backslash', Comma: 'comma', Period: 'dot', Slash: 'slash',
+  };
+  for (let i = 0; i < 26; i++) keys[`Key${String.fromCharCode(65 + i)}`] = String.fromCharCode(97 + i);
+  for (let i = 0; i < 10; i++) keys[`Digit${i}`] = String(i);
+  for (let i = 1; i <= 12; i++) keys[`F${i}`] = `f${i}`;
+  return keys;
+})();
+export interface ModifierFlags { ctrlKey?: boolean; altKey?: boolean; shiftKey?: boolean; metaKey?: boolean }
+export function anyModifier(flags: ModifierFlags): boolean { return flags.ctrlKey === true || flags.altKey === true || flags.shiftKey === true || flags.metaKey === true; }
+export function isModifierCode(code: string): boolean { return MODIFIERS.some(modifier => modifier.code === code); }
+
+/** Local view of which modifier keys are down. It only shapes the next chord; the Guest never holds a key. */
+export class ModifierTracker {
+  private readonly down = new Set<string>();
+  private lone: string | null = null;
+  /** Returns true when `code` is a modifier (the caller sends nothing for the press itself). */
+  press(code: string, repeat = false): boolean {
+    if (!isModifierCode(code)) { this.lone = null; return false; }
+    if (!repeat) { this.down.add(code); this.lone = code; }
+    return true;
+  }
+  /** A modifier released with no other key or pointer use since its press is a tap of that key: returns the chord
+   * to send, which is any modifiers still held plus the tapped one (so Alt+Shift reaches the Guest as a chord). */
+  release(code: string): string[] | null {
+    if (!this.down.delete(code)) return null;
+    const tapped = this.lone === code; this.lone = null;
+    return tapped ? [...this.held(), MODIFIERS.find(modifier => modifier.code === code)!.qcode] : null;
+  }
+  /** Pointer use or any refusal between press and release means the release is not a tap. */
+  interrupt(): void { this.lone = null; }
+  clear(): void { this.down.clear(); this.lone = null; }
+  /** Modifiers for a chord, reconciled with the event's own flags: a key whose release was missed (focus was
+   * elsewhere) is dropped; a flag with no tracked key uses the left key. */
+  held(flags: ModifierFlags = {}): string[] {
+    const result: string[] = [];
+    for (const flag of ['ctrlKey', 'altKey', 'shiftKey', 'metaKey'] as const) {
+      const family = MODIFIERS.filter(modifier => modifier.flag === flag);
+      if (flags[flag] === false) { for (const modifier of family) this.down.delete(modifier.code); continue; }
+      const tracked = family.filter(modifier => this.down.has(modifier.code)).map(modifier => modifier.qcode);
+      if (tracked.length > 0) result.push(...tracked); else if (flags[flag] === true) result.push(family[0]!.qcode);
+    }
+    return result;
+  }
+}
+/** One whole chord for a non-modifier key, or null when the position has no qcode in the controller allowlist. */
+export function keyChord(code: string, held: readonly string[]): string[] | null {
+  const qcode = KEYS[code];
+  if (!qcode) return null;
+  const chord = [...held.filter((key, index) => held.indexOf(key) === index), qcode];
+  return chord.length > KEY_CHORD_MAX ? null : chord;
+}
+
+export type LinkState = 'idle' | 'connecting' | 'live' | 'reconnecting' | 'ended';
+export type SessionState = 'idle' | 'connecting' | 'live' | 'input-pending' | 'frame-stale' | 'reconnecting' | 'ended';
+/** One visible state. Transport states win; then what the user's input is doing; then whether the picture input
+ * would be bound to is still fresh. `frame-stale` is reported only while the session may send input. */
+export function sessionState(input: { link: LinkState; reason: string; sending: boolean; waiting: number; queueMax: number; inputAllowed: boolean; frameFresh: boolean; graceMs: number }): { state: SessionState; text: string } {
+  if (input.link === 'ended') return { state: 'ended', text: `Ended: ${input.reason || 'the session was closed.'}` };
+  if (input.link === 'idle') return { state: 'idle', text: 'Not connected.' };
+  if (input.link === 'reconnecting') return { state: 'reconnecting', text: `Reconnecting: the connection dropped; waiting up to ${Math.round(input.graceMs / 1000)} seconds. Input is refused until it returns.` };
+  if (input.sending || input.waiting > 0) {
+    const full = input.waiting >= input.queueMax;
+    return { state: 'input-pending', text: `Input pending: ${input.sending ? '1 sending' : 'none sending'}, ${input.waiting} waiting${full ? ` (queue full at ${input.queueMax}; further input is refused)` : ''}.` };
+  }
+  if (input.inputAllowed && !input.frameFresh) return { state: 'frame-stale', text: 'Picture stale: the control picture is older than 4 seconds. Input is refused until it is refreshed.' };
+  if (input.link === 'connecting') return { state: 'connecting', text: 'Connecting…' };
+  return { state: 'live', text: input.inputAllowed ? 'Live. Input enabled.' : 'Live. Viewing only.' };
 }

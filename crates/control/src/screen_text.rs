@@ -68,7 +68,12 @@ pub fn vision(args: &[String], shot: &Value) -> Result<Value> {
     run_helper(&helper()?, args, decode(shot)?)
 }
 
-fn decode(shot: &Value) -> Result<Vec<u8>> {
+/// Runs one `vm-vision` mode on image bytes.
+pub fn vision_image(args: &[String], image: Vec<u8>) -> Result<Value> {
+    run_helper(&helper()?, args, image)
+}
+
+pub(crate) fn decode(shot: &Value) -> Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD
         .decode(
             shot["data_base64"]
@@ -138,7 +143,12 @@ pub fn run(dir: &Path, args: &Value) -> Result<Value> {
     let flags = arguments(args)?;
     let helper = helper()?;
     let shot = crate::call(dir, "screenshot", json!({"id":args["id"]}))?;
-    let mut text = recognize(&helper, &flags, decode(&shot)?)?;
+    let text = recognize(&helper, &flags, decode(&shot)?)?;
+    result(&shot, text)
+}
+
+/// The `vm_screen_text` reply for a helper's `text` output on `shot`.
+pub fn result(shot: &Value, mut text: Value) -> Result<Value> {
     if text["width"] != shot["width"] || text["height"] != shot["height"] {
         bail!("recognized image size differs from the screenshot")
     }

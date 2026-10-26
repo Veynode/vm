@@ -2604,6 +2604,8 @@ dependencies = [
  "axum",
  "axum-server",
  "base64 0.22.1",
+ "flate2",
+ "futures-util",
  "libc",
  "rustls",
  "serde",

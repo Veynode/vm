@@ -20,6 +20,33 @@ fn empty() -> Registration {
         firmware: artifact("/abs/firmware".into()),
     }
 }
+
+#[test]
+fn host_geometry_observation_is_bound_to_catalog_and_not_guest_acceptance() {
+    let constraints = host_api_constraints(Profile::VenusMoltenvkExperimental);
+    let gs = &constraints["geometry_shader"];
+    assert_eq!(gs["status"], "unsupported");
+    assert_eq!(gs["reported_feature"], true);
+    assert_eq!(gs["guest_verified"], false);
+    assert_eq!(
+        gs["driver_sha256"],
+        catalog().frameworks["MoltenVK.framework/Versions/A/MoltenVK"]
+    );
+    assert_eq!(gs["reported_limits"].as_object().unwrap().len(), 5);
+    let mut replaced = catalog();
+    replaced.frameworks.insert(
+        "MoltenVK.framework/Versions/A/MoltenVK".into(),
+        "0".repeat(64),
+    );
+    let unknown = catalog_geometry_constraint(&replaced);
+    assert_eq!(unknown["geometry_shader"]["status"], "unknown");
+    assert!(unknown["geometry_shader"].get("reported_feature").is_none());
+    assert!(host_api_constraints(Profile::Virgl)
+        .as_object()
+        .unwrap()
+        .is_empty());
+}
+
 #[test]
 fn config_profile_is_strict_local_paths_never_in_vm_config() {
     let raw = json!({"id":"fixture","backend":"qemu-hvf","guest":"linux","cpus":2,"memory_mib":1024,"kernel":"/dev/null"});
@@ -73,6 +100,75 @@ fn argv_preserves_default_and_exact_venus_granule_device() {
     assert!(Profile::VenusMoltenvkExperimental
         .device(Some(1279), Some(720))
         .is_err());
+}
+#[test]
+fn virtio_2d_is_explicit_and_requires_linux_qemu() {
+    let raw = json!({"id":"two-d","backend":"qemu-hvf","guest":"linux","cpus":2,"memory_mib":1024,"kernel":"/dev/null","qemu_graphics_profile":"virtio-2d"});
+    let config: crate::Config = serde_json::from_value(raw).unwrap();
+    let profile = config.qemu_graphics_profile;
+    assert_eq!(profile, Profile::Virtio2d);
+    assert!(!profile.is_default());
+    assert!(!profile.venus());
+    assert_eq!(
+        serde_json::to_value(config).unwrap()["qemu_graphics_profile"],
+        "virtio-2d"
+    );
+    assert!(profile
+        .validate(crate::backend::Backend::QemuHvf, "linux")
+        .is_ok());
+    assert!(profile
+        .validate(crate::backend::Backend::AppleVirtualization, "linux")
+        .is_err());
+    assert!(profile
+        .validate(crate::backend::Backend::QemuHvf, "macos")
+        .is_err());
+    for alias in ["virtio2d", "2d", "virtio-gpu-pci"] {
+        assert!(serde_json::from_value::<Profile>(json!(alias)).is_err());
+    }
+    assert_eq!(Profile::default(), Profile::Virgl);
+}
+#[test]
+fn virtio_2d_uses_separate_non_gl_device_and_preserves_dimension_bounds() {
+    assert_eq!(
+        Profile::Virtio2d.machine_arguments(),
+        ["-machine", "virt,accel=hvf"]
+    );
+    assert_eq!(
+        Profile::Virtio2d.device(None, None).unwrap(),
+        "virtio-gpu-pci"
+    );
+    assert_eq!(
+        Profile::Virtio2d.device(Some(1280), Some(720)).unwrap(),
+        "virtio-gpu-pci,xres=1280,yres=720"
+    );
+    for (width, height) in [
+        (Some(1279), Some(720)),
+        (Some(1280), None),
+        (None, Some(720)),
+        (Some(318), Some(720)),
+        (Some(3842), Some(2160)),
+        (Some(3840), Some(2162)),
+    ] {
+        assert!(Profile::Virtio2d.device(width, height).is_err());
+    }
+    assert_eq!(
+        Profile::Virtio2d.device(Some(320), Some(320)).unwrap(),
+        "virtio-gpu-pci,xres=320,yres=320"
+    );
+    assert_eq!(
+        Profile::Virtio2d.device(Some(3840), Some(2160)).unwrap(),
+        "virtio-gpu-pci,xres=3840,yres=2160"
+    );
+}
+#[test]
+fn only_virtio_2d_turns_off_gl_without_inheriting_venus_host_evidence() {
+    assert!(Profile::Virgl.requires_gl());
+    assert!(Profile::VenusMoltenvkExperimental.requires_gl());
+    assert!(!Profile::Virtio2d.requires_gl());
+    assert!(host_api_constraints(Profile::Virtio2d)
+        .as_object()
+        .unwrap()
+        .is_empty());
 }
 #[test]
 fn registered_environment_replaces_injection_without_changing_spice() {
@@ -245,7 +341,7 @@ fn manager_rejects_unregistered_venus_before_persist_or_spawn_default_stays_avai
     let kernel = dir.path().join("kernel");
     fs::write(&kernel, b"fixture").unwrap();
     let mut manager = crate::Manager::load(
-        dir.path().into(),
+        crate::test_private_state(dir.path()),
         "/unused".into(),
         crate::resources::MemoryBudget::new(16 * 1024 * 1024 * 1024, None).unwrap(),
     )
@@ -295,4 +391,38 @@ fn manager_rejects_unregistered_venus_before_persist_or_spawn_default_stays_avai
         .contains("not registered"));
     assert!(manager.running.is_empty());
     assert!(!dir.path().join("venus.json").exists());
+}
+
+#[test]
+fn source_qemu_layout_requires_compiled_exact_path_and_retains_vendor_default() {
+    let mut approved = catalog();
+    let frameworks = Path::new("/vendor/Frameworks");
+    let vendor = frameworks.join("qemu-aarch64-softmmu.framework/Versions/A/qemu-aarch64-softmmu");
+    let source = PathBuf::from(
+        "/private/reviewed/VeynodeQEMUDevelopment.framework/Versions/A/VeynodeQEMUDevelopment",
+    );
+    assert!(qemu_dependency_layout(&approved, frameworks, &vendor).is_ok());
+    assert!(qemu_dependency_layout(&approved, frameworks, &source).is_err());
+    approved.source_qemu_library = Some(source.clone());
+    assert!(qemu_dependency_layout(&approved, frameworks, &source).is_ok());
+    assert!(qemu_dependency_layout(&approved, frameworks, &vendor).is_err());
+    let substituted =
+        Path::new("/other/VeynodeQEMUDevelopment.framework/Versions/A/VeynodeQEMUDevelopment");
+    assert!(qemu_dependency_layout(&approved, frameworks, substituted).is_err());
+    for bad in [
+        "relative/VeynodeQEMUDevelopment.framework/Versions/A/VeynodeQEMUDevelopment",
+        "/private/../reviewed/VeynodeQEMUDevelopment.framework/Versions/A/VeynodeQEMUDevelopment",
+        "/private/not-the-reviewed-framework",
+    ] {
+        approved.source_qemu_library = Some(bad.into());
+        assert!(qemu_dependency_layout(&approved, frameworks, Path::new(bad)).is_err());
+    }
+}
+
+#[test]
+fn registration_cannot_supply_its_own_compiled_source_qemu_policy() {
+    let mut value = serde_json::to_value(empty()).unwrap();
+    value["source_qemu_library"] =
+        json!("/attacker/VeynodeQEMUDevelopment.framework/Versions/A/VeynodeQEMUDevelopment");
+    assert!(serde_json::from_value::<Registration>(value).is_err());
 }

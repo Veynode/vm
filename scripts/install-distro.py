@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unattended install of a full Linux distribution from its official ISO.
+"""Unattended install of a full Linux distribution or Windows 11 from its official ISO.
 
 Creates a QEMU/HVF UEFI machine (`veynodevm machine create --monitor`), boots
 the distribution's own GRUB from the unmodified ISO, types the installer
@@ -12,11 +12,20 @@ installed disk and captures a screenshot of the GNOME desktop.
   fedora  Fedora Everything netinstall aarch64 ISO boots Anaconda, which reads
           ks.cfg from a seed image labelled OEMDRV and installs the unmodified
           Fedora Workstation Live ISO's root filesystem (`liveimg`), offline.
+  windows Windows 11 ARM64 ISO (the user's own download). Windows Setup reads
+          Autounattend.xml from a seed CD-ROM labelled VEYNODEWIN; TPM, Secure
+          Boot, RAM and storage checks are bypassed (LabConfig) because the
+          machine has no TPM and no Secure Boot keys. The virtio-win ARM64
+          drivers (--drivers-iso, required) load in Windows PE, so Setup sees the
+          virtio-blk disk, and are injected into the installed system; the
+          first logon powers the machine off.
 
 The installed systems get user `veynode` (password from --password, default
 `veynode`), GDM automatic login, no GNOME first-run wizard, and a small boot
 reporter that writes `VEYNODE-BOOTED ...` and `VEYNODE-GL renderer=...` lines to
-the serial consoles (ttyAMA0 on QEMU, hvc0 on Apple Virtualization).
+the serial consoles (ttyAMA0 on QEMU, hvc0 on Apple Virtualization). Windows
+gets local administrator `veynode` with automatic logon; it writes nothing to
+the serial console, so its evidence is a desktop screenshot.
 
 Examples (VEYNODEVM_HOME and a running daemon as for any veynodevm command):
   scripts/install-distro.py ubuntu --name ubuntu --iso .local/iso/ubuntu-24.04.5-desktop-arm64.iso \\
@@ -25,6 +34,9 @@ Examples (VEYNODEVM_HOME and a running daemon as for any veynodevm command):
       --iso .local/iso/Fedora-Everything-netinst-aarch64-44-1.7.iso \\
       --live-iso .local/iso/Fedora-Workstation-Live-44-1.7.aarch64.iso \\
       --evidence .local/evidence/fedora-installed.png
+  scripts/install-distro.py windows --name win11 \\
+      --iso ~/Downloads/Windows11_Client_arm64_en-us.iso --drivers-iso virtio-win.iso \\
+      --evidence .local/evidence/windows-installed.png
   scripts/install-distro.py screenshot --name ubuntu --output shot.png
 """
 import argparse, base64, json, os, pathlib, shutil, socket, subprocess, sys, tempfile, threading, time
@@ -120,9 +132,10 @@ def send_keys(qmp, *combos, delay=0.15):
         time.sleep(delay)
 
 
-def type_text(qmp, text, delay=0.06):
+def type_text(qmp, text, delay=0.18):
+    # Windows drops keys (and once kept one repeating) at 40 ms holds 60 ms apart.
     for char in text:
-        qmp.call('send-key', keys=[{'type': 'qcode', 'data': k} for k in qcodes(char)], **{'hold-time': 40})
+        qmp.call('send-key', keys=[{'type': 'qcode', 'data': k} for k in qcodes(char)], **{'hold-time': 80})
         time.sleep(delay)
 
 # ---------------------------------------------------------------- screenshots
@@ -400,6 +413,126 @@ systemctl set-default graphical.target
     return make_seed(work, 'OEMDRV', {'ks.cfg': kickstart})
 
 
+# Generic (non-activating) installation keys that select an edition.
+WINDOWS_KEYS = {'Windows 11 Pro': 'VK7JG-NPHTM-C97JM-9MPGT-3V66T', 'Windows 11 Home': 'YTMG3-N6DKC-DKB77-7M9GH-8HVX7'}
+
+
+def xml_text(value):
+    return value.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+
+
+# virtio-win ARM64 driver directories (virtio-win 0.1.302 layout). viogpudo is
+# left out (virtio-ramfb stays on Basic Display), as are viosock/viofs/viomem
+# (no vhost-vsock, virtiofsd or virtio-mem on this host).
+VIRTIO_DRIVERS = ['viostor', 'vioscsi', 'NetKVM', 'vioserial', 'Balloon', 'viorng', 'vioinput', 'pvpanic']
+# Windows PE and Setup letter CD-ROMs from D:, in an order we don't control.
+DRIVE_LETTERS = 'DEFGHIJK'
+
+
+def driver_paths(drivers):
+    return [f'{letter}:\\{driver}\\w11\\ARM64' for driver in drivers for letter in DRIVE_LETTERS]
+
+
+def openssh_server(authorized_key):
+    """PowerShell for FirstLogonCommands: Windows' OpenSSH Server (a Windows
+    Update download), the key for administrators, PowerShell as the shell."""
+    keys = 'C:\\ProgramData\\ssh\\administrators_authorized_keys'
+    script = '; '.join([
+        "Get-WindowsCapability -Online -Name 'OpenSSH.Server*' | Add-WindowsCapability -Online",
+        'Set-Service sshd -StartupType Automatic', 'Start-Service sshd',
+        "New-NetFirewallRule -Name veynode-sshd -DisplayName 'OpenSSH (VeynodeVM)' -Protocol TCP -LocalPort 22 -Action Allow",
+        f"Set-Content -Encoding ascii {keys} '{authorized_key.strip()}'",
+        f'icacls {keys} /inheritance:r /grant Administrators:F /grant SYSTEM:F',
+        "New-ItemProperty -Path HKLM:\\SOFTWARE\\OpenSSH -Name DefaultShell -PropertyType String -Force "
+        "-Value C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    ])
+    return f'powershell -NoProfile -ExecutionPolicy Bypass -Command "{script}"'
+
+
+def windows_answer(work, user, password, edition, product_key, authorized_key=None):
+    component = lambda name: (f'<component name="{name}" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" '
+                              'language="neutral" versionScope="nonSxS">')
+    def commands(tag, element, lines):
+        body = ''.join(f'<{element} wcm:action="add"><Order>{i}</Order>'
+                       f'<{"CommandLine" if element == "SynchronousCommand" else "Path"}>{xml_text(line)}'
+                       f'</{"CommandLine" if element == "SynchronousCommand" else "Path"}></{element}>'
+                       for i, line in enumerate(lines, 1))
+        return f'<{tag}>{body}</{tag}>'
+    def paths(drivers):
+        return '<DriverPaths>' + ''.join(
+            f'<PathAndCredentials wcm:action="add" wcm:keyValue="{i}"><Path>{xml_text(path)}</Path></PathAndCredentials>'
+            for i, path in enumerate(driver_paths(drivers), 1)) + '</DriverPaths>'
+    # No TPM, no Secure Boot keys: tell Setup to skip the Windows 11 checks.
+    labconfig = [f'reg add HKLM\\SYSTEM\\Setup\\LabConfig /v {value} /t REG_DWORD /d 1 /f'
+                 for value in ('BypassTPMCheck', 'BypassSecureBootCheck', 'BypassRAMCheck', 'BypassStorageCheck', 'BypassCPUCheck')]
+    first_logon = [
+        # Fallback for any virtio driver offline servicing did not install.
+        *[f'cmd /c for %d in ({" ".join(DRIVE_LETTERS)}) do @if exist %d:\\{d}\\w11\\ARM64 pnputil /add-driver %d:\\{d}\\w11\\ARM64\\*.inf /install'
+          for d in VIRTIO_DRIVERS],
+        'powercfg /change monitor-timeout-ac 0',
+        'powercfg /change standby-timeout-ac 0',
+        # No Fast Startup: QEMU/HVF aborts (assert isv) resuming its hybrid
+        # shutdown image once the Neptune GPU driver is installed.
+        'powercfg /hibernate off',
+        *([openssh_server(authorized_key)] if authorized_key else []),
+        # Powering off tells the host the install is complete.
+        'shutdown /s /t 20 /c "VeynodeVM install complete"',
+    ]
+    # Local account without a network: no "connect to the internet" page.
+    specialize = ['reg add HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\OOBE /v BypassNRO /t REG_DWORD /d 1 /f']
+    user, password = xml_text(user), xml_text(password)
+    xml = f'''<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+<settings pass="windowsPE">
+{component('Microsoft-Windows-International-Core-WinPE')}
+<SetupUILanguage><UILanguage>en-US</UILanguage></SetupUILanguage>
+<InputLocale>en-US</InputLocale><SystemLocale>en-US</SystemLocale><UILanguage>en-US</UILanguage><UserLocale>en-US</UserLocale>
+</component>
+{component('Microsoft-Windows-PnpCustomizationsWinPE')}{paths(['viostor', 'vioscsi', 'NetKVM'])}</component>
+{component('Microsoft-Windows-Setup')}
+{commands('RunSynchronous', 'RunSynchronousCommand', labconfig)}
+<DiskConfiguration><Disk wcm:action="add"><DiskID>0</DiskID><WillWipeDisk>true</WillWipeDisk>
+<CreatePartitions>
+<CreatePartition wcm:action="add"><Order>1</Order><Type>EFI</Type><Size>260</Size></CreatePartition>
+<CreatePartition wcm:action="add"><Order>2</Order><Type>MSR</Type><Size>16</Size></CreatePartition>
+<CreatePartition wcm:action="add"><Order>3</Order><Type>Primary</Type><Extend>true</Extend></CreatePartition>
+</CreatePartitions>
+<ModifyPartitions>
+<ModifyPartition wcm:action="add"><Order>1</Order><PartitionID>1</PartitionID><Format>FAT32</Format><Label>System</Label></ModifyPartition>
+<ModifyPartition wcm:action="add"><Order>2</Order><PartitionID>3</PartitionID><Format>NTFS</Format><Label>Windows</Label><Letter>C</Letter></ModifyPartition>
+</ModifyPartitions>
+</Disk></DiskConfiguration>
+<ImageInstall><OSImage>
+<InstallFrom><MetaData wcm:action="add"><Key>/IMAGE/NAME</Key><Value>{xml_text(edition)}</Value></MetaData></InstallFrom>
+<InstallTo><DiskID>0</DiskID><PartitionID>3</PartitionID></InstallTo>
+</OSImage></ImageInstall>
+<UserData><ProductKey><Key>{xml_text(product_key)}</Key><WillShowUI>Never</WillShowUI></ProductKey><AcceptEula>true</AcceptEula></UserData>
+</component>
+</settings>
+<settings pass="offlineServicing">
+{component('Microsoft-Windows-PnpCustomizationsNonWinPE')}{paths(VIRTIO_DRIVERS)}</component>
+</settings>
+<settings pass="specialize">
+{component('Microsoft-Windows-Shell-Setup')}<ComputerName>WIN-VEYNODE</ComputerName><TimeZone>UTC</TimeZone></component>
+{component('Microsoft-Windows-Deployment')}
+{commands('RunSynchronous', 'RunSynchronousCommand', specialize)}
+</component>
+</settings>
+<settings pass="oobeSystem">
+{component('Microsoft-Windows-International-Core')}<InputLocale>en-US</InputLocale><SystemLocale>en-US</SystemLocale><UILanguage>en-US</UILanguage><UserLocale>en-US</UserLocale></component>
+{component('Microsoft-Windows-Shell-Setup')}
+<OOBE><HideEULAPage>true</HideEULAPage><HideOEMRegistrationScreen>true</HideOEMRegistrationScreen><HideOnlineAccountScreens>true</HideOnlineAccountScreens><HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE><ProtectYourPC>3</ProtectYourPC></OOBE>
+<UserAccounts><LocalAccounts><LocalAccount wcm:action="add"><Name>{user}</Name><DisplayName>VeynodeVM</DisplayName><Group>Administrators</Group>
+<Password><Value>{password}</Value><PlainText>true</PlainText></Password></LocalAccount></LocalAccounts></UserAccounts>
+<AutoLogon><Enabled>true</Enabled><Username>{user}</Username><LogonCount>9999999</LogonCount><Password><Value>{password}</Value><PlainText>true</PlainText></Password></AutoLogon>
+{commands('FirstLogonCommands', 'SynchronousCommand', first_logon)}
+</component>
+</settings>
+</unattend>
+'''
+    return make_seed(work, 'VEYNODEWIN', {'Autounattend.xml': xml})
+
+
 def iso_label(path):
     with open(path, 'rb') as f:
         f.seek(32768 + 40)
@@ -422,15 +555,38 @@ def grub_command_line(name, serial, commands, menu_marker):
         qmp.close()
 
 
-def wait_stopped(name, timeout, work, label):
+def vcpu_pcs(name):
+    """Program counters of every vCPU (HMP `info registers -a`)."""
+    qmp = Qmp(runtime(name)['monitor_socket'])
+    try:
+        out = qmp.call('human-monitor-command', **{'command-line': 'info registers -a'})
+    finally:
+        qmp.close()
+    return tuple(line.split('PC=')[1].split()[0] for line in out.splitlines() if 'PC=' in line)
+
+
+def wait_stopped(name, timeout, work, label, hang_checks=0):
+    """Wait for the guest to power off. With hang_checks, stop early when no
+    vCPU program counter moves across that many samples two minutes apart
+    (a firmware or kernel spin, as seen with a corrupt UEFI variable store)."""
     until = time.time() + timeout
     next_shot = 0
+    pcs, still = None, 0
     while time.time() < until:
         state = vm_state(name)
         if state in ('stopped', 'crashed'):
             return state
         if time.time() >= next_shot:
             next_shot = time.time() + 120
+            if hang_checks:
+                try:
+                    now = vcpu_pcs(name)
+                except Exception:  # monitor briefly unavailable across a reset
+                    now = None
+                still = still + 1 if now and now == pcs else 0
+                pcs = now
+                if still >= hang_checks:
+                    raise SystemExit(f'{name} looks hung: vCPU PCs {pcs} unchanged for {still * 2} minutes')
             try:
                 path = screenshot(name, pathlib.Path(work) / f'{label}-{time.strftime("%H%M%S")}.png')
                 log(f'{label}: {state}, screen {path}')
@@ -438,6 +594,81 @@ def wait_stopped(name, timeout, work, label):
                 log(f'{label}: {state} (screenshot failed: {e})')
         time.sleep(10)
     raise SystemExit(f'{name} did not finish within {timeout // 60} minutes')
+
+
+def press_any_key(name, serial, seconds=8):
+    """Windows' CD boot loader waits a few seconds for a key, else falls
+    through to the next boot entry. Its prompt is drawn only on the screen,
+    so tap Enter from the moment edk2 starts the first boot entry (the CD).
+    Stop soon: a late Enter lands on Setup's focused Cancel button."""
+    log('waiting for edk2 to start the installer CD (serial console)')
+    serial.wait_for('BdsDxe: starting Boot', 300, name)
+    log('pressing Enter for "Press any key to boot from CD or DVD"')
+    qmp = Qmp(runtime(name)['monitor_socket'])
+    try:
+        until = time.time() + seconds
+        while time.time() < until:
+            send_keys(qmp, 'ret', delay=0.5)
+    finally:
+        qmp.close()
+
+
+def install_windows(args):
+    work = pathlib.Path(args.work_dir or ROOT / '.local/install' / args.name).resolve()
+    work.mkdir(parents=True, exist_ok=True)
+    os.chmod(work, 0o700)
+    key = args.product_key or WINDOWS_KEYS.get(args.edition)
+    if not key:
+        raise SystemExit(f'--product-key required for edition {args.edition!r}')
+    ssh_key = None
+    if args.ssh_port:
+        ssh_key = pathlib.Path(args.ssh_key or work / 'id_ed25519')
+        if not ssh_key.exists():
+            subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', f'veynodevm-{args.name}', '-f', str(ssh_key)], check=True)
+    authorized_key = ssh_key and pathlib.Path(f'{ssh_key}.pub').read_text()
+    seed = windows_answer(work, args.user, args.password, args.edition, key, authorized_key)
+    create = ['machine', 'create', args.name, '--os', 'windows', '--iso', str(pathlib.Path(args.iso).expanduser().resolve()),
+              '--disk-size', args.disk_size or '64G', '--memory', args.memory, '--cpus', str(args.cpus), '--monitor',
+              '--attach', str(seed)]
+    if args.ssh_port:
+        create += ['--publish', f'{args.ssh_port}:22']
+    create += ['--attach', str(pathlib.Path(args.drivers_iso).expanduser().resolve())]
+    log(f'creating machine {args.name}')
+    veynodevm(*create)
+    serial = Serial(inspect(args.name)['vm']['config']['serial_log'])
+    started = time.time()
+    veynodevm('machine', 'start', args.name)
+    press_any_key(args.name, serial)
+    log('Windows Setup running unattended; waiting for the first logon to power the machine off')
+    state = wait_stopped(args.name, args.timeout_minutes * 60, work, 'install', hang_checks=2)
+    if state != 'stopped':
+        raise SystemExit(f'installer VM ended in state {state}')
+    log(f'install finished in {(time.time() - started) / 60:.1f} minutes')
+    veynodevm('machine', 'eject', args.name)
+    boot_windows(args.name, args.evidence, work)
+    if ssh_key:
+        ssh = ['ssh', '-i', str(ssh_key), '-p', str(args.ssh_port), '-o', f'UserKnownHostsFile={work / "known_hosts"}',
+               '-o', 'StrictHostKeyChecking=accept-new', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', f'{args.user}@127.0.0.1']
+        result = subprocess.run([*ssh, '(Get-CimInstance Win32_OperatingSystem).Caption'], capture_output=True, text=True)
+        if result.returncode:
+            raise SystemExit(f'ssh into {args.name} failed: {result.stderr.strip()}')
+        log(f'ssh: {result.stdout.strip()}; connect with: {" ".join(ssh)}')
+        # The daemon's vm_exec, file and desktop tools log in with this key.
+        veynodevm('machine', 'ssh-key', args.name, '--user', args.user, '--key', str(ssh_key))
+
+
+def boot_windows(name, evidence, work, settle=240):
+    log('booting installed Windows from its disk')
+    veynodevm('machine', 'start', name)
+    # No serial marker: give boot and automatic logon time, then capture.
+    until = time.time() + settle
+    while time.time() < until:
+        if vm_state(name) in ('stopped', 'crashed'):
+            raise SystemExit(f'{name} stopped while booting')
+        time.sleep(10)
+    output = pathlib.Path(evidence or pathlib.Path(work) / f'{name}-installed.png')
+    screenshot(name, output)
+    log(f'desktop screenshot: {output}')
 
 
 def install(args):
@@ -516,9 +747,26 @@ def main():
         p.add_argument('--timeout-minutes', type=int, default=120)
         p.add_argument('--work-dir')
         p.add_argument('--evidence', help='PNG path for the installed desktop screenshot')
+    p = sub.add_parser('windows')
+    p.add_argument('--name', required=True)
+    p.add_argument('--iso', required=True, help='Windows 11 ARM64 ISO')
+    p.add_argument('--drivers-iso', required=True, help='virtio-win ISO (ARM64 virtio drivers; 0.1.302 verified)')
+    p.add_argument('--edition', default='Windows 11 Pro', help='install.wim image name')
+    p.add_argument('--product-key', help='defaults to the generic key for --edition')
+    p.add_argument('--disk-size', default='64G')
+    p.add_argument('--memory', default='8g')
+    p.add_argument('--cpus', type=int, default=4)
+    p.add_argument('--user', default='veynode')
+    p.add_argument('--password', default='veynode')
+    p.add_argument('--timeout-minutes', type=int, default=180)
+    p.add_argument('--ssh-port', type=int, default=2222, help='host port forwarded to the guest OpenSSH Server (0: none)')
+    p.add_argument('--ssh-key', help='private key whose .pub is authorized (default: generated in the work dir)')
+    p.add_argument('--work-dir')
+    p.add_argument('--evidence', help='PNG path for the installed desktop screenshot')
     p = sub.add_parser('boot', help='start an installed machine and capture its desktop')
     p.add_argument('--name', required=True)
     p.add_argument('--evidence')
+    p.add_argument('--windows', action='store_true', help='no serial markers: wait, then capture')
     p = sub.add_parser('screenshot')
     p.add_argument('--name', required=True)
     p.add_argument('--output', required=True)
@@ -531,6 +779,10 @@ def main():
     args = parser.parse_args()
     if args.distro in ('ubuntu', 'fedora'):
         install(args)
+    elif args.distro == 'windows':
+        install_windows(args)
+    elif args.distro == 'boot' and args.windows:
+        boot_windows(args.name, args.evidence, ROOT / '.local/install' / args.name)
     elif args.distro == 'boot':
         boot_installed(args.name, args.evidence, ROOT / '.local/install' / args.name)
     elif args.distro == 'screenshot':

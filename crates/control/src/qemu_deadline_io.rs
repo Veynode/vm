@@ -219,6 +219,9 @@ mod tests {
             next: 1,
             poisoned: false,
             reply_prefix: Vec::new(),
+            guest_reset: false,
+            run_state_event: false,
+            shutdown_event: false,
         };
         let mut input = InputState {
             held: std::collections::BTreeMap::from([(
@@ -280,6 +283,9 @@ mod tests {
             next: 1,
             poisoned: false,
             reply_prefix: Vec::new(),
+            guest_reset: false,
+            run_state_event: false,
+            shutdown_event: false,
         };
         let mut input = InputState::default();
         let deadline = Instant::now() + Duration::from_millis(30);
@@ -325,6 +331,9 @@ mod ack_deadline_tests {
             next: 1,
             poisoned: false,
             reply_prefix: Vec::new(),
+            guest_reset: false,
+            run_state_event: false,
+            shutdown_event: false,
         };
         let started = Instant::now();
         let result = qmp.arguments("query-status", json!({}));
@@ -368,6 +377,9 @@ mod ack_framing_tests {
             next: 1,
             poisoned: false,
             reply_prefix: Vec::new(),
+            guest_reset: false,
+            run_state_event: false,
+            shutdown_event: false,
         };
         let mut input = InputState::default();
         let started = Instant::now();
@@ -406,6 +418,9 @@ mod ack_framing_tests {
                 next: 1,
                 poisoned: false,
                 reply_prefix: Vec::new(),
+                guest_reset: false,
+                run_state_event: false,
+                shutdown_event: false,
             };
             let mut input = InputState::default();
             let error = input
@@ -459,6 +474,9 @@ mod release_write_tests {
             next: 1,
             poisoned: false,
             reply_prefix: Vec::new(),
+            guest_reset: false,
+            run_state_event: false,
+            shutdown_event: false,
         };
         let mut input = InputState {
             operation: Some("a".repeat(32)),

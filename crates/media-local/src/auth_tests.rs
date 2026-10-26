@@ -1259,6 +1259,36 @@ fn enable_ice(f: &mut Fixture) -> PathBuf {
     auth.test_identity = Some(Arc::new(TestIdentity::new(1)));
     path
 }
+/// Synthetic clock only: the credential is issued at 100 and expires at 700, and the
+/// admission and deadline checks run on that same clock.
+fn synthetic_ice(f: &mut Fixture) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = f._directory.path().join("ice-synthetic.json");
+    let config = protocol::ice::IceConfig {
+        version: 1,
+        transport_policy: "relay".into(),
+        issued_at: 100,
+        expires_at: 700,
+        ice_servers: vec![protocol::ice::IceServer {
+            urls: vec!["turn:127.0.0.1:3478?transport=udp".into()],
+            username: "fixture-user".into(),
+            credential: "not-a-real-credential-secret".into(),
+        }],
+    };
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .unwrap()
+        .write_all(&serde_json::to_vec(&config).unwrap())
+        .unwrap();
+    let auth = Arc::get_mut(f.app.auth.as_mut().unwrap()).unwrap();
+    auth.ice_config = Some(Arc::new(
+        crate::ice_config::IceSource::open(path, 100).unwrap(),
+    ));
+}
 fn ice_request(f: &Fixture) -> protocol::ice::SignedIceRequest {
     let request = protocol::ice::IceRequest {
         challenge: f
@@ -1398,14 +1428,38 @@ async fn expired_or_short_ice_credential_refuses_offer_before_session_reservatio
     }
 }
 
+/// Refused after admission and before any session slot: the admitted entry must not survive.
 #[tokio::test]
-async fn admitted_offer_records_credential_deadline_before_session_work() {
+async fn offer_refused_after_admission_leaves_no_admitted_entry() {
     let mut f = Fixture::new();
-    let path = enable_ice(&mut f);
+    enable_ice(&mut f);
     // Refused at the codec gate: after admission, before any session slot exists.
     f.app.capabilities = json!({"h265":"unavailable","h264":"unavailable"});
     let signed = f.signed_offer();
     let request = signed.intent.request_id.clone();
+    let body = json!({"signed_offer": signed, "sdp": sdp("11")});
+    let (status, _) = f
+        .post("/auth/offer", body.clone(), Some(&f.app.origin))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(f.app.active.lock().await.active.is_none());
+    let source = f.auth().ice_config.clone().unwrap();
+    assert!(
+        source.bind_session(&request, "refused-session").is_err(),
+        "a refused offer must not keep an admitted entry"
+    );
+    // accept_offer consumed the challenge, so the same signed offer cannot be admitted again.
+    let (status, _) = f.post("/auth/offer", body, Some(&f.app.origin)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+/// A refused offer never reaches SessionGate::answer, so it leaves no pending gate entry:
+/// all 256 gate slots stay available after it, and a leaked entry would fail the 256th answer.
+#[tokio::test]
+async fn refused_offer_leaves_session_gate_at_full_capacity() {
+    let mut f = Fixture::new();
+    enable_ice(&mut f);
+    f.app.capabilities = json!({"h265":"unavailable","h264":"unavailable"});
+    let signed = f.signed_offer();
     let (status, _) = f
         .post(
             "/auth/offer",
@@ -1414,14 +1468,94 @@ async fn admitted_offer_records_credential_deadline_before_session_work() {
         )
         .await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert!(f.app.active.lock().await.active.is_none());
-    let config: protocol::ice::IceConfig =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    let source = f.auth().ice_config.clone().unwrap();
-    source.bind_session(&request, "admitted-session").unwrap();
-    let end = config.expires_at - crate::ice_config::SESSION_END_MARGIN_SECONDS;
-    assert!(source.check_session("admitted-session", end - 1).is_ok());
-    assert!(source.check_session("admitted-session", end).is_err());
+    let auth = f.auth();
+    for _ in 0..256 {
+        let offer = f.signed_offer();
+        let accepted = auth
+            .gate
+            .accept_offer(&offer, &sdp("11"), now().unwrap())
+            .unwrap();
+        auth.gate
+            .answer(
+                accepted,
+                uuid::Uuid::new_v4().to_string(),
+                &sdp("22"),
+                &f.host,
+                now().unwrap(),
+            )
+            .expect("the refused offer must not occupy a gate slot");
+    }
+    // Capacity is exactly 256: the next offer is refused by the gate's own capacity check.
+    let offer = f.signed_offer();
+    let Err(refused) = auth.gate.accept_offer(&offer, &sdp("11"), now().unwrap()) else {
+        panic!("the gate holds exactly 256 answered sessions");
+    };
+    assert!(
+        refused.to_string().contains("session capacity"),
+        "the 257th offer must fail on capacity, not another check: {refused}"
+    );
+}
+/// Synthetic clock only. Filling the 256-entry admission table with live sessions blocks
+/// the next offer. Tearing one down through the teardown path frees its slot and deadline.
+#[tokio::test]
+async fn torn_down_session_releases_its_deadline_and_admission_capacity() {
+    let mut f = Fixture::new();
+    synthetic_ice(&mut f);
+    let auth = f.auth();
+    let source = auth.ice_config.clone().unwrap();
+    for i in 0..256 {
+        source.admit_offer(&format!("request-{i}"), 100).unwrap();
+        source
+            .bind_session(&format!("request-{i}"), &format!("session-{i}"))
+            .unwrap();
+    }
+    assert!(source.admit_offer("over-capacity", 100).is_err());
+    auth.teardown_session("request-0", "session-0");
+    source
+        .admit_offer("after-teardown", 100)
+        .expect("the torn-down session's admission slot is free");
+    assert!(
+        source.check_session("session-0", 100).is_err(),
+        "a torn-down session has no deadline and fails closed"
+    );
+    // A session that never bound its answer also releases its request-keyed entry.
+    auth.teardown_session("after-teardown", "never-bound");
+    assert!(
+        source.bind_session("after-teardown", "late").is_err(),
+        "a torn-down unbound offer leaves no admitted entry"
+    );
+}
+/// Synthetic clock only. While its session runs, the offer's post-response release must keep
+/// the admitted entry, because the peer may still bind it. Teardown then releases it.
+#[tokio::test]
+async fn running_session_keeps_its_admitted_entry_until_teardown() {
+    let mut f = Fixture::new();
+    synthetic_ice(&mut f);
+    let auth = f.auth();
+    let source = auth.ice_config.clone().unwrap();
+    source.admit_offer("running-request", 100).unwrap();
+    let (cancel, _cancelled) = watch::channel(false);
+    let (confirmed, _confirmation) = watch::channel(false);
+    let (_done, finished) = watch::channel(None);
+    f.app.active.lock().await.active = Some(Session {
+        request: "running-request".into(),
+        id: "running-session".into(),
+        cancel,
+        finished,
+        confirmed,
+        input: None,
+        files: None,
+    });
+    release_unstarted(&f.app, "running-request").await;
+    source
+        .bind_session("running-request", "running-session")
+        .expect("a running offer keeps its admitted entry");
+    f.app.active.lock().await.active = None;
+    auth.teardown_session("running-request", "running-session");
+    assert!(
+        source.check_session("running-session", 100).is_err(),
+        "teardown releases the running session's entry"
+    );
 }
 
 #[tokio::test]
@@ -1898,4 +2032,134 @@ fn restarted_gate_keeps_active_grant_at_durable_version() {
             100,
         )
         .unwrap();
+}
+/// Codec matrix: requested codec (the signed intent's `codec`) by host capability state. The
+/// expected outcomes are read from the code, not measured:
+/// - `accept_offer` runs `OfferIntent::canonical` first, which accepts only h264 and h265
+///   (session-auth lib.rs:329-332). Any other codec is refused with the generic 403 before any
+///   capability is read.
+/// - `offer_inner` then requires `capabilities[codec] == "verified-hardware"` exactly
+///   (main.rs:398). Every other value, a missing key included, is refused with 409.
+/// - `stopping` is checked after that gate and before any session slot, encoder or peer exists
+///   (main.rs:414). It is set in every row, so a row that passes the gate is observed as 503 and
+///   nothing starts.
+/// The other codec is always verified, so a silent substitution would show up as a pass.
+#[tokio::test]
+async fn codec_matrix_requested_codec_by_capability_state_fails_closed() {
+    const PASSED_GATE: (StatusCode, &str) = (StatusCode::SERVICE_UNAVAILABLE, "service stopping");
+    const CAPABILITY_REFUSED: (StatusCode, &str) = (
+        StatusCode::CONFLICT,
+        "required hardware encoder unavailable",
+    );
+    const CANONICAL_REFUSED: (StatusCode, &str) = (
+        StatusCode::FORBIDDEN,
+        r#"{"error":"authorization rejected"}"#,
+    );
+    // The value stored under the requested codec's key. None removes the key.
+    let states: [(&str, Option<Value>); 7] = [
+        ("available", Some(json!("verified-hardware"))),
+        ("unavailable", Some(json!("unavailable"))),
+        ("missing key", None),
+        ("malformed bool", Some(json!(true))),
+        ("malformed text", Some(json!("verified"))),
+        ("malformed case", Some(json!("VERIFIED-HARDWARE"))),
+        ("malformed null", Some(Value::Null)),
+    ];
+    for codec in ["h264", "h265", "vp9"] {
+        for (state, value) in &states {
+            let mut f = Fixture::new();
+            enable_ice(&mut f);
+            f.app.active.lock().await.stopping = true;
+            let mut capabilities = json!({"h264":"verified-hardware","h265":"verified-hardware"});
+            match value {
+                Some(value) => capabilities[codec] = value.clone(),
+                None => {
+                    capabilities.as_object_mut().unwrap().remove(codec);
+                }
+            }
+            f.app.capabilities = capabilities;
+            let source = f.auth().ice_config.clone().unwrap();
+            let signed = matrix_offer(&f, codec);
+            let request_id = signed.intent.request_id.clone();
+            let body = json!({"signed_offer": signed, "sdp": sdp("11")});
+            let expected = match (codec, *state) {
+                ("vp9", _) => CANONICAL_REFUSED,
+                (_, "available") => PASSED_GATE,
+                _ => CAPABILITY_REFUSED,
+            };
+            let (status, reply) = f
+                .post("/auth/offer", body.clone(), Some(&f.app.origin))
+                .await;
+            let reply = String::from_utf8(reply).unwrap();
+            assert_eq!(
+                (status, reply.as_str()),
+                expected,
+                "codec {codec}, capability {state}"
+            );
+            {
+                let book = f.app.active.lock().await;
+                assert!(
+                    book.active.is_none() && book.completed.is_empty(),
+                    "codec {codec}, capability {state}: no session slot may exist"
+                );
+            }
+            assert!(
+                source.bind_session(&request_id, "matrix-probe").is_err(),
+                "codec {codec}, capability {state}: no ICE admission may survive"
+            );
+            let (replay, _) = f.post("/auth/offer", body, Some(&f.app.origin)).await;
+            assert_eq!(
+                replay,
+                StatusCode::FORBIDDEN,
+                "codec {codec}, capability {state}: a replayed offer is refused"
+            );
+        }
+    }
+}
+/// A validly signed offer for `codec`. A codec outside h264|h265 cannot be canonicalised, so it is
+/// swapped in after signing and is refused by canonicalisation before any signature is checked.
+fn matrix_offer(f: &Fixture, codec: &str) -> protocol::SignedOffer {
+    let signing = if matches!(codec, "h264" | "h265") {
+        codec
+    } else {
+        "h265"
+    };
+    let mut intent = protocol::OfferIntent {
+        challenge: f
+            .auth()
+            .gate
+            .challenge(
+                &f.grant.grant.device_id,
+                &f.grant.grant.vm_id,
+                vec!["observe".into()],
+                now().unwrap(),
+            )
+            .unwrap(),
+        request_id: uuid::Uuid::new_v4().to_string(),
+        codec: signing.into(),
+        offer: protocol::SdpBinding::from_sdp(&sdp("11")).unwrap(),
+    };
+    let signature = f.device.sign(&intent.canonical().unwrap()).unwrap();
+    intent.codec = codec.into();
+    protocol::SignedOffer { intent, signature }
+}
+/// The unsigned route's own codec allowlist (`offer_inner`, main.rs:394) refuses a codec outside
+/// h264|h265 even when a capability entry under that name says verified-hardware.
+#[tokio::test]
+async fn codec_matrix_unsigned_route_refuses_unknown_codec_with_verified_entry() {
+    let mut f = Fixture::new();
+    f.app.capabilities =
+        json!({"h264":"verified-hardware","h265":"verified-hardware","vp9":"verified-hardware"});
+    f.app.active.lock().await.stopping = true;
+    let offer = crate::Offer {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        sdp: sdp("11"),
+        r#type: "offer".into(),
+        codec: "vp9".into(),
+    };
+    let response = crate::offer_inner(f.app.clone(), offer, None).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 1024).await.unwrap();
+    assert_eq!(body.to_vec(), b"invalid offer".to_vec());
+    assert!(f.app.active.lock().await.active.is_none());
 }

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { EncryptedControlChannel, CONTROL_MESSAGE_BYTES } from '../dist/control-channel.js';
+import { EncryptedControlChannel, ControlChannelError, ControlFrameUnavailableError, CONTROL_MESSAGE_BYTES } from '../dist/control-channel.js';
 import { FakeChannel, frames } from './control-channel-fixture.mjs';
 const request = sequence => ({ request: { sequence }, signature: 'synthetic transport fixture only' });
 const pause = () => new Promise(resolve => setTimeout(resolve, 5));
@@ -60,3 +60,47 @@ test('oversized outgoing JSON is refused before allocating channel buffers or se
   const c = new FakeChannel(), t = new EncryptedControlChannel(c, { isConfirmed: () => true }); await assert.rejects(t.request({ ...request(1), data: 'x'.repeat(CONTROL_MESSAGE_BYTES) }), /too large/); assert.equal(c.sent.length, 0); t.close();
 });
 test('malformed response diagnostics never include file content from JSON parser errors',async()=>{let reported;const c=new FakeChannel(),t=new EncryptedControlChannel(c,{isConfirmed:()=>true,onFailure:error=>reported=error.message});const pending=t.request(request(1));await sent(c);c.emit(frames(1,'{"sensitive":"PRIVATE-FILE-CONTENT", trailing')[0]);await assert.rejects(pending,/^ControlChannelError: Malformed control response$/);assert.equal(reported,'Malformed control response');});
+const action = (sequence, kind) => ({ request: { sequence, action: { kind } }, signature: 'synthetic transport fixture only' });
+test('typed frame-unavailable reply to observe_frame rejects that one request, keeps the channel open and consumes the sequence', async () => {
+  let failures = 0, answer = body => ({ sequence: body.request.sequence, error: 'frame unavailable', reason: 'controller_refused' });
+  const c = new FakeChannel(body => answer(body)), t = new EncryptedControlChannel(c, { isConfirmed: () => true, onFailure: () => failures++ });
+  await assert.rejects(t.request(action(1, 'observe_frame')), error => error instanceof ControlFrameUnavailableError && !(error instanceof ControlChannelError) && error.reason === 'controller_refused' && error.name === 'ControlFrameUnavailableError');
+  assert.equal(t.fenced, false); assert.equal(c.readyState, 'open'); assert.equal(failures, 0);
+  // The sequence was consumed, as on the host: it cannot be reused, and that refusal does not fence either.
+  await assert.rejects(t.request(action(1, 'observe_frame')), /Control sequence must increase/); assert.equal(t.fenced, false); assert.equal(c.sent.length, 1);
+  // Every reason word the service uses today, and the longest word the pattern admits.
+  let sequence = 1;
+  for (const reason of ['controller_deadline', 'png_decode_unsupported', 'scaled_frame_over_cap', 'a'.repeat(32)]) {
+    answer = body => ({ sequence: body.request.sequence, error: 'frame unavailable', reason });
+    await assert.rejects(t.request(action(++sequence, 'observe_frame')), error => error instanceof ControlFrameUnavailableError && error.reason === reason); assert.equal(t.fenced, false);
+  }
+  // The next picture and the next input use the same channel; no timer of the answered request is left behind.
+  answer = body => ({ sequence: body.request.sequence, result: { kind: body.request.action.kind } });
+  assert.deepEqual(await t.request(action(++sequence, 'observe_frame')), { sequence, result: { kind: 'observe_frame' } });
+  assert.deepEqual(await t.request(action(++sequence, 'key')), { sequence, result: { kind: 'key' } });
+  assert.equal(c.sent.length, 7); assert.equal(failures, 0); t.close(); assert.equal(failures, 1);
+});
+test('frame-unavailable reply to any request that is not observe_frame is a protocol violation and fences', async () => {
+  for (const signed of [action(1, 'acquire'), action(1, 'release'), action(1, 'key'), action(1, 'click'), action(1, 'file'), request(1), { request: { sequence: 1, action: null }, signature: 'x' }]) {
+    let failures = 0; const c = new FakeChannel(body => ({ sequence: body.request.sequence, error: 'frame unavailable', reason: 'controller_refused' }));
+    const t = new EncryptedControlChannel(c, { isConfirmed: () => true, onFailure: () => failures++ });
+    await assert.rejects(t.request(signed), error => error instanceof ControlChannelError && error.message === 'Invalid control response fields');
+    assert.equal(t.fenced, true); assert.equal(c.readyState, 'closed'); assert.equal(failures, 1); await assert.rejects(t.request(action(2, 'observe_frame'))); assert.equal(c.sent.length, 1);
+  }
+});
+test('malformed frame-unavailable replies still fence: reason, error text, key set and sequence are exact', async () => {
+  const replies = [
+    { error: 'frame unavailable', reason: 'Controller_refused' }, { error: 'frame unavailable', reason: 'controller refused' }, { error: 'frame unavailable', reason: '' },
+    { error: 'frame unavailable', reason: 'a'.repeat(33) }, { error: 'frame unavailable', reason: 'png2' }, { error: 'frame unavailable', reason: 7 }, { error: 'frame unavailable', reason: null },
+    { error: 'frame unavailable', reason: ['controller_refused'] }, { error: 'frame unavailable', reason: 'controller_refused\n' }, { error: 'control rejected', reason: 'controller_refused' },
+    { error: 'Frame unavailable', reason: 'controller_refused' }, { error: 'frame unavailable', reason: 'controller_refused', result: {} }, { error: 'frame unavailable', reason: 'controller_refused', detail: 'x' },
+    { error: 'frame unavailable' }, { result: {}, reason: 'controller_refused' },
+  ];
+  for (const reply of replies) {
+    const c = new FakeChannel(body => ({ sequence: body.request.sequence, ...reply })), t = new EncryptedControlChannel(c, { isConfirmed: () => true });
+    await assert.rejects(t.request(action(1, 'observe_frame')), error => error instanceof ControlChannelError, JSON.stringify(reply));
+    assert.equal(t.fenced, true, JSON.stringify(reply)); assert.equal(c.readyState, 'closed');
+  }
+  const c = new FakeChannel(body => ({ sequence: body.request.sequence + 1, error: 'frame unavailable', reason: 'controller_refused' })), t = new EncryptedControlChannel(c, { isConfirmed: () => true });
+  await assert.rejects(t.request(action(1, 'observe_frame')), /Invalid control response envelope/); assert.equal(t.fenced, true);
+});

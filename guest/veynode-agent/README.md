@@ -33,10 +33,14 @@ Unknown fields and trailing JSON are rejected. Up to 16 simultaneous connections
 leave management capacity when all four command slots are executing synchronously.
 
 - `info`: actual OS/architecture and implemented capabilities, including
-  `async_exec` when command execution is enabled.
+  `async_exec` when command execution is enabled. `max_timeout_ms` remains
+  30000 for synchronous execution; `max_async_timeout_ms` reports the manager's
+  asynchronous bound.
 - `exec`: existing synchronous API; `argv` (1–128 arguments, no NUL) and
   `timeout_ms` (1–30000). Results now also contain `cancelled:false`.
-- `exec_start`: same arguments; starts a real process and returns
+- `exec_start`: same arguments; only verified Linux `cgroup-v2-clone3-kill`
+  execution accepts `timeout_ms` up to 120000. Legacy process groups and other
+  platforms retain the 30000 limit. Starts a real process and returns
   `{job_id,state:"running"}`. Job IDs are random 128-bit values as 32 hex digits.
 - `exec_poll`: takes `job_id`; returns `{job_id,state:"running"}` or
   `{job_id,state:"finished",result:{exit_code,stdout,stderr,stdout_truncated,
@@ -56,6 +60,21 @@ minutes after completion; expiry is checked on all manager operations, and the
 oldest finished results are evicted at capacity. Active jobs are never evicted.
 Unknown or expired jobs return `not_found`. Results are in-memory and do not
 survive service restart. There is no unbounded output/history cache.
+
+The longer asynchronous bound does not change output, active-command, result
+TTL or cancellation limits. The serial v2 preflight uses the
+same manager bound as `exec_start`; synchronous execution retains its separate
+30-second validation regardless of the request's method field. No default
+timeout is changed. `TestRealContainedLongAsyncImmediateCancel` exercises the
+90/120-second admission and immediate confirmed cgroup cleanup only when
+explicitly opted in inside a dedicated root Linux test Guest:
+
+```sh
+VEYNODE_TEST_REAL_CGROUP=1 go test -run '^TestRealContainedLongAsyncImmediateCancel$' -v
+```
+
+It is skipped on Darwin and without the opt-in; policy/serialization host tests
+are not real Linux containment or Guest acceptance.
 
 Production Linux execution uses a separate root-owned cgroup v2 subtree per
 command. Go's `clone3(CLONE_INTO_CGROUP)` starts the child inside that group before
@@ -88,6 +107,67 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go -C guest/veynode-agent build -trimpath 
 Host unit tests prove process handling, bounded state, and protocol logic only;
 real Linux VM + MCP acceptance is a separate validation. The separate Swift
 macOS Guest service currently does not implement these async job methods.
+
+## Unicode text input (Linux X11)
+
+`--allow-text-input` enables the `text_input` method; `--text-input-display=:N`
+(default `:0`) names the local display and `--text-input-xauthority=FILE` supplies
+its MIT-MAGIC-COOKIE-1 when the server requires one. The opened authority
+must be a regular file (a symlink to one is allowed), bounded to 64 KiB. FIFOs,
+directories and device files are refused; nonblocking open prevents waiting for
+a FIFO writer before the existing X11 connection deadline begins. This does not
+guarantee a deadline for arbitrary filesystem stalls. It is independent of execute,
+shutdown and files permission and is rejected with `--virtio-serial`.
+`info` reports `capabilities.text_input` (true only while the display, XTEST and
+at least eight spare keycodes are usable) and a `text_input` object with the
+reason when it is not, `spare_keycodes`, `bound_keycodes` and, if the last
+restore failed, `last_restore_error`.
+
+`text_input {text_hex}` carries lowercase hex of 1..64 UTF-8 bytes that decode to
+1..16 Unicode scalar values. U+000A (Return) and U+0009 (Tab) are the only control
+characters; other C0/C1 controls, DEL and noncharacters are `invalid_request`. The
+host splits longer text. Mechanism `x11-xtest-keymap`: spare keycodes of the X
+server (up to 64) are bound to the characters' keysyms, the server's mapping is
+read back and must show each binding before any key is sent, and XTEST sends one
+press/release per character. No xdotool, IBus, uinput or clipboard is used, and
+nothing is normalized.
+
+An X client resolves a key event against the server mapping at the time it
+handles the event, not when the event was sent, so a binding must outlive the
+client's backlog. Bindings are therefore kept and reused across requests; a
+keycode is never rebound or restored within 1 s of its last key event (a request
+that needs to rebind waits, inside its 3 s budget, or answers `busy`), and
+keycodes unused for 3 s are restored to NoSymbol in the background. The first
+real-Xorg run restored 60 ms after the last key and a client that needed 14 ms
+per key lost the last 7 of 16 characters; a client that needs more than 1 s to
+work through its backlog can still lose characters, and the service cannot
+observe that.
+
+Errors are explicit and never hide a dropped character: `unsupported` (not
+enabled, no display, authorization refused, no XTEST, too few spare keycodes),
+`not_ready` (no focused window, or Shift/CapsLock/Control/Alt/Super held),
+`busy`, `injection_failed` (nothing was typed; includes a binding that does not
+read back), and `partial_delivery` (counts in the message). A
+success result states `injected_scalars`, `injected_bytes`,
+`keymap_restore:"deferred"`, `guest_delivery_confirmed:false`, `batches`,
+`waited_ms` and `pool_keycodes`. The X server acknowledged the key events; what
+the application did is not observed. The service never restates the text: an
+RPC reply carries counts only, a rejected character is named by its position,
+a binding that does not read back by its keycode, and nothing is logged. Only
+the local `--text-input-once-hex` diagnostic adds `bindings` (`keycode`,
+`keysym`, the `readback` row and `reused` for each keycode used), because its
+operator typed the text on the command line.
+One request finishes within 3 s (normally a few tens of milliseconds; about 1 s
+more for each rebind wait); the host allows 4 s.
+
+`--text-input-once-hex=HEX` is a local diagnostic: it runs the same validation
+and injector once, prints `TEXT_INPUT_STATUS` and `TEXT_INPUT_ONCE` lines, then
+waits the 1 s quiet period if it bound anything, restores the keycodes and prints
+`TEXT_INPUT_RESTORE {restored, remaining, waited_ms, error}`. It exits 0, 3
+(request refused or failed) or 4 (restore failed) and opens no listener.
+`scripts/test-linux-text-input.py` uses it for the real-Xorg acceptance. Unit
+tests use a fake keyboard and an in-process X server written from the protocol
+documents, both with a slow-client model; they are not Xorg acceptance.
 
 ## Fixed command identity and cleanup
 

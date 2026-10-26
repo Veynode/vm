@@ -27,6 +27,22 @@ UID. Execute permission does not imply files permission. Query `vm_guest_info`
 for the running Guest's `capabilities.files` and `file_policy`; the OS name alone
 does not establish availability.
 
+For test input only, the daemon accepts `--worker-key-event-log-dir /absolute/private/logs`.
+The directory must already exist, belong to the daemon user, have mode 0700, carry
+no extended ACL and not be a symlink; the daemon does not create it, checks it again
+at every worker start (before changing any start state) and hands the worker only
+its canonical path. Every ancestor must be owned by root or the daemon user and not
+group/other writable unless sticky, so that no other account can replace the
+directory between the check and the worker's open. Logging is off by default and
+never enabled for QEMU. Each Apple worker start receives a new
+`key-events-<vm id>-<unix seconds>-<first 8 worker-instance characters>.jsonl` path.
+The worker exclusively creates the file with mode 0600. Key codes and modifier
+flags can reconstruct typed text: use only test input while this is enabled.
+Per-VM `list`/`status` includes `key_event_log: {"enabled":true,"path":"..."}`
+while that worker runs and `{"enabled":false}` otherwise. The daemon writes one
+startup diagnostic naming the path, without key data. This reports the launch
+option, not proof that the worker has opened or written the file.
+
 `vm_create` registers an existing direct-boot Linux configuration or installed
 macOS configuration. It does not install the OS or allocate a guest disk.
 The registry is atomically replaced and fsynced. Directory permissions are 0700,
@@ -66,6 +82,99 @@ guest RAM, **not measured RSS or available RAM**. Native/backend overhead, other
 daemons, installation subprocesses and unrelated host workloads are not counted;
 this limit does not guarantee freedom from memory pressure or swap.
 
+The same report states every product-spec control feature per backend and Guest
+under `backends.<backend>.control_features.<guest>` (Apple macOS and Linux, QEMU
+Linux, macOS and Windows), and each VM's status repeats its own cells under
+`capabilities.control_features`, narrowed by its registration (`qemu_guest_exec`,
+registered QEMU capture, console and graphics runtime). Each of the 23 cells has
+a `status` and a `reason`:
+
+- `supported`: implemented, with an `evidence` path to a real-Guest record
+  retained in this tree (`archive/docs-evidence/`);
+- `implemented_unverified`: code exists, but no real-Guest record is retained
+  here (offline tests at most);
+- `requires_guest_permission`: code exists, only the refusal without the Guest
+  grant is recorded;
+- `external_blocked`: waits on something outside this tree (Windows media);
+- `unsupported`: not implemented, or refused for this pair.
+
+Named full-state snapshots are `implemented_unverified` for Apple Linux and
+`unsupported` elsewhere. Memory reclaim is `unsupported` on both backends; the
+reasons state the 2026-10-12 real-Guest measurement. The desktop window,
+accessibility and application tools of Linux desktop containers and macOS
+containers are `implemented_unverified`. `product_capabilities` is the older
+seven-entry report.
+
+The explicit `snapshot` cell means live snapshot/save/restore, not an offline
+disk clone. `balloon` repeats `memory_reclaim`; an attached balloon device alone
+does not establish working host memory reclaim. `clipboard` is unsupported:
+no clipboard channel is implemented. The existing Windows cells retain their
+registration-refusal reasons. QEMU macOS cells now explicitly report unsupported;
+this does not enable macOS registration on QEMU.
+
+`application_launch_list` is unsupported: no `vm_app_*` tool exists. On Linux
+only, `vm_exec_start` is the documented route for explicit command argv, subject
+to `command_execution` requirements; it does not provide an application-list API.
+`accessibility_tree` is unsupported on every pair. macOS tree queries are
+unimplemented: `vm_windows` always reports `accessibility_tree:false`. Input
+separately requires a Guest Accessibility grant and returns
+`accessibility_permission_required` on denial. Granting permission does not
+enable a tree query. `window_list` repeats `window_metadata`: macOS on Apple
+Virtualization uses the Guest observation service, with existing Screen Recording
+permission and `--allow-observe`; Linux and Windows return `unsupported`.
+
+`gpu_3d` uses `supported` only for narrow samples with real-Guest evidence:
+macOS Metal Forward+ in Godot, or Linux QEMU virgl/OpenGL 2.1 in SolveSpace.
+macOS has no accelerated OpenGL, and large Metal compute/Cycles remains unavailable
+(decisions 0017 and 0023, detailed under `known_limits` below). Apple Linux,
+QEMU macOS and Windows are unsupported. A QEMU VM without a registered runtime
+reports unsupported. An opt-in Venus VM additionally needs its registered Venus
+runtime and cites the separate raster/vkmark record. These cells describe
+evidenced samples, not current per-VM Guest verification, general application
+compatibility or performance; `graphics_profile.guest_verified` is unchanged.
+
+`screenshot_scaled_jpeg` describes the explicit `screenshot` request with
+`format:"jpeg"`, `max_width`, `max_height` and `quality`. It requires a Linux
+Guest on QEMU. It is supported when a console broker and a helper that understands
+the form are registered; a helper that does not understand the form returns its
+full-size PNG, which is passed through unchanged (the caller must check `mime_type`
+and dimensions). Per-VM status marks it unsupported without the broker; Apple
+and Windows entries are unsupported. Plain screenshot requests are unchanged.
+
+Known backend limits of macOS Guests are listed under
+`backends.apple-virtualization.known_limits.macos`, and each macOS VM's status
+repeats them under `capabilities.known_limits`. Linux and Windows Guests have no
+such key. Each entry has `code` (stable), `description`, `effect`,
+`classification`, `measured_on`, `decision` and `evidence`. Two are stated, both
+measured on a macOS 26.6.2 Guest on one host and not on other versions:
+
+- `macos_guest_metal_large_compute_pipelines`: large Metal compute pipelines
+  (the Blender Cycles shading kernels) are not created on the Guest's Metal
+  device; Cycles runs on the Guest's CPUs (decision 0023). The control plane has
+  no render request path, so it raises no error of its own and does no fallback.
+- `macos_guest_opengl_not_accelerated`: the Guest has no accelerated OpenGL
+  (CGL) renderer; OpenGL applications get Apple Software Renderer (decision 0017).
+
+After a successful macOS `guest_info` reply reports `graphics.status:"unavailable"`
+and `reason:"no_metal_device"`, `status` and `list` expose
+`runtime.guest_metal_device_alert`. This is the last observed loss for that worker,
+not a current-health guarantee: the daemon does not poll the Guest. Only a later
+valid schema1 Metal public-device report with the current service's device
+identity and query timestamp clears the alert. An older agent without `graphics`
+or a malformed/unrecognized successful reply reports `unknown` in the separate
+`runtime.guest_metal_device_observation` and retains the last known loss. A failed
+query changes neither last-successful observation nor loss alert. Worker state
+events retain both records, and a new worker starts without them. The
+Guest-authored reply is unchanged. Non-macOS VMs have no such fields.
+
+The alert includes `operator_guidance`: save Guest work, request normal Guest
+shutdown, wait for the stopped state, start the Guest and query `vm_guest_info`
+again. Normal Guest restarts recovered the device in the retained decision 0023
+observations; the loss trigger and live agent reporting during a loss remain
+unverified. The daemon does not automatically restart the VM or provide a CPU
+fallback. A recovered device report proves device presence only; application
+rendering, large compute pipelines and performance still require separate tests.
+
 For an explicit local experiment, pass `--memory-budget-mib MIB` to `daemon`.
 The value must be positive and no greater than physical host memory; it may
 intentionally reduce the default host reserve. Remote MCP cannot alter it.
@@ -81,11 +190,82 @@ When the session ends, the adapter sends `session_end {"owner":...}`, which
 cancels that session's unfinished async jobs and file sessions and replies
 `{"closed":true,"job_cancellation":{...},"file_cancellation":{...}}`.
 
+## Tool groups
+
+Permissions decide which tools a session may call; tool groups only narrow which
+of them it lists, so an agent's context carries the tools its task needs. A group
+never adds a tool its permissions withhold. Without `--tools` a session lists
+every permitted tool, as before.
+
+```sh
+./target/debug/vm-control mcp --state-dir /absolute/private/state --allow-input --tools core,screen,input
+veynodevm mcp --input --tools core,screen,input
+```
+
+| Group | Tools | Permission |
+|---|---|---|
+| `core` | `vm_list`, `vm_status`, `vm_capabilities`, `vm_guest_info`, `container_*`, `image_*`; with lifecycle also `vm_start`, `vm_shutdown`, `vm_force_stop`, `vm_create`, the console window, `container_run`/`stop`/`rm`, `image_pull` | observe, lifecycle |
+| `exec` | `vm_exec`, `vm_exec_start`/`poll`/`cancel`, `container_exec` | execute |
+| `files` | `vm_file_*` | files |
+| `screen` | `vm_screenshot`, `vm_screen_wait`, `vm_screen_text` | observe |
+| `input` | `vm_input_*` | input |
+| `desktop` | `vm_desktop_state`, `vm_desktop_apps`, `vm_windows`, `vm_accessibility_tree`/`find`; with input also `vm_window_action`, `vm_app_launch`, `vm_accessibility_action` | observe, input |
+| `snapshots` | `vm_snapshot_list`/`status`; with lifecycle also create, restore, delete, reconcile, resume_source | observe, lifecycle |
+
+`all` names every group. The mapping lives in
+[`src/tool_groups.rs`](src/tool_groups.rs), apart from the tool definitions: a new
+tool needs a line there or a matching prefix, and the `every_tool_has_a_group`
+test fails until it has one. An unmapped tool stays listed.
+
+While a permitted group is hidden, the session also lists `vm_tools_enable`. Its
+`groups` argument offers exactly the hidden groups that hold permitted tools, so
+an observe-only session is never offered `input`, `exec` or `files`. A call lists
+those groups for the rest of the session, replies with the added tool names, then
+sends `notifications/tools/list_changed`; `initialize` reports
+`tools.listChanged: true` in this case only. Calling a permitted tool of a hidden
+group fails with an error that names `vm_tools_enable`.
+
+Size of `tools/list` (compact JSON; tokens estimated at 4 bytes each, not a
+tokenizer count):
+
+| Session | Tools | Bytes | ≈ tokens |
+|---|---|---|---|
+| observe, before this change | 18 | 9,526 | 2,380 |
+| observe | 18 | 8,866 | 2,220 |
+| observe, `--tools core` | 9 | 2,682 | 670 |
+| observe, `--tools core,screen` | 12 | 4,974 | 1,240 |
+| lifecycle | 33 | 17,100 | 4,280 |
+| execute | 23 | 11,116 | 2,780 |
+| files | 24 | 11,037 | 2,760 |
+| input | 26 | 18,590 | 4,650 |
+| all permissions, before this change | 52 | 32,273 | 8,070 |
+| all permissions | 52 | 31,245 | 7,810 |
+| all permissions, `--tools core,exec,files` | 30 | 12,838 | 3,210 |
+| all permissions, `--tools core,screen,input,desktop` | 35 | 24,094 | 6,020 |
+
+Per group with every permission: core 8.5 KB, input 8.1 KB (the coordinate
+schemas and key enum), desktop 6.8 KB, snapshots 4.0 KB, screen 3.1 KB, exec
+3.0 KB, files 2.9 KB, each counting `vm_tools_enable`. Tightened descriptions
+cut description text from 12,937 to 11,909 bytes (8%) and the `initialize`
+instructions from 2,559 to 1,797 bytes (30%), keeping every permission,
+confirmation, timeout and does-not-prove statement.
+
 ## Bounded asynchronous commands
 
 Execute-enabled MCP connections expose `vm_exec_start`, `vm_exec_poll` and
-`vm_exec_cancel`. Start takes the same argv and 1–30000 ms timeout as synchronous
-`vm_exec`. Its text result retains the Guest protocol wrapper:
+`vm_exec_cancel`. Start takes the same argv as synchronous `vm_exec`. The asynchronous host timeout range is 1–120000 ms; synchronous
+`vm_exec` retains its 1–30000 ms range. Both default to 5000 ms. A start above
+30000 ms first requires a successful explicit `vm_guest_info` query for the same
+running QEMU Linux worker, opted into exec-v2. Its reply must advertise the
+no-reconnect, rootless cgroup execution contract and an integer
+`max_async_timeout_ms` covering the request. Unknown, older, malformed and
+reconnecting Guest policies retain the 30000 ms host limit; Apple/vsock remains
+at that limit because its Guest service can restart within the same VM process.
+The observed cap belongs to one worker and cannot carry into its replacement.
+An unsupported longer start is rejected before reserving a job or sending
+`exec_start`; the host does not retry through legacy execution.
+A fresh info query clears its prior cap until the reply is validated. Its text result retains the Guest
+protocol wrapper:
 
 ```json
 {"id":"native-request-id","result":{"job_id":"32-lowercase-hex-characters","state":"running"}}
@@ -121,12 +301,72 @@ disconnected direct Unix-socket synchronous caller also requests cancellation of
 its own job. An individual HTTP connection closing does not end its
 authenticated MCP session; use session DELETE or wait for its configured TTL.
 Cleanup is best effort; SIGKILL of the MCP adapter cannot run it, so its Guest
-commands run until their own timeout (at most 30 seconds). Async
+commands run until their own timeout (at most 30 seconds for synchronous
+commands, 120 seconds for an admitted asynchronous job). Async
 completion/output is not recoverable by a newly created connection. No job is
 automatically resumed. Prefer explicit cancel and terminal polling when
 confirmed termination is required. On QEMU with `qemu_guest_exec`, shutdown
 stops new commands and gives running Guest execution a 60-second quiesce
 deadline.
+
+## Pushed events and resources
+
+MCP clients that handle notifications need not poll. Both transports offer the
+same events; clients without them keep using `vm_status`, `vm_screen_wait` and
+`vm_exec_poll`, which are unchanged. `initialize` advertises
+`resources: {subscribe: true, listChanged: false}` next to `tools`.
+
+- **Progress.** A `tools/call` with `_meta.progressToken` receives
+  `notifications/progress` about once a second (`progress` is elapsed
+  milliseconds, no `total`) until its result; none follows the result.
+  `vm_exec_poll` takes an optional `wait_ms` (0–30000): the adapter waits for
+  the job to leave `running` instead of the client polling, and returns the
+  same reply `vm_exec_poll` would.
+- **Resources.** `veynode://vm/{id}/status` (the `vm_status` JSON),
+  `/screen` (the screenshot as a blob plus its metadata), `/log/serial` and
+  `/log/worker` (text) and, with execute permission, `/job/{job_id}` (the
+  `vm_exec_poll` reply). `resources/list` lists the first four per VM;
+  `resources/templates/list` has all five.
+- **Subscriptions.** `resources/subscribe` makes the session send
+  `notifications/resources/updated` for that URI, with the event in
+  `_meta["veynode.dev/event"]`:
+
+| Resource | Events |
+| --- | --- |
+| status | `started`; `state` (worker-reported state changed, with `state`); `guest_reset`; `stopped` or `crashed` with `exit_code`, once per worker; `lost` when the session read too late |
+| screen | `changed` (at most one a second), then `settled` once still for 750 ms |
+| log | `appended` with the new `size` |
+| job | `finished` with `exit_code`, `timed_out`, `cancelled` and truncation flags, or `expired`; then the subscription ends |
+
+The Guest returns a command's output only with its exit, so a job reports no
+partial output; read the job resource or poll for stdout and stderr. Screen
+watching repeats a 5-second `screen_wait`, so a change in the short gap between
+two waits can be missed. A session holds at most 32 subscriptions, at most 2 of
+them screens.
+
+The daemon side is two non-blocking methods, so no adapter holds one of the
+daemon's 32 connections while it waits: `events {after}` reads a sequence-numbered
+log of the last 512 lifecycle events (`vm`, `event`, `state`, `reason`,
+`exit_code`, `unix_ms`; no host path or pid), and `log_read {id, stream,
+max_bytes}` returns at most the last 64 KiB of the VM's `serial_log` or its QEMU
+worker's stderr log. The log file must be owner-private and is opened without
+following symlinks. Terminal escapes and control characters are removed, runs
+of 32 or more token-like characters (hex, base64) with a digit are replaced by
+`<redacted>`, and in the worker log every absolute path is replaced by `<path>`.
+Serial output is Guest output and keeps Guest paths. The adapter checks for new
+events, log growth and finished jobs every 500 ms (logs every second).
+
+Over HTTPS a principal reads and subscribes only to resources of its
+allowlisted VMs, `resources/list` is filtered to them, the status resource gets
+the same public projection as `vm_status`, and the endpoint forwards only
+`resources/updated` notifications for allowlisted VMs (progress reaches only the
+request that asked for it). Each session queues at most 256 notifications or
+1 MiB for its GET stream; a client that reads too slowly, or has no stream open,
+loses the oldest ones and next receives `notifications/veynode/events_dropped`
+with the count. One GET stream per session is expected; its 15-second
+keepalives count as session activity, the 8-hour absolute limit still applies,
+and the stream ends with the session. Screen subscriptions are capped at 8
+across all HTTPS sessions.
 
 ## APFS base images and writable clones
 
@@ -186,6 +426,134 @@ symlink rejection, corrupt-base refusal and configurable space-headroom refusal.
 They do not certify an installed guest booting from the clone; that needs a
 separate cleanly stopped installed-guest fixture.
 
+## Agent checkpoints, rollback and forks
+
+Agents that are about to try something risky, or want to try several
+approaches at once, use the container tools (lifecycle permission; the list is
+observe):
+
+| Tool | Does | Confirm |
+|---|---|---|
+| `container_checkpoint` | APFS clone of the container's writable layer, plus RAM/CPU/device state on Apple Virtualization (`memory`, default true) | — |
+| `container_checkpoint_list` | name, time, whether it was running and synced | — |
+| `container_rollback` | hard stop, swap in a clone of the checkpoint, restore its machine state or boot again (`memory: false` forces a boot) | container |
+| `container_checkpoint_delete` | delete one checkpoint | name |
+| `container_fork` | `count` (1–16) new containers from one checkpoint or the live layer | — |
+| `container_fork_rm` | stop and delete a fork group, or every fork of a source | selector |
+
+The tools run `veynodevm checkpoint|rollback|fork` (`crates/cli/src/checkpoint.rs`).
+A Linux container's only mutable state is `rw.raw`: the image root, boot assets
+and configuration disk are read-only. A checkpoint is `clonefile` of that layer
+into `<container>/checkpoints/NAME/`, so it costs no data blocks until the
+container writes. A running container runs `sync` first; the clone is one
+atomic APFS operation, so the copy is crash-consistent (ext4 replays its
+journal). A disk-only checkpoint does not capture memory or processes; rolling
+back to it cold-boots the micro-VM and the entrypoint runs again. Warm
+checkpoints (below) also capture memory on Apple Virtualization.
+
+A fork gets a clone of the chosen layer (the live layer is synced and cloned
+once, so all forks of one call start from the same state), a new container
+id, hostname and session token in its own configuration disk, a random locally
+administered MAC (`mac_address`; QEMU sets it on its virtio-net NIC) and a fresh free
+loopback host port for each port the source published. The guest agent records
+the owning container id on the layer (`/run/disk/.veynodevm-container-id`);
+booting a layer owned by another id removes `/etc/machine-id` and
+`/var/lib/dbus/machine-id` from the overlay upper directory, and systemd
+containers get a new one (`guest/veynode-agent/layer.go`). With `start`
+(default) the forks are booted and the call returns when every entrypoint has
+started. Before creating anything, `count × memory_mib` is checked against
+`capabilities.resource_admission.remaining_budget_mib`; a later per-start
+admission failure removes the forks the call created. Results name a `group`
+for `container_fork_rm`, and each fork carries `fork_of` in `container_list`.
+
+Measured 2026-10-26 on an M3 Pro (macOS 27), live micro-VMs in a disposable
+`VEYNODEVM_HOME`, alpine with a 16 GiB sparse layer, 512 MiB (Apple) or 2 GiB
+(QEMU) RAM; three runs each:
+
+| Step | Apple Virtualization | QEMU/HVF `--gpus virgl` |
+|---|---|---|
+| checkpoint of a running container (incl. guest `sync`) | 57–82 ms | 105–111 ms |
+| rollback: hard stop / swap / boot to entrypoint | 32–127 / 0 / 768–1975 ms | 3 / 0–1 / 1249–1490 ms |
+| fork ×3 from a checkpoint, all entrypoints started | 1086 ms (35–52 ms per fork to create) | 2460 ms (24–25 ms per fork) |
+| fork ×3 from the live layer | 775 ms | 3147 ms |
+| disk | logical 16 GiB per clone; free space moved by 0–11 MiB per checkpoint or fork group (noisy: other sessions share the volume) | same |
+
+Each fork reported its own hostname and MAC from inside the Guest, served its
+own HTTP response on its remapped host port, kept the checkpoint's files and
+dropped the source's `/etc/machine-id`; writes in one fork were not visible in
+another or in the source. A 16 × 2 GiB fork was refused by the memory check
+before creating anything. Unit tests cover names, config derivation, port
+remapping, fork selection, tool scopes and confirmations, and the agent's
+layer adoption; they do not boot a Guest.
+
+### Warm checkpoints and rollback (Apple Virtualization)
+
+On Apple Virtualization a checkpoint of a running container also saves its
+machine state (`veynodevm checkpoint create` without `--disk-only`, macOS 14+).
+The daemon's `machine_state_save` worker method (`container_state.rs`,
+`native/worker/ContainerState.swift`) pauses the VM, writes
+`checkpoints/NAME/machine.vzstate` with `saveMachineStateTo`, `fsync`s and
+`fclonefileat`s the writable layer from the worker's held descriptor while
+still paused, and resumes: disk and memory come from one paused interval. Both
+files are mode 0400 in a 0700 staging directory, and the paths must stay
+inside the container directory. The guest console log is copied alongside.
+
+Restore needs the same configuration, so containers created since this change
+get a persistent `vz-machine-id.bin` (`machine_identifier_file`, a
+`VZGenericMachineIdentifier` created 0600 on first start) and a fixed random
+`mac_address`. Extra disks, the configuration disk, virtiofs shares and a new
+serial log path do not block restore. Rollback (`container_rollback`, or
+`veynodevm rollback` without `--cold`) hard-stops the VM, swaps in a clone of
+the checkpoint's layer and starts a fresh worker with
+`restore_machine_state` (`--restore-machine-state PATH`), which restores and
+resumes it, emitting `machine_state_restored`. The CLI then sends
+`clock_sync` (the guest agent steps `CLOCK_REALTIME` to the host time; the
+monotonic clock continues from the checkpoint). Processes, tmpfs contents and
+the published ports carry on from the checkpoint. If the restore fails, the
+reply carries `warm_error`, and rollback re-clones the layer and cold-boots;
+`path` says `warm` or `cold`. An agent older than `clock_sync` leaves the
+clock behind and reports the error in `restore.clock_sync`. Deleting a
+checkpoint deletes its state file with it.
+
+Forks always cold-boot (`path: "cold"`). VZ restores a state file only into a
+VM with the source's MAC address and machine identifier: a new MAC or a new
+identifier failed restore with "invalid argument" in live tests, and changing
+the MAC inside the restored guest leaves it without a DHCP lease, because
+vmnet filters by the configured MAC. A warm fork would therefore be a second
+VM on the network with the source's MAC. QEMU containers keep disk-only
+checkpoints: virgl and Venus install a migration blocker, so the reply names
+`warm_unavailable`. So do containers created before machine identifiers.
+
+Measured 2026-10-26 on an M3 Pro (macOS 27), live alpine micro-VMs in a
+disposable `VEYNODEVM_HOME`, worker built from this tree, three runs each:
+
+| Step | 512 MiB guest | 2 GiB guest, 1 GiB tmpfs filled |
+|---|---|---|
+| warm checkpoint (VM paused) | 228–258 ms (paused 211–252 ms) | 1290–1342 ms |
+| state file | 34 MiB | 1088 MiB |
+| warm rollback, total (restore to running) | 409–566 ms (363–513 ms) | 1578–1768 ms |
+| cold rollback, total (boot to entrypoint) | 864–916 ms (830–881 ms) | 697–791 ms |
+| fork ×3 from a warm checkpoint (cold) | 1041 ms | 858 ms |
+| checkpoint of a stopped container (disk only) | 10 ms | — |
+
+The state file grows with the memory the guest has touched, and saving and
+restoring it costs about 1.2 s per GiB here: a small, idle guest rolls back
+about twice as fast warm, a guest with a gigabyte in use rolls back faster
+cold, but warm keeps its processes. After each warm rollback a counter
+process resumed from its checkpoint value, HTTP through the published port
+answered, and the clock was stepped by the time spent since the checkpoint
+(2.3–9.5 s). A `-v` virtiofs share stayed mounted. Through MCP, warm rollback
+took 335 ms and `memory: false` 715 ms. Unit tests cover path containment,
+eligibility, fork identifiers and the agent's clock request validation; they
+do not boot a guest.
+
+Live full-state snapshots of whole VMs remain the separate `vm_snapshot_*`
+tools: they save RAM/CPU/device state for single-disk Apple Linux VMs with a
+persistent `machine_identity_dir` (`implemented_unverified`) and keep named,
+transactional snapshots in the VM's state. QEMU's paused-migration helper
+(`qemu_snapshot.rs`) is not wired in and refuses virgl/Venus because QEMU
+installs a migration blocker for accelerated virtio-gpu.
+
 ## HTTPS endpoint
 
 `vm-mcp-http` exposes `/mcp` using rustls with TLS terminating on the user's Mac.
@@ -193,7 +561,11 @@ It defaults to `127.0.0.1:8443`; wider binding requires an explicit bind address
 No public deployment or firewall changes are made by this repository.
 
 The transport supports MCP version `2025-06-18`, JSON POST responses, notification
-202 responses and DELETE. GET returns 405 because SSE delivery is not implemented.
+202 responses, DELETE, and server-sent events (see [Pushed events and
+resources](#pushed-events-and-resources)): a POST carrying `_meta.progressToken`
+is answered as an SSE stream of its progress notifications followed by its
+response, and GET (Accept `text/event-stream`) opens the session's notification
+stream. There is no resumption (`Last-Event-ID` is ignored).
 It uses provisioned bearer tokens, **not OAuth discovery or dynamic registration**;
 clients must support explicit authorization headers. This is not a claim of
 complete MCP OAuth authorization-profile support.
@@ -212,7 +584,8 @@ Example private JSON configuration (replace placeholders):
       "name": "trusted-agent-device",
       "token_sha256": "64-lowercase-hex-characters-of-SHA256-of-a-random-bearer-token",
       "scopes": ["observe", "execute"],
-      "vm_ids": ["linux-agent"]
+      "vm_ids": ["linux-agent"],
+      "tools": ["core", "exec"]
     }
   ]
 }
@@ -231,6 +604,11 @@ No token, operation body or guest output is written to service logs.
 ```
 
 Every remote principal has an explicit VM-id allowlist (omission grants none).
+Optional `tools` lists the [tool groups](#tool-groups) its sessions see (omission
+lists every permitted tool); it grants nothing beyond `scopes`. `vm_tools_enable`
+needs no VM id. JSON POST replies carry no server notifications, so this
+transport answers `initialize` with `tools.listChanged: false` and drops the
+`list_changed` after `vm_tools_enable`; call `tools/list` again after it.
 Remote `vm_create` is blocked even with lifecycle scope: host disk paths, shared
 directories, restore images and kernel command lines must be configured locally.
 List/status/start responses hide host paths, kernel arguments and process IDs.
@@ -322,6 +700,17 @@ directory traversal, arbitrary Guest file access, overwrite or directory creatio
 The controller routing tests use pipe fixtures and do not establish actual macOS
 Guest transfer acceptance. See [Linux Guest boundary](../../guest/veynode-agent/README.md).
 
+Windows machines (QEMU/HVF, `guest: windows`) have no guest agent; the daemon
+moves files over the Guest's OpenSSH Server instead (see
+[Windows machines over SSH](#windows-machines-over-ssh)). Writes and reads
+are staged on the host (`<state>/windows-files`, 0600) and cross SSH once, at
+`vm_file_upload_commit` and `vm_file_download_begin`; the other calls never
+touch the Guest. The directory is `%USERPROFILE%\veynodevm-files` of the SSH
+user, which has no separate account: anything that user runs can read it.
+Names are single Windows file names (no device names, separators, wildcards
+or trailing dots); publication checks SHA256 in the Guest and never
+overwrites.
+
 
 ## Opt-in QEMU/HVF console backend
 
@@ -367,6 +756,10 @@ lose Guest data; they are not normal Guest shutdown. Automatic VM restart is not
 implemented. A SIGKILLed worker can leave its private runtime directory and
 socket names; it does not leave an executing QEMU child in the verified path.
 
+Daemon stderr logging uses a non-blocking 64-line queue. Existing successful and
+error returns from the daemon's serve function allow up to 250 ms to drain it.
+On SIGTERM, queued lines not yet written may be lost; at most the 64-line queue.
+
 Guest serial logging is disabled by default. Explicit `serial_log` enables an
 owner-private append-only diagnostic file, bounded to 8MiB. Backend stderr is
 retained in a private per-run file, also bounded to 8MiB. Disabled/full/failed log
@@ -376,7 +769,7 @@ controller. The explicit test script saves diagnostics and screenshots.
 `vm_screenshot` is observation-only and returns MCP image content plus UUID,
 timestamps, physical Guest pixel dimensions and unknown Guest UI scale. Internal
 SPICE scanout IDs are removed. One asynchronous capture per VM is allowed; another
-returns busy. Screenshot responses are <=3MiB, PNG <=2MiB, worker deadline 15s, control
+returns busy. Screenshot responses are <=12MiB, PNG <=8MiB (decision 0024; 3MiB and 2MiB before 2026-10-11), worker deadline 15s, control
 wait bound 17s. Shutdown/stop can be processed while capture is pending. Capture
 currently starts a short-lived SPICE consumer: a completely static desktop that
 sends no new draw can fail explicitly. Use the persistent console broker below to
@@ -389,6 +782,24 @@ Screenshot JSON avoids optional slash escaping to keep worst-case base64 within
 its response budget. The macOS Guest JPEG producer and 700KiB validation remain
 unchanged. Fixed native error diagnostics report the stage and encoded byte count,
 never pixels or file paths.
+
+The MCP `vm_screenshot` also takes `max_width`, `max_height` (16–8192), `region`
+(`{x, y, width, height}` in screenshot pixels), `format` (`jpeg`, `png`) and
+`quality` (1–100, default 80) on every backend. The full capture still crosses
+the daemon; the stdio adapter crops, scales down (never up, one factor for both
+axes) and re-encodes it with `vm-vision image` (ImageIO) and refuses a result
+above 700 KiB. Scaling defaults to JPEG, a crop alone keeps the capture's format.
+`width`, `height`, `frame_id` and `source_generation` stay those of the full
+frame, for input; `image_width`, `image_height`, `image_scale` (image pixels per
+source pixel) and `image_region` describe the image, and the source digest moves
+to `source_sha256`. A point in the image maps back as
+`x = image_region.x + image_x / image_scale` (y likewise). For a whole-screen
+image the reply adds `image_point_pixel_scale` (`1 / image_scale`, when at most
+8): pass it as `point_pixel_scale` with `"coordinate_space":"points"` and click
+image coordinates directly. Clients such as Claude downscale images over about
+1568 px themselves, so without `max_width` the pixels a model sees are not the
+ones `width`/`height` describe; `"max_width":1568` makes them agree. The QEMU
+broker's own scaled-JPEG form (decision 0025) is not used by this path.
 
 Reproduce the actual RAM-only test (requires the pinned media and local runtimes):
 
@@ -465,12 +876,62 @@ independent **`input`** scope alongside `observe` and an explicit VM allowlist.
 - `vm_input_scroll`: `x`,`y`, `direction` (`up`,`down`,`left`,`right`), 1–20 discrete `ticks`.
 - `vm_input_key`: 1–8 explicit `keys` in the advertised QEMU qcode enum. These are
   physical key positions/chords interpreted by the Guest keyboard layout, **not**
-  Unicode text injection. Presses are followed by releases, 20 ms later by default;
+  Unicode text injection (see `vm_input_text`). Presses are followed by releases, 20 ms later by default;
   optional `hold_ms` (0–900) holds them longer, for games that steer or accelerate
   only while a key is down. Longer holds are repeated calls.
+- `vm_input_text`: `text`, 1–256 Unicode scalar values and at most 1024 UTF-8 bytes;
+  U+000A (Return) and U+0009 (Tab) are the only control characters, noncharacters
+  are refused, nothing is normalized. Supported only for a Linux Guest on QEMU
+  registered with `qemu_guest_exec`, whose Guest service runs on the execution
+  transport with `--allow-text-input` in an X11 session (XTEST, at least 8 spare
+  keycodes; no Wayland). Every other VM is refused with `unsupported: Unicode text
+  input requires ...` before any console check; a Guest without the service is
+  refused with `unsupported` after one `guest_info` query. The text does not
+  travel as key codes: the daemon splits it into chunks of 16 scalar values and
+  the worker sends each as a `text_input` request (hex of the UTF-8 bytes)
+  under the same operation and recent-frame fences as `input_step`;
+  the Guest binds temporary keycodes, reads the mapping back and sends XTEST key
+  events (`guest/veynode-agent/README.md`). The first failure ends the call and
+  states how many characters were delivered and how many are unconfirmed;
+  nothing is retried or dropped silently. A chunk may take up to 4 s when the
+  Guest has to wait before rebinding a keycode. The daemon, worker and Guest
+  service do not log or persist the text, and replies carry counts only; the
+  caller's own process arguments and MCP client logs are outside this code.
+  Success means the Guest X server acknowledged the key events, not that the
+  application accepted them.
+
+Click, drag and scroll accept optional `coordinate_space`: `"source_pixels"`
+(the default, preserving existing integer pixel requests) or `"points"`.
+Points require a caller-supplied finite `point_pixel_scale` greater than 0 and
+at most 8; supplying a scale with source pixels, omitting the scale for points,
+or using an unknown space is a typed error (`invalid_point_pixel_scale` or
+`invalid_coordinate_space`). Point coordinates may be fractional and must be
+finite and nonnegative (`invalid_point_coordinate` otherwise). Before the existing
+frame bounds, generation, expiry and identity checks, the control plane multiplies
+each position by the scale and rounds to the nearest pixel, with ties away from
+zero. Converted pixels outside the frame are refused without clamping. Both drag
+endpoints and scroll positions are converted; scroll `ticks` remain discrete
+wheel-button press/release pairs in the wire's own units and are never scaled.
+The conversion is shared by QEMU Linux and opted-in macOS Guest input.
+
+For example, `"coordinate_space":"points","point_pixel_scale":2.0,"x":200,"y":150`
+on a 2560×1440 frame converts to source pixel (400,300), normalized (5126,6838).
+Keep `width` and `height` in source pixels. The scale is caller knowledge (for
+example from `vm_windows` or the display); it is never inferred from or added to
+the screenshot binding. macOS screenshots already report `point_pixel_scale`
+and `guest_ui_scale`, but input does not depend on those metadata fields.
+Points are local to the captured display's upper-left origin: `vm_windows`
+reports global desktop points, so callers must first subtract the selected
+display's global origin. This option supplies no display selection, rotation
+or letterbox transform.
 
 On QEMU, input requires the persistent console broker and a screenshot observation younger
-than 5 seconds. Each worker keeps at most 16 observation metadata records; restarting
+than 5 seconds, or older when the console has drawn nothing since: the worker
+records the capture's `source_sequence` with the frame and accepts an aged frame
+whose sequence still equals the current `frame_status.source_sequence` (any draw,
+a blinking caret included, ends that). Freshness is checked when an operation
+begins; its later steps keep the generation and size checks but not the age, so a
+click's release is not refused because the press redrew the button. Each worker keeps at most 16 observation metadata records; restarting
 the VM discards them. Static source capture timestamps may be old: expiry uses the
 host's new screenshot observation time without falsifying the original capture time.
 Every step queries the native capture owner's current generation/dimensions through `frame_status`; unavailable,
@@ -488,8 +949,88 @@ that an application accepted input. Guest evdev/Xorg acceptance is tested separa
 
 Actual stdio disconnect during a drag releases the button and prevents completing
 the drag. Internet browser input,
-accessibility, Unicode/layout handling, Retina calibration, multiple displays,
+accessibility, keyboard layout translation for `vm_input_key`, Unicode text outside
+the `vm_input_text` case above (Apple Virtualization, macOS, Wayland, QEMU without
+`qemu_guest_exec`), Retina calibration, multiple displays,
 macOS input and Windows input are still unsupported.
+The host path of `vm_input_text` (daemon, worker fence, serial transport) is covered
+by offline tests and the Rust-to-Go interop test.
+
+#### Act and observe (`observe`)
+
+Through MCP, every input tool and `vm_accessibility_action` take an optional
+`observe` object (`crates/control/src/agent_view.rs`). After dispatch the adapter
+waits as `vm_screen_wait` does from the frame the input was bound to (for an
+accessibility action, the last frame the session saw, else one taken before the
+action), with `settle_ms` (default 300) and `timeout_ms` (default 2000; 0 skips
+the wait), then takes a fresh screenshot and returns its anchor as `frame`
+(`frame_id`, `width`, `height`, `source_generation`) plus `observed` (`changed`,
+`settled`, `elapsed_ms`). The next input can use that frame without a separate
+screenshot. `return` chooses what else comes back:
+
+| `return` | Reply |
+| --- | --- |
+| `delta` (default) | accessibility elements added (`+`), changed (`~`) or removed (`-`) since the last tree this session read, as compact lines by ref; the first time, the whole tree. Without a tree (QEMU, Windows Guests) the changed regions between the bound frame's image and the new one (`vm-vision diff`, 16 px cells, at most 16 regions) and the text recognized in them |
+| `compact_tree` | the whole compact tree, with the arguments of the session's last `vm_accessibility_tree` (default `interactive_only`) |
+| `text` | the screen's text lines, `"text" @x,y` |
+| `screenshot` | the image, with `max_width`, `max_height`, `format`, `quality` as for `vm_screenshot` |
+| `none` | only the frame |
+
+The action has already happened when an observation fails, so a failure is
+reported in `observed.error` and the call is not an error. The input reply drops
+its dispatch note; `guest_delivery_confirmed` stays false, and the observation is
+the evidence of acceptance.
+
+The adapter also re-anchors frames on Apple Virtualization Linux desktops and
+macOS Guests, whose services keep the 5 s window: input bound to a frame this
+session saw more than 4 s ago first takes a new screenshot and, when its SHA-256,
+geometry and generation equal the old frame's (the screen has not changed),
+sends the input with the new `frame_id` and reports `reanchored`
+(`from`, `to`). A different digest refuses the input with `stale_frame` before
+anything is sent. QEMU frames are left to the worker's sequence check above, and
+frames this session never saw are passed through to the backend's own check.
+
+#### Batched input (`vm_input_batch`)
+
+`vm_input_batch` (input permission, MCP only) runs 1–50 `steps` in order and
+stops at the first failure. Each step has a `type`: `click` and `scroll` (at `x`,
+`y` or at the box center of a `ref` this session read), `drag`, `key` and `text`
+take the fields of the single tools; `a11y` takes `ref`, `action`, `action_name`,
+`text`, `value` as `vm_accessibility_action`; `wait` waits `settle_ms` for the
+screen (as `vm_screen_wait`), or until `until_text` is recognized on screen, or
+until an element matching `until_name`/`until_role` exists (polled every 300 ms
+up to its `timeout_ms`, default 5000). Every step's shape is checked before the
+first is sent. `timeout_ms` (default 30000, at most 120000) bounds the batch.
+
+Coordinates are in the pixels of the frame given (`frame_id`, `width`, `height`,
+`source_generation`, required when there are input steps). Every input step is
+sent bound to a frame the backend checks as for the single tools: the caller's
+frame (re-anchored when old and unchanged, as above), reused while it is younger
+than 4 s, then a fresh frame taken before the step. A fresh frame whose size or
+generation differs from the batch's fails the step with nothing sent. A redraw
+caused by the batch itself does not fail it; express what must have happened
+between steps with `wait` steps. The reply lists a short summary per step done
+(`click @960,316`, `text 12 chars`, `a11y set_text e12`, `wait found …`) and, on
+failure, `failed` (`index`, `type`, `error`) with `isError` set. `observe` runs
+once at the end or at the failure and compares with the frame the batch started
+from. With `interactive_only` trees the delta leaves out static text such as a
+confirmation label; wait for it with `until_name` or `until_text`, or observe
+`text`.
+
+Fixture measurements (`agent_view_tests.rs`, scripted daemon and helper, text
+tokens counted as bytes / 4, images as width × height / 750 after fitting
+1568 px; run with `cargo test -p vm-control --lib agent_view::tests::measure -- --nocapture`):
+
+| Flow | Before: calls, tokens, bytes | After: calls, tokens, bytes |
+| --- | --- | --- |
+| Linux desktop, act by ref and verify | 3, ~33.9k, 157 KB (JSON tree, action, JSON tree) | 2, ~2.2k, 9.5 KB (compact `interactive_only` tree, action with `observe` delta) |
+| QEMU 1920×1080, click and verify | 5, ~5.0k, 1.72 MB (3 screenshots, click, wait) | 1, ~0.1k, 0.6 KB (click with `observe` delta: regions and their text) or 1, ~1.8k, 186 KB (`observe` screenshot at 1568 px) |
+| Form, 5 fields and Submit, by ref | 8, ~34.2k, 159 KB | 2, ~2.3k, 9.8 KB (tree, one batch) |
+| Form, 5 fields and Submit, QEMU coordinates | 19, ~12.0k, 4.0 MB (a screenshot before each field, as model turns outlast 5 s) | 2, ~1.9k, 186 KB (1568 px screenshot, one batch) |
+
+These are fixture numbers for the MCP surface, not live Guest timings; a real
+tokenizer counts JSON refs and numbers more densely than 4 bytes per token, so
+the JSON rows understate the earlier cost.
 
 Reproduce the actual disposable Linux input acceptance (requires existing pinned
 QEMU/Alpine prerequisites and the console broker/native helper):
@@ -541,7 +1082,9 @@ screen when the call starts. It returns `changed`, `settled`, `first_change_ms`,
 
 The daemon remembers the last 16 screenshot anchors per VM for QEMU and macOS
 baselines. A blinking cursor or a clock is a change; use `region` (Linux) or a
-short `settle_ms` window accordingly. Take a new screenshot before input.
+short `settle_ms` window accordingly. Take a new screenshot before input, or pass
+`observe` to the input call itself, which waits the same way and returns a fresh
+frame and what changed (see "Act and observe" above).
 
 ### Reading screen text (`vm_screen_text`)
 
@@ -556,7 +1099,10 @@ recognized word can be clicked with the input tools directly. `find` adds
 `matches`: every case-insensitive occurrence of a string with its own box.
 (`vm-vision row --y Y --from X` is a second mode used by the macOS first-boot
 grant: the runs of pixels along a row that differ from its background, which
-finds the control at the end of a list row.)
+finds the control at the end of a list row. `image` crops, scales and encodes a
+screenshot for `vm_screenshot`; `diff --before PATH` returns the changed regions
+between two screenshots and `text --crop X,Y,W,H` reads only part of one, for
+`observe`.)
 `fast` uses the fast recognizer; `languages` takes up to 8 BCP 47 codes (default
 automatic). The helper reads the screen in overlapping full-width bands, each
 upscaled twice: Vision skips rows of small text on a full desktop and reads
@@ -618,6 +1164,32 @@ or text) and/or exact `role` and returns only matches with their `context`.
 else the first), `focus`, `set_text` or `set_value`, and returns the element
 100 ms later.
 
+Through MCP both tree tools default to `"format":"compact"`: a header line
+(`count`, `visited`, `truncated`) and one line per element, indented by depth in
+the tree (not in `_find` or `interactive_only`):
+
+```text
+e12 push button "Save" @1119,598 [focused,is_default]
+e40 dialog "Save changes?" @960,512 512x256 [modal]
+e7 text ="Meeting notes…" [editable,multi_line,focused]
+```
+
+That is `ref role[:subrole] "name" ="text" placeholder "…" value=V @center_x,center_y`
+(windows and dialogs add `WxH`) `[states] {actions}` (only when there are
+several) `+N` (unexpanded children) `pid=P` and, from `_find`, `in "context"`.
+Names are cut at 80 and texts at 160 characters. Refs are short (`e12`): the
+adapter maps them to the Guest's refs for the life of the MCP session, gives an
+element the same short ref in every read and never reuses a number, and
+`vm_accessibility_action` takes either form (an unknown short ref is refused
+before anything is sent; its reply is a compact line too). `"format":"json"`
+returns the Guest's elements unchanged. `interactive_only` keeps applications,
+windows and dialogs plus elements with actions, editable or focused ones and
+controls by role, filtering in the adapter: it asks the Guest for four times
+`max_nodes` (at most 2000) so `max_nodes` counts what is shown. On the fixture
+in `agent_view_tests.rs` (a GNOME-like desktop of 420 elements, 400 read) the
+JSON form is 78.9 KB, the compact form 15.7 KB and compact `interactive_only`
+8.8 KB.
+
 ### Desktop and accessibility tools in macOS containers
 
 `veynodevm` macOS containers answer the same seven tools with the macOS
@@ -660,7 +1232,52 @@ the host's copy changes. A call takes 0.15 to 0.7 s, most of it SSH.
   or fails as gone if there is none or several; the reply's `ref` is the
   current one. `do` prefers press, confirm, pick, show menu, raise.
 
-### macOS Guest screenshots
+### Windows machines over SSH
+
+Windows machines (`machine create --os windows` on QEMU/HVF) answer
+`vm_exec`, the six file tools and the seven desktop tools over Windows' own
+OpenSSH Server, as the user whose key `install-distro.py windows` set up.
+Nothing is installed in the Guest: the daemon sends PowerShell scripts
+(`guest/windows/*.ps1`, built into `vm-control`) as text and Windows
+PowerShell 5.1 runs them. Requests and replies are UTF-8; the scripts that
+use the SSH console set its encoding first, because it defaults to the OEM
+code page (`tests/windows_scripts.rs`). The daemon needs a port forward to the Guest's port
+22 (`--publish 2222:22`) and the login, which `install-distro.py` records with
+`veynodevm machine ssh-key NAME --user USER --key PRIVATE_KEY`
+(`machines/NAME/ssh`, 0600). Without either, calls fail and the error names
+the missing step; a stopped machine or an SSH failure says so too.
+
+- `vm_exec`: argv runs without a shell (`Process.Start`; the command line is
+  built with the Windows quoting rules), so `cmd /c …` and
+  `powershell -Command …` work as programs, in the SSH user's home, without
+  a window. Up to 30 s and 64 KiB per stream; a timeout kills the process
+  tree and returns exit code -1. `vm_exec_start`, `_poll` and `_cancel` are
+  unsupported.
+- Desktop tools: an SSH session has no desktop, so `guest/windows/session.ps1`
+  runs `desktop.ps1` in the logged-on console user's session through a
+  one-off scheduled task (interactive token, hidden, `conhost --headless`, so
+  no window or console flash), waits for its result, then deletes the task
+  and its request directory (`%ProgramData%\VeynodeVM\desktop\<id>`, readable
+  only by SYSTEM, administrators and that user). No user logged on is an
+  error. `vm_desktop_state` and `vm_window_action` use Win32 (the Alt+Tab
+  window list, DWM visible frames, physical pixels); `vm_desktop_apps` lists
+  Start menu entries (`Get-StartApps`), `vm_app_launch` opens one through
+  `shell:AppsFolder` and activates its new window; the accessibility tools
+  use UI Automation (control view) with the same node shape, limits and
+  `do`/`focus`/`set_text`/`set_value` actions as Linux and macOS. Refs are
+  `hwnd|child path|role|AutomationId or name` and re-resolve like macOS refs.
+  `fullscreen` is unsupported (Windows has no such window state).
+- `vm_windows` stays macOS-only, as on Linux: `vm_desktop_state` returns
+  the windows.
+
+Measured on one Windows 11 26300 ARM64 machine through the daemon
+socket: `vm_exec` 1.2 to 1.9 s (SSH and PowerShell start), file commit or
+download 1.5 to 1.7 s, desktop tools 2.5 to 3.8 s, of which the UI Automation
+walk is 0.07 to 0.19 s and the rest SSH, the task and a second PowerShell
+start. A compiled helper would not shorten the measured part, so there is
+none. The first desktop call 30 s after boot timed out once (40 s) while
+the logon settled; the next calls answered in 2.6 s.
+
 
 An installed Apple macOS VM can serve `vm_screenshot` through the same host-only
 vsock integration, without command execution. Launch the Guest service with

@@ -18,6 +18,7 @@ fn fixture_app(dir: &Path, control_bin: PathBuf) -> Arc<App> {
         closing: AtomicBool::new(false),
         cleanup_failed: AtomicBool::new(false),
         changed: Notify::new(),
+        screens: std::sync::Mutex::new(BTreeMap::new()),
     })
 }
 
@@ -35,6 +36,7 @@ async fn cancelled_exchange(initializing: bool) {
         token_sha256: "a".repeat(64),
         scopes: vec!["observe".into()],
         vm_ids: vec![],
+        tools: vec![],
     };
     let mut headers = HeaderMap::new();
     headers.insert("content-type", HeaderValue::from_static("application/json"));
@@ -47,21 +49,13 @@ async fn cancelled_exchange(initializing: bool) {
         HeaderValue::from_static(vm_control::VERSION),
     );
     if !initializing {
-        let mut child = Command::new(script)
+        let child = Command::new(script)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        let stdin = child.stdin.take();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
-        let lifecycle = Arc::new(Lifecycle {
-            child: Mutex::new(child),
-            stdin: Mutex::new(stdin),
-            stdout: Mutex::new(stdout),
-            retired: AtomicBool::new(false),
-            outcome: OnceCell::new(),
-        });
+        let lifecycle = Lifecycle::new(child, principal.clone());
         let io = Arc::new(Mutex::new(Bridge {
             lifecycle: lifecycle.clone(),
         }));
@@ -166,20 +160,21 @@ async fn screenshot_bridge_large_png_is_method_scoped_and_rejects_truncation_and
             data.push(b'\n');
         }
         fs::write(&path, data).unwrap();
-        let mut child=Command::new("/usr/bin/python3").args(["-c","import sys; sys.stdin.readline(); sys.stdout.buffer.write(open(sys.argv[1],'rb').read()); sys.stdout.flush()",path.to_str().unwrap()]).stdin(Stdio::piped()).stdout(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
-        let stdin = child.stdin.take();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
-        let lifecycle = Arc::new(Lifecycle {
-            child: Mutex::new(child),
-            stdin: Mutex::new(stdin),
-            stdout: Mutex::new(stdout),
-            retired: AtomicBool::new(false),
-            outcome: OnceCell::new(),
-        });
+        let child=Command::new("/usr/bin/python3").args(["-c","import sys; sys.stdin.readline(); sys.stdout.buffer.write(open(sys.argv[1],'rb').read()); sys.stdout.flush()",path.to_str().unwrap()]).stdin(Stdio::piped()).stdout(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+        let lifecycle = Lifecycle::new(
+            child,
+            Principal {
+                name: "fixture".into(),
+                token_sha256: "a".repeat(64),
+                scopes: vec!["observe".into()],
+                vm_ids: vec![],
+                tools: vec![],
+            },
+        );
         let mut bridge = Bridge {
             lifecycle: lifecycle.clone(),
         };
-        let result=timeout(Duration::from_secs(5),bridge.exchange(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":method,"arguments":{"id":"fixture"}}}))).await.unwrap();
+        let result=timeout(Duration::from_secs(5),bridge.exchange(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":method,"arguments":{"id":"fixture"}}}),None)).await.unwrap();
         assert_eq!(result.is_ok(), expected, "{method}/{terminated}/{oversize}");
         if let Ok(Some(reply)) = result {
             assert_eq!(reply["result"]["content"][0]["data"], png["data_base64"]);

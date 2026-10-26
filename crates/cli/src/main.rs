@@ -5,6 +5,7 @@
 //! serves the docker CLI. Tart-format macOS images run as macOS VMs. All state lives under `veynodevm_home` (see
 //! `vm_control::home`); the per-user daemon owns VM processes.
 mod args;
+mod checkpoint;
 mod container;
 mod daemon;
 mod desktop;
@@ -58,6 +59,19 @@ Containers:
   inspect CONTAINER|IMAGE            Show low-level details
   desktop [--close] CONTAINER|VM     Open (or close) the native desktop window
 
+Checkpoints and forks (Linux containers; APFS clones of the writable layer):
+  checkpoint create [--disk-only] CONTAINER NAME
+                                     Apple Virtualization: memory + disk in one
+                                     pause; otherwise a crash-consistent disk clone
+  checkpoint ls|rm CONTAINER [NAME]
+  rollback [--start|--no-start] [--cold] CONTAINER NAME
+                                     Discard the current state; resume NAME's
+                                     memory when saved, else boot its disk
+  fork [-n N] [--checkpoint NAME] [--no-start] CONTAINER
+                                     N new containers from one state, each with
+                                     a fresh id, hostname, MAC and host ports
+  fork rm GROUP|CONTAINER            Remove a fork group (or every fork of one)
+
 Images:
   pull IMAGE        images [-q]       rmi IMAGE...
   load -i ARCHIVE   (docker save archive)
@@ -79,7 +93,9 @@ Virtual machines:
 
 Service:
   daemon run|start|stop|status      Per-user control daemon (launchd agent)
-  mcp [--lifecycle] [--execute] [--files] [--input]   MCP over stdio
+  mcp [--lifecycle] [--execute] [--files] [--input] [--tools GROUP,...]
+                                    MCP over stdio; --tools lists only those groups
+                                    (core exec files screen input desktop snapshots)
   ui [--port N] [--open]            Web management UI on localhost
   version
 ";
@@ -639,6 +655,133 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
             }
             Ok(result["exit_code"].as_i64().unwrap_or(126) as i32)
         }
+        "checkpoint" => {
+            let (action, rest) = rest
+                .split_first()
+                .context("usage: veynodevm checkpoint create|ls|rm CONTAINER [NAME]")?;
+            let p = parse(rest, &[("disk-only", None, false)], false)?;
+            let args = &p.positional;
+            let c = container::find(args.first().context("checkpoint requires a CONTAINER")?)?;
+            let name = || {
+                args.get(1)
+                    .map(String::as_str)
+                    .context("checkpoint requires a NAME")
+            };
+            let value = match action.as_str() {
+                "create" => checkpoint::create(&c, name()?, !p.has("disk-only"))?,
+                "ls" | "list" => serde_json::to_value(checkpoint::list(&c)?)?,
+                "rm" | "delete" => {
+                    checkpoint::remove(&c, name()?)?;
+                    json!({"container":c.name,"removed":name()?})
+                }
+                other => bail!("unknown checkpoint action: {other} (create, ls, rm)"),
+            };
+            if json_output {
+                print_json(&value)?;
+            } else if action == "ls" || action == "list" {
+                println!("{:<24} {:<16} CONSISTENCY", "NAME", "CREATED");
+                for m in checkpoint::list(&c)? {
+                    let consistency = if m.machine_state_bytes.is_some() {
+                        "running, memory saved"
+                    } else if !m.source_running {
+                        "stopped"
+                    } else if m.guest_synced {
+                        "running, synced"
+                    } else {
+                        "running, unsynced"
+                    };
+                    println!("{:<24} {:<16} {consistency}", m.name, age(m.created_at));
+                }
+            } else {
+                println!("{}", name()?);
+            }
+            Ok(0)
+        }
+        "rollback" => {
+            let p = parse(
+                rest,
+                &[
+                    ("start", None, false),
+                    ("no-start", None, false),
+                    ("cold", None, false),
+                ],
+                false,
+            )?;
+            let [container, name] = p.positional.as_slice() else {
+                bail!("usage: veynodevm rollback [--start|--no-start] [--cold] CONTAINER NAME")
+            };
+            let start = match (p.has("start"), p.has("no-start")) {
+                (true, true) => bail!("--start and --no-start are exclusive"),
+                (true, false) => Some(true),
+                (false, true) => Some(false),
+                _ => None,
+            };
+            let report =
+                checkpoint::rollback(&container::find(container)?, name, start, !p.has("cold"))?;
+            if json_output {
+                print_json(&report)?;
+            } else {
+                println!(
+                    "{} rolled back to {name} in {} ms ({})",
+                    report["container"].as_str().unwrap_or_default(),
+                    report["total_ms"],
+                    report["path"].as_str().unwrap_or("stopped")
+                );
+            }
+            Ok(0)
+        }
+        "fork" => {
+            if rest.first().is_some_and(|a| a == "rm") {
+                let selector = rest
+                    .get(1)
+                    .context("usage: veynodevm fork rm GROUP|CONTAINER")?;
+                let report = checkpoint::remove_forks(selector)?;
+                if json_output {
+                    print_json(&report)?;
+                } else {
+                    for name in report["removed"].as_array().into_iter().flatten() {
+                        println!("{}", name.as_str().unwrap_or_default());
+                    }
+                }
+                return Ok(0);
+            }
+            let p = parse(
+                rest,
+                &[
+                    ("count", Some('n'), true),
+                    ("checkpoint", None, true),
+                    ("no-start", None, false),
+                ],
+                false,
+            )?;
+            let source = container::find(p.positional.first().context(
+                "usage: veynodevm fork [-n N] [--checkpoint NAME] [--no-start] CONTAINER",
+            )?)?;
+            let options = checkpoint::ForkOptions {
+                count: p
+                    .value("count")
+                    .map(str::parse)
+                    .transpose()
+                    .context("invalid -n")?
+                    .unwrap_or(1),
+                checkpoint: p.value("checkpoint").map(str::to_owned),
+                start: !p.has("no-start"),
+            };
+            let report = checkpoint::fork(&source, &options)?;
+            if json_output {
+                print_json(&report)?;
+            } else {
+                for fork in report["forks"].as_array().into_iter().flatten() {
+                    println!("{}", fork["name"].as_str().unwrap_or_default());
+                }
+                eprintln!(
+                    "group {} (remove with: veynodevm fork rm {})",
+                    report["group"].as_str().unwrap_or_default(),
+                    report["group"].as_str().unwrap_or_default()
+                );
+            }
+            Ok(0)
+        }
         "cp" => match rest {
             [source, target] => macos::cp(source, target),
             _ => bail!("usage: veynodevm cp SRC DST (one side CONTAINER:PATH)"),
@@ -776,14 +919,21 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
         "daemon" => daemon::command(rest),
         "mcp" => {
             let mut flags = Vec::new();
-            for flag in rest {
-                flags.push(match flag.as_str() {
+            let mut rest = rest.iter();
+            while let Some(flag) = rest.next() {
+                let mapped = match flag.as_str() {
                     "--lifecycle" | "--allow-lifecycle" => "--allow-lifecycle",
                     "--execute" | "--allow-execute" => "--allow-execute",
                     "--files" | "--allow-files" => "--allow-files",
                     "--input" | "--allow-input" => "--allow-input",
+                    // Tool groups narrow the listing; vm-control validates the names.
+                    "--tools" => {
+                        flags.push("--tools");
+                        rest.next().context("--tools needs GROUP,...")?.as_str()
+                    }
                     other => bail!("unknown mcp flag: {other}"),
-                });
+                };
+                flags.push(mapped);
             }
             let err = std::os::unix::process::CommandExt::exec(
                 std::process::Command::new(sibling("vm-control")?)

@@ -53,9 +53,25 @@ pub(crate) enum FailureCode {
     Signature,
     Busy,
     SessionEnded,
+    // Sub-reasons of what used to be the single `dispatch_rejected` catch-all on the console control path.
+    // Each is a fixed word chosen by this service; none carries controller, Guest or request text.
+    InputAuthorization,
+    VmStatus,
+    FrameAnchor,
+    ControllerUnavailable,
+    ControllerDeadline,
+    ControllerRefused,
+    ControllerReplyInvalid,
+    ScreenshotReplyTooLarge,
+    ScreenshotReplyInvalid,
+    PngDecodeUnsupported,
+    PngDecodeCorrupt,
+    ScaledFrameOverCap,
+    FrameVerification,
+    FrameWorker,
 }
 impl FailureCode {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::ChannelValidation => "channel_validation",
             Self::Assembly => "fragment_assembly",
@@ -74,6 +90,20 @@ impl FailureCode {
             Self::Signature => "request_signature",
             Self::Busy => "adapter_busy",
             Self::SessionEnded => "session_ended",
+            Self::InputAuthorization => "input_authorization",
+            Self::VmStatus => "vm_status_mismatch",
+            Self::FrameAnchor => "frame_anchor",
+            Self::ControllerUnavailable => "controller_unavailable",
+            Self::ControllerDeadline => "controller_deadline",
+            Self::ControllerRefused => "controller_refused",
+            Self::ControllerReplyInvalid => "controller_reply_invalid",
+            Self::ScreenshotReplyTooLarge => "screenshot_reply_too_large",
+            Self::ScreenshotReplyInvalid => "screenshot_reply_invalid",
+            Self::PngDecodeUnsupported => "png_decode_unsupported",
+            Self::PngDecodeCorrupt => "png_decode_corrupt",
+            Self::ScaledFrameOverCap => "scaled_frame_over_cap",
+            Self::FrameVerification => "frame_verification",
+            Self::FrameWorker => "frame_worker_failed",
         }
     }
 }
@@ -83,6 +113,26 @@ impl std::fmt::Display for FailureCode {
     }
 }
 impl std::error::Error for FailureCode {}
+impl FailureCode {
+    /// The code an error already carries, if any.
+    pub(crate) fn of(error: &anyhow::Error) -> Option<Self> {
+        error.downcast_ref::<Self>().copied()
+    }
+    /// Attach this code to an error that carries none. The first (innermost) code wins, so a specific reason is
+    /// never relabelled by a caller. The error keeps its own message for callers and tests; only the code is ever
+    /// printed (`report_failure`), so the message may contain controller text without reaching a log.
+    pub(crate) fn tag(self, error: anyhow::Error) -> anyhow::Error {
+        if Self::of(&error).is_some() {
+            return error;
+        }
+        let message = error.to_string();
+        anyhow::Error::new(self).context(message)
+    }
+    /// `result.map_err(|e| code.tag(e))` for any error convertible to `anyhow::Error`.
+    pub(crate) fn on<T, E: Into<anyhow::Error>>(self, result: Result<T, E>) -> Result<T> {
+        result.map_err(|error| self.tag(error.into()))
+    }
+}
 fn failure_category(error: &anyhow::Error) -> &'static str {
     let code = error
         .downcast_ref::<FailureCode>()
@@ -110,7 +160,19 @@ pub fn bounded_settings() -> SettingEngine {
 #[async_trait::async_trait]
 pub trait ControlDispatch: Send + Sync + 'static {
     async fn handle(&self, request: SignedControl) -> Result<Value>;
+    /// The reply to `sequence` was handed to the transport. Timing only; the default ignores it.
+    async fn replied(&self, _sequence: u64, _timing: ReplyTiming) {}
     async fn end(&self) -> Result<()>;
+}
+
+/// What sending one reply cost. Numbers only.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReplyTiming {
+    pub serialise_us: u64,
+    /// Every fragment handed to the DataChannel (enqueued; not a browser receipt).
+    pub send_us: u64,
+    pub bytes: usize,
+    pub fragments: usize,
 }
 
 pub struct ControlChannel {
@@ -304,9 +366,19 @@ impl ControlChannel {
                             ),
                             Err(_) => bail!(FailureCode::DispatchTimeout),
                         };
+                        let started = Instant::now();
                         let encoded = bounded_json(&response).context(FailureCode::Malformed)?;
+                        drop(response);
+                        let mut reply = ReplyTiming {
+                            serialise_us: started.elapsed().as_micros() as u64,
+                            bytes: encoded.len(),
+                            fragments: encoded.len().div_ceil(CHUNK_BYTES - HEADER_BYTES),
+                            ..Default::default()
+                        };
+                        let started = Instant::now();
                         timeout(SEND_TIMEOUT, async {
                             send_response(channel.as_ref(), sequence, &encoded).await?;
+                            reply.send_us = started.elapsed().as_micros() as u64;
                             #[cfg(test)]
                             {
                                 let barrier = self.response_tail.lock().unwrap().take();
@@ -322,6 +394,7 @@ impl ControlChannel {
                         if let Some(error) = rejected {
                             return Err(error);
                         }
+                        self.dispatch.replied(sequence, reply).await;
                     }
                 }
                 Some(
@@ -486,6 +559,46 @@ mod tests {
             failure_category(&anyhow::anyhow!("private arbitrary text")),
             "dispatch_rejected"
         );
+    }
+    #[test]
+    fn tagged_errors_report_the_innermost_code_and_keep_their_message_out_of_the_category() {
+        let inner = FailureCode::ControllerRefused.tag(anyhow::anyhow!("GUEST_TEXT /private/path"));
+        assert_eq!(inner.to_string(), "GUEST_TEXT /private/path");
+        assert_eq!(failure_category(&inner), "controller_refused");
+        // An outer caller cannot relabel it, and the category never contains the message.
+        let outer = FailureCode::FrameVerification.tag(inner);
+        assert_eq!(failure_category(&outer), "controller_refused");
+        assert!(!failure_category(&outer).contains("GUEST"));
+        assert_eq!(
+            FailureCode::ScaledFrameOverCap
+                .on::<(), _>(Err(std::io::Error::other("x")))
+                .map_err(|e| failure_category(&e))
+                .unwrap_err(),
+            "scaled_frame_over_cap"
+        );
+        // Every category is a short lowercase word list: nothing a log scanner could mistake for data.
+        for code in [
+            FailureCode::InputAuthorization,
+            FailureCode::VmStatus,
+            FailureCode::FrameAnchor,
+            FailureCode::ControllerUnavailable,
+            FailureCode::ControllerDeadline,
+            FailureCode::ControllerRefused,
+            FailureCode::ControllerReplyInvalid,
+            FailureCode::ScreenshotReplyTooLarge,
+            FailureCode::ScreenshotReplyInvalid,
+            FailureCode::PngDecodeUnsupported,
+            FailureCode::PngDecodeCorrupt,
+            FailureCode::ScaledFrameOverCap,
+            FailureCode::FrameVerification,
+            FailureCode::FrameWorker,
+        ] {
+            let name = code.name();
+            assert!(
+                name.len() <= 32 && name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
+                "{name}"
+            );
+        }
     }
     #[test]
     fn fragment_header_is_network_order_and_safe_integer_bounded() {
@@ -818,6 +931,46 @@ mod tests {
         assert_eq!(pair.dispatch.dispatched.load(Ordering::SeqCst), 1);
         assert!(!*pair.failure.borrow());
         pair.close().await;
+    }
+    /// Benchmark, ignored by default: wall time of one 900,000-byte reply (about the largest control picture)
+    /// from request sent to last fragment reassembled, over real loopback ICE/DTLS/SCTP between two instances of
+    /// this stack. A browser peer and a real network path will differ; this isolates the sender's share.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "benchmark; run in release with --ignored --nocapture"]
+    async fn budget_of_one_large_reply_over_loopback_datachannel() {
+        for run in 0..5 {
+            let pair = Pair::new(true, false).await;
+            let started = Instant::now();
+            pair.request().await;
+            let (mut first, mut fragments) = (None, 0);
+            let bytes = timeout(Duration::from_secs(8), async {
+                let mut assembly = Assembly::default();
+                loop {
+                    match pair.channel.poll().await {
+                        Some(DataChannelEvent::OnMessage(message)) => {
+                            first.get_or_insert_with(|| started.elapsed());
+                            fragments += 1;
+                            if let Some((_, body)) = assembly.push(&message.data).unwrap() {
+                                break body.len();
+                            }
+                        }
+                        Some(
+                            DataChannelEvent::OnBufferedAmountHigh
+                            | DataChannelEvent::OnBufferedAmountLow,
+                        ) => {}
+                        _ => panic!("channel ended before complete response"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            eprintln!(
+                "budget datachannel run={run} bytes={bytes} fragments={fragments} first_fragment_ms={:.1} complete_ms={:.1}",
+                first.unwrap().as_secs_f64() * 1000.0,
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+            pair.close().await;
+        }
     }
     #[tokio::test]
     async fn actual_unconfirmed_request_is_rejected_and_retired() {

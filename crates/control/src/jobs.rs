@@ -67,6 +67,15 @@ pub fn validate_job_id(id: &str) -> Result<()> {
     Ok(())
 }
 impl Jobs {
+    /// An unacknowledged start may have left the pending RPC table but not yet
+    /// registered its Guest job. Reservations close that admission race.
+    pub(crate) fn snapshot_idle(&self, vm: &str) -> bool {
+        self.reservations == 0
+            && !self
+                .entries
+                .values()
+                .any(|job| job.vm == vm && !job.finished)
+    }
     fn prune(&mut self, now: Instant) {
         prune_terminal(&mut self.entries, now, |job| (job.created, job.finished));
     }
@@ -203,6 +212,25 @@ mod tests {
         drop(reservations);
         assert!(Jobs::reserve(&jobs, now).is_ok());
         assert!(validate_job_id("../bad").is_err());
+    }
+    #[test]
+    fn snapshot_admission_fences_unregistered_starts_and_unfinished_jobs() {
+        let jobs = Arc::new(Mutex::new(Jobs::default()));
+        let now = Instant::now();
+        assert!(jobs.lock().unwrap().snapshot_idle("vm"));
+        let reservation = Jobs::reserve(&jobs, now).unwrap();
+        assert!(!jobs.lock().unwrap().snapshot_idle("vm"));
+        drop(reservation);
+        assert!(jobs.lock().unwrap().snapshot_idle("vm"));
+        let id = "a".repeat(32);
+        Jobs::reserve(&jobs, now)
+            .unwrap()
+            .register("vm", &id, "owner", now)
+            .unwrap();
+        assert!(!jobs.lock().unwrap().snapshot_idle("vm"));
+        assert!(jobs.lock().unwrap().snapshot_idle("other-vm"));
+        jobs.lock().unwrap().finish("vm", &id);
+        assert!(jobs.lock().unwrap().snapshot_idle("vm"));
     }
     #[test]
     fn capacity_evicts_oldest_finished_without_losing_active_jobs_or_reservations() {

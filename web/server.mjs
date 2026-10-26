@@ -19,6 +19,8 @@ if (!token || token.length < 32) {
 }
 const { default: app } = await import(join(root, 'dist/server/server.js'))
 const assets = join(root, 'dist/client')
+// Inside the Bun executable (build-bun.mjs) assets are embedded files, not dist/client.
+const embedded = import.meta.url.startsWith('file:///$bunfs/') ? (await import(join(root, 'dist/assets.mjs'))).default : null
 const TYPES = {
   '.js': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
@@ -37,6 +39,7 @@ const SECURITY = {
 
 function staticFile(pathname) {
   if (!pathname.startsWith('/assets/')) return null
+  if (embedded) return Object.hasOwn(embedded, pathname) ? embedded[pathname] : null
   const file = normalize(join(assets, decodeURIComponent(pathname)))
   if (!file.startsWith(assets + '/')) return null
   try {
@@ -62,12 +65,25 @@ const server = createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`)
     const file = staticFile(url.pathname)
     if (file) {
-      res.writeHead(200, {
-        'content-type': TYPES[extname(file)] ?? 'application/octet-stream',
+      const headers = {
+        'content-type': TYPES[extname(url.pathname)] ?? 'application/octet-stream',
         'cache-control': 'public, max-age=31536000, immutable',
         ...SECURITY,
-      })
-      createReadStream(file).pipe(res)
+      }
+      if (embedded) {
+        // Bun's node:fs can't open embedded files; Bun.file can.
+        const body = Buffer.from(await Bun.file(file).arrayBuffer())
+        res.writeHead(200, headers)
+        res.end(body)
+        return
+      }
+      res.writeHead(200, headers)
+      createReadStream(file)
+        .on('error', (error) => {
+          console.error(error)
+          res.destroy()
+        })
+        .pipe(res)
       return
     }
     const controller = new AbortController()

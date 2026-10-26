@@ -8,6 +8,41 @@ spec.loader.exec_module(install_distro)
 
 
 class InstallDistroTests(unittest.TestCase):
+    def test_windows_answer_file_is_valid_xml_for_arm64(self):
+        import xml.etree.ElementTree as ET
+        with tempfile.TemporaryDirectory() as work:
+            fake = mock.patch.object(install_distro, "make_seed", lambda directory, label, files: (label, files))
+            self.addCleanup(fake.stop)
+            fake.start()
+            label, files = install_distro.windows_answer(work, 'veynode', 'p&ss<w>', 'Windows 11 Pro', 'KEY',
+                                                         'ssh-ed25519 AAAAC3Nza+/x= veynodevm-test\n')
+        self.assertEqual(label, 'VEYNODEWIN')
+        body = files['Autounattend.xml']
+        ns = {'u': 'urn:schemas-microsoft-com:unattend'}
+        root = ET.fromstring(body)
+        self.assertEqual([s.get('pass') for s in root.findall('u:settings', ns)], ['windowsPE', 'offlineServicing', 'specialize', 'oobeSystem'])
+        pe = [e.text for e in root.find("u:settings[@pass='windowsPE']", ns).iter('{urn:schemas-microsoft-com:unattend}Path') if 'ARM64' in e.text]
+        self.assertIn('D:\\viostor\\w11\\ARM64', pe)
+        offline = [e.text for e in root.find("u:settings[@pass='offlineServicing']", ns).iter('{urn:schemas-microsoft-com:unattend}Path')]
+        self.assertIn('K:\\vioinput\\w11\\ARM64', offline)
+        self.assertFalse(any('viogpudo' in p for p in pe + offline))
+        keys = [e.get('{http://schemas.microsoft.com/WMIConfig/2002/State}keyValue') for e in root.iter('{urn:schemas-microsoft-com:unattend}PathAndCredentials')]
+        self.assertEqual(len(keys), 3 * 8 + 8 * 8)
+        self.assertTrue(all(c.get('processorArchitecture') == 'arm64' for c in root.iter('{urn:schemas-microsoft-com:unattend}component')))
+        self.assertEqual(root.find('.//u:InstallFrom/u:MetaData/u:Value', ns).text, 'Windows 11 Pro')
+        self.assertEqual(root.find('.//u:LocalAccount/u:Password/u:Value', ns).text, 'p&ss<w>')
+        setup = [c.text for c in root.iter('{urn:schemas-microsoft-com:unattend}Path')]
+        self.assertTrue(any('BypassTPMCheck' in c for c in setup))
+        self.assertTrue(any('BypassSecureBootCheck' in c for c in setup))
+        commands = [c.text for c in root.iter('{urn:schemas-microsoft-com:unattend}CommandLine')]
+        self.assertTrue(any('NetKVM\\w11\\ARM64\\*.inf' in c for c in commands))
+        self.assertIn('powercfg /hibernate off', commands)
+        self.assertTrue(commands[-1].startswith('shutdown /s'))
+        ssh = commands[-2]
+        self.assertIn("OpenSSH.Server*", ssh)
+        self.assertIn("C:\\ProgramData\\ssh\\administrators_authorized_keys 'ssh-ed25519 AAAAC3Nza+/x= veynodevm-test'", ssh)
+        self.assertLess(len(ssh), 1024)  # FirstLogonCommands CommandLine limit
+
     def test_grub_command_lines_type_with_us_qcodes(self):
         line = 'linux /images/pxeboot/vmlinuz inst.stage2=hd:LABEL=Fedora-E-dvd-aarch64-44 ro\n'
         codes = [install_distro.qcodes(c) for c in line]

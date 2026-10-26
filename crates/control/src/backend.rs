@@ -50,7 +50,7 @@ impl QemuRegistration {
         Ok(())
     }
     pub fn require_profile(&self, profile: crate::qemu_graphics::Profile) -> Result<()> {
-        if profile.venus() {
+        if profile.venus() || profile.neptune() {
             let path = self
                 .venus_runtime
                 .as_deref()
@@ -61,6 +61,12 @@ impl QemuRegistration {
                 self.spice_library.as_deref(),
             )?;
             crate::qemu_graphics::host_admission()?;
+            if profile.neptune() {
+                crate::qemu_graphics::Neptune::locate(
+                    &self.library,
+                    &crate::qemu_graphics::Registration::load(path)?,
+                )?;
+            }
         }
         Ok(())
     }
@@ -98,7 +104,7 @@ pub fn capabilities(backend: Backend) -> Value {
             json!({"guest_os":["linux","macos"],"boot":["kernel","uefi"],"uefi":"Linux: VZEFIBootLoader with per-VM efi_vars, cdrom as read-only USB mass storage","lifecycle":true,"native_window":true,"window_enumeration":true,"window_enumeration_requirements":"macOS Guest --allow-observe with existing Screen Recording permission and eligible console; no titles or input authority; query vm_guest_info capabilities.windows","screenshot":true,"screenshot_requirements":"macOS Guest service --allow-observe with existing Guest Screen Recording permission; Linux desktop containers (--desktop) through the guest agent's DRM scanout","input":true,"input_requirements":"macOS Guest --allow-observe --allow-input with existing Screen Recording and Accessibility permissions; Linux desktop containers through the guest agent's uinput keyboard and tablet","guest_integration":"enabled Linux or macOS Guest service over host-only vsock; query vm_guest_info for actual availability","command_execution":true,"command_execution_requirements":"MCP requires enabled Linux async jobs for cancellation; macOS service legacy exec is not exposed by current MCP execution API","gpu":"requires actual Guest measurements"})
         }
         Backend::QemuHvf => {
-            json!({"guest_os":["linux"],"lifecycle":true,"native_window":false,"window_enumeration":false,"screenshot":false,"input":false,"guest_integration":"observer-only private virtio-serial; requires enabled Linux service, query vm_guest_info for actual readiness; no reconnect in this worker incarnation","command_execution":false,"file_transfer":false,"guest_ready":false,"normal_shutdown":"QMP power button request only; requires Guest support; acknowledgement is not completion","boot":["kernel","uefi"],"uefi":"edk2 pflash with per-VM efi_vars, read-only cdrom on virtio-scsi, USB keyboard/tablet","storage":"Linux direct kernel or UEFI boot with optional private pinned raw disk; inherited device/inode sidecar lock and QEMU locking, APFS cloning is an independent image operation","initial_display_dimensions":{"supported":true,"default_width":1280,"default_height":800,"maximum_width":3840,"maximum_height":2160,"paired_even_dimensions_required":true,"semantics":"initial EDID preference; actual Guest mode must be measured"},"dynamic_resolution":false,"gpu":"experimental virtio-gpu-gl / virgl / ANGLE Metal; SPICE connection does not establish acceleration or release quality"})
+            json!({"guest_os":["linux","windows"],"lifecycle":true,"native_window":false,"window_enumeration":false,"screenshot":false,"input":false,"guest_integration":"observer-only private virtio-serial; requires enabled Linux service, query vm_guest_info for actual readiness; no reconnect in this worker incarnation","command_execution":false,"file_transfer":false,"guest_ready":false,"normal_shutdown":"QMP power button request only; requires Guest support; acknowledgement is not completion","boot":["kernel","uefi"],"uefi":"edk2 pflash with per-VM efi_vars, read-only cdrom on virtio-scsi, USB keyboard/tablet; Windows ARM: cdrom and seed images on USB, virtio disk (or NVMe), NIC, serial, balloon, RNG and input with virtio-win ARM64 drivers, virtio-ramfb display, no TPM or Secure Boot keys","windows":"UEFI install from the user's Windows 11 ARM64 ISO; Basic Display unless qemu_graphics_profile neptune-dxmt-experimental with UTM's viogpu3d guest driver; no guest integration","storage":"Linux direct kernel or UEFI boot with optional private pinned raw disk; inherited device/inode sidecar lock and QEMU locking, APFS cloning is an independent image operation","initial_display_dimensions":{"supported":true,"default_width":1280,"default_height":800,"maximum_width":3840,"maximum_height":2160,"paired_even_dimensions_required":true,"semantics":"initial EDID preference; actual Guest mode must be measured"},"dynamic_resolution":false,"gpu":"experimental virtio-gpu-gl / virgl / ANGLE Metal; SPICE connection does not establish acceleration or release quality"})
         }
     }
 }
@@ -112,15 +118,19 @@ pub fn guest_capabilities(backend: Backend, guest: &str) -> Value {
         value["input"] = json!(true);
         if guest == "linux" {
             value["screenshot_requirements"] = json!("Linux desktop container (--desktop): guest agent DRM scanout, PNG (JPEG when large); vm_guest_info capabilities.screenshot");
-            value["input_requirements"] = json!("Linux desktop container (--desktop): guest agent uinput keyboard and absolute tablet; fresh screenshot anchor and current control lease required");
+            value["input_requirements"] = json!("Linux desktop container (--desktop): guest agent uinput keyboard and absolute tablet; fresh screenshot anchor required");
         }
         if guest == "macos" {
-            value["input_requirements"] = json!("Guest service --allow-observe --allow-input with existing Guest Screen Recording and Accessibility permissions; fresh screenshot anchor and current control lease required; vm_guest_info reports actual permission availability");
+            value["input_requirements"] = json!("Guest service --allow-observe --allow-input with existing Guest Screen Recording and Accessibility permissions; fresh screenshot anchor required; vm_guest_info reports actual permission availability");
             value["text_input"] = json!(false);
         }
         value["command_execution"] = json!(guest == "linux");
         value["async_commands"] = json!(guest == "linux");
         value["guest_integration"]=json!(format!("requires enabled {guest} Guest vsock service; vm_guest_info reports current permissions and capabilities"));
+    }
+    if backend == Backend::QemuHvf && guest == "windows" {
+        value["guest_integration"] = json!(false);
+        value["gpu"] = json!("virtio-ramfb on Windows Basic Display; experimental Neptune/DXMT D3D with qemu_graphics_profile neptune-dxmt-experimental and UTM's viogpu3d guest driver, not verified");
     }
     value
 }
@@ -214,6 +224,14 @@ pub fn qemu_graphics_device(width: Option<u32>, height: Option<u32>) -> Result<S
     Ok(match qemu_display_size(width, height)? {
         None => "virtio-gpu-gl-pci".into(),
         Some((w, h)) => format!("virtio-gpu-gl-pci,xres={w},yres={h}"),
+    })
+}
+/// The separate non-GL QEMU device, with the same initial EDID bounds as GL.
+/// This selects no virgl/blob/Venus features and is not a save/restore guarantee.
+pub fn qemu_2d_graphics_device(width: Option<u32>, height: Option<u32>) -> Result<String> {
+    Ok(match qemu_display_size(width, height)? {
+        None => "virtio-gpu-pci".into(),
+        Some((w, h)) => format!("virtio-gpu-pci,xres={w},yres={h}"),
     })
 }
 /// Existing pre-window helpers used this exact usage/exit pair. A crash, timeout

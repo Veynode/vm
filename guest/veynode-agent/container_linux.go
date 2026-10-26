@@ -370,6 +370,11 @@ func prepareRoot(config containerConfig) error {
 			return err
 		}
 	}
+	if forked, err := adoptWritableLayer("/run/disk", "/run/disk/upper", config.ID); err != nil {
+		return err
+	} else if forked {
+		marker("status", "forked writable layer: new machine identity")
+	}
 	if err := mountAt(imageDevice, "/run/lower", "squashfs", syscall.MS_RDONLY, ""); err != nil {
 		return err
 	}

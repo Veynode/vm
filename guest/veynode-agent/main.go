@@ -35,6 +35,8 @@ type request struct {
 	Size      int64    `json:"size,omitempty"`
 	Offset    int64    `json:"offset,omitempty"`
 	SHA256    string   `json:"sha256,omitempty"`
+	TextHex   string   `json:"text_hex,omitempty"`
+	UnixNS    int64    `json:"unix_ns,omitempty"`
 	// Arguments carries the daemon's desktop input and wait arguments (observe.go).
 	Arguments json.RawMessage `json:"arguments,omitempty"`
 }
@@ -96,7 +98,8 @@ func handleWithManager(manager *jobManager, req request, allowExec bool, allowSh
 				filePolicy = reply.Result
 			}
 		}
-		return response{ID: req.ID, Result: map[string]any{"protocol_version": 1, "os": runtime.GOOS, "arch": runtime.GOARCH, "os_release": string(release), "transport": "vsock-host-only", "execution_identity": manager.identity, "execution_containment": manager.containmentMode, "service_uid": os.Geteuid(), "file_policy": filePolicy, "capabilities": map[string]bool{"exec": allowExec, "async_exec": allowExec, "descendant_containment": allowExec && manager.containmentMode == "cgroup-v2-clone3-kill", "shutdown": shutdownEnabled, "desktop": desktop != nil, "screenshot": desktop != nil, "input": desktop != nil, "screen_wait": desktop != nil, "desktop_windows": desktop != nil, "app_launch": desktop != nil, "accessibility": desktop != nil, "files": files != nil}, "max_output_bytes_per_stream": maxOutput, "max_timeout_ms": 30000, "max_active_commands": maxActiveCommands, "max_finished_jobs": maxFinishedJobs, "finished_job_ttl_seconds": int(finishedJobTTL.Seconds())}}
+		textAvailable, textStatus := textInfo()
+		return response{ID: req.ID, Result: map[string]any{"text_input": textStatus, "protocol_version": 1, "os": runtime.GOOS, "arch": runtime.GOARCH, "os_release": string(release), "transport": "vsock-host-only", "execution_identity": manager.identity, "execution_containment": manager.containmentMode, "service_uid": os.Geteuid(), "file_policy": filePolicy, "capabilities": map[string]bool{"exec": allowExec, "async_exec": allowExec, "descendant_containment": allowExec && manager.containmentMode == "cgroup-v2-clone3-kill", "shutdown": shutdownEnabled, "desktop": desktop != nil, "screenshot": desktop != nil, "input": desktop != nil, "screen_wait": desktop != nil, "desktop_windows": desktop != nil, "app_launch": desktop != nil, "accessibility": desktop != nil, "files": files != nil, "text_input": textAvailable}, "max_output_bytes_per_stream": maxOutput, "max_timeout_ms": maxCommandTimeoutMS, "max_async_timeout_ms": manager.maxAsyncTimeoutMS(), "max_active_commands": maxActiveCommands, "max_finished_jobs": maxFinishedJobs, "finished_job_ttl_seconds": int(finishedJobTTL.Seconds())}}
 	case "file_upload_begin", "file_upload_write", "file_upload_commit", "file_download_begin", "file_download_read", "file_cancel", "file_session_end":
 		if files == nil {
 			return failure(req.ID, "unsupported", "file integration disabled; requires Linux files worker and explicit directory")
@@ -137,6 +140,11 @@ func handleWithManager(manager *jobManager, req request, allowExec bool, allowSh
 			return failure(req.ID, "accessibility_failed", err.Error())
 		}
 		return response{ID: req.ID, Result: result}
+	case "clock_sync":
+		return clockSync(req)
+	case "text_input":
+		// Independent of execute/shutdown/files permission; the host applies the input permission.
+		return handleTextInput(req)
 	case "shutdown":
 		if !shutdownEnabled {
 			return failure(req.ID, "forbidden", "normal shutdown disabled or service lacks privilege")
@@ -222,6 +230,10 @@ func main() {
 		fmt.Printf("@@veynodevm %s %s\n", os.Args[2], os.Args[3])
 		return
 	}
+	allowText := flag.Bool("allow-text-input", false, "allow host-authorized Unicode text input into the focused X11 application (XTEST with temporary keycodes)")
+	textDisplay := flag.String("text-input-display", ":0", "local X display for --allow-text-input")
+	textAuthority := flag.String("text-input-xauthority", "", "Xauthority file holding the display's MIT-MAGIC-COOKIE-1; empty sends no authorization")
+	textOnce := flag.String("text-input-once-hex", "", "DIAGNOSTIC: inject this lowercase-hex UTF-8 text once through the local display, print the service status and reply, then exit; opens no listener")
 	flag.Parse()
 	resolveIdentity := func() (executionIdentity, error) {
 		if *containerRoot != "" {
@@ -233,13 +245,71 @@ func main() {
 		return resolveExecutionIdentity(*execUser)
 	}
 	if *serial {
-		if *desktopStream || *serialExec || *allowExec || *allowShutdown || *allowFiles || *legacyExec || *execUser != "" || *filesUser != "" || *filesRoot != "" || *fileWorker {
+		if *desktopStream || *serialExec || *allowExec || *allowShutdown || *allowFiles || *legacyExec || *execUser != "" || *filesUser != "" || *filesRoot != "" || *fileWorker || *allowText || *textOnce != "" || *textDisplay != ":0" || *textAuthority != "" {
 			fmt.Fprintln(os.Stderr, "virtio-serial is observer-only; privilege options rejected")
 			os.Exit(1)
 		}
 		if err := listenSerial(); err != nil {
 			fmt.Fprintln(os.Stderr, "virtio-serial integration fenced:", err)
 			os.Exit(1)
+		}
+		return
+	}
+	if *allowText {
+		if *fileWorker {
+			fmt.Fprintln(os.Stderr, "text input is not available to the files worker")
+			os.Exit(1)
+		}
+		service, err := newX11TextService(*textDisplay, *textAuthority)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "text input display rejected:", err)
+			os.Exit(1)
+		}
+		textInput = service
+	} else if *textDisplay != ":0" || *textAuthority != "" {
+		fmt.Fprintln(os.Stderr, "text input settings require --allow-text-input")
+		os.Exit(1)
+	}
+	if *textOnce != "" {
+		// Local diagnostic for real-Guest acceptance: same validation and injector as the RPC.
+		if textInput != nil {
+			textInput.diagnostic = true // print the bindings; the operator typed the text on this command line
+		}
+		_, status := textInfo()
+		reply := handleTextInput(request{ID: "once", Method: "text_input", TextHex: *textOnce})
+		for _, record := range []struct {
+			label string
+			value any
+		}{{"TEXT_INPUT_STATUS", status}, {"TEXT_INPUT_ONCE", reply}} {
+			line, err := json.Marshal(record.value)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			fmt.Printf("%s %s\n", record.label, line)
+		}
+		restoreFailed := false
+		if textInput != nil {
+			// This process is about to exit, so the deferred restore happens here, after the
+			// quiet period that lets a slow client finish resolving the key events.
+			waited := time.Duration(0)
+			if textInput.boundCount() != 0 {
+				waited = textQuietPeriod
+				time.Sleep(waited)
+			}
+			restored, remaining, err := textInput.restoreAll()
+			message := ""
+			if err != nil {
+				message, restoreFailed = err.Error(), true
+			}
+			line, _ := json.Marshal(map[string]any{"restored": restored, "remaining": remaining, "waited_ms": waited.Milliseconds(), "error": message})
+			fmt.Printf("TEXT_INPUT_RESTORE %s\n", line)
+		}
+		if reply.Error != nil {
+			os.Exit(3)
+		}
+		if restoreFailed {
+			os.Exit(4)
 		}
 		return
 	}
@@ -330,6 +400,13 @@ func installSignalCleanup(manager *jobManager) {
 		<-signals
 		if files != nil {
 			files.stop()
+		}
+		if textInput != nil {
+			// Best effort: temporary keycodes are harmless if this fails, and info reports them.
+			if textInput.mu.TryLock() {
+				_, _, _ = textInput.restoreLocked(true)
+				textInput.mu.Unlock()
+			}
 		}
 		if !manager.stopAll(time.Second) {
 			fmt.Fprintln(os.Stderr, "active command cleanup failed or exceeded 1 second; containment cleanup was not confirmed")

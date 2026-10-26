@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { DeviceIdentity, hex, grantBytes, answerBytes, sdpBinding, verifyOffer, verifyConfirmation, verifyClose } from '../dist/session-auth.js';
-import { controlBytes, signControl, verifyControl, validateControlResponse, screenshotAnchor, verifiedScreenshotSource, SCREENSHOT_MAX_BYTES } from '../dist/session-control.js';
+import { controlBytes, signControl, verifyControl, validateControlResponse, screenshotAnchor, verifiedScreenshotSource, SCREENSHOT_MAX_BYTES, CONTROL_FRAME_MAX_DIVISOR, controlFrameGeometry, checkDecodedControlFrame, sourceToFrame, frameToSource, pointerToSource } from '../dist/session-control.js';
 import { AuthenticatedReceiver } from '../dist/native-auth.js';
 
 const pairBinary = process.env.VEYNODE_PAIR_BIN ?? new URL('../../target/debug/vm-pair', import.meta.url).pathname;
@@ -238,3 +238,92 @@ test('files-only signatures verify in Rust and semantic file refusal leaves the 
  assert.equal((await f.receiver.control({kind:'file',operation:{kind:'download_begin',path:'private'}})).result.ok,false);assert.equal(f.receiver.controlConfirmed,true);
  assert.equal((await f.receiver.control({kind:'file',operation:{kind:'download_begin',path:'private'}})).result.ok,false);
 },['files','observe']));
+
+// Header-only JPEG: SOI, a baseline frame header with the given size, EOI. These are protocol/structure tests;
+// no image decoder exists in node, and real decoding is the page's (and a real browser's) job.
+const jpegOf = (width, height) => Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 4, 0, 0, 0xff, 0xc0, 0, 17, 8, height >> 8, height & 255, width >> 8, width & 255, 3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1, 0xff, 0xd9]);
+const scaledFrame = (width, height, divisor, real = [Math.ceil(width / divisor), Math.ceil(height / divisor)]) => {
+  const bytes = jpegOf(...real);
+  return { ...frame, width, height, frame_width: Math.ceil(width / divisor), frame_height: Math.ceil(height / divisor), scale_divisor: divisor, mime_type: 'image/jpeg', byte_length: bytes.length, data_base64: bytes.toString('base64'), sha256: createHash('sha256').update(bytes).digest('hex') };
+};
+const checkFrame = result => validateControlResponse({ sequence: 1, result }, 1, { kind: 'observe_frame' });
+
+test('scaled 2560x1440 and 3840x2160 control frames validate; the anchor stays the source geometry', async () => {
+  for (const [width, height, divisor] of [[2560, 1440, 2], [3840, 2160, 2], [3840, 2160, 3], [3840, 2160, 16], [1366, 768, 4], [2560, 1440, 1]]) {
+    const result = scaledFrame(width, height, divisor); checkFrame(result);
+    assert.deepEqual(screenshotAnchor(result), { ...frame, width, height });
+    assert.deepEqual(controlFrameGeometry(result), { source_width: width, source_height: height, frame_width: Math.ceil(width / divisor), frame_height: Math.ceil(height / divisor), scale_divisor: divisor });
+    assert.equal(await verifiedScreenshotSource(result), `data:image/jpeg;base64,${result.data_base64}`);
+    // A signed click at the far source corner is accepted against the source geometry; one past it is not.
+    const anchor = screenshotAnchor(result), request = (x, y) => ({ session_id: 's', transcript_sha256: '00'.repeat(32), sequence: 1, expires_at: 1, action: { kind: 'click', frame: anchor, x, y, button: 'left' } });
+    controlBytes(request(width - 1, height - 1)); assert.throws(() => controlBytes(request(width, 0))); assert.throws(() => controlBytes(request(0, height)));
+  }
+});
+test('a frame whose declared scale disagrees with its geometry or real dimensions is refused', async () => {
+  const good = scaledFrame(2560, 1440, 2); checkFrame(good);
+  for (const mutate of [
+    r => r.scale_divisor = 3, r => r.scale_divisor = 1, r => r.scale_divisor = 0, r => r.scale_divisor = CONTROL_FRAME_MAX_DIVISOR + 1,
+    r => r.scale_divisor = 2.5, r => r.scale_divisor = '2', r => delete r.scale_divisor, r => delete r.frame_width, r => delete r.frame_height,
+    r => r.frame_width++, r => r.frame_height--, r => r.frame_width = 0, r => r.width = 2562, r => r.height = 1442,
+  ]) {
+    const changed = structuredClone(good); mutate(changed);
+    assert.throws(() => checkFrame(changed)); assert.throws(() => controlFrameGeometry(changed)); await assert.rejects(verifiedScreenshotSource(changed));
+  }
+  // Self-consistent declaration, but the image header really has other dimensions.
+  for (const real of [[1280, 721], [1279, 720], [2560, 1440], [720, 1280]]) {
+    const changed = scaledFrame(2560, 1440, 2, real);
+    assert.throws(() => checkFrame(changed), /real dimensions/); await assert.rejects(verifiedScreenshotSource(changed), /real dimensions/);
+  }
+  { const changed = { ...good, width: 5120, height: 2880, frame_width: 2560, frame_height: 1440 }; controlFrameGeometry(changed); assert.throws(() => checkFrame(changed), /real dimensions/); await assert.rejects(verifiedScreenshotSource(changed), /real dimensions/); }
+  // Same for an unscaled JPEG, and a JPEG with no frame header at all.
+  assert.throws(() => checkFrame(scaledFrame(1000, 500, 1, [999, 500])), /real dimensions/);
+  const headless = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+  assert.throws(() => checkFrame({ ...good, byte_length: headless.length, data_base64: headless.toString('base64'), sha256: createHash('sha256').update(headless).digest('hex') }), /frame header/);
+  // A PNG is always unscaled.
+  assert.throws(() => checkFrame({ ...png, frame_width: 640, frame_height: 400, scale_divisor: 2 }), /must not declare/);
+  assert.throws(() => checkFrame({ ...png, frame_width: 1280, frame_height: 800, scale_divisor: 1 }), /must not declare/);
+  // The decoder's verdict is checked against the declared frame, never against the source.
+  const geometry = controlFrameGeometry(good); checkDecodedControlFrame(geometry, 1280, 720);
+  for (const [w, h] of [[2560, 1440], [1280, 721], [1279, 720], [0, 0]]) assert.throws(() => checkDecodedControlFrame(geometry, w, h), /do not match/);
+});
+test('an unscaled small frame behaves as before', async () => {
+  checkFrame(png);
+  assert.deepEqual(controlFrameGeometry(png), { source_width: 1280, source_height: 800, frame_width: 1280, frame_height: 800, scale_divisor: 1 });
+  checkDecodedControlFrame(controlFrameGeometry(png), 1280, 800); assert.throws(() => checkDecodedControlFrame(controlFrameGeometry(png), 640, 400));
+  assert.equal(await verifiedScreenshotSource(png), `data:image/png;base64,${png.data_base64}`);
+  for (const extent of [1280, 800]) for (let s = 0; s < extent; s++) { assert.equal(sourceToFrame(s, 1), s); assert.equal(frameToSource(s, 1, extent), s); assert.equal(pointerToSource(s, extent, extent, 1, extent), s); assert.equal(pointerToSource(s / 2, extent / 2, extent, 1, extent), s); }
+});
+test('coordinate round trip: exact from the frame, within floor(divisor / 2) from the source, corners and centre', () => {
+  for (const [width, height] of [[2560, 1440], [3840, 2160], [1366, 768], [1, 1]]) for (let divisor = 1; divisor <= CONTROL_FRAME_MAX_DIVISOR; divisor++) {
+    const tolerance = Math.floor(divisor / 2);
+    for (const extent of [width, height]) {
+      const frames = Math.ceil(extent / divisor);
+      for (let f = 0; f < frames; f++) { const s = frameToSource(f, divisor, extent); if (s < 0 || s >= extent || sourceToFrame(s, divisor) !== f) assert.fail(`frame ${f} / ${divisor} of ${extent}`); }
+      for (let s = 0; s < extent; s++) { const f = sourceToFrame(s, divisor); if (f >= frames || Math.abs(frameToSource(f, divisor, extent) - s) > tolerance) assert.fail(`source ${s} / ${divisor} of ${extent}`); }
+      // A pointer anywhere inside displayed frame pixel f lands in f's own source block (partial last block
+      // included), whatever CSS size the frame is shown at: exact registration with the picture.
+      for (const zoom of [1, 0.5, 3]) for (let f = 0; f < frames; f++) for (const inside of [0, 0.5, 0.999]) { const s = pointerToSource((f + inside) * zoom, frames * zoom, frames, divisor, extent); if (s >= extent || sourceToFrame(s, divisor) !== f) assert.fail(`pointer in frame ${f} / ${divisor} of ${extent} at zoom ${zoom}`); }
+    }
+    for (const [sx, sy] of [[0, 0], [width - 1, 0], [0, height - 1], [width - 1, height - 1], [width >> 1, height >> 1]]) {
+      const fx = sourceToFrame(sx, divisor), fy = sourceToFrame(sy, divisor);
+      assert.ok(fx < Math.ceil(width / divisor) && fy < Math.ceil(height / divisor));
+      const bx = frameToSource(fx, divisor, width), by = frameToSource(fy, divisor, height);
+      assert.ok(bx < width && by < height && Math.abs(bx - sx) <= tolerance && Math.abs(by - sy) <= tolerance, `${width}x${height} / ${divisor} at ${sx},${sy}`);
+      if (divisor === 1) assert.deepEqual([bx, by], [sx, sy]);
+    }
+  }
+  // Pointer mapping over a displayed box of any size: corners and centre of a 3840x2160 source.
+  for (const [displayedWidth, displayedHeight] of [[3840, 2160], [1920, 1080], [960, 540], [1234.5, 694.40625], [7680, 4320]]) {
+    const x = offset => pointerToSource(offset, displayedWidth, 1920, 2, 3840), y = offset => pointerToSource(offset, displayedHeight, 1080, 2, 2160);
+    assert.deepEqual([x(0), y(0)], [0, 0]);
+    assert.deepEqual([x(displayedWidth - 1e-6), y(displayedHeight - 1e-6)], [3839, 2159]);
+    assert.deepEqual([x(displayedWidth / 2), y(displayedHeight / 2)], [1920, 1080]);
+    // One displayed pixel spans source / displayed source pixels: that is the pointing resolution, stated and bounded.
+    const span = Math.ceil(3840 / displayedWidth);
+    for (const offset of [0, 1, 17, Math.floor(displayedWidth) - 1]) { const s = x(offset); assert.ok(Math.abs(s - offset * 3840 / displayedWidth) < 1 && x(offset + 0.999) - s <= span); }
+  }
+  for (const [offset, extent] of [[-0.001, 100], [100, 100], [NaN, 100], [1, 0], [1, Infinity]]) assert.throws(() => pointerToSource(offset, extent, 1920, 2, 3840));
+  // The pointer rule refuses a frame extent that is not ceil(source / divisor).
+  assert.throws(() => pointerToSource(1, 100, 1920, 3, 3840)); assert.throws(() => pointerToSource(1, 100, 1921, 2, 3840)); assert.throws(() => pointerToSource(1, 100, 8193, 1, 8193));
+  assert.throws(() => frameToSource(0, 0, 100)); assert.throws(() => sourceToFrame(1, 17));
+});

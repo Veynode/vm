@@ -1,6 +1,7 @@
 //! Valid uncompressed PNG fixture, generated in memory without image dependencies.
 //! This is protocol test data, not a Guest screenshot or render acceptance.
-pub fn png() -> Vec<u8> {
+/// The same uncompressed fixture at another size; `png_sized(2560, 720)` is about 5.5 MiB.
+pub fn png_sized(w: u32, h: u32) -> Vec<u8> {
     fn crc(bytes: &[u8]) -> u32 {
         let mut v = !0u32;
         for b in bytes {
@@ -19,7 +20,6 @@ pub fn png() -> Vec<u8> {
         let c = crc(&out[start..]);
         out.extend_from_slice(&c.to_be_bytes());
     }
-    let (w, h) = (1280u32, 320u32);
     let mut raw = Vec::new();
     for y in 0..h {
         raw.push(0);
@@ -53,7 +53,10 @@ pub fn png() -> Vec<u8> {
     out
 }
 pub fn value() -> serde_json::Value {
+    value_sized(1280, 320)
+}
+pub fn value_sized(w: u32, h: u32) -> serde_json::Value {
     use base64::Engine;
-    let png = png();
-    serde_json::json!({"mime_type":"image/png","byte_length":png.len(),"data_base64":base64::engine::general_purpose::STANDARD.encode(png),"width":1280,"height":320,"frame_id":"12345678-1234-4234-8234-123456789abc","captured_monotonic_us":1,"source_generation":1,"source_sequence":1})
+    let png = png_sized(w, h);
+    serde_json::json!({"mime_type":"image/png","byte_length":png.len(),"data_base64":base64::engine::general_purpose::STANDARD.encode(png),"width":w,"height":h,"frame_id":"12345678-1234-4234-8234-123456789abc","captured_monotonic_us":1,"source_generation":1,"source_sequence":1})
 }

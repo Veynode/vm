@@ -53,10 +53,10 @@ The process owner must explicitly call `disable_interaction_for_process`; this d
 ## Reproduce
 
 ```
-cargo test -p vm-session-auth --target-dir .local/stage-target
-cargo clippy -p vm-session-auth --all-targets --target-dir .local/stage-target -- -D warnings
-cargo run -p vm-session-auth --example generate-golden --target-dir .local/stage-target
-.local/stage-target/debug/vm-pair keychain-self-test test-UNIQUE_RANDOM_NAME
+cargo test -p vm-session-auth
+cargo clippy -p vm-session-auth --all-targets -- -D warnings
+cargo run -p vm-session-auth --example generate-golden
+target/debug/vm-pair keychain-self-test test-UNIQUE_RANDOM_NAME
 ```
 
 The self-test creates and removes only its newly generated `test-` key, verifies the actual extractability property, signs/verifies, and reopens the same identity. No existing host key is deleted.
@@ -64,7 +64,7 @@ The self-test creates and removes only its newly generated `test-` key, verifies
 Real Keychain positive and negative acceptance (creates/removes one fresh test key):
 
 ```
-cargo test -p vm-session-auth --test keychain --target-dir .local/stage-target -- --ignored --nocapture
+cargo test -p vm-session-auth --test keychain -- --ignored --nocapture
 ```
 
 ## Signed physical console control
@@ -101,3 +101,14 @@ This integration is confined to the existing loopback diagnostic server. Signed
 HTTP input is authenticated but **not encrypted**. Internet deployment, authenticated
 TLS/client delivery and end-to-end sensitive control transport remain separate
 gates. macOS browser input is explicitly unsupported in this slice.
+
+## Status codes (offer refusals)
+
+`OfferIntent::canonical` refuses a codec other than `h264` or `h265` (`src/lib.rs`, the
+`invalid codec` check at ~329-332) before admission. The embedding `vm-media-local` signed route
+`POST /auth/offer` maps every such refusal to **403** `{"error":"authorization rejected"}`, which
+does not say why the signed offer was refused. Its unauthenticated loopback route `POST /offer`
+(reachable only when authentication is unset) returns **400** `invalid offer` for the same
+unknown codec. This split is intentional and unchanged (decision 0021). Unavailable, missing and
+malformed encoder capabilities all return **409** and cannot be told apart. The full table is
+in [the media-local README](../media-local/README.md#status-codes-offer-admission).

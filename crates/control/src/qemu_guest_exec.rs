@@ -96,6 +96,8 @@ pub struct Pending {
     rx: mpsc::Receiver<Result<Value>>,
     cancelled: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    state: Arc<Mutex<&'static str>>,
+    stream: Arc<Mutex<super::guest_transport::Lifetime>>,
     done: bool,
 }
 impl Pending {
@@ -103,7 +105,16 @@ impl Pending {
         let r = match self.rx.try_recv() {
             Ok(r) => Some(r),
             Err(mpsc::TryRecvError::Empty) => None,
-            Err(_) => Some(Err(anyhow::anyhow!("serial execution fenced"))),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // Unwinding can drop the task sender before the worker's outer
+                // epilogue publishes its fence. Never expose that failure to a
+                // caller while the same incarnation still reports ready or
+                // accepts another request.
+                self.stop.store(true, Ordering::Release);
+                *self.state.lock().unwrap() = "fenced";
+                self.stream.lock().unwrap().stop();
+                Some(Err(anyhow::anyhow!("serial execution fenced")))
+            }
         };
         if r.is_some() {
             self.done = true
@@ -125,6 +136,8 @@ pub struct Transport {
     stop: Arc<AtomicBool>,
     lane: Arc<AtomicBool>,
     stream: Arc<Mutex<super::guest_transport::Lifetime>>,
+    #[cfg(test)]
+    iterations: Arc<std::sync::atomic::AtomicU64>,
 }
 impl Transport {
     pub fn state(&self) -> &'static str {
@@ -146,6 +159,10 @@ impl Transport {
         let stream = Arc::new(Mutex::new(super::guest_transport::Lifetime::default()));
         let saved = stream.clone();
         let path = path.to_owned();
+        #[cfg(test)]
+        let iterations = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        #[cfg(test)]
+        let counted = iterations.clone();
         thread::spawn(move || {
             let run = || -> Result<()> {
                 if !hex(&host) || stopped.load(Ordering::Acquire) {
@@ -200,7 +217,11 @@ impl Transport {
                 let mut pending = BTreeMap::<u64, Awaited>::new();
                 let mut bytes = Vec::new();
                 let mut next_heartbeat = Instant::now();
+                // A task taken off the channel by the idle wait below, dispatched next pass.
+                let mut carried: Option<Task> = None;
                 loop {
+                    #[cfg(test)]
+                    counted.fetch_add(1, Ordering::Relaxed);
                     if stopped.load(Ordering::Acquire) {
                         bail!("serial execution cancelled")
                     }
@@ -213,10 +234,13 @@ impl Transport {
                     }) {
                         bail!("serial execution response deadline; incarnation fenced")
                     }
-                    let task = match rx.try_recv() {
-                        Ok(t) => Some(t),
-                        Err(mpsc::TryRecvError::Empty) => None,
-                        Err(_) => bail!("serial execution owner closed"),
+                    let task = match carried.take() {
+                        Some(t) => Some(t),
+                        None => match rx.try_recv() {
+                            Ok(t) => Some(t),
+                            Err(mpsc::TryRecvError::Empty) => None,
+                            Err(_) => bail!("serial execution owner closed"),
+                        },
                     };
                     let mut queue = Vec::new();
                     if let Some(task) = task {
@@ -269,10 +293,12 @@ impl Transport {
                         }
                     }
                     let mut chunk = [0; 16384];
+                    let mut received = false;
                     loop {
                         match s.read(&mut chunk) {
                             Ok(0) => bail!("serial execution EOF"),
                             Ok(n) => {
+                                received = true;
                                 bytes.extend_from_slice(&chunk[..n]);
                                 if bytes.len() > 1048580 + 16384 {
                                     bail!("serial response buffer bound")
@@ -320,7 +346,24 @@ impl Transport {
                             let _ = task.reply.send(Ok(response));
                         }
                     }
-                    thread::sleep(Duration::from_millis(2));
+                    // Idle: nothing awaited, nothing buffered, nothing just read. The Guest only
+                    // speaks in reply to a request, so the socket carries nothing we must act on
+                    // except EOF or a protocol violation; both still fence, at most 50 ms later.
+                    // Block on the channel so a new task wakes the loop at once, bounded by the
+                    // next heartbeat so its schedule is unchanged, and by 50 ms so stop, EOF and
+                    // unsolicited bytes are still observed promptly.
+                    if !received && pending.is_empty() && bytes.is_empty() {
+                        let wait = next_heartbeat
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(50));
+                        // Timeout and disconnect both fall through: the next pass re-checks stop
+                        // first and then reports a closed owner exactly as before.
+                        if let Ok(t) = rx.recv_timeout(wait) {
+                            carried = Some(t);
+                        }
+                    } else {
+                        thread::sleep(Duration::from_millis(2));
+                    }
                 }
             };
             let _ = run();
@@ -334,6 +377,8 @@ impl Transport {
             stop,
             lane: Arc::new(AtomicBool::new(false)),
             stream,
+            #[cfg(test)]
+            iterations,
         }
     }
     #[cfg(test)]
@@ -346,7 +391,15 @@ impl Transport {
         }
 
         let method = request["method"].as_str().context("method required")?;
-        if !["info", "exec_start", "exec_poll", "exec_cancel"].contains(&method) {
+        if ![
+            "info",
+            "exec_start",
+            "exec_poll",
+            "exec_cancel",
+            vm_control::input::TEXT_GUEST_METHOD,
+        ]
+        .contains(&method)
+        {
             bail!("unsupported serial execution method")
         }
         if self.state() != "ready" || self.stop.load(Ordering::Acquire) {
@@ -358,7 +411,15 @@ impl Transport {
         }
         let (tx, rx) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
-        let deadline = admitted_deadline.min(Instant::now() + Duration::from_secs(1));
+        let deadline = admitted_deadline.min(
+            Instant::now()
+                + Duration::from_secs(match method {
+                    // One text chunk; the Guest bounds its own work to 3 s (quiet-period waits).
+                    // Exceeding this deadline fences the incarnation like any other late reply.
+                    vm_control::input::TEXT_GUEST_METHOD => 4,
+                    _ => 1,
+                }),
+        );
         if self
             .tx
             .try_send(Task {
@@ -377,6 +438,8 @@ impl Transport {
             rx,
             cancelled,
             stop: self.stop.clone(),
+            state: self.state.clone(),
+            stream: self.stream.clone(),
             done: false,
         })
     }
@@ -419,6 +482,39 @@ fn validate_reply(method: &str, response: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn disconnected_task_publishes_fence_and_closes_stream_before_error_is_observed() {
+        let directory = tempfile::Builder::new()
+            .prefix("v2fence-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = directory.path().join("s");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let lifetime = Arc::new(Mutex::new(
+            super::super::guest_transport::Lifetime::default(),
+        ));
+        let _socket = super::super::guest_transport::connect_private(&path, &lifetime).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let state = Arc::new(Mutex::new("ready"));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let mut pending = Pending {
+            rx: receiver,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            stop: stop.clone(),
+            state: state.clone(),
+            stream: lifetime.clone(),
+            done: false,
+        };
+        // Deliberately reproduce the interval before any worker epilogue runs.
+        drop(sender);
+        assert!(pending.poll().unwrap().is_err());
+        assert!(stop.load(Ordering::Acquire));
+        assert_eq!(*state.lock().unwrap(), "fenced");
+        assert_eq!(peer.read(&mut [0; 1]).unwrap(), 0);
+        assert!(super::super::guest_transport::connect_private(&path, &lifetime).is_err());
+    }
     fn hello(s: &mut UnixStream) -> (String, String) {
         let g = "a".repeat(64);
         s.set_nonblocking(true).unwrap();
@@ -529,6 +625,57 @@ mod tests {
         assert!(t.request(json!({"id":"other","method":"info"})).is_err());
         assert_eq!(poll(&mut start).unwrap()["id"], "start");
         server.join().unwrap();
+    }
+    #[test]
+    fn idle_loop_blocks_between_heartbeats_and_wakes_for_a_task() {
+        let d = tempfile::Builder::new()
+            .prefix("v2idle-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = d.path().join("a.sock");
+        let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let (g, h) = hello(&mut s);
+            let mut heartbeats = 0;
+            loop {
+                let r = initial(&mut s, Instant::now() + Duration::from_secs(2)).unwrap();
+                match r.request.as_ref().unwrap()["method"].as_str().unwrap() {
+                    "heartbeat" => {
+                        heartbeats += 1;
+                        reply(&mut s, &g, &h, r, json!({"alive":true}));
+                    }
+                    "exec_poll" => {
+                        reply(&mut s, &g, &h, r, json!({"state":"running"}));
+                        break;
+                    }
+                    _ => panic!("unexpected"),
+                }
+            }
+            thread::sleep(Duration::from_millis(30));
+            heartbeats
+        });
+        let t = Transport::start(&path, "c".repeat(64));
+        let until = Instant::now() + Duration::from_secs(2);
+        while t.state() == "starting" {
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(2));
+        }
+        // Let the first heartbeat settle, then observe a window spanning the next one.
+        thread::sleep(Duration::from_millis(100));
+        let before = t.iterations.load(Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(600));
+        let passes = t.iterations.load(Ordering::Relaxed) - before;
+        // A 2 ms poll makes about 300 passes in 600 ms; a 50 ms idle wait makes about 12
+        // plus the few passes that carry one heartbeat exchange.
+        assert!(passes > 0, "loop stopped running");
+        assert!(passes < 60, "idle loop spun: {passes} passes in 600 ms");
+        assert_eq!(t.state(), "ready");
+        let mut job = t
+            .request(json!({"id":"poll","method":"exec_poll","job_id":"b".repeat(32)}))
+            .unwrap();
+        assert_eq!(poll(&mut job).unwrap()["id"], "poll");
+        assert!(server.join().unwrap() >= 2, "heartbeat schedule slipped");
     }
     #[test]
     fn heartbeat_requires_exact_proof() {

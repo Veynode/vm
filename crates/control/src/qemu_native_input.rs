@@ -240,6 +240,74 @@ impl NativeInput {
     }
 }
 
+/// Guest reply budget for one text chunk. The Guest bounds its own work to 3 s:
+/// it may have to wait out the 1 s quiet period of a temporary keycode before
+/// rebinding it (see guest/veynode-agent/text_input.go).
+pub(super) const TEXT_CHUNK_DEADLINE: Duration = Duration::from_secs(4);
+
+/// Worker-side fence for one chunk of Unicode text (`input_text_step`).
+///
+/// Text does not travel over QMP: the chunk becomes a `text_input` request to the Guest
+/// service, handed to `submit` (the serial execution transport). The fences are those of
+/// `InputState::step`: one operation at a time, a recent matching frame and a live operation
+/// deadline. Without a transport the answer is an explicit `unsupported`; there
+/// is no fallback to physical key codes. Nothing is submitted unless every check passes.
+pub(super) fn text_step<P>(
+    args: &Value,
+    input: &mut InputState,
+    frames: &vm_control::input::Frames,
+    console: &Path,
+    submit: Option<&dyn Fn(Value, Instant) -> Result<P>>,
+) -> Result<P> {
+    let submit = submit.context(
+        "unsupported: Unicode text input requires the Guest execution transport (qemu_guest_exec) and a Guest service started with --allow-text-input",
+    )?;
+    let operation = args["operation_id"]
+        .as_str()
+        .context("missing input operation")?;
+    if operation.len() != 32 || !operation.bytes().all(|c| c.is_ascii_hexdigit()) {
+        bail!("invalid input operation")
+    }
+    let begin = args["begin"] == true;
+    if begin {
+        if input.operation.is_some() {
+            bail!("input busy: another operation is active")
+        }
+        if input
+            .completed_operations
+            .iter()
+            .any(|known| known == operation)
+        {
+            bail!("input operation was already completed")
+        }
+    } else if input.operation.as_deref() != Some(operation) {
+        bail!("input operation expired or replaced")
+    }
+    let index = args["index"]
+        .as_u64()
+        .filter(|index| {
+            *index < vm_control::input::TEXT_MAX_SCALARS as u64 && (*index == 0) == begin
+        })
+        .context("invalid text chunk index")?;
+    let request = vm_control::input::guest_text_request(
+        &format!("text-{operation}-{index}"),
+        args["text"].as_str().context("text chunk required")?,
+    )?;
+    let current = console_frame_status(console)?;
+    frames.check(args, &current, Instant::now())?;
+    if input.until.is_some_and(|until| Instant::now() >= until) {
+        bail!("input operation deadline expired")
+    }
+    // A chunk the transport refuses leaves no operation behind: the caller is told "not sent".
+    let pending = submit(request, Instant::now() + TEXT_CHUNK_DEADLINE)?;
+    if begin {
+        input.operation = Some(operation.into());
+    }
+    // Each admitted chunk renews the idle deadline; the daemon bounds the number of chunks.
+    input.until = Some(Instant::now() + Duration::from_secs(5));
+    Ok(pending)
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AcquisitionValidation {
@@ -289,6 +357,9 @@ mod tests {
             next: 1,
             poisoned: false,
             reply_prefix: Vec::new(),
+            guest_reset: false,
+            run_state_event: false,
+            shutdown_event: false,
         };
         let mut input = InputState {
             operation: Some("o".repeat(32)),
@@ -430,6 +501,9 @@ mod tests {
             next: 1,
             poisoned: false,
             reply_prefix: Vec::new(),
+            guest_reset: false,
+            run_state_event: false,
+            shutdown_event: false,
         };
         let mut input = InputState::default();
         let mut native = NativeInput::default();
@@ -629,6 +703,9 @@ mod acquisition_tests {
                 next: 1,
                 poisoned: false,
                 reply_prefix: Vec::new(),
+                guest_reset: false,
+                run_state_event: false,
+                shutdown_event: false,
             };
             let mut input = InputState::default();
             let mut native = NativeInput::default();
@@ -767,6 +844,9 @@ mod acquisition_tests {
             next: 1,
             poisoned: false,
             reply_prefix: Vec::new(),
+            guest_reset: false,
+            run_state_event: false,
+            shutdown_event: false,
         };
         let mut input = InputState {
             operation: Some("o".repeat(32)),
@@ -851,5 +931,392 @@ mod acquisition_tests {
         assert!(r.is_err(), "legacy rejects unexpected acquisition reply");
         assert!(!written);
         assert_eq!(count, 1);
+    }
+}
+
+#[cfg(test)]
+mod text_tests {
+    use super::*;
+    use std::cell::RefCell;
+    const FRAME: &str = "00000000-0000-0000-0000-000000000000";
+    const MIXED: &str = "你好e\u{301}😀";
+    /// A console broker that answers `frame_status` and counts the requests it saw.
+    fn console(
+        generation: u64,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        std::sync::Arc<AtomicBool>,
+        thread::JoinHandle<usize>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let done = stop.clone();
+        let server = thread::spawn(move || {
+            let mut count = 0;
+            while !done.load(Ordering::Acquire) {
+                let (mut s, _) = match listener.accept() {
+                    Ok(v) => v,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(e) => panic!("{e}"),
+                };
+                s.set_nonblocking(false).unwrap();
+                s.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                let r: Value = serde_json::from_slice(
+                    &read_frame(&mut BufReader::new(s.try_clone().unwrap()))
+                        .unwrap()
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(r["method"], "frame_status");
+                count += 1;
+                let b = serde_json::to_vec(&json!({"request_id":r["request_id"],"result":{"capture_connected":true,"frame_available":true,"source_generation":generation,"width":1280,"height":800}})).unwrap();
+                let mut wire = Vec::new();
+                wire.extend_from_slice(&(b.len() as u32).to_be_bytes());
+                wire.push(1);
+                wire.extend_from_slice(&[0; 8]);
+                wire.extend(b);
+                s.write_all(&wire).unwrap();
+            }
+            count
+        });
+        (dir, path, stop, server)
+    }
+    fn args(begin: bool, index: u64, text: &str) -> Value {
+        json!({"operation_id":"0123456789abcdef0123456789abcdef",
+            "begin":begin,"index":index,"text":text,
+            "frame_id":FRAME,"width":1280,"height":800,"source_generation":7})
+    }
+    fn observed() -> vm_control::input::Frames {
+        let mut frames = vm_control::input::Frames::default();
+        frames.record(
+            &json!({"frame_id":FRAME,"width":1280,"height":800,"source_generation":7}),
+            Instant::now(),
+        );
+        frames
+    }
+    #[test]
+    fn chunk_becomes_one_guest_request_under_the_input_fences() {
+        let (_dir, path, stop, server) = console(7);
+        let frames = observed();
+        let mut input = InputState::default();
+        let sent = RefCell::new(Vec::<(Value, Instant)>::new());
+        let submit = |request: Value, deadline: Instant| -> Result<usize> {
+            sent.borrow_mut().push((request, deadline));
+            Ok(sent.borrow().len())
+        };
+        let before = Instant::now();
+        assert_eq!(
+            text_step(
+                &args(true, 0, MIXED),
+                &mut input,
+                &frames,
+                &path,
+                Some(&submit)
+            )
+            .unwrap(),
+            1
+        );
+        {
+            let sent = sent.borrow();
+            assert_eq!(
+                sent[0].0,
+                json!({"id":"text-0123456789abcdef0123456789abcdef-0","method":"text_input",
+                    "text_hex":"e4bda0e5a5bd65cc81f09f9880"})
+            );
+            let budget = sent[0].1.duration_since(before);
+            assert!(
+                budget >= TEXT_CHUNK_DEADLINE
+                    && budget < TEXT_CHUNK_DEADLINE + Duration::from_secs(1)
+            );
+        }
+        assert_eq!(
+            input.operation.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert!(input.held.is_empty(), "text holds no physical key");
+        // The same operation continues; its idle deadline is renewed, never shortened.
+        let first_deadline = input.until.unwrap();
+        thread::sleep(Duration::from_millis(5));
+        assert_eq!(
+            text_step(
+                &args(false, 1, "q"),
+                &mut input,
+                &frames,
+                &path,
+                Some(&submit)
+            )
+            .unwrap(),
+            2
+        );
+        assert!(input.until.unwrap() > first_deadline);
+        assert_eq!(sent.borrow()[1].0["text_hex"], "71");
+        assert_eq!(
+            sent.borrow()[1].0["id"],
+            "text-0123456789abcdef0123456789abcdef-1"
+        );
+
+        // Every rejection below must leave the Guest untouched.
+        let mut other = args(true, 0, "a");
+        other["operation_id"] = json!("f".repeat(32));
+        let mut replaced = args(false, 2, "a");
+        replaced["operation_id"] = json!("f".repeat(32));
+        let mut stale_frame = args(false, 2, "a");
+        stale_frame["frame_id"] = json!("11111111-1111-1111-1111-111111111111");
+        let mut resized = args(false, 2, "a");
+        resized["width"] = json!(1920);
+        let mut no_text = args(false, 2, "a");
+        no_text["text"] = json!(["a"]);
+        for (case, rejected) in [
+            ("second operation while one is active", other),
+            ("replaced operation", replaced),
+            ("unknown frame", stale_frame),
+            ("geometry change", resized),
+            ("text type", no_text),
+            ("control character", args(false, 2, "\u{1b}")),
+            ("carriage return", args(false, 2, "a\r")),
+            ("oversized chunk", args(false, 2, &"a".repeat(17))),
+            ("begin with nonzero index", args(true, 1, "a")),
+            ("continuation with zero index", args(false, 0, "a")),
+            ("index out of range", args(false, 256, "a")),
+        ] {
+            assert!(
+                text_step(&rejected, &mut input, &frames, &path, Some(&submit)).is_err(),
+                "{case}"
+            );
+            assert_eq!(sent.borrow().len(), 2, "{case} reached the Guest");
+        }
+        // An expired operation deadline is not renewed by a late chunk.
+        input.until = Some(Instant::now() - Duration::from_millis(1));
+        assert!(text_step(
+            &args(false, 2, "a"),
+            &mut input,
+            &frames,
+            &path,
+            Some(&submit)
+        )
+        .is_err());
+        assert_eq!(sent.borrow().len(), 2);
+        // A completed operation cannot be replayed.
+        input.operation = None;
+        input.until = None;
+        input
+            .completed_operations
+            .push_back("0123456789abcdef0123456789abcdef".into());
+        assert!(text_step(
+            &args(true, 0, "a"),
+            &mut input,
+            &frames,
+            &path,
+            Some(&submit)
+        )
+        .is_err());
+        assert_eq!(sent.borrow().len(), 2);
+        stop.store(true, Ordering::Release);
+        assert!(server.join().unwrap() >= 2);
+    }
+    #[test]
+    fn missing_transport_is_unsupported_and_changes_nothing() {
+        let (_dir, path, stop, server) = console(7);
+        let frames = observed();
+        let mut input = InputState::default();
+        let error =
+            text_step::<()>(&args(true, 0, MIXED), &mut input, &frames, &path, None).unwrap_err();
+        assert!(error.to_string().starts_with("unsupported: "), "{error}");
+        assert!(error.to_string().contains("--allow-text-input"));
+        assert!(input.operation.is_none() && input.until.is_none());
+        stop.store(true, Ordering::Release);
+        assert_eq!(
+            server.join().unwrap(),
+            0,
+            "no console request without a transport"
+        );
+    }
+    #[test]
+    fn source_generation_change_and_transport_refusal_send_or_report_nothing_false() {
+        // The console now reports another generation than the observed frame.
+        let (_dir, path, stop, server) = console(8);
+        let frames = observed();
+        let mut input = InputState::default();
+        let calls = RefCell::new(0);
+        let submit = |_: Value, _: Instant| -> Result<()> {
+            *calls.borrow_mut() += 1;
+            bail!("serial execution busy")
+        };
+        assert!(text_step(
+            &args(true, 0, "a"),
+            &mut input,
+            &frames,
+            &path,
+            Some(&submit)
+        )
+        .is_err());
+        assert_eq!(*calls.borrow(), 0);
+        assert!(input.operation.is_none());
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+        // A refusing transport surfaces its error and leaves no operation: nothing was sent.
+        let (_dir, path, stop, server) = console(7);
+        let error = text_step(
+            &args(true, 0, "a"),
+            &mut input,
+            &frames,
+            &path,
+            Some(&submit),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "serial execution busy");
+        assert_eq!(*calls.borrow(), 1);
+        assert!(input.operation.is_none() && input.until.is_none());
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+    }
+    /// Host planner, worker fence and serial transport against the real Go Guest service, whose
+    /// text backend talks to an in-process X server. Byte identity is asserted on the Go side.
+    ///
+    /// The Go test executable comes from VEYNODE_SERIAL_TEXT_GO_TEST_BIN, or is built here with
+    /// the Go toolchain. Without either the test fails; it never passes without running. The only
+    /// way not to run it is the explicit VEYNODE_SERIAL_TEXT_INTEROP=skip, which says so on stderr.
+    /// Not real Guest evidence: the X server on the Go side is this repository's fake.
+    #[test]
+    fn actual_go_service_receives_planned_text_byte_identical() {
+        let text = format!("{}\n\t", MIXED.repeat(8));
+        let directory = tempfile::Builder::new()
+            .prefix("vtgo-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let binary = match std::env::var_os("VEYNODE_SERIAL_TEXT_GO_TEST_BIN") {
+            Some(binary) => std::path::PathBuf::from(binary),
+            None if std::env::var_os("VEYNODE_SERIAL_TEXT_INTEROP")
+                .is_some_and(|v| v == "skip") =>
+            {
+                eprintln!("SKIPPED actual_go_service_receives_planned_text_byte_identical: VEYNODE_SERIAL_TEXT_INTEROP=skip; the Rust-to-Go text interop was NOT exercised");
+                return;
+            }
+            None => {
+                let built = directory.path().join("agent.test");
+                let source =
+                    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../guest/veynode-agent");
+                let status = ["go", "/opt/homebrew/bin/go", "/usr/local/go/bin/go"]
+                    .iter()
+                    .find_map(|go| {
+                        std::process::Command::new(go)
+                            .arg("-C")
+                            .arg(&source)
+                            .args(["test", "-c", "-o"])
+                            .arg(&built)
+                            .arg(".")
+                            .stdout(std::process::Stdio::null())
+                            .status()
+                            .ok()
+                    })
+                    .expect("Go toolchain not found: set VEYNODE_SERIAL_TEXT_GO_TEST_BIN to a `go test -c` build of guest/veynode-agent, or VEYNODE_SERIAL_TEXT_INTEROP=skip to skip explicitly");
+                assert!(status.success(), "go test -c of guest/veynode-agent failed");
+                built
+            }
+        };
+        let socket = directory.path().join("agent.sock");
+        struct Owned(std::process::Child);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+        let mut child = Owned(
+            std::process::Command::new(binary)
+                .arg("-test.run=^TestSerialTextInteropProcess$")
+                .env("VEYNODE_SERIAL_TEXT_SOCKET", &socket)
+                .env(
+                    "VEYNODE_SERIAL_TEXT_EXPECT_HEX",
+                    text.bytes().map(|b| format!("{b:02x}")).collect::<String>(),
+                )
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        let until = Instant::now() + Duration::from_secs(5);
+        while !socket.exists() {
+            assert!(Instant::now() < until);
+            assert!(child.0.try_wait().unwrap().is_none());
+            thread::sleep(Duration::from_millis(5));
+        }
+        let transport = guest_exec::Transport::start(&socket, "c".repeat(64));
+        while transport.state() == "starting" {
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(transport.state(), "ready");
+        fn wait(mut pending: guest_exec::Pending) -> Result<Value> {
+            let until = Instant::now() + Duration::from_secs(3);
+            loop {
+                if let Some(result) = pending.poll() {
+                    return result;
+                }
+                assert!(Instant::now() < until, "Guest reply missing");
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        let info = wait(
+            transport
+                .request(json!({"id":"info","method":"info"}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(info["result"]["capabilities"]["text_input"], true);
+        let (_dir, console_path, stop, server) = console(7);
+        let frames = observed();
+        let mut input = InputState::default();
+        let mut arguments = args(true, 0, "");
+        arguments["text"] = json!(text);
+        let plan = vm_control::input::plan_text(&arguments).unwrap();
+        assert_eq!(plan.chunks.len(), 3);
+        let submit =
+            |request: Value, deadline: Instant| transport.request_before(request, deadline);
+        let result = vm_control::input::deliver_text(&plan, &info, |index, chunk| {
+            let step = args(index == 0, index as u64, chunk);
+            let started = Instant::now();
+            let reply = wait(text_step(
+                &step,
+                &mut input,
+                &frames,
+                &console_path,
+                Some(&submit),
+            )?)?;
+            assert!(
+                started.elapsed() < TEXT_CHUNK_DEADLINE,
+                "chunk exceeded its reply deadline"
+            );
+            // What the daemon forwards: counts and codes, never the Guest's per-key diagnostics.
+            assert!(reply["result"]["bindings"].is_array());
+            let summary = vm_control::input::guest_text_summary(&reply);
+            assert!(!summary.to_string().contains("keysym"));
+            Ok(summary)
+        })
+        .unwrap();
+        assert_eq!(result["scalars"], 42);
+        assert_eq!(result["bytes"], text.len());
+        assert_eq!(transport.state(), "ready");
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+        drop(transport);
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success(), "Go side did not decode the exact text");
+                break;
+            }
+            assert!(Instant::now() < end);
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 }

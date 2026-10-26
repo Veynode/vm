@@ -199,3 +199,23 @@ export class ReceptionDeadline {
     this.close(); this.options.onTimeout(code);
   }
 }
+
+// A transient ICE `disconnected` may recover. `failed` and `closed` stay
+// terminal at once; `disconnected` is terminal only if the peer has not
+// returned to `connected` within this fixed grace. Session caps and
+// authorization checks run independently and are never extended by it.
+export const DISCONNECT_GRACE_MS = 5000;
+export class DisconnectGrace {
+  private timer: ReturnType<typeof setTimeout> | undefined;
+  private finished = false;
+  constructor(private readonly onLost: (reason: 'failed' | 'closed' | 'disconnected_grace_expired') => void) {}
+  get pending(): boolean { return this.timer !== undefined; }
+  update(state: string): void {
+    if (this.finished) return;
+    if (state === 'failed' || state === 'closed') { this.close(); this.onLost(state); return; }
+    if (state === 'connected') { clearTimeout(this.timer); this.timer = undefined; return; }
+    // A repeated `disconnected`, or any state other than `connected`, never restarts the grace.
+    if (state === 'disconnected') this.timer ??= setTimeout(() => { this.close(); this.onLost('disconnected_grace_expired'); }, DISCONNECT_GRACE_MS);
+  }
+  close(): void { clearTimeout(this.timer); this.timer = undefined; this.finished = true; }
+}

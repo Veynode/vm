@@ -11,6 +11,19 @@ use std::{
 };
 pub const MIN_BPS: u64 = 250_000;
 pub const MAX_BPS: u64 = 40_000_000;
+// Half-framing-limit AU ceiling: (4 * 1024 * 1024) / 2 = 2,097,152 bytes.
+// archive/docs-evidence/encoder-rate-live/baseline-v1/encoder-rate-live-v1/
+// {h264,hevc}-result.json: max(records[].bytes) = 987,750 and 1,687,652;
+// records[0].bytes = 821,922 and 1,437,745 (initial_status.target_bps = 8e6).
+// 2 MiB is the next power of two above the measured maximum, with
+// 2,097,152 - 1,687,652 = 409,500 bytes of headroom, inside the 4 MiB
+// frame_schedule::frame_header limit. These are decoded hardware AUs, though
+// the recordings failed their separate bitrate-response check.
+// MAX_BPS caps the encoder target, not link throughput: even 40e6 * .250 / 8
+// = 1,250,000 bytes would reject valid HEVC startup AUs. This size ceiling
+// does not promise delivery; the existing 250 ms egress deadline still applies.
+pub const MAX_ENCODED_ACCESS_UNIT_BYTES: usize = (4 * 1024 * 1024) / 2;
+pub const MAX_CONSECUTIVE_OVERSIZED_UNITS: u64 = 3;
 const SAFE: u64 = 9_007_199_254_740_991;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

@@ -16,15 +16,19 @@
 <label>Codec preference <select id="codec-preference"><option value="auto">Automatic: prefer hardware H.265, fallback H.264</option><option value="h264">H.264 only (compatibility check)</option></select></label>
 <div class="actions"><button id="connect" disabled>Connect native console</button><button id="disconnect" disabled>Disconnect</button><button id="retry-cleanup" hidden disabled>Retry cleanup</button><button id="download">Download JSON evidence</button></div>
 <p id="status" role="status">Reading live native hardware capabilities…</p>
+<p id="session-state" role="status" data-state="idle">Not connected.</p>
 <video id="received" autoplay muted playsinline></video><canvas id="last-frame" width="640" height="360" hidden></canvas>
 <fieldset id="desktop-control" hidden><legend>Desktop control</legend>
-<p>Control uses the refreshed screenshot below. Video is for viewing. A screenshot expires after 4 seconds; refresh it before another action. Keys are physical keys, not text or Unicode input.</p>
+<p>Control uses the control picture below; the video above is for viewing and cannot anchor input. Every input is signed against one picture issued by the host, and a picture is usable for 4 seconds. Keys are physical keys, not text or Unicode input.</p>
+<label><input id="direct-control" type="checkbox" checked> Direct control: click, double-click, drag, scroll and type on the picture</label>
+<p class="hint">Inputs are sent one at a time, in order; up to 8 may wait and further ones are refused, never sent late. After each input the picture is fetched again. Not available on this connection: pointer hover, held keys or buttons, modifier + click, text paste and IME. Ctrl+Alt+Escape releases the keyboard from the picture. Browser-reserved shortcuts (for example Ctrl+W) never reach the page.</p>
 <div class="actions"><button id="refresh-control-frame" disabled>Refresh screenshot</button></div>
-<label>Screenshot action <select id="pointer-action"><option value="click">Left click</option><option value="right-click">Right click</option><option value="drag">Drag: select start, then end</option><option value="scroll-up">Scroll up at point</option><option value="scroll-down">Scroll down at point</option></select></label>
+<div id="stepwise-controls"><label>Screenshot action <select id="pointer-action"><option value="click">Left click</option><option value="right-click">Right click</option><option value="drag">Drag: select start, then end</option><option value="scroll-up">Scroll up at point</option><option value="scroll-down">Scroll down at point</option></select></label>
 <label>Physical key <select id="physical-key"><option value="ret">Enter</option><option value="esc">Escape</option><option value="tab">Tab</option><option value="backspace">Backspace</option><option value="delete">Delete</option><option value="up">Up</option><option value="down">Down</option><option value="left">Left</option><option value="right">Right</option><option value="home">Home</option><option value="end">End</option><option value="pgup">Page Up</option><option value="pgdn">Page Down</option><option value="spc">Space</option><option value="ctrl,a">Ctrl+A</option></select></label>
-<button id="send-physical-key" disabled>Send key</button>
-<p id="control-status" role="status">Connect an authorized session to observe its screenshot. Desktop input requires the input permission.</p>
-<canvas id="control-frame" width="640" height="360" hidden aria-label="Fresh desktop screenshot for pointer input"></canvas>
+<button id="send-physical-key" disabled>Send key</button></div>
+<p id="input-notice" role="alert"></p>
+<p id="control-status" role="status">Connect an authorized session to observe its screenshot. Desktop input requires a separate permission.</p>
+<canvas id="control-frame" width="640" height="360" hidden tabindex="0" aria-label="Desktop control picture: pointer and keyboard input"></canvas>
 </fieldset>
 <fieldset id="file-transfer" hidden><legend>Guest files</legend>
 <p>Transfer one file at a time, up to 8 MiB, within the configured Guest folder. Uploads never replace existing files. Downloads are checked before saving.</p>

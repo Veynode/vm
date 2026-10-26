@@ -241,7 +241,7 @@ running service binary:
 ```sh
 native/guest-macos/build.sh --output "$PWD/.local/guest-share/macos-guest-agent-input-stage5"
 "$PWD/.local/guest-share/macos-guest-agent-input-stage5" --self-test
-cargo build -p vm-control --bins -j 2 --target-dir .local/macos-input-target
+cargo build -p vm-control --bins
 ```
 
 The build refuses an existing `--output` path; choose a new stage name for another
@@ -268,7 +268,7 @@ be retained, but do not start a second daemon or attach a writable Guest disk tw
 For a daemon already running the updated code, start MCP with:
 
 ```sh
-.local/macos-input-target/debug/vm-control mcp --state-dir /absolute/private/state --allow-input
+target/debug/vm-control mcp --state-dir /absolute/private/state --allow-input
 ```
 
 Take a fresh screenshot and pass its `frame_id`,

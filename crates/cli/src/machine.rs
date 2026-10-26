@@ -1,5 +1,7 @@
 //! `veynodevm machine`: full Linux distributions installed from their own
-//! installer ISO and booted through UEFI with their own kernel and bootloader.
+//! installer ISO and booted through UEFI with their own kernel and bootloader,
+//! and Windows 11 ARM64 installed from the user's own ISO (`--os windows`,
+//! QEMU/HVF only: Apple Virtualization has no Windows support).
 //!
 //! A machine is a daemon VM whose id is the machine name, plus a private
 //! directory `<home>/machines/NAME` holding a sparse raw `disk.raw`, the
@@ -18,13 +20,22 @@ use std::{
 };
 use vm_control::home;
 
-pub const USAGE: &str = "Full Linux distributions (UEFI boot from the distribution's own ISO/disk):
+pub const USAGE: &str =
+    "Full Linux distributions and Windows 11 ARM64 (UEFI boot from their own ISO/disk):
   machine create NAME [--iso PATH] [--disk-size 40G] [-m, --memory 4g] [--cpus 4]
                       [--gpus virgl|venus | --backend apple|qemu] [--monitor]
                       [--attach IMAGE]...   (read-only seed image, e.g. cloud-init/kickstart)
+                      [--os linux|windows]  (windows: QEMU/HVF, 64G disk default, --attach an
+                                             Autounattend and the virtio-win image; --gpus neptune:
+                                             UTM Neptune/DXMT, needs UTM's viogpu3d guest driver)
+                      [--disk-bus virtio|nvme]  (QEMU; nvme for disks installed without viostor)
+                      [-p, --publish HOST:GUEST]...  (QEMU; TCP 127.0.0.1:HOST → guest, e.g. 2222:22)
   machine start NAME            Boot (installer ISO first while attached, then the disk)
   machine stop [-f] NAME        ACPI power button (-f kills the VM)
   machine eject NAME            Detach the installer ISO and seed images (machine stopped)
+  machine ssh-key NAME --user USER --key PRIVATE_KEY
+                                Windows: the guest login MCP uses for vm_exec, files and the
+                                desktop tools (the key the answer file authorized)
   machine ls | inspect NAME | rm NAME
   desktop NAME                  Native window (Apple Virtualization machines)";
 
@@ -32,21 +43,42 @@ pub const USAGE: &str = "Full Linux distributions (UEFI boot from the distributi
 pub struct Machine {
     pub name: String,
     pub backend: String,
+    #[serde(default = "linux")]
+    pub os: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iso: Option<PathBuf>,
     pub disk_gib: u64,
     pub created_at: u64,
 }
 
+fn linux() -> String {
+    "linux".into()
+}
+
 pub struct Spec {
     pub name: String,
     pub qemu: bool,
+    pub windows: bool,
     pub gpu_profile: Option<&'static str>,
     pub iso: Option<PathBuf>,
     pub cpus: u32,
     pub memory_mib: u64,
     pub monitor: bool,
     pub attach: Vec<PathBuf>,
+    pub nvme: bool,
+    /// QEMU user-network TCP forwards, 127.0.0.1:HOST → guest GUEST.
+    pub publish: Vec<(u16, u16)>,
+}
+
+/// `HOST:GUEST` TCP ports, e.g. `2222:22`.
+fn publish_port(value: &str) -> Result<(u16, u16)> {
+    let parsed = value
+        .split_once(':')
+        .and_then(|(host, guest)| Some((host.parse::<u16>().ok()?, guest.parse::<u16>().ok()?)));
+    match parsed {
+        Some((host, guest)) if host != 0 && guest != 0 => Ok((host, guest)),
+        _ => bail!("--publish takes HOST:GUEST TCP ports, got {value}"),
+    }
 }
 
 /// `40G`, `40g`, `40GiB`, `40` (GiB), `1T` → GiB.
@@ -74,7 +106,7 @@ pub fn vm_config(spec: &Spec, dir: &Path) -> Value {
     let mut vm = json!({
         "backend": if spec.qemu {"qemu-hvf"} else {"apple-virtualization"},
         "id": spec.name,
-        "guest": "linux",
+        "guest": if spec.windows {"windows"} else {"linux"},
         "cpus": spec.cpus,
         "memory_mib": spec.memory_mib,
         "boot": "uefi",
@@ -98,6 +130,16 @@ pub fn vm_config(spec: &Spec, dir: &Path) -> Value {
         }
         if spec.monitor {
             vm["qemu_monitor"] = json!(true);
+        }
+        if spec.nvme {
+            vm["qemu_disk_bus"] = json!("nvme");
+        }
+        if !spec.publish.is_empty() {
+            vm["ports"] = json!(spec
+                .publish
+                .iter()
+                .map(|(host, guest)| json!({"host_address":"127.0.0.1","host_port":host,"guest_port":guest,"protocol":"tcp"}))
+                .collect::<Vec<_>>());
         }
     } else {
         vm["width"] = json!(1920);
@@ -150,21 +192,39 @@ fn create(rest: &[String]) -> Result<Value> {
             ("backend", None, true),
             ("monitor", None, false),
             ("attach", None, true),
+            ("os", None, true),
+            ("disk-bus", None, true),
+            ("publish", Some('p'), true),
         ],
         false,
     )?;
+    let windows = match p.value("os") {
+        None | Some("linux") => false,
+        Some("windows") => true,
+        Some(other) => bail!("--os accepts linux|windows, got {other}"),
+    };
     let [name] = p.positional.as_slice() else {
         bail!("usage: veynodevm machine create NAME [--iso PATH] [--disk-size 40G] ...")
     };
     let gpu_profile = match p.value("gpus") {
         None => None,
+        Some(_) if windows => None, // below
         Some("all" | "virgl" | "gl") => Some("virgl"),
         Some("venus" | "vulkan") => Some("venus-moltenvk-experimental"),
         Some(other) => bail!("--gpus accepts all|virgl|venus, got {other}"),
     };
+    let gpu_profile = match (windows, p.value("gpus")) {
+        // UTM 5.0.5 Neptune + DXMT; the guest needs UTM's viogpu3d driver.
+        (true, Some("all" | "neptune" | "dxmt" | "d3d")) => Some("neptune-dxmt-experimental"),
+        (true, Some(other)) => bail!("--gpus for Windows accepts all|neptune, got {other}"),
+        _ => gpu_profile,
+    };
     let qemu = match p.value("backend") {
-        None => gpu_profile.is_some(),
+        None => windows || gpu_profile.is_some(),
         Some("qemu" | "qemu-hvf") => true,
+        Some("apple" | "apple-virtualization") if windows => {
+            bail!("Apple Virtualization cannot run Windows; use the QEMU/HVF backend")
+        }
         Some("apple" | "apple-virtualization") if gpu_profile.is_none() => false,
         Some("apple" | "apple-virtualization") => {
             bail!("--gpus needs the QEMU/HVF backend")
@@ -177,14 +237,30 @@ fn create(rest: &[String]) -> Result<Value> {
     if p.has("monitor") && !qemu {
         bail!("--monitor is a QEMU option")
     }
+    let nvme = match p.value("disk-bus") {
+        None | Some("virtio") => false,
+        Some("nvme") if qemu => true,
+        Some("nvme") => bail!("--disk-bus nvme is a QEMU option"),
+        Some(other) => bail!("--disk-bus accepts virtio|nvme, got {other}"),
+    };
+    let publish = p
+        .values("publish")
+        .iter()
+        .map(|value| publish_port(value))
+        .collect::<Result<Vec<_>>>()?;
+    if !publish.is_empty() && !qemu {
+        bail!("--publish is a QEMU option (Apple Virtualization guests are reachable directly)")
+    }
     let iso = p
         .value("iso")
         .map(|iso| fs::canonicalize(iso).with_context(|| format!("installer ISO not found: {iso}")))
         .transpose()?;
-    let disk_gib = disk_gib(p.value("disk-size").unwrap_or("32G"))?;
+    let default_disk = if windows { "64G" } else { "32G" };
+    let disk_gib = disk_gib(p.value("disk-size").unwrap_or(default_disk))?;
     let spec = Spec {
         name: name.clone(),
         qemu,
+        windows,
         gpu_profile,
         iso: iso.clone(),
         cpus: p
@@ -199,6 +275,8 @@ fn create(rest: &[String]) -> Result<Value> {
             .transpose()?
             .unwrap_or(4096),
         monitor: p.has("monitor"),
+        nvme,
+        publish,
         attach: p
             .values("attach")
             .iter()
@@ -229,6 +307,7 @@ fn create(rest: &[String]) -> Result<Value> {
                 "apple-virtualization"
             }
             .into(),
+            os: if windows { "windows" } else { "linux" }.into(),
             iso,
             disk_gib,
             created_at: crate::container::now(),
@@ -239,6 +318,52 @@ fn create(rest: &[String]) -> Result<Value> {
         cleanup_files(&dir);
     }
     result
+}
+
+const SSH_FILES: [&str; 3] = ["id_ed25519", "known_hosts", "user"];
+
+/// `machine ssh-key`: copies the private key and records the user in
+/// `<machine>/ssh/`, where the daemon's Windows guest tools find them
+/// (`vm_control::windows_guest`).
+fn ssh_key(name: &str, args: &[String]) -> Result<PathBuf> {
+    let machine = load(name)?;
+    if machine.os != "windows" {
+        bail!(
+            "ssh-key is for Windows machines; {name} runs {}",
+            machine.os
+        )
+    }
+    let value = |flag: &str| {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .with_context(|| format!("{flag} required"))
+    };
+    let user = value("--user")?;
+    if user.is_empty()
+        || !user
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    {
+        bail!("--user takes a Windows account name (letters, digits, . _ -)")
+    }
+    let key = fs::read(value("--key")?).context("cannot read --key")?;
+    if !key.starts_with(b"-----BEGIN OPENSSH PRIVATE KEY-----") {
+        bail!("--key must be an OpenSSH private key")
+    }
+    let ssh = home::private_dir(&dir(name)?.join("ssh"))?;
+    for (file, bytes) in [("id_ed25519", key.as_slice()), ("user", user.as_bytes())] {
+        let tmp = ssh.join(format!("{file}.tmp"));
+        let _ = fs::remove_file(&tmp);
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, bytes))?;
+        fs::rename(tmp, ssh.join(file))?;
+    }
+    Ok(ssh)
 }
 
 /// Remove only the files a machine owns, then its directory (never recursive).
@@ -252,6 +377,10 @@ fn cleanup_files(dir: &Path) {
     ] {
         let _ = fs::remove_file(dir.join(file));
     }
+    for file in SSH_FILES {
+        let _ = fs::remove_file(dir.join("ssh").join(file));
+    }
+    let _ = fs::remove_dir(dir.join("ssh"));
     if dir.exists() && fs::remove_dir(dir).is_err() {
         eprintln!(
             "veynodevm: left {} in place: it contains files VeynodeVM did not create",
@@ -357,6 +486,15 @@ pub fn command(rest: &[String], json_output: bool) -> Result<i32> {
             cleanup_files(&dir);
             done(name, json_output)?;
         }
+        "ssh-key" => {
+            let name = name()?;
+            let ssh = ssh_key(name, args)?;
+            if json_output {
+                print_json(&json!({"name":name,"ssh":ssh}))?;
+            } else {
+                println!("{}", ssh.display());
+            }
+        }
         "inspect" => {
             let name = name()?;
             let machine = load(name)?;
@@ -428,12 +566,15 @@ mod tests {
         Spec {
             name: "ubuntu".into(),
             qemu,
+            windows: false,
             gpu_profile: qemu.then_some("virgl"),
             iso: Some("/isos/ubuntu.iso".into()),
             cpus: 4,
             memory_mib: 4096,
             monitor: qemu,
             attach: vec!["/seed/cidata.iso".into()],
+            nvme: false,
+            publish: vec![],
         }
     }
     #[test]
@@ -462,5 +603,46 @@ mod tests {
         installed.attach.clear();
         let installed = vm_config(&installed, dir);
         assert!(installed.get("cdrom").is_none() && installed.get("extra_disks").is_none());
+    }
+    #[test]
+    fn windows_machines_are_qemu_uefi_windows_guests() {
+        let mut windows = spec(true);
+        windows.windows = true;
+        windows.gpu_profile = None;
+        let w = vm_config(&windows, Path::new("/home/machines/win"));
+        assert_eq!(w["guest"], "windows");
+        assert_eq!(w["backend"], "qemu-hvf");
+        assert!(w.get("qemu_graphics_profile").is_none() && w.get("qemu_disk_bus").is_none());
+        windows.nvme = true;
+        let nvme = vm_config(&windows, Path::new("/home/machines/win"));
+        assert_eq!(nvme["qemu_disk_bus"], "nvme");
+        let w = vm_config(
+            &{
+                windows.nvme = false;
+                windows.publish = vec![(2222, 22)];
+                windows
+            },
+            Path::new("/home/machines/win"),
+        );
+        let config: vm_control::Config = serde_json::from_value(w).unwrap();
+        assert_eq!(config.guest, "windows");
+        assert_eq!(
+            (
+                config.ports[0].host_address,
+                config.ports[0].host_port,
+                config.ports[0].guest_port
+            ),
+            (std::net::Ipv4Addr::LOCALHOST, 2222, 22)
+        );
+        assert_eq!(publish_port("2222:22").unwrap(), (2222, 22));
+        for bad in ["22", "0:22", "x:22", "2222:70000"] {
+            assert!(publish_port(bad).is_err(), "{bad}");
+        }
+        // Older machine.json files have no os field.
+        let old: Machine = serde_json::from_value(json!({
+            "name":"u","backend":"qemu-hvf","disk_gib":32,"created_at":0
+        }))
+        .unwrap();
+        assert_eq!(old.os, "linux");
     }
 }

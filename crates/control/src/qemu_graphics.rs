@@ -1,4 +1,4 @@
-//! Local-only admission for the reviewed experimental Venus runtime.
+//! Explicit QEMU display profiles and local-only experimental Venus admission.
 //! Config contains a profile enum, never executable paths or environment overrides.
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,13 @@ pub enum Profile {
     #[default]
     Virgl,
     VenusMoltenvkExperimental,
+    /// Windows D3D through UTM 5.0.5's Neptune (virglrenderer) and DXMT
+    /// (`dxmt-native.framework` in the registered UTM runtime); the guest needs
+    /// UTM's viogpu3d driver (utm-guest-tools 0.1.274).
+    NeptuneDxmtExperimental,
+    /// Non-GL 2D display; full-state save/restore still requires actual validation.
+    #[serde(rename = "virtio-2d")]
+    Virtio2d,
 }
 impl Profile {
     pub fn is_default(&self) -> bool {
@@ -28,20 +35,39 @@ impl Profile {
     pub fn venus(self) -> bool {
         self == Self::VenusMoltenvkExperimental
     }
+    pub fn neptune(self) -> bool {
+        self == Self::NeptuneDxmtExperimental
+    }
+
+    pub fn requires_gl(self) -> bool {
+        self != Self::Virtio2d
+    }
     pub fn validate(self, backend: crate::backend::Backend, guest: &str) -> Result<()> {
+        if self.neptune() && (backend != crate::backend::Backend::QemuHvf || guest != "windows") {
+            bail!("Neptune profile requires a Windows QEMU/HVF guest")
+        }
         if self.venus() && (backend != crate::backend::Backend::QemuHvf || guest != "linux") {
             bail!("Venus profile requires Linux QEMU/HVF")
+        }
+        if self == Self::Virtio2d
+            && (backend != crate::backend::Backend::QemuHvf || guest != "linux")
+        {
+            bail!("virtio-2d profile requires Linux QEMU/HVF")
         }
         Ok(())
     }
     pub fn machine_arguments(self) -> &'static [&'static str] {
-        if self.venus() {
+        // Neptune shares the device with Venus, as in UTM's default Triton setup.
+        if self.venus() || self.neptune() {
             &["-machine", "virt", "-accel", "hvf,ipa-granule-size=4096"]
         } else {
             &["-machine", "virt,accel=hvf"]
         }
     }
     pub fn device(self, width: Option<u32>, height: Option<u32>) -> Result<String> {
+        if self == Self::Virtio2d {
+            return crate::backend::qemu_2d_graphics_device(width, height);
+        }
         let mut value = crate::backend::qemu_graphics_device(width, height)?;
         if self.venus() {
             value.push_str(",id=veynode-gpu,blob=on,hostmem=256M,venus=on");
@@ -76,9 +102,66 @@ struct Catalog {
     profile_revision: String,
     roles: BTreeMap<String, String>,
     frameworks: BTreeMap<String, String>,
+    // Compiled admission policy only; never supplied by a runtime registration.
+    #[serde(default)]
+    source_qemu_library: Option<PathBuf>,
 }
+fn qemu_dependency_layout(approved: &Catalog, frameworks: &Path, qemu: &Path) -> Result<()> {
+    if let Some(expected) = &approved.source_qemu_library {
+        if !expected.is_absolute()
+            || expected.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+            || !expected
+                .ends_with("VeynodeQEMUDevelopment.framework/Versions/A/VeynodeQEMUDevelopment")
+            || qemu != expected
+        {
+            bail!("compiled source QEMU dependency layout mismatch")
+        }
+    } else if frameworks.join("qemu-aarch64-softmmu.framework/Versions/A/qemu-aarch64-softmmu")
+        != qemu
+    {
+        bail!("QEMU dependency layout mismatch")
+    }
+    Ok(())
+}
+
 fn catalog() -> Catalog {
     serde_json::from_str(include_str!("qemu_venus_catalog.json")).expect("compiled Venus catalog")
+}
+
+/// Observed host constraints for the exact compiled catalog, not live Guest API support.
+/// A catalog replacement requires its own real query instead of inheriting this result.
+pub fn host_api_constraints(profile: Profile) -> Value {
+    if !profile.venus() {
+        return json!({});
+    }
+    catalog_geometry_constraint(&catalog())
+}
+
+fn catalog_geometry_constraint(approved: &Catalog) -> Value {
+    const DRIVER_SHA: &str = "b96a76813884c04ebe7f13ddf4c4b305234224117a0688a56b81a398fc1641dd";
+    if approved
+        .frameworks
+        .get("MoltenVK.framework/Versions/A/MoltenVK")
+        .map(String::as_str)
+        != Some(DRIVER_SHA)
+    {
+        return json!({"geometry_shader":{"status":"unknown","reason":"this host driver has no matching actual capability-query evidence; do not inherit another binary's Geometry result","guest_verified":false}});
+    }
+    json!({"geometry_shader":{
+        "status":"unsupported",
+        "reason":"the exact registered host driver reports geometryShader=true with all five limits zero; its required capability contract is not accepted; Geometry workloads and Zink OpenGL 3.2+ are unverified",
+        "driver_sha256":DRIVER_SHA,
+        "reported_feature":true,
+        "reported_limits":{"maxGeometryShaderInvocations":0,"maxGeometryInputComponents":0,"maxGeometryOutputComponents":0,"maxGeometryOutputVertices":0,"maxGeometryTotalOutputComponents":0},
+        "guest_verified":false,
+        "scope":"actual pinned host driver query only; not a per-VM Guest query, complete Vulkan conformance or performance result",
+        "evidence":"native/tests/zink-catalog-capabilities-v1/README.md"
+    }})
 }
 fn trusted_ancestors(path: &Path) -> Result<()> {
     for parent in path.ancestors().skip(1) {
@@ -189,18 +272,16 @@ impl Registration {
         for (relative, expected) in &approved.frameworks {
             hash_file(&self.frameworks_dir.join(relative), expected)?;
         }
-        if self
-            .frameworks_dir
-            .join("qemu-aarch64-softmmu.framework/Versions/A/qemu-aarch64-softmmu")
-            != self.qemu_library.path
-        {
-            bail!("QEMU dependency layout mismatch")
-        }
+        qemu_dependency_layout(&approved, &self.frameworks_dir, &self.qemu_library.path)?;
         // Reviewed loader/server/host image have this fixed absolute LC_RPATH.
         // Their exact binary hashes above prevent a different Mach-O layout being admitted.
         let mut rpath = self.frameworks_dir.as_os_str().as_encoded_bytes().to_vec();
         rpath.push(0);
-        for artifact in [&self.loader, &self.host_library, &self.render_server] {
+        let mut rpath_artifacts = vec![&self.loader, &self.host_library, &self.render_server];
+        if approved.source_qemu_library.is_some() {
+            rpath_artifacts.push(&self.qemu_library);
+        }
+        for artifact in rpath_artifacts {
             let mut bytes = Vec::new();
             safe_file(&artifact.path, 128 * 1024 * 1024, false)?
                 .take(128 * 1024 * 1024 + 1)
@@ -241,7 +322,67 @@ impl Registration {
     }
 }
 
-/// Clear loader/driver injection for both profiles, before setting trusted SPICE and ANGLE.
+/// UTM's host side of Neptune, found relative to the registered QEMU framework
+/// (`UTM.app/Contents/Frameworks/qemu-aarch64-softmmu.framework/Versions/A/qemu-aarch64-softmmu`).
+pub struct Neptune {
+    /// DXMT, which Neptune loads for D3D11, D3D12 and DXGI.
+    pub dxmt: PathBuf,
+    /// virglrenderer's render server; without it virglrenderer falls back to
+    /// its build-time path and fails with "failed to initialize proxy renderer".
+    /// UTM's own `QEMURenderServer` is App-Sandbox-signed and traps at launch
+    /// unless UTM's sandboxed QEMUHelper is its parent, so this is the reviewed
+    /// Venus registration's server: built from the virglrenderer commit UTM
+    /// 5.0.5 ships (482f9d8b, Neptune wire format 1) with `-Dneptune=true`.
+    pub render_server: PathBuf,
+    /// UTM's MoltenVK ICD for the Venus side of the device (its default
+    /// Vulkan driver); the guest driver package also ships a Venus ICD.
+    pub vulkan_icd: PathBuf,
+}
+
+impl Neptune {
+    pub fn locate(qemu: &Path, registration: &Registration) -> Result<Self> {
+        let frameworks = qemu
+            .ancestors()
+            .nth(4)
+            .context("QEMU library is not inside a Frameworks directory")?;
+        let contents = frameworks.parent().unwrap_or(frameworks);
+        let neptune = Self {
+            dxmt: frameworks.join("dxmt-native.framework/Versions/A/dxmt-native"),
+            render_server: registration.render_server.path.clone(),
+            vulkan_icd: contents.join("Resources/vulkan/icd.d/MoltenVK_icd.json"),
+        };
+        for path in [&neptune.dxmt, &neptune.render_server, &neptune.vulkan_icd] {
+            if !path.is_file() {
+                bail!(
+                    "Neptune profile needs UTM's runtime around the QEMU framework: {} missing",
+                    path.display()
+                )
+            }
+        }
+        Ok(neptune)
+    }
+
+    /// The environment UTM 5.0.5 gives QEMU for its DXMT DirectX driver
+    /// (`Services/UTMQemuSystem.m`; QEMUHelper sets the render server).
+    /// DXMT writes `<exe>_dxmt.log` (an empty exe name for QEMU) into `log_dir`
+    /// instead of the worker's current directory; its messages also go to stderr.
+    pub fn configure(&self, command: &mut Command, log_dir: &Path) {
+        for key in [
+            "NPT_D3D11_LIBRARY_PATH",
+            "NPT_D3D12_LIBRARY_PATH",
+            "NPT_DXGI_LIBRARY_PATH",
+        ] {
+            command.env(key, &self.dxmt);
+        }
+        command
+            .env("NPT_BACKEND", "dxmt")
+            .env("DXMT_LOG_PATH", log_dir)
+            .env("RENDER_SERVER_EXEC_PATH", &self.render_server)
+            .env("VK_DRIVER_FILES", &self.vulkan_icd);
+    }
+}
+
+/// Clear loader/driver injection for every profile, before setting trusted SPICE and ANGLE.
 /// No arbitrary env values are accepted via VM config or MCP.
 pub fn clean_environment(command: &mut Command) {
     for (key, _) in std::env::vars_os() {
@@ -279,6 +420,8 @@ fn blocked_environment_key(key: &OsStr) -> bool {
         b"MESA_",
         b"VIRGL_",
         b"ANGLE_",
+        b"NPT_",
+        b"D3DMETAL_",
     ]
     .iter()
     .any(|p| key.starts_with(p))

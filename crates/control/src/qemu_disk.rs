@@ -194,8 +194,11 @@ fn home() -> Result<PathBuf> {
     )))
 }
 fn raw_file(path: &Path, pins: &mut Pins) -> Result<File> {
+    raw_file_impl(path, pins, true)
+}
+fn raw_file_impl(path: &Path, pins: &mut Pins, qemu_suffix: bool) -> Result<File> {
     ensure!(
-        path.is_absolute() && path.extension().is_some_and(|e| e == "raw"),
+        path.is_absolute() && (!qemu_suffix || path.extension().is_some_and(|e| e == "raw")),
         "QEMU disk must be an absolute .raw file, explicitly raw format"
     );
     let parent = pins.directory(path.parent().context("disk parent required")?)?;
@@ -256,10 +259,31 @@ struct OwnedDisk {
 pub struct DiskGuard {
     inner: Arc<OwnedDisk>,
 }
+/// Observe an already-running VM's disk without acquiring or releasing its
+/// lifetime lock. Recovery must still acquire DiskGuard before trusting this
+/// recorded inode as retired.
+pub(crate) fn observe_raw_identity(path: &Path) -> Result<(File, Identity)> {
+    let mut pins = Pins::default();
+    // Apple raw images need not use QEMU's explicit registration suffix.
+    let disk = raw_file_impl(path, &mut pins, false)?;
+    pins.verify_child()?;
+    ensure!(
+        fs::canonicalize(path)? == path,
+        "disk observation requires canonical path"
+    );
+    let identity = Identity::of(&disk)?;
+    Ok((disk, identity))
+}
 impl DiskGuard {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_impl(path, true)
+    }
+    pub(crate) fn open_apple_raw(path: &Path) -> Result<Self> {
+        Self::open_impl(path, false)
+    }
+    fn open_impl(path: &Path, qemu_suffix: bool) -> Result<Self> {
         let mut pins = Pins::default();
-        let disk = raw_file(path, &mut pins)?;
+        let disk = raw_file_impl(path, &mut pins, qemu_suffix)?;
         let support = pins.directory(&home()?.join("Library/Application Support"))?;
         let product = pins.child_directory(support, c"VeynodeVM", true, Some(0o022))?;
         let locks = pins.child_directory(product, c"locks", true, Some(0o077))?;
@@ -335,7 +359,9 @@ impl DiskGuard {
         }
         Ok(())
     }
-    pub fn configure_command(&self, command: &mut Command) -> Result<()> {
+    /// `device` is the guest-facing `-device` for drive `veynode-disk`
+    /// (see `qemu_uefi::disk_device`).
+    pub fn configure_command(&self, command: &mut Command, device: &str) -> Result<()> {
         self.install_inheritance(command)?;
         command.args([
             "-add-fd",
@@ -355,10 +381,7 @@ impl DiskGuard {
         ]);
         command.arg("-blockdev").arg(serde_json::to_string(&json!({"driver":"file","node-name":"veynode-disk-file","filename":"/dev/fdset/1","locking":"on","cache":{"direct":false,"no-flush":false}}))?);
         command.arg("-blockdev").arg(serde_json::to_string(&json!({"driver":"raw","node-name":"veynode-disk","file":"veynode-disk-file","read-only":false}))?);
-        command.args([
-            "-device",
-            "virtio-blk-pci,drive=veynode-disk,id=veynode-disk-device",
-        ]);
+        command.args(["-device", device]);
         Ok(())
     }
     /// Validate the actual QMP query-fdsets result before QMP cont. Registration
@@ -672,7 +695,12 @@ mod tests {
         let f = Fixture::new();
         let guard = f.open().unwrap();
         let mut c = Command::new("qemu");
-        guard.configure_command(&mut c).unwrap();
+        guard
+            .configure_command(
+                &mut c,
+                "virtio-blk-pci,drive=veynode-disk,id=veynode-disk-device",
+            )
+            .unwrap();
         let args: Vec<_> = c
             .get_args()
             .map(|x| x.to_str().unwrap().to_owned())
@@ -800,7 +828,12 @@ else:
         let socket = f.root.join("qmp.sock");
         let stderr_path = f.root.join("qemu.log");
         let mut template = Command::new("unused");
-        guard.configure_command(&mut template).unwrap();
+        guard
+            .configure_command(
+                &mut template,
+                "virtio-blk-pci,drive=veynode-disk,id=veynode-disk-device",
+            )
+            .unwrap();
         let args: Vec<_> = template.get_args().map(|x| x.to_owned()).collect();
         let mut command = Command::new(option("--qemu-launcher"));
         command

@@ -6,11 +6,13 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
+flate2 = "1"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 axum = "0.8"
+futures-util = { version = "0.3", default-features = false }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "sync", "time", "signal"] }
@@ -20,3 +22,5 @@ tower-http = { version = "0.6", features = ["timeout"] }
 
 [dev-dependencies]
 tempfile = "3"
+# The screenshot path test reads a reply the way the media service does; adds no crate, only a tokio feature.
+tokio = { version = "1", features = ["net"] }

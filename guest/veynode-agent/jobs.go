@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +15,8 @@ import (
 const maxActiveCommands = 4
 const maxFinishedJobs = 32
 const finishedJobTTL = 5 * time.Minute
+const maxCommandTimeoutMS = 30000
+const maxContainedAsyncTimeoutMS = 120000
 
 type executionControl struct {
 	cancel chan struct{}
@@ -52,8 +55,29 @@ func newJobManager(now func() time.Time) *jobManager {
 	return &jobManager{jobs: make(map[string]*commandJob), now: now, identity: currentExecutionIdentity(), controls: make(map[*executionControl]struct{}), boundary: legacyBoundary, containmentMode: "legacy-process-group-not-contained"}
 }
 func validateCommand(req request) *rpcError {
-	if len(req.Argv) == 0 || len(req.Argv) > 128 || req.Argv[0] == "" || req.TimeoutMS < 1 || req.TimeoutMS > 30000 {
-		return &rpcError{"invalid_request", "argv required; timeout_ms must be 1..30000"}
+	return validateCommandTimeout(req, maxCommandTimeoutMS)
+}
+
+// Only startup-verified Linux containment permits longer asynchronous jobs.
+// The platform check also keeps other backends at 30s if a mode tag is present.
+func asyncCommandTimeoutMS(goos, containmentMode string) int {
+	if goos == "linux" && containmentMode == "cgroup-v2-clone3-kill" {
+		return maxContainedAsyncTimeoutMS
+	}
+	return maxCommandTimeoutMS
+}
+
+func (manager *jobManager) maxAsyncTimeoutMS() int {
+	return asyncCommandTimeoutMS(runtime.GOOS, manager.containmentMode)
+}
+
+func (manager *jobManager) validateAsyncCommand(req request) *rpcError {
+	return validateCommandTimeout(req, manager.maxAsyncTimeoutMS())
+}
+
+func validateCommandTimeout(req request, maximum int) *rpcError {
+	if len(req.Argv) == 0 || len(req.Argv) > 128 || req.Argv[0] == "" || req.TimeoutMS < 1 || req.TimeoutMS > maximum {
+		return &rpcError{"invalid_request", fmt.Sprintf("argv required; timeout_ms must be 1..%d", maximum)}
 	}
 	for _, argument := range req.Argv {
 		if strings.ContainsRune(argument, 0) {
@@ -182,7 +206,7 @@ func (manager *jobManager) execute(req request) response {
 	return response{ID: req.ID, Result: result}
 }
 func (manager *jobManager) start(req request) response {
-	if err := validateCommand(req); err != nil {
+	if err := manager.validateAsyncCommand(req); err != nil {
 		return response{ID: req.ID, Error: err}
 	}
 	control := manager.reserve()

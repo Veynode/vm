@@ -4,6 +4,7 @@ import { signIceRequest, verifyIceConfiguration, type IceConfiguration, type Sig
  * independent trusted channel and installs only the verified answer returned here.
  * Browser code delivery remains trusted; this module does not make HTTP E2EE. */
 import { BrowserIdentityStore, DeviceIdentity, SessionAuthError, SCOPES, identityId, pairingBytes, sha256, randomNonce, verifyGrant, signOffer, confirmAnswer, signClose, verifyOfferRejection, type OfferRejection, type SignedOfferRejection, type Scope, type Pairing, type SignedGrant, type Challenge, type SignedAnswer, type AnswerTranscript, type Confirmation } from './session-auth.js';
+import { ControlFrameUnavailableError } from './control-channel.js';
 import { signControl, validateControlResponse, type SignedControl, type ControlAction, type ControlResponse } from './session-control.js';
 export interface VerifiedAnswer { answer: { type: 'answer'; sdp: string; session_id: string }; transcript: AnswerTranscript; confirmation: Confirmation }
 export interface Configuration { pinnedHostPublicKey: string; vmId: string; databaseName?: string; scopes?: Scope[] }
@@ -122,7 +123,8 @@ export class AuthenticatedReceiver {
   }
   async signedClose() { this.usable(); ensure(!this.busy && this.session, 'No verified session to close'); return signClose(this.identity, structuredClone(this.session.transcript)); }
   /** No retries/reacquisition: an uncertain response may follow a dispatched
-   * input. Sequence is consumed before signing and remains consumed on failure. */
+   * input. Sequence is consumed before signing and remains consumed on failure.
+   * The one failure that does not end control is ControlFrameUnavailableError. */
   async control(action: ControlAction, signal?: AbortSignal): Promise<ControlResponse> {
     this.usable(); ensure(!this.busy, 'Another session operation is pending');
     ensure(this.session?.confirmed && !this.session.closing, 'A confirmed open session is required for control');
@@ -133,7 +135,11 @@ export class AuthenticatedReceiver {
     try {
       const signed = await signControl(this.identity, session.transcript, snapshot, { sequence, now: Math.floor(Date.now() / 1000) });
       try { return validateControlResponse(await this.transport.request(signed, signal), sequence, snapshot); }
-      catch (error) { session.closing = true; try { this.transport.close(); } catch { /* local session remains fenced */ } throw error; }
+      catch (error) {
+        // "No picture this time" for an observe_frame is an ordinary outcome: the session and its channel stay open
+        // and the sequence stays consumed. For any other action it would be a protocol violation and fences.
+        if (error instanceof ControlFrameUnavailableError && snapshot.kind === 'observe_frame') throw error;
+        session.closing = true; try { this.transport.close(); } catch { /* local session remains fenced */ } throw error; }
     } finally { this.busy = false; }
   }
   /** Success proves local non-transmission, a signed exact-offer non-admission,

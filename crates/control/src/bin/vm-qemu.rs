@@ -24,7 +24,12 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use vm_control::{backend::Backend, read_frame, Config};
+use vm_control::{
+    backend::Backend,
+    read_frame,
+    screenshot_scaled::{Refusal, Refused, Scaled, REFUSAL_FIELD},
+    Config,
+};
 static STOP: AtomicBool = AtomicBool::new(false);
 extern "C" fn stop_signal(_: i32) {
     STOP.store(true, Ordering::Release);
@@ -108,6 +113,260 @@ struct Qmp {
     next: u64,
     poisoned: bool,
     reply_prefix: Vec<u8>,
+    /// A SHUTDOWN event with reason guest-reset was seen (`-action reboot=shutdown`).
+    guest_reset: bool,
+    /// A run-state event was read (while waiting for a reply or by `drain_events`) and not yet acted on.
+    run_state_event: bool,
+    /// The same for `SHUTDOWN`.
+    shutdown_event: bool,
+}
+/// QMP events after which `query-status` may answer differently. Run state is only ever taken from `query-status`;
+/// an event is a reason to ask now and never a state by itself. Any other event is ignored: the slow safety poll
+/// covers a transition that announces itself with none of these. `POWERDOWN` is absent because it only echoes the
+/// worker's own `system_powerdown`, which changes no run state and already schedules a query.
+const RUN_STATE_EVENTS: [&str; 10] = [
+    "STOP",
+    "RESUME",
+    "RESET",
+    "SUSPEND",
+    "SUSPEND_DISK",
+    "WAKEUP",
+    "GUEST_PANICKED",
+    "GUEST_CRASHLOADED",
+    "WATCHDOG",
+    "BLOCK_IO_ERROR",
+];
+/// Records drained per worker loop pass, so an event storm cannot hold the loop.
+const EVENT_DRAIN_BOUND: usize = 64;
+/// While the run state may still be moving, `query-status` keeps its original 1 s cadence.
+const STATUS_ACTIVE_INTERVAL: Duration = Duration::from_secs(1);
+/// How long that cadence lasts after a run-state event, a run-state command, startup, an observed change or a failed
+/// query.
+const STATUS_ACTIVE_WINDOW: Duration = Duration::from_secs(10);
+/// Steady state: the poll that catches a transition for which no listed event was delivered.
+const STATUS_SAFETY_INTERVAL: Duration = Duration::from_secs(30);
+/// Slots of `EVENTS_SEEN`: one per `RUN_STATE_EVENTS` name, then `SHUTDOWN`, then every other event name together.
+const EVENT_SLOTS: usize = RUN_STATE_EVENTS.len() + 2;
+thread_local! {
+    /// Events read from QMP on this thread, for the run-state summary only. Not a `Qmp` field because the
+    /// scripted-peer tests build `Qmp` by literal; the worker reads QMP on one thread.
+    static EVENTS_SEEN: std::cell::Cell<[u64; EVENT_SLOTS]> = const { std::cell::Cell::new([0; EVENT_SLOTS]) };
+}
+fn event_seen(slot: usize) {
+    EVENTS_SEEN.with(|seen| {
+        let mut counts = seen.get();
+        counts[slot] += 1;
+        seen.set(counts);
+    });
+}
+/// Why the next `query-status` is asked. Only used to attribute a change that query finds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Asked {
+    /// A listed event or `SHUTDOWN` was read (or the drain could not judge the stream).
+    Event,
+    /// Startup `cont` or `system_powerdown`.
+    Command,
+    /// The 1 s timer inside the active window.
+    Cadence,
+    /// The 30 s timer.
+    Safety,
+}
+/// Counters for the run-state summary. A change is a successful query that answered a different state than the last
+/// successful one; a change to or from `unavailable` is counted as a query error, not as a change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Observed {
+    queries: u64,
+    query_errors: u64,
+    event_changes: u64,
+    command_changes: u64,
+    /// Found by the 1 s timer with no event read: unannounced, like `safety_changes`, but inside the active window.
+    cadence_changes: u64,
+    safety_polls: u64,
+    /// Found by the 30 s timer with no event read: a transition for which no listed event was delivered.
+    safety_changes: u64,
+    safety_errors: u64,
+}
+/// When the worker next asks QEMU for its run state.
+struct StatusPoll {
+    next: Instant,
+    active_until: Instant,
+    asked: Asked,
+    seen: Observed,
+}
+impl StatusPoll {
+    /// After connect and `cont`: ask on the first loop pass, then at the active cadence.
+    fn new(now: Instant) -> Self {
+        Self {
+            next: now,
+            active_until: now + STATUS_ACTIVE_WINDOW,
+            asked: Asked::Command,
+            seen: Observed::default(),
+        }
+    }
+    /// A run-state event arrived or a run-state command was sent: ask at once and stay at the active cadence.
+    fn disturbed(&mut self, now: Instant) {
+        self.next = now;
+        self.active_until = now + STATUS_ACTIVE_WINDOW;
+        self.asked = Asked::Command;
+    }
+    /// `SHUTDOWN` arrived. QEMU runs without `-no-shutdown`, so it is now exiting and may never answer: do not ask at
+    /// once (a query here would usually publish `unavailable` just before the exit is observed and could hold the
+    /// loop for the 3 s reply deadline). Ask one active interval later if QEMU is somehow still there, which is the
+    /// latest the previous fixed 1 s poll could have asked.
+    fn exiting(&mut self, now: Instant) {
+        self.next = now + STATUS_ACTIVE_INTERVAL;
+        self.active_until = now + STATUS_ACTIVE_WINDOW;
+    }
+    fn due(&self, now: Instant) -> bool {
+        now >= self.next
+    }
+    /// `settled`: the query succeeded and answered what was already published.
+    fn queried(&mut self, now: Instant, settled: bool) {
+        if !settled {
+            self.active_until = now + STATUS_ACTIVE_WINDOW;
+        }
+        self.next = now
+            + if now < self.active_until {
+                STATUS_ACTIVE_INTERVAL
+            } else {
+                STATUS_SAFETY_INTERVAL
+            };
+        self.asked = if now < self.active_until {
+            Asked::Cadence
+        } else {
+            Asked::Safety
+        };
+    }
+    /// Counts one query. `raced`: a run-state event was read while waiting for this very reply, so the change was
+    /// announced. Answers which timer found an unannounced change, if one did.
+    fn count(&mut self, answered: bool, changed: bool, raced: bool) -> Option<&'static str> {
+        let safety = self.asked == Asked::Safety;
+        self.seen.queries += 1;
+        self.seen.safety_polls += safety as u64;
+        if !answered {
+            self.seen.query_errors += 1;
+            self.seen.safety_errors += safety as u64;
+            return None;
+        }
+        if !changed {
+            return None;
+        }
+        match if raced { Asked::Event } else { self.asked } {
+            Asked::Event => self.seen.event_changes += 1,
+            Asked::Command => self.seen.command_changes += 1,
+            Asked::Cadence => {
+                self.seen.cadence_changes += 1;
+                return Some("cadence_poll");
+            }
+            Asked::Safety => {
+                self.seen.safety_changes += 1;
+                return Some("safety_poll");
+            }
+        }
+        None
+    }
+    /// Counters only: event names are QEMU's own, and nothing of an event's data or of the Guest is kept.
+    fn summary(&self) -> Value {
+        let counts = EVENTS_SEEN.with(|seen| seen.get());
+        let events: serde_json::Map<String, Value> = RUN_STATE_EVENTS
+            .iter()
+            .chain(&["SHUTDOWN"])
+            .zip(counts)
+            .filter(|(_, count)| *count > 0)
+            .map(|(name, count)| (name.to_string(), json!(count)))
+            .collect();
+        let seen = &self.seen;
+        json!({"queries":seen.queries,"query_errors":seen.query_errors,"changes":{"event":seen.event_changes,"command":seen.command_changes,"cadence_poll":seen.cadence_changes,"safety_poll":seen.safety_changes},"safety_polls":seen.safety_polls,"safety_poll_errors":seen.safety_errors,"events":events,"events_unlisted":counts[EVENT_SLOTS - 1]})
+    }
+    fn summary_line(&self) -> String {
+        let mut line = self.summary();
+        line["event"] = json!("qmp_run_state_summary");
+        line.to_string()
+    }
+}
+/// The summary reaches stderr however the worker loop ends.
+impl Drop for StatusPoll {
+    fn drop(&mut self) {
+        log_line(&self.summary_line());
+    }
+}
+/// One line on the worker's stderr; a failed write is ignored. Silent in tests, whose output it would bypass capture.
+fn log_line(line: &str) {
+    if !cfg!(test) {
+        let _ = writeln!(std::io::stderr(), "{line}");
+    }
+}
+/// The stderr line for a change found by a timer rather than announced by an event. `from` and `to` are QEMU run
+/// state names.
+fn poll_change_line(source: &str, from: &Value, to: &Value) -> String {
+    json!({"event":"qmp_run_state_poll_change","source":source,"from":from,"to":to}).to_string()
+}
+/// What the records read since the last pass ask of the status poll.
+#[derive(Debug, PartialEq, Eq)]
+enum Drained {
+    Nothing,
+    RunState,
+    Exiting,
+}
+/// One pass of run-state observation: drain delivered QMP events, then `query-status` if an event, a command or a
+/// timer asks for it, and publish the state only when it differs. `may_query` is false while a screenshot is in
+/// flight, as before; a due query then waits for the capture to finish.
+fn observe_status(
+    qmp: &mut Qmp,
+    poll: &mut StatusPoll,
+    state: &mut Value,
+    now: Instant,
+    may_query: bool,
+    mut publish: impl FnMut(Value) -> Result<()>,
+) -> Result<()> {
+    match qmp.drain_events() {
+        Drained::Nothing => {}
+        Drained::RunState => {
+            poll.disturbed(now);
+            poll.asked = Asked::Event;
+        }
+        Drained::Exiting => {
+            poll.exiting(now);
+            poll.asked = Asked::Event;
+        }
+    }
+    if !may_query || !poll.due(now) {
+        return Ok(());
+    }
+    let mut updated = state.clone();
+    let answered = match qmp.call("query-status") {
+        Ok(status) => {
+            updated["qmp_status"] = status["status"].clone();
+            updated["state"] = json!(if status["running"] == true {
+                "running"
+            } else {
+                "paused"
+            });
+            updated.as_object_mut().unwrap().remove("qmp_error");
+            true
+        }
+        Err(error) => {
+            updated["state"] = json!("unavailable");
+            updated["qmp_error"] = json!(error.to_string());
+            false
+        }
+    };
+    let changed = updated != *state;
+    let raced = qmp.run_state_event || qmp.shutdown_event;
+    if let Some(source) = poll.count(answered, changed && state["state"] != "unavailable", raced) {
+        log_line(&poll_change_line(
+            source,
+            &state["qmp_status"],
+            &updated["qmp_status"],
+        ));
+    }
+    if changed {
+        publish(updated.clone())?;
+        *state = updated;
+    }
+    // An event read while waiting for this very reply preceded the answer or asks for one more query; keep it.
+    poll.queried(now, answered && !changed);
+    Ok(())
 }
 impl Qmp {
     fn connect(path: &Path, child: &mut Child) -> Result<Self> {
@@ -135,6 +394,9 @@ impl Qmp {
             next: 1,
             poisoned: false,
             reply_prefix: Vec::new(),
+            guest_reset: false,
+            run_state_event: false,
+            shutdown_event: false,
         };
         let greeting: Value =
             serde_json::from_slice(&read_frame(&mut qmp.reader)?.context("missing QMP greeting")?)?;
@@ -196,6 +458,8 @@ impl Qmp {
         let deadline = Instant::now() + Duration::from_secs(3);
         for _ in 0..128 {
             let value: Value = serde_json::from_slice(&self.line_before(deadline)?)?;
+            // Before the deadline check: this record is consumed either way, and an event in it must not be lost.
+            self.note_event(&value);
             if Instant::now() >= deadline {
                 bail!("QMP response deadline expired after decoding")
             }
@@ -213,6 +477,117 @@ impl Qmp {
             }
         }
         bail!("QMP response deadline or event bound exceeded")
+    }
+    /// A record that is not the awaited reply. Only a record without `id` is an event; a reply (which always
+    /// carries the `id` this client sent) is never read as one, and an event is never returned as a reply.
+    fn note_event(&mut self, value: &Value) {
+        if value.get("id").is_some() {
+            return;
+        }
+        match value["event"].as_str() {
+            Some("SHUTDOWN") => {
+                self.shutdown_event = true;
+                // `-action reboot=shutdown` (Windows): a guest reboot arrives as this SHUTDOWN.
+                if value["data"]["reason"] == "guest-reset" {
+                    self.guest_reset = true;
+                }
+                event_seen(EVENT_SLOTS - 2);
+            }
+            Some(event) => match RUN_STATE_EVENTS.iter().position(|listed| *listed == event) {
+                Some(slot) => {
+                    self.run_state_event = true;
+                    event_seen(slot);
+                }
+                None => event_seen(EVENT_SLOTS - 1),
+            },
+            None => {}
+        }
+    }
+    /// After QEMU exited: read the events it wrote before exiting (the socket
+    /// keeps them) and report whether the exit was a guest reboot.
+    fn exited_for_guest_reset(&mut self) -> bool {
+        let deadline = Instant::now() + Duration::from_millis(300);
+        for _ in 0..64 {
+            if self.guest_reset {
+                break;
+            }
+            match self.line_before(deadline) {
+                Ok(line) => {
+                    if let Ok(value) = serde_json::from_slice::<Value>(&line) {
+                        self.note_event(&value);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        self.guest_reset
+    }
+    /// Reads every complete record QEMU has already delivered, without waiting and without sending anything, and
+    /// answers what they ask of the status poll. An incomplete record stays in `reply_prefix` for the next
+    /// read. End of stream, an oversized record or a read error is not consumed or judged here: it asks for a query,
+    /// whose ordinary bounded reply path then reports it exactly as before.
+    fn drain_events(&mut self) -> Drained {
+        if self.poisoned {
+            return Drained::Nothing;
+        }
+        let mut query = false;
+        if self.stream.set_nonblocking(true).is_ok() {
+            for _ in 0..EVENT_DRAIN_BOUND {
+                match self.delivered_line() {
+                    Ok(Some(line)) => match serde_json::from_slice::<Value>(&line) {
+                        Ok(value) => self.note_event(&value),
+                        Err(_) => query = true,
+                    },
+                    Ok(None) => break,
+                    Err(()) => {
+                        query = true;
+                        break;
+                    }
+                }
+            }
+        } else {
+            query = true;
+        }
+        if self.stream.set_nonblocking(false).is_err() {
+            self.poisoned = true;
+        }
+        let run_state = std::mem::take(&mut self.run_state_event);
+        if std::mem::take(&mut self.shutdown_event) {
+            Drained::Exiting
+        } else if run_state || query {
+            Drained::RunState
+        } else {
+            Drained::Nothing
+        }
+    }
+    /// `Ok(None)`: nothing more is available now. `Err`: the reply path must look at this stream.
+    fn delivered_line(&mut self) -> std::result::Result<Option<Vec<u8>>, ()> {
+        loop {
+            let available = match self.reader.fill_buf() {
+                Ok([]) => return Err(()),
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    return Ok(None)
+                }
+                Err(_) => return Err(()),
+            };
+            let end = available.iter().position(|b| *b == b'\n');
+            let count = end.map_or(available.len(), |n| n + 1);
+            if count > vm_control::MAX_MESSAGE.saturating_sub(self.reply_prefix.len()) {
+                return Err(());
+            }
+            self.reply_prefix.extend_from_slice(&available[..count]);
+            self.reader.consume(count);
+            if end.is_some() {
+                return Ok(Some(std::mem::take(&mut self.reply_prefix)));
+            }
+        }
     }
     fn line_before(&mut self, deadline: Instant) -> Result<Vec<u8>> {
         self.ensure_usable()?;
@@ -478,10 +853,42 @@ fn log_pipe(mut pipe: impl Read + Send + 'static, path: Option<PathBuf>) -> Resu
     });
     Ok(())
 }
+/// Where one broker screenshot spent its time inside the worker, in microseconds. Numbers only.
+#[derive(Clone, Copy, Debug)]
+struct CaptureTiming {
+    /// Request written until the reply's record header arrived: the helper and the broker.
+    wait_us: u64,
+    read_us: u64,
+    parse_us: u64,
+    bytes: u64,
+    /// When the reader had its result; the loop measures how long it took to notice.
+    ready: Instant,
+}
+impl CaptureTiming {
+    /// The worker's diagnostic record for the daemon, sent just before the reply. `request` is not `id`: the daemon
+    /// routes any record with an `id` as a reply.
+    fn event(&self, request: &Value, noticed: Instant) -> Value {
+        json!({"event":"screenshot_timing","request":request,"broker_wait_us":self.wait_us,"broker_read_us":self.read_us,"parse_us":self.parse_us,"wake_us":noticed.saturating_duration_since(self.ready).as_micros() as u64,"bytes":self.bytes})
+    }
+}
+/// An error reply to the daemon; a refusal of the scaled screenshot form also carries its fixed word.
+fn refusal_reply(id: &Value, error: &anyhow::Error) -> Value {
+    let mut reply = json!({"id":id,"error":error.to_string()});
+    Refused::mark(&mut reply, error);
+    reply
+}
+/// What ends the worker loop's wait before its timeout.
+enum Wake {
+    Request(Result<Value>),
+    /// A broker capture has its result, or the supervisor closed stdin: observe now instead of at the next step.
+    /// Sent once per event and never while nothing is in flight, so an idle loop wakes exactly as often as before.
+    Observe,
+}
 struct Capture {
     child: Option<QemuChild>,
     socket: Option<UnixStream>,
-    receiver: mpsc::Receiver<Result<Value>>,
+    receiver: mpsc::Receiver<(Result<Value>, Option<CaptureTiming>)>,
+    timing: Option<CaptureTiming>,
     deadline: Instant,
     id: Value,
 }
@@ -506,7 +913,7 @@ impl Capture {
                     .take((vm_control::MAX_SCREENSHOT_RESPONSE + 1) as u64)
                     .read_to_end(&mut bytes)?;
                 if bytes.len() > vm_control::MAX_SCREENSHOT_RESPONSE {
-                    bail!("screenshot output exceeds 3MiB")
+                    bail!("screenshot output exceeds the 12 MiB response bound")
                 }
                 let mut value: Value = serde_json::from_slice(&bytes)
                     .context("screenshot helper emitted invalid JSON")?;
@@ -529,35 +936,62 @@ impl Capture {
                     .remove("internal_scanout_id");
                 Ok(value)
             })();
-            let _ = tx.send(result);
+            let _ = tx.send((result, None));
         });
         Ok(Self {
             child: Some(child),
             socket: None,
             receiver,
+            timing: None,
             deadline: Instant::now() + Duration::from_secs(15),
             id,
         })
     }
-    fn broker(socket_path: &Path, id: Value) -> Result<Self> {
+    #[cfg(test)]
+    fn broker(socket_path: &Path, id: Value, wake: mpsc::SyncSender<Wake>) -> Result<Self> {
+        Self::broker_scaled(socket_path, id, wake, None)
+    }
+    /// `scaled` asks the broker for the scaled-JPEG form; `None` writes the same request as before.
+    fn broker_scaled(
+        socket_path: &Path,
+        id: Value,
+        wake: mpsc::SyncSender<Wake>,
+        scaled: Option<Scaled>,
+    ) -> Result<Self> {
         let mut socket = UnixStream::connect(socket_path).context("console broker unavailable")?;
         socket.set_write_timeout(Some(Duration::from_secs(1)))?;
         let request_id = format!("screenshot-{id}");
-        serde_json::to_writer(
-            &mut socket,
-            &json!({"request_id":request_id,"method":"screenshot"}),
-        )?;
+        let mut request = json!({"request_id":request_id,"method":"screenshot"});
+        if let Some(scaled) = &scaled {
+            scaled.apply(&mut request);
+        }
+        serde_json::to_writer(&mut socket, &request)?;
         socket.write_all(b"\n")?;
         let cancel = socket.try_clone()?;
         let deadline = Instant::now() + Duration::from_secs(15);
+        let started = Instant::now();
         let (tx, receiver) = mpsc::sync_channel(1);
         thread::spawn(move || {
-            let _ = tx.send(read_console_screenshot(&mut socket, &request_id, deadline));
+            let _ = tx.send(
+                match read_console_screenshot_scaled(
+                    &mut socket,
+                    &request_id,
+                    deadline,
+                    started,
+                    scaled,
+                ) {
+                    Ok((value, timing)) => (Ok(value), Some(timing)),
+                    Err(error) => (Err(error), None),
+                },
+            );
+            // A full queue means the loop is awake and polls this capture on every pass anyway.
+            let _ = wake.try_send(Wake::Observe);
         });
         Ok(Self {
             child: None,
             socket: Some(cancel),
             receiver,
+            timing: None,
             deadline,
             id,
         })
@@ -565,7 +999,10 @@ impl Capture {
     fn poll(&mut self) -> Option<Result<Value>> {
         if self.child.is_none() {
             match self.receiver.try_recv() {
-                Ok(result) => return Some(result),
+                Ok((result, timing)) => {
+                    self.timing = timing;
+                    return Some(result);
+                }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     return Some(Err(anyhow::anyhow!("console request reader disconnected")))
                 }
@@ -579,8 +1016,8 @@ impl Capture {
             .transpose()
         {
             Ok(Some(Some(exit))) => match self.receiver.try_recv() {
-                Ok(Err(error)) => return Some(Err(error)),
-                Ok(Ok(value)) => {
+                Ok((Err(error), _)) => return Some(Err(error)),
+                Ok((Ok(value), _)) => {
                     return Some(if exit.success() {
                         Ok(value)
                     } else {
@@ -623,6 +1060,16 @@ fn read_console_reply_bounded(
     deadline: Instant,
     limit: usize,
 ) -> Result<Value> {
+    read_console_reply_stamped(socket, request_id, deadline, limit).map(|(reply, _)| reply)
+}
+/// `read_console_reply_bounded`, also returning when the record header arrived, when its body was complete and
+/// its length.
+fn read_console_reply_stamped(
+    socket: &mut UnixStream,
+    request_id: &str,
+    deadline: Instant,
+    limit: usize,
+) -> Result<(Value, (Instant, Instant, usize))> {
     fn read_until(socket: &mut UnixStream, mut buffer: &mut [u8], deadline: Instant) -> Result<()> {
         while !buffer.is_empty() {
             let remaining = deadline
@@ -678,9 +1125,12 @@ fn read_console_reply_bounded(
     if header[4] != 1 || header[5..13] != [0; 8] || length == 0 || length > limit {
         bail!("invalid or oversized console screenshot frame")
     }
+    let header_at = Instant::now();
     let mut body = vec![0u8; length];
     read_until(socket, &mut body, deadline)?;
-    let reply: Value = serde_json::from_slice(&body)?;
+    let stamps = (header_at, Instant::now(), length);
+    let mut reply: Value = serde_json::from_slice(&body)?;
+    drop(body);
     if reply["request_id"] != request_id {
         bail!("console screenshot response identity mismatch")
     }
@@ -692,12 +1142,17 @@ fn read_console_reply_bounded(
                 return Err(stage.into());
             }
         }
+        // The broker's fixed word for a refused scaled screenshot stays beside the same text.
+        if let Some(refusal) = Refusal::from_name(&reply[REFUSAL_FIELD]) {
+            return Err(Refused::new(refusal, format!("console operation failed: {error}")).into());
+        }
         bail!("console operation failed: {error}")
     }
     reply
-        .get("result")
-        .cloned()
+        .get_mut("result")
+        .map(Value::take)
         .context("missing console result")
+        .map(|result| (result, stamps))
 }
 fn console_window(path: &Path, method: &str) -> Result<Value> {
     if !["show_window", "close_window", "window_status"].contains(&method) {
@@ -736,27 +1191,62 @@ fn console_frame_status(path: &Path) -> Result<Value> {
         Instant::now() + Duration::from_millis(750),
     )
 }
+#[cfg(test)]
 fn read_console_screenshot(
     socket: &mut UnixStream,
     request_id: &str,
     deadline: Instant,
 ) -> Result<Value> {
-    let mut value = read_console_reply_bounded(
+    read_console_screenshot_timed(socket, request_id, deadline, Instant::now())
+        .map(|(value, _)| value)
+}
+/// `started` is when the request was written; the timing is relative to it.
+#[cfg(test)]
+fn read_console_screenshot_timed(
+    socket: &mut UnixStream,
+    request_id: &str,
+    deadline: Instant,
+    started: Instant,
+) -> Result<(Value, CaptureTiming)> {
+    read_console_screenshot_scaled(socket, request_id, deadline, started, None)
+}
+/// `read_console_screenshot_timed` for a request that may have asked for the scaled form. With `scaled`, the reply
+/// may also be the helper's scaled JPEG, which must then agree with the request and with itself
+/// (`Scaled::verify`); a PNG reply to a scaled request comes from a helper without that form and is held to the
+/// same checks as any PNG.
+fn read_console_screenshot_scaled(
+    socket: &mut UnixStream,
+    request_id: &str,
+    deadline: Instant,
+    started: Instant,
+    scaled: Option<Scaled>,
+) -> Result<(Value, CaptureTiming)> {
+    let (mut value, (header_at, body_at, bytes)) = read_console_reply_stamped(
         socket,
         request_id,
         deadline,
         vm_control::MAX_SCREENSHOT_RESPONSE,
     )?;
-    if value["mime_type"] != "image/png"
+    let jpeg = scaled.filter(|_| value["mime_type"] == "image/jpeg");
+    let (mime, limit) = match jpeg {
+        Some(_) => ("image/jpeg", vm_control::screenshot_scaled::MAX_BYTES),
+        None => ("image/png", vm_control::MAX_SCREENSHOT_BYTES),
+    };
+    if value["mime_type"] != mime
         || value["byte_length"]
             .as_u64()
-            .is_none_or(|n| n > vm_control::MAX_SCREENSHOT_BYTES as u64)
+            .is_none_or(|n| n > limit as u64)
         || !value["data_base64"].is_string()
         || !value["captured_monotonic_us"].is_u64()
         || !value["width"].is_u64()
         || !value["height"].is_u64()
     {
         bail!("invalid console screenshot metadata")
+    }
+    if let Some(scaled) = jpeg {
+        scaled
+            .verify(&value)
+            .context("invalid console scaled screenshot")?;
     }
     let mut random = [0u8; 16];
     File::open("/dev/urandom")?.read_exact(&mut random)?;
@@ -777,7 +1267,16 @@ fn read_console_screenshot(
     value["display_id"] = json!(0);
     value["guest_ui_scale"] = Value::Null;
     value.as_object_mut().unwrap().remove("internal_scanout_id");
-    Ok(value)
+    let ready = Instant::now();
+    let micros = |from: Instant, to: Instant| to.saturating_duration_since(from).as_micros() as u64;
+    let timing = CaptureTiming {
+        wait_us: micros(started, header_at),
+        read_us: micros(header_at, body_at),
+        parse_us: micros(body_at, ready),
+        bytes: bytes as u64,
+        ready,
+    };
+    Ok((value, timing))
 }
 struct ConsoleBroker {
     child: QemuChild,
@@ -873,7 +1372,8 @@ impl Drop for ConsoleBroker {
         // QemuChild's fallback kills/reaps only this still-owned child.
     }
 }
-fn run() -> Result<()> {
+/// Returns true when the guest rebooted and the worker must start a fresh QEMU.
+fn run() -> Result<bool> {
     if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         bail!("QEMU/HVF backend requires Apple Silicon macOS")
     }
@@ -959,6 +1459,22 @@ fn run() -> Result<()> {
     let mut launcher = options.remove("--launcher").context("missing launcher")?;
     let library = options.remove("--library").context("missing library")?;
     let resources = options.remove("--resources").context("missing resources")?;
+    // Neptune reuses the reviewed Venus registration for its render server.
+    let neptune_registration = if config.qemu_graphics_profile.neptune() {
+        let registration = vm_control::qemu_graphics::Registration::load(
+            options.get("--venus-runtime").context(
+                "Neptune needs the locally registered Venus runtime (its render server)",
+            )?,
+        )?;
+        registration.validate(
+            &library,
+            &resources,
+            options.get("--spice-library").map(PathBuf::as_path),
+        )?;
+        Some(registration)
+    } else {
+        None
+    };
     let (venus, graphics_host) = if config.qemu_graphics_profile.venus() {
         let registration = vm_control::qemu_graphics::Registration::load(
             options
@@ -990,6 +1506,9 @@ fn run() -> Result<()> {
     let console_path = runtime.0.join("console.sock");
     let agent_path = runtime.0.join("agent.sock");
     let uefi = config.boot == vm_control::BootMode::Uefi;
+    // Windows ARM hangs in edk2 after an in-process (warm) reset on HVF; QEMU
+    // exits on a guest reboot instead and run() returns to start a fresh one.
+    let cold_reboot = config.guest == "windows";
     let monitor_path = config.qemu_monitor.then(|| runtime.0.join("monitor.sock"));
     let disk_guard = config
         .disk
@@ -1013,6 +1532,10 @@ fn run() -> Result<()> {
     if let Some(registration) = &venus {
         registration.configure(&mut command);
     }
+    if let Some(registration) = &neptune_registration {
+        vm_control::qemu_graphics::Neptune::locate(&library, registration)?
+            .configure(&mut command, &runtime.0);
+    }
     command
         .arg(library)
         .arg("-L")
@@ -1032,11 +1555,7 @@ fn run() -> Result<()> {
         ])
         .arg(vm_control::qemu_extras::nic(&config))
         .arg("-device")
-        .arg(
-            config
-                .qemu_graphics_profile
-                .device(config.width, config.height)?,
-        )
+        .arg(vm_control::qemu_uefi::display_device(&config)?)
         .arg("-m")
         .arg(format!("{}M", config.memory_mib))
         .arg("-smp")
@@ -1045,13 +1564,20 @@ fn run() -> Result<()> {
         .arg(format!("unix:{},server=on,wait=off", qmp_path.display()))
         .arg("-spice")
         .arg(format!(
-            "unix=on,addr={},disable-ticketing=on,gl=es",
-            spice_path.display()
+            "unix=on,addr={},disable-ticketing=on,gl={}",
+            spice_path.display(),
+            if config.qemu_graphics_profile.requires_gl() {
+                "es"
+            } else {
+                "off"
+            }
         ))
-        .env("ANGLE_DEFAULT_PLATFORM", "metal")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if config.qemu_graphics_profile.requires_gl() {
+        command.env("ANGLE_DEFAULT_PLATFORM", "metal");
+    }
     if options.contains_key("--console-broker") || disk_guard.is_some() || venus.is_some() {
         command.arg("-S");
     }
@@ -1065,6 +1591,9 @@ fn run() -> Result<()> {
             &resources,
             monitor_path.as_deref(),
         )?);
+        if cold_reboot {
+            command.args(["-action", "reboot=shutdown"]);
+        }
     } else {
         command
             .arg("-bios")
@@ -1102,7 +1631,7 @@ fn run() -> Result<()> {
         command.env("VEYNODE_SPICE_LIBRARY", spice_library);
     }
     if let Some(disk) = &disk_guard {
-        disk.configure_command(&mut command)?;
+        disk.configure_command(&mut command, vm_control::qemu_uefi::disk_device(&config))?;
     }
     command.args(vm_control::qemu_extras::arguments(&config)?);
     let mut child = QemuChild(
@@ -1123,13 +1652,16 @@ fn run() -> Result<()> {
     log_pipe(child.0.stdout.take().unwrap(), serial_log.clone())?;
     log_pipe(child.0.stderr.take().unwrap(), Some(stderr_log.clone()))?;
     let (tx, rx) = mpsc::sync_channel(16);
+    let capture_wake = tx.clone();
     thread::spawn(move || {
         let mut reader = BufReader::new(std::io::stdin());
         loop {
             match read_frame(&mut reader) {
                 Ok(Some(bytes)) => {
                     if tx
-                        .send(serde_json::from_slice::<Value>(&bytes).map_err(anyhow::Error::from))
+                        .send(Wake::Request(
+                            serde_json::from_slice::<Value>(&bytes).map_err(anyhow::Error::from),
+                        ))
                         .is_err()
                     {
                         break;
@@ -1137,11 +1669,13 @@ fn run() -> Result<()> {
                 }
                 Ok(None) => {
                     STOP.store(true, Ordering::Release);
+                    // The loop keeps a sender for capture wakes, so the channel no longer disconnects here.
+                    let _ = tx.try_send(Wake::Observe);
                     break;
                 }
                 Err(e) => {
                     STOP.store(true, Ordering::Release);
-                    let _ = tx.send(Err(e));
+                    let _ = tx.send(Wake::Request(Err(e)));
                     break;
                 }
             }
@@ -1228,7 +1762,7 @@ fn run() -> Result<()> {
         broker.is_some() || disk_guard.is_some() || venus.is_some(),
         emit,
     )?;
-    let mut status_poll = Instant::now();
+    let mut status_poll = StatusPoll::new(Instant::now());
     let mut capture: Option<Capture> = None;
     let mut frames = vm_control::input::Frames::default();
     let mut input = InputState::default();
@@ -1252,13 +1786,19 @@ fn run() -> Result<()> {
         }
         // Observe the owned child before reading its guardian socket: normal exit closes both.
         if let Some(status) = child.0.try_wait()? {
+            if status.success() && cold_reboot && qmp.exited_for_guest_reset() {
+                emit(
+                    json!({"event":"state","state":"starting","reason":"guest-reset","guest_ready":null,"vm_id":config.id}),
+                )?;
+                return Ok(true);
+            }
             emit(
-                json!({"event":"state","state":if status.success(){"stopped"}else{"crashed"},"exit_code":status.code(),"guest_ready":null,"vm_id":config.id}),
+                json!({"event":"state","state":if status.success(){"stopped"}else{"crashed"},"exit_code":status.code(),"guest_ready":null,"vm_id":config.id,"qmp_run_state":status_poll.summary()}),
             )?;
             if !status.success() {
                 bail!("QEMU process crashed: {status}")
             }
-            return Ok(());
+            return Ok(false);
         }
         execution_shutdown.check(Instant::now())?;
         if guardian_heartbeat.elapsed() >= Duration::from_millis(500) {
@@ -1304,13 +1844,17 @@ fn run() -> Result<()> {
         if let Some(active) = &mut capture {
             if let Some(result) = active.poll() {
                 let id = active.id.clone();
+                let timing = active.timing.take().filter(|_| result.is_ok());
                 drop(capture.take());
+                if let Some(timing) = timing {
+                    emit(timing.event(&id, Instant::now()))?;
+                }
                 emit(match result {
                     Ok(value) => {
                         frames.record(&value, Instant::now());
                         json!({"id":id,"result":value})
                     }
-                    Err(error) => json!({"id":id,"error":error.to_string()}),
+                    Err(error) => refusal_reply(&id, &error),
                 })?;
             }
         }
@@ -1328,44 +1872,48 @@ fn run() -> Result<()> {
             }
         }
         if let Some(status) = child.0.try_wait()? {
+            if status.success() && cold_reboot && qmp.exited_for_guest_reset() {
+                emit(
+                    json!({"event":"state","state":"starting","reason":"guest-reset","guest_ready":null,"vm_id":config.id}),
+                )?;
+                return Ok(true);
+            }
             emit(
-                json!({"event":"state","state":if status.success(){"stopped"}else{"crashed"},"exit_code":status.code(),"guest_ready":null,"vm_id":config.id}),
+                json!({"event":"state","state":if status.success(){"stopped"}else{"crashed"},"exit_code":status.code(),"guest_ready":null,"vm_id":config.id,"qmp_run_state":status_poll.summary()}),
             )?;
             if !status.success() {
                 bail!("QEMU process crashed: {status}")
             }
-            return Ok(());
+            return Ok(false);
         }
-        if status_poll.elapsed() >= Duration::from_secs(1) && capture.is_none() {
-            let mut updated = state.clone();
-            match qmp.call("query-status") {
-                Ok(status) => {
-                    updated["qmp_status"] = status["status"].clone();
-                    updated["state"] = json!(if status["running"] == true {
-                        "running"
-                    } else {
-                        "paused"
-                    });
-                    updated.as_object_mut().unwrap().remove("qmp_error");
-                }
-                Err(error) => {
-                    updated["state"] = json!("unavailable");
-                    updated["qmp_error"] = json!(error.to_string());
-                }
+        observe_status(
+            &mut qmp,
+            &mut status_poll,
+            &mut state,
+            Instant::now(),
+            capture.is_none(),
+            emit,
+        )?;
+        if let Some(exec) = &guest_exec {
+            // Lets the daemon refuse execution while the transport is not ready. A local read,
+            // so it keeps its own cadence instead of waiting for the next QMP status query.
+            let integration = json!(exec.state());
+            if state["guest_integration_state"] != integration {
+                state["guest_integration_state"] = integration;
+                emit(state.clone())?;
             }
-            if let Some(exec) = &guest_exec {
-                // Lets the daemon refuse execution while the transport is not ready.
-                updated["guest_integration_state"] = json!(exec.state());
-            }
-            if updated != state {
-                emit(updated.clone())?;
-                state = updated;
-            }
-            status_poll = Instant::now();
         }
-        let request = match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(request) => request?,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+        // A request or a finished broker capture wakes this at once. The timeout only bounds how stale the polled
+        // state above may get, so it stays at 50 ms while anything in flight is being polled for.
+        let request = match rx.recv_timeout(request_wait(
+            !exec_pending.is_empty()
+                || guest_pending.is_some()
+                || capture.is_some()
+                || input.until.is_some()
+                || execution_shutdown.active(),
+        )) {
+            Ok(Wake::Request(request)) => request?,
+            Ok(Wake::Observe) | Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         let id = request["id"].clone();
@@ -1379,6 +1927,7 @@ fn run() -> Result<()> {
                         | "native_event"
                         | "input_step"
                         | "desktop_input"
+                        | "input_text_step"
                 )
             )
         {
@@ -1398,11 +1947,17 @@ fn run() -> Result<()> {
                 } else { console_window(&console_path,method) }
             },
             Some("screenshot") => {
+                // The four fields of the scaled-JPEG form, all or none; `None` is the request as it always was.
+                let scaled = match Scaled::parse(&request) { Ok(scaled) => scaled, Err(error) => { emit(refusal_reply(&id, &error))?; continue } };
                 if capture.is_some() { Err(anyhow::anyhow!("screenshot busy: one capture per VM")) }
                 else if options.contains_key("--console-broker") {
                     if broker.is_none() { Err(anyhow::anyhow!("console broker unavailable; VM restart required to restore capture")) }
-                    else { match Capture::broker(&console_path,id.clone()) { Ok(started)=>{capture=Some(started);continue},Err(error)=>Err(error) } }
+                    // A broker from before the scaled form would drop the connection on the unknown fields.
+                    else if scaled.is_some() && broker.as_ref().is_some_and(|b| b.capabilities["broker_screenshot_scaled_protocol"] != 1) { Err(Refused::new(Refusal::FormatUnavailable, "unsupported: this console broker has no scaled JPEG screenshot form").into()) }
+                    else { match Capture::broker_scaled(&console_path,id.clone(),capture_wake.clone(),scaled) { Ok(started)=>{capture=Some(started);continue},Err(error)=>Err(error) } }
                 }
+                // The one-shot capture helper has no scaled form.
+                else if scaled.is_some() { Err(Refused::new(Refusal::FormatUnavailable, "unsupported: the scaled JPEG screenshot form requires the console broker").into()) }
                 else if let Some(helper) = options.get("--screenshot-helper") {
                     match Capture::start(helper, &spice_path, id.clone()) { Ok(started) => { capture = Some(started); continue; }, Err(error) => Err(error) }
                 } else { Err(anyhow::anyhow!("unsupported: screenshot helper is not registered")) }
@@ -1415,6 +1970,16 @@ fn run() -> Result<()> {
             Some("input_step") => {
                 if broker.is_none() {Err(anyhow::anyhow!("persistent console unavailable"))}
                 else {input.step(&request["arguments"],&frames,&console_path,&mut qmp)}
+            },
+            Some("input_text_step") => {
+                if broker.is_none() {Err(anyhow::anyhow!("persistent console unavailable"))}
+                else {
+                    let submit = guest_exec.as_ref().map(|exec| move |request: Value, deadline: Instant| exec.request_before(request, deadline));
+                    match native_input_worker::text_step(&request["arguments"], &mut input, &frames, &console_path, submit.as_ref().map(|f| f as &dyn Fn(Value, Instant) -> Result<guest_exec::Pending>)) {
+                        Ok(pending) => { exec_pending.push((id.clone(), pending)); continue },
+                        Err(error) => Err(error),
+                    }
+                }
             },
             Some("input_cleanup") => {
                 input.cleanup_operation(&request["arguments"], &mut qmp)
@@ -1433,11 +1998,13 @@ fn run() -> Result<()> {
                     }
                 }
             }
-            Some("status") => qmp.call("query-status").map(|status|json!({"qmp_status":status,"guest_ready":null,"vm_id":config.id,"disk_provenance":state.get("disk_provenance"),"guest_integration_state":guest.as_ref().map(|g|g.state()).unwrap_or_else(||guest_exec.as_ref().unwrap().state())})),
+            Some("status") => qmp.call("query-status").map(|status|json!({"qmp_status":status,"qmp_run_state":status_poll.summary(),"guest_ready":null,"vm_id":config.id,"disk_provenance":state.get("disk_provenance"),"guest_integration_state":guest.as_ref().map(|g|g.state()).unwrap_or_else(||guest_exec.as_ref().unwrap().state())})),
             Some("shutdown") => {
                 if guest_exec.is_some() {
                     execution_shutdown.begin(Instant::now());
                 }
+                // Powerdown is the worker's one run-state command after `cont`: query on the next pass, then at 1 s.
+                status_poll.disturbed(Instant::now());
                 request_powerdown(&mut qmp, &mut input, guest_exec.is_some()).map(|_|json!({"requested":true,"mechanism":"qmp-system-powerdown","completed":false,"requires_guest_power_button_support":true,"execution_quiescing":execution_shutdown.active(),"shutdown_timeout_seconds":if execution_shutdown.active(){json!(60)}else{Value::Null}}))
             },
             Some("stop") => { emit(json!({"id":id,"result":{"requested":true,"forced":true}}))?; break },
@@ -1452,6 +2019,7 @@ fn run() -> Result<()> {
                 {
                     reply["native_input_diagnostic"] = serde_json::to_value(diagnostic)?;
                 }
+                Refused::mark(&mut reply, &error);
                 reply
             }
         })?;
@@ -1473,9 +2041,18 @@ fn run() -> Result<()> {
         )
     }
     emit(
-        json!({"event":"state","state":"stopped","reason":"supervisor_disconnected_or_stop","vm_id":config.id}),
+        json!({"event":"state","state":"stopped","reason":"supervisor_disconnected_or_stop","vm_id":config.id,"qmp_run_state":status_poll.summary()}),
     )?;
-    Ok(())
+    Ok(false)
+}
+/// How long the worker loop may block on its request channel before re-observing what it can
+/// only poll: QEMU and console broker exit, the stop signal, supervisor pipe loss, a fenced
+/// execution transport, delivered QMP events, and the 500 ms guardian and status timers. With a result pending
+/// (execution, Guest request, screenshot), held input awaiting timed release, or a normal
+/// shutdown in progress, the original 50 ms step is kept. Otherwise nothing is in flight and
+/// those observations may be up to 100 ms later than before; all have multi-second deadlines.
+fn request_wait(in_flight: bool) -> Duration {
+    Duration::from_millis(if in_flight { 50 } else { 150 })
 }
 fn request_powerdown(qmp: &mut Qmp, input: &mut InputState, retire_input: bool) -> Result<Value> {
     if retire_input {
@@ -1513,9 +2090,24 @@ fn main() {
         }
         return;
     }
-    if let Err(error) = run() {
-        let _ = emit(json!({"event":"state","state":"error","error":error.to_string()}));
-        std::process::exit(1);
+    match run() {
+        Ok(false) => {}
+        // Same PID, arguments and pipe to the daemon; every resource of the
+        // previous incarnation was dropped when run() returned.
+        Ok(true) => {
+            use std::os::unix::process::CommandExt;
+            let error = Command::new(std::env::current_exe().unwrap_or_else(|_| "vm-qemu".into()))
+                .args(&early)
+                .exec();
+            let _ = emit(
+                json!({"event":"state","state":"error","error":format!("restart after guest reboot failed: {error}")}),
+            );
+            std::process::exit(1);
+        }
+        Err(error) => {
+            let _ = emit(json!({"event":"state","state":"error","error":error.to_string()}));
+            std::process::exit(1);
+        }
     }
 }
 
@@ -1537,6 +2129,17 @@ mod tests {
             "expected",
             Instant::now() + Duration::from_secs(1),
         )
+    }
+    #[test]
+    fn idle_request_wait_is_longer_but_in_flight_work_keeps_the_original_step() {
+        assert_eq!(request_wait(true), Duration::from_millis(50));
+        let idle = request_wait(false);
+        assert!(idle > request_wait(true));
+        // At most 100 ms later than before, and well inside the guardian's 500 ms cadence
+        // and 5 s challenge expiry.
+        assert!(idle <= Duration::from_millis(150));
+        assert!(idle * 2 < Duration::from_millis(500));
+        assert!(Duration::from_millis(500) + idle < guardian::ACTIVE_TIMEOUT / 2);
     }
     #[test]
     fn startup_proof_is_published_before_cont_even_when_qmp_closes_after_ack() {
@@ -1562,6 +2165,9 @@ mod tests {
             next: 1,
             poisoned: false,
             reply_prefix: Vec::new(),
+            guest_reset: false,
+            run_state_event: false,
+            shutdown_event: false,
         };
         let mut state = json!({"state":"paused","disk_provenance":{"device":7,"inode":9,"qmp_fdsets_verified_at_start":true}});
         let mut events = Vec::new();
@@ -1587,6 +2193,9 @@ mod tests {
             next: 1,
             poisoned: false,
             reply_prefix: Vec::new(),
+            guest_reset: false,
+            run_state_event: false,
+            shutdown_event: false,
         };
         assert!(publish_startup_then_resume(
             &mut qmp,
@@ -1845,6 +2454,9 @@ f.close();c.close();s.close()
             next: 1,
             poisoned: false,
             reply_prefix: Vec::new(),
+            guest_reset: false,
+            run_state_event: false,
+            shutdown_event: false,
         };
         let mut state = InputState {
             operation: Some("a".repeat(32)),
@@ -2015,6 +2627,253 @@ f.close();c.close();s.close()
 }
 
 #[cfg(test)]
+#[path = "../qemu_status_events_tests.rs"]
+mod status_events_tests;
+/// Attribution counters of the run-state summary, against a scripted QMP peer in the style of
+/// `qemu_status_events_tests.rs` (whose helpers are private to it).
+#[cfg(test)]
+mod status_counter_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    const MS: Duration = Duration::from_millis(1);
+    const S: Duration = Duration::from_secs(1);
+    struct Worker {
+        qmp: Qmp,
+        poll: StatusPoll,
+        state: Value,
+        published: usize,
+        start: Instant,
+        /// What the peer answers `query-status` with; `null` answers a QMP error.
+        status: Arc<Mutex<Value>>,
+        before_reply: Arc<Mutex<Vec<u8>>>,
+        peer: UnixStream,
+    }
+    fn record(name: &str) -> Vec<u8> {
+        format!(
+            "{}\n",
+            json!({"event":name,"data":{"secret":"guest-content"}})
+        )
+        .into_bytes()
+    }
+    impl Worker {
+        fn pass(&mut self, offset: Duration) {
+            let published = &mut self.published;
+            observe_status(
+                &mut self.qmp,
+                &mut self.poll,
+                &mut self.state,
+                self.start + offset,
+                true,
+                |_| {
+                    *published += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+        fn set(&self, running: bool, status: &str) {
+            *self.status.lock().unwrap() = json!({"running":running,"status":status});
+        }
+        fn event(&mut self, name: &str) {
+            self.peer.write_all(&record(name)).unwrap();
+        }
+        fn changes(&self) -> (u64, u64, u64, u64) {
+            let seen = self.poll.seen;
+            (
+                seen.event_changes,
+                seen.command_changes,
+                seen.cadence_changes,
+                seen.safety_changes,
+            )
+        }
+    }
+    /// Past the active window: 11 queries, none of them a safety poll, nothing changed.
+    fn settled() -> Worker {
+        let (client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let status = Arc::new(Mutex::new(json!({"running":true,"status":"running"})));
+        let before_reply = Arc::new(Mutex::new(Vec::new()));
+        let (answers, interleaved) = (status.clone(), before_reply.clone());
+        let peer = server.try_clone().unwrap();
+        thread::spawn(move || {
+            let mut reader = BufReader::new(server.try_clone().unwrap());
+            let mut writer = server;
+            while let Ok(Some(line)) = read_frame(&mut reader) {
+                let request: Value = serde_json::from_slice(&line).unwrap();
+                assert_eq!(request["execute"], "query-status");
+                let early = std::mem::take(&mut *interleaved.lock().unwrap());
+                writer.write_all(&early).unwrap();
+                let status = answers.lock().unwrap().clone();
+                let reply = if status.is_null() {
+                    json!({"id":request["id"],"error":{"class":"GenericError","desc":"scripted"}})
+                } else {
+                    json!({"id":request["id"],"return":status})
+                };
+                writer.write_all(format!("{reply}\n").as_bytes()).unwrap();
+            }
+        });
+        let start = Instant::now();
+        let mut worker = Worker {
+            qmp: Qmp {
+                reader: BufReader::new(client.try_clone().unwrap()),
+                stream: client,
+                next: 1,
+                poisoned: false,
+                reply_prefix: Vec::new(),
+                run_state_event: false,
+                shutdown_event: false,
+                guest_reset: false,
+            },
+            poll: StatusPoll::new(start),
+            state: json!({"event":"state","state":"running","qmp_status":"running","vm_id":"test"}),
+            published: 0,
+            start,
+            status,
+            before_reply,
+            peer,
+        };
+        assert_eq!(worker.poll.asked, Asked::Command);
+        for second in 0..=10 {
+            worker.pass(S * second);
+        }
+        assert_eq!(
+            worker.poll.seen,
+            Observed {
+                queries: 11,
+                ..Observed::default()
+            }
+        );
+        assert_eq!(worker.poll.asked, Asked::Safety);
+        worker
+    }
+
+    #[test]
+    fn change_after_an_event_is_counted_as_event_and_not_as_a_poll() {
+        let mut worker = settled();
+        worker.set(false, "paused");
+        worker.event("STOP");
+        worker.pass(S * 10 + MS);
+        worker.set(true, "running");
+        worker.event("RESUME");
+        worker.pass(S * 10 + MS * 2);
+        assert_eq!(worker.published, 2);
+        assert_eq!(worker.changes(), (2, 0, 0, 0));
+        // An event that changes nothing is a query and no change; an unlisted event is not even a query.
+        worker.event("RESUME");
+        worker.event("RTC_CHANGE");
+        worker.event("POWERDOWN");
+        worker.pass(S * 10 + MS * 3);
+        assert_eq!(worker.changes(), (2, 0, 0, 0));
+        let seen = worker.poll.seen;
+        assert_eq!(
+            (seen.queries, seen.safety_polls, seen.query_errors),
+            (14, 0, 0)
+        );
+        let summary = worker.poll.summary();
+        assert_eq!(summary["events"], json!({"STOP":1,"RESUME":2}));
+        assert_eq!(summary["events_unlisted"], 2);
+        assert_eq!(
+            summary["changes"],
+            json!({"event":2,"command":0,"cadence_poll":0,"safety_poll":0})
+        );
+    }
+
+    #[test]
+    fn change_found_by_the_safety_poll_is_counted_as_a_missed_event() {
+        let mut worker = settled();
+        // Steady state with nothing happening: one safety poll, no change.
+        worker.pass(S * 40);
+        assert_eq!(worker.poll.seen.safety_polls, 1);
+        assert_eq!(worker.changes(), (0, 0, 0, 0));
+        worker.set(false, "paused");
+        worker.pass(S * 70 - MS);
+        assert_eq!(worker.poll.seen.safety_polls, 1);
+        worker.pass(S * 70);
+        assert_eq!(worker.published, 1);
+        assert_eq!(worker.poll.seen.safety_polls, 2);
+        assert_eq!(worker.changes(), (0, 0, 0, 1));
+        // The silent change back is found by the 1 s timer of the restarted active window: also unannounced, and
+        // counted apart from the safety poll.
+        worker.set(true, "running");
+        worker.pass(S * 71);
+        assert_eq!(worker.published, 2);
+        assert_eq!(worker.changes(), (0, 0, 1, 1));
+        assert_eq!(worker.poll.seen.safety_polls, 2);
+        assert_eq!(worker.poll.seen.queries, 14);
+    }
+
+    #[test]
+    fn event_read_while_the_safety_poll_waits_for_its_reply_is_not_a_missed_event() {
+        let mut worker = settled();
+        worker.set(false, "paused");
+        *worker.before_reply.lock().unwrap() = record("STOP");
+        worker.pass(S * 40);
+        assert_eq!(worker.published, 1);
+        assert_eq!(worker.poll.seen.safety_polls, 1);
+        assert_eq!(worker.changes(), (1, 0, 0, 0));
+        // The event still asks for its own query on the next pass, which changes nothing.
+        worker.pass(S * 40 + MS);
+        assert_eq!(worker.poll.seen.queries, 13);
+        assert_eq!(worker.changes(), (1, 0, 0, 0));
+    }
+
+    #[test]
+    fn failed_queries_are_errors_and_neither_they_nor_the_recovery_are_changes() {
+        let mut worker = settled();
+        *worker.status.lock().unwrap() = Value::Null;
+        worker.pass(S * 40);
+        worker.pass(S * 41);
+        assert_eq!(worker.published, 1);
+        assert_eq!(worker.state["state"], "unavailable");
+        let seen = worker.poll.seen;
+        assert_eq!(
+            (seen.safety_polls, seen.safety_errors, seen.query_errors),
+            (1, 1, 2)
+        );
+        worker.set(true, "running");
+        worker.pass(S * 42);
+        assert_eq!(worker.published, 2);
+        assert_eq!(worker.changes(), (0, 0, 0, 0));
+        assert_eq!(worker.poll.seen.query_errors, 2);
+    }
+
+    #[test]
+    fn command_and_shutdown_attribution() {
+        let mut worker = settled();
+        // What the loop does around `system_powerdown`; a change the next query finds belongs to the command.
+        worker.poll.disturbed(worker.start + S * 12);
+        worker.set(false, "paused");
+        worker.pass(S * 12);
+        assert_eq!(worker.changes(), (0, 1, 0, 0));
+        worker.event("SHUTDOWN");
+        worker.set(false, "shutdown");
+        worker.pass(S * 12 + MS);
+        worker.pass(S * 13 + MS);
+        assert_eq!(worker.changes(), (1, 1, 0, 0));
+        assert_eq!(worker.poll.summary()["events"], json!({"SHUTDOWN":1}));
+    }
+
+    #[test]
+    fn log_lines_are_single_line_json_with_names_and_counts_only() {
+        let mut worker = settled();
+        worker.set(false, "paused");
+        worker.event("STOP");
+        worker.pass(S * 10 + MS);
+        let line = worker.poll.summary_line();
+        assert_eq!(
+            line,
+            r#"{"changes":{"cadence_poll":0,"command":0,"event":1,"safety_poll":0},"event":"qmp_run_state_summary","events":{"STOP":1},"events_unlisted":0,"queries":12,"query_errors":0,"safety_poll_errors":0,"safety_polls":0}"#
+        );
+        assert!(!line.contains('\n') && !line.contains("guest-content"));
+        assert_eq!(
+            poll_change_line("safety_poll", &json!("running"), &json!("paused")),
+            r#"{"event":"qmp_run_state_poll_change","from":"running","source":"safety_poll","to":"paused"}"#
+        );
+    }
+}
+#[cfg(test)]
 #[path = "../screenshot_test_support.rs"]
 mod screenshot_test_support;
 #[cfg(test)]
@@ -2099,6 +2958,9 @@ mod venus_qmp_admission_tests {
                 next: 1,
                 poisoned: false,
                 reply_prefix: Vec::new(),
+                guest_reset: false,
+                run_state_event: false,
+                shutdown_event: false,
             };
             let admitted = vm_control::qemu_graphics::verify_gpu_properties(|method, args| {
                 qmp.arguments(method, args)
@@ -2121,6 +2983,255 @@ mod venus_qmp_admission_tests {
             } else {
                 assert_eq!(methods.iter().position(|m| m == "cont"), Some(4));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod capture_wake_tests {
+    use super::*;
+    /// A console broker that answers one `screenshot` after `delay` and reports when its reply was written.
+    fn scripted_broker(
+        delay: Duration,
+        result: Value,
+    ) -> (tempfile::TempDir, PathBuf, mpsc::Receiver<Instant>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let (tx, written) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(socket.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], "screenshot");
+            let body =
+                serde_json::to_vec(&json!({"request_id":request["request_id"],"result":result}))
+                    .unwrap();
+            let mut record = (body.len() as u32).to_be_bytes().to_vec();
+            record.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0, 0]);
+            record.extend_from_slice(&body);
+            thread::sleep(delay);
+            socket.write_all(&record).unwrap();
+            let _ = tx.send(Instant::now());
+        });
+        (dir, path, written)
+    }
+    #[test]
+    fn finished_broker_capture_wakes_the_loop_at_once_and_exactly_once() {
+        let picture = screenshot_test_support::value();
+        // Each delay ends 30 to 40 ms before the next 50 ms step of the loop's in-flight wait.
+        for delay in [10, 20, 60, 70] {
+            let (_dir, path, written) =
+                scripted_broker(Duration::from_millis(delay), picture.clone());
+            let (wake, rx) = mpsc::sync_channel::<Wake>(16);
+            let mut capture = Capture::broker(&path, json!(7), wake.clone()).unwrap();
+            let (mut steps, noticed) = (
+                0,
+                loop {
+                    match rx.recv_timeout(request_wait(true)) {
+                        Ok(Wake::Observe) => break Instant::now(),
+                        Ok(Wake::Request(_)) => panic!("no request was sent"),
+                        Err(mpsc::RecvTimeoutError::Timeout) => assert!(capture.poll().is_none()),
+                        Err(mpsc::RecvTimeoutError::Disconnected) => panic!("loop keeps a sender"),
+                    }
+                },
+            );
+            let lag = noticed.saturating_duration_since(written.recv().unwrap());
+            assert!(
+                lag < Duration::from_millis(15),
+                "woken {lag:?} after a {delay} ms reply"
+            );
+            let result = capture
+                .poll()
+                .expect("result is ready when the wake arrives")
+                .unwrap();
+            assert!(result["data_base64"] == picture["data_base64"]);
+            let timing = capture.timing.take().expect("broker capture is timed");
+            assert!(timing.wait_us >= delay * 1000 && timing.bytes > 1024 * 1024);
+            let event = timing.event(&json!(7), noticed);
+            assert!(event.get("id").is_none() && event["request"] == 7);
+            assert!(event
+                .as_object()
+                .unwrap()
+                .iter()
+                .all(|(key, value)| key == "event" || value.is_u64()));
+            // Nothing in flight any more: no second wake, and the idle wait runs its full length.
+            let idle = Instant::now();
+            while idle.elapsed() < Duration::from_millis(450) {
+                assert!(matches!(
+                    rx.recv_timeout(request_wait(false)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ));
+                steps += 1;
+            }
+            assert_eq!(steps, 3, "150 ms idle step");
+        }
+    }
+    #[test]
+    fn failed_broker_capture_wakes_the_loop_too_and_carries_no_timing() {
+        let mut oversized = screenshot_test_support::value();
+        oversized["byte_length"] = json!(vm_control::MAX_SCREENSHOT_BYTES + 1);
+        let (_dir, path, _written) = scripted_broker(Duration::from_millis(10), oversized);
+        let (wake, rx) = mpsc::sync_channel::<Wake>(16);
+        let mut capture = Capture::broker(&path, json!(8), wake).unwrap();
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)),
+            Ok(Wake::Observe)
+        ));
+        let error = capture.poll().unwrap().unwrap_err();
+        assert_eq!(error.to_string(), "invalid console screenshot metadata");
+        assert!(capture.timing.is_none());
+    }
+    #[test]
+    fn full_request_queue_does_not_block_the_capture_reader() {
+        let (_dir, path, written) =
+            scripted_broker(Duration::from_millis(5), screenshot_test_support::value());
+        let (wake, rx) = mpsc::sync_channel::<Wake>(1);
+        wake.send(Wake::Request(Ok(json!({"id":1,"method":"status"}))))
+            .unwrap();
+        let mut capture = Capture::broker(&path, json!(9), wake.clone()).unwrap();
+        written.recv().unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        let result = loop {
+            if let Some(result) = capture.poll() {
+                break result;
+            }
+            assert!(Instant::now() < until, "reader blocked on a full queue");
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert!(result.is_ok());
+        assert!(matches!(rx.try_recv(), Ok(Wake::Request(_))));
+        assert!(rx.try_recv().is_err());
+    }
+}
+#[cfg(test)]
+mod scaled_screenshot_tests {
+    use super::*;
+    use base64::Engine;
+    use std::os::unix::net::UnixListener;
+
+    const ASK: Scaled = Scaled {
+        max_width: 1280,
+        max_height: 720,
+        quality: 50,
+    };
+    /// What `Capture::broker_scaled` writes to the console broker for request number 7.
+    fn written(scaled: Option<Scaled>) -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (wake, _woken) = mpsc::sync_channel(1);
+        let capture = Capture::broker_scaled(&path, json!(7), wake, scaled).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        let mut line = Vec::new();
+        BufReader::new(peer).read_until(b'\n', &mut line).unwrap();
+        drop(capture);
+        line
+    }
+    /// SOI, one frame header, EOI: enough for the dimension check. Not a picture.
+    fn jpeg(width: u16, height: u16) -> Vec<u8> {
+        let mut out = vec![0xff, 0xd8, 0xff, 0xc0, 0, 17, 8];
+        out.extend_from_slice(&height.to_be_bytes());
+        out.extend_from_slice(&width.to_be_bytes());
+        out.extend_from_slice(&[3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1, 0xff, 0xd9]);
+        out
+    }
+    fn scaled_result(frame: (u16, u16)) -> Value {
+        let bytes = jpeg(frame.0, frame.1);
+        json!({"mime_type":"image/jpeg","byte_length":bytes.len(),
+            "data_base64":base64::engine::general_purpose::STANDARD.encode(&bytes),
+            "captured_monotonic_us":1234,"source_generation":2,"source_sequence":4,"width":2560,"height":1440,
+            "frame_width":1280,"frame_height":720,"scale_divisor":2,"frame_quality":50,"internal_scanout_id":9})
+    }
+    fn read(reply: Value, scaled: Option<Scaled>) -> Result<Value> {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        let body = serde_json::to_vec(&reply).unwrap();
+        let mut header = [0u8; 13];
+        header[..4].copy_from_slice(&(body.len() as u32).to_be_bytes());
+        header[4] = 1;
+        writer.write_all(&header).unwrap();
+        writer.write_all(&body).unwrap();
+        drop(writer);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        read_console_screenshot_scaled(&mut reader, "expected", deadline, Instant::now(), scaled)
+            .map(|(value, _)| value)
+    }
+
+    #[test]
+    fn broker_request_without_the_scaled_form_is_byte_for_byte_what_it_was() {
+        assert_eq!(
+            written(None),
+            b"{\"method\":\"screenshot\",\"request_id\":\"screenshot-7\"}\n"
+        );
+        assert_eq!(
+            written(Some(ASK)),
+            b"{\"format\":\"jpeg\",\"max_height\":720,\"max_width\":1280,\"method\":\"screenshot\",\"quality\":50,\"request_id\":\"screenshot-7\"}\n"
+        );
+    }
+    #[test]
+    fn scaled_reply_is_accepted_only_when_asked_for_and_only_when_it_agrees_with_itself() {
+        let good = json!({"request_id":"expected","result":scaled_result((1280, 720))});
+        let result = read(good.clone(), Some(ASK)).unwrap();
+        assert_eq!(result["mime_type"], "image/jpeg");
+        assert_eq!(
+            (&result["width"], &result["frame_width"]),
+            (&json!(2560), &json!(1280))
+        );
+        assert_eq!(result["frame_id"].as_str().unwrap().len(), 36);
+        assert!(result.get("internal_scanout_id").is_none());
+        // The same JPEG to a request that did not ask for it: refused exactly as any non-PNG always was.
+        assert_eq!(
+            read(good, None).unwrap_err().to_string(),
+            "invalid console screenshot metadata"
+        );
+        // Header dimensions that are not the declared frame, and a frame larger than the bound asked for.
+        let wrong = json!({"request_id":"expected","result":scaled_result((1280, 722))});
+        let error = format!("{:#}", read(wrong, Some(ASK)).unwrap_err());
+        assert!(
+            error.contains("invalid console scaled screenshot")
+                && error.contains("real dimensions"),
+            "{error}"
+        );
+        let small = Scaled {
+            max_width: 640,
+            ..ASK
+        };
+        let over = json!({"request_id":"expected","result":scaled_result((1280, 720))});
+        assert!(format!("{:#}", read(over, Some(small)).unwrap_err())
+            .contains("exceeds the requested size"));
+        // A PNG answer to the scaled form (a helper without it) is held to the PNG checks and forwarded.
+        let png = json!({"request_id":"expected","result":{"mime_type":"image/png","byte_length":3,"data_base64":"YWJj","captured_monotonic_us":1,"width":1280,"height":800}});
+        assert_eq!(read(png, Some(ASK)).unwrap()["mime_type"], "image/png");
+    }
+    #[test]
+    fn broker_refusal_word_travels_beside_the_unchanged_text() {
+        for refusal in Refusal::ALL {
+            let reply = json!({"request_id":"expected","error":"native operation failed: x","screenshot_refusal":refusal.name()});
+            let error = read(reply, Some(ASK)).unwrap_err();
+            assert_eq!(Refused::of(&error), Some(refusal));
+            assert_eq!(
+                error.to_string(),
+                "console operation failed: \"native operation failed: x\""
+            );
+            assert_eq!(
+                refusal_reply(&json!(7), &error),
+                json!({"id":7,"error":"console operation failed: \"native operation failed: x\"","screenshot_refusal":refusal.name()})
+            );
+        }
+        // No word, or anything but one of the fixed words: an ordinary error with the same text and one field.
+        for reply in [
+            json!({"request_id":"expected","error":"native operation failed: x"}),
+            json!({"request_id":"expected","error":"native operation failed: x","screenshot_refusal":"GUEST_TEXT"}),
+        ] {
+            let error = read(reply, Some(ASK)).unwrap_err();
+            assert_eq!(Refused::of(&error), None);
+            assert_eq!(
+                refusal_reply(&json!(7), &error),
+                json!({"id":7,"error":"console operation failed: \"native operation failed: x\""})
+            );
         }
     }
 }

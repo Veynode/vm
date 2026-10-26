@@ -163,6 +163,8 @@ With production `--console SOCKET` plus `--auth-state DIR --auth-namespace NAME 
 
 No command, clipboard or MCP protocol is exposed by this proprietary channel. The separate explicitly enabled `--allow-files` path requires strict Guest binding and a `files` grant; it grants no input authority. See [actual file-channel evidence](../../archive/docs-evidence/browser-files-live/README.md). HTTP signaling remains loopback-only. Limits apply to application messages and RTC queues separately; this is not a claim of Internet or total-memory acceptance. Freeze a single binary for Keychain-backed pairing administration and serving; executable identity changes are a separate upgrade/signing gate.
 
+Control replies have three forms. `{"sequence","result"}` is success. `{"sequence","error":"control rejected"}` is a refusal that fences the session's control; the service prints `control channel failure category=<word>`, where the word is a fixed sub-reason (for example `request_replay`, `input_authorization`, `vm_status_mismatch`, `frame_anchor`, `controller_unavailable`, `controller_reply_invalid`, `screenshot_reply_too_large`, `screenshot_reply_invalid`, `png_decode_corrupt`, `frame_verification`) and `dispatch_rejected` only for what has no word yet. `{"sequence","error":"frame unavailable","reason":<word>}` answers `observe_frame` alone and fences nothing: the request was authentic and in sequence, but the controller had no usable picture (`controller_refused`, `controller_deadline`, `png_decode_unsupported`, `scaled_frame_over_cap`). The session and the video stay as they were; the service prints `control frame unavailable reason=<word>`. No log line or reply carries controller or Guest error text. Tested offline only (2026-10-12); the browser page does not accept the third form yet.
+
 ### Guest capture cleanup reconciliation
 
 With strict Guest observation binding and a receipt-v1 encoder/service, a failed
@@ -403,3 +405,32 @@ wire bytes/counts, dedup/suppression/failure counts and actual unbind/close
 state, tied only to the independent Peer `fence_id`. Main requires the actual
 close callback and empty resources for confirmed cleanup. See
 [component boundaries and tests](../../archive/docs-evidence/media-nack-budget-component-v1/README.md).
+
+## Status codes (offer admission)
+
+These are the interface contract for the two offer routes. Owner decision 0021 kept both
+behaviours as they are. A change to any row is a public contract change and must be decided on
+purpose.
+
+| Condition | `POST /offer` (loopback, unauthenticated, only when auth is unset) | `POST /auth/offer` (signed) |
+|---|---|---|
+| Codec is not `h264` or `h265` | **400** `invalid offer` (`main.rs` `offer_inner`, the codec test at ~396, reached when auth is unset, ~381-383) | **403** `{"error":"authorization rejected"}` (session-auth `OfferIntent::canonical`, `lib.rs` ~329-332, refused before admission) |
+| Hardware encoder for the requested codec unavailable, absent from the capability table, or its entry malformed | **409** `required hardware encoder unavailable` | **409** `required hardware encoder unavailable` (same shared admission path, after signature admission) |
+
+- The 400 versus 403 split is deliberate: the signed route's 403 is part of its authenticated
+  contract and does not say why a signed offer was refused, while the unauthenticated route
+  names a malformed offer. The 400 also covers a bad request ID, a type other than `offer` and an
+  SDP over 200000 bytes. When authentication is configured, `POST /offer` returns **403**
+  `signed offer required` for every body.
+- The three capability cases (encoder **unavailable**, codec **missing** from the capability
+  table, entry **malformed** or any value other than the exact string `verified-hardware`) all
+  return the same 409 and the same body. **They cannot be told apart by status code or body.**
+  The 409 fails closed: no session slot, peer or encoder exists after it. Other 409 responses on
+  this route (`request already cancelled`, `previous session cleanup unconfirmed`, `one
+  diagnostic session already active`) have different bodies and are separate conditions.
+- Do not build client logic that branches on telling "codec unsupported by this host" from
+  "capability entry malformed". Read `GET /capabilities` for the advertised state instead.
+- The 180 s media cap on a connected session is the named constant
+  `ice_config::MEDIA_SESSION_CAP_SECONDS`, consumed by `run_session` through
+  `ice_config::media_session_cap_elapsed`; `src/remote_bounds_tests.rs` fails on any drift of the
+  value or its wiring.

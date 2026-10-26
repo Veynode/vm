@@ -49,7 +49,7 @@ const BOOT_TIMEOUT: Duration = Duration::from_secs(300);
 const LOG: &str = ".veynodevm/main.log";
 const EXIT: &str = ".veynodevm/exit";
 
-fn clone_file(source: &Path, target: &Path) -> Result<()> {
+pub(crate) fn clone_file(source: &Path, target: &Path) -> Result<()> {
     let s = CString::new(source.as_os_str().as_encoded_bytes())?;
     let t = CString::new(target.as_os_str().as_encoded_bytes())?;
     if unsafe { libc::clonefile(s.as_ptr(), t.as_ptr(), 0) } != 0 {
@@ -62,7 +62,7 @@ fn clone_file(source: &Path, target: &Path) -> Result<()> {
 }
 
 /// Random locally administered unicast MAC.
-fn random_mac() -> String {
+pub(crate) fn random_mac() -> String {
     let hex = random_hex(6);
     let first = u8::from_str_radix(&hex[..2], 16).unwrap() & 0xfc | 0x02;
     let rest: Vec<&str> = (1..6).map(|i| &hex[2 * i..2 * i + 2]).collect();
@@ -696,6 +696,7 @@ pub fn create_and_start(
             os: "darwin".into(),
             mac_address: Some(mac),
             session_port: None,
+            fork_of: None,
             init: None,
             tty: false,
             stdin: false,

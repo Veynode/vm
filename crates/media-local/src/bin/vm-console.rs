@@ -19,6 +19,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use vm_control::screenshot_scaled::{Refusal, Refused, Scaled};
 use vm_media_local::console_read::PollReader;
 use vm_media_local::console_wire::{read_record, Record};
 use vm_media_local::console_write::write_record_deadline;
@@ -75,16 +76,23 @@ impl Output {
         }
     }
 }
-fn native_write(input: &mut ChildStdin, value: &Value) -> Result<()> {
-    use std::os::fd::AsRawFd;
+fn native_write(
+    input: &mut (impl Write + std::os::fd::AsRawFd),
+    value: &Value,
+    budget: Option<&ScreenshotBudget<'_>>,
+) -> Result<()> {
     let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');
     if bytes.len() > 1024 {
         bail!("native command exceeds bound")
     }
     let until = Instant::now() + Duration::from_millis(500);
+    let until = budget.map_or(until, |budget| until.min(budget.deadline));
     let mut offset = 0;
     while offset < bytes.len() {
+        if let Some(budget) = budget {
+            budget.check_write(offset)?;
+        }
         match input.write(&bytes[offset..]) {
             Ok(0) => bail!("native pipe closed"),
             Ok(n) => offset += n,
@@ -94,6 +102,9 @@ fn native_write(input: &mut ChildStdin, value: &Value) -> Result<()> {
                     bail!("broker interrupted during capability probe")
                 }
                 if Instant::now() >= until {
+                    if let Some(budget) = budget {
+                        budget.check_write(offset)?;
+                    }
                     bail!("native pipe write deadline")
                 }
                 let mut fd = libc::pollfd {
@@ -206,7 +217,25 @@ fn receive_native(receive: &Native, pipe: &mut impl Read) -> Result<()> {
 }
 
 impl Native {
-    fn call(&self, mut command: Value) -> Result<Value> {
+    fn call(&self, command: Value) -> Result<Value> {
+        self.call_with_budget(command, None)
+    }
+    fn call_with_budget(
+        &self,
+        command: Value,
+        budget: Option<&ScreenshotBudget<'_>>,
+    ) -> Result<Value> {
+        self.call_with_writer(command, budget, native_write)
+    }
+    fn call_with_writer(
+        &self,
+        mut command: Value,
+        budget: Option<&ScreenshotBudget<'_>>,
+        write: impl FnOnce(&mut ChildStdin, &Value, Option<&ScreenshotBudget<'_>>) -> Result<()>,
+    ) -> Result<Value> {
+        if let Some(budget) = budget {
+            budget.check()?;
+        }
         if !self.alive.load(Ordering::Acquire) {
             bail!("capture process unavailable")
         }
@@ -230,16 +259,33 @@ impl Native {
             };
             pending.insert(id.clone(), (epoch, tx));
         }
-        let send = {
-            let mut input = self.input.lock().unwrap();
-            native_write(&mut input, &command)
-        };
+        let send = (|| {
+            let mut input = if let Some(budget) = budget {
+                loop {
+                    budget.check().map_err(ScreenshotNotSent)?;
+                    match self.input.try_lock() {
+                        Ok(input) => break input,
+                        Err(std::sync::TryLockError::WouldBlock) => {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(std::sync::TryLockError::Poisoned(_)) => {
+                            bail!("native input lock poisoned")
+                        }
+                    }
+                }
+            } else {
+                self.input.lock().unwrap()
+            };
+            write(&mut input, &command, budget)
+        })();
         if let Err(error) = send {
             self.pending.lock().unwrap().remove(&id);
-            self.alive.store(false, Ordering::Release);
+            if !error.is::<ScreenshotNotSent>() {
+                self.alive.store(false, Ordering::Release);
+            }
             return Err(error);
         }
-        let reply = rx.recv_timeout(Duration::from_secs(if command["method"] == "shutdown" {
+        let timeout = Duration::from_secs(if command["method"] == "shutdown" {
             1
         } else if [
             "show_window",
@@ -254,10 +300,30 @@ impl Native {
             2
         } else {
             12
-        }));
+        });
+        let until = Instant::now() + timeout;
+        let until = budget.map_or(until, |budget| until.min(budget.deadline));
+        let reply = loop {
+            if let Some(budget) = budget {
+                if client_disconnected(budget.client) {
+                    self.pending.lock().unwrap().remove(&id);
+                    bail!("screenshot client disconnected")
+                }
+            }
+            let remaining = until.saturating_duration_since(Instant::now());
+            let wait = if budget.is_some() {
+                remaining.min(SCREENSHOT_CANCEL_POLL)
+            } else {
+                remaining
+            };
+            match rx.recv_timeout(wait) {
+                Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < until => continue,
+                reply => break reply,
+            }
+        };
         self.pending.lock().unwrap().remove(&id);
         match reply {
-            Ok(value) => {
+            Ok(mut value) => {
                 if let Some(error) = value.get("error") {
                     if let Some(stage) = helper_display_rejection(&command["method"], error) {
                         return Err(stage.into());
@@ -273,10 +339,24 @@ impl Native {
                             )
                         )
                     }
+                    if command["method"] == "screenshot" && error["code"] == "screenshot_busy" {
+                        return Err(HelperBusy(error.to_string()).into());
+                    }
+                    // A request of the scaled form: the helper's refusal keeps its fixed word beside the text.
+                    if command["method"] == "screenshot" && command.get("format").is_some() {
+                        if let Some(refusal) = Refusal::from_helper(error) {
+                            return Err(Refused::new(
+                                refusal,
+                                format!("native operation failed: {error}"),
+                            )
+                            .into());
+                        }
+                    }
                     bail!("native operation failed: {error}")
                 }
-                match value.get("result").filter(|result| result.is_object()) {
-                    Some(result) => Ok(result.clone()),
+                // Moved out, not copied: a screenshot result is several MiB.
+                match value.get_mut("result").filter(|result| result.is_object()) {
+                    Some(result) => Ok(result.take()),
                     None => {
                         self.alive.store(false, Ordering::Release);
                         bail!("malformed native acknowledgement; capture owner fenced")
@@ -450,6 +530,12 @@ struct Request {
     epoch: Option<u64>,
     sequence: Option<u64>,
     target_bps: Option<u64>,
+    // The scaled-JPEG screenshot form. Only named here so that the request is not refused as unknown; the values
+    // are read from the request line by `Scaled::parse`, which refuses a partial or out-of-range set.
+    format: Option<Value>,
+    max_width: Option<Value>,
+    max_height: Option<Value>,
+    quality: Option<Value>,
 }
 fn helper_display_rejection(
     method: &Value,
@@ -466,9 +552,183 @@ fn rejection_reply(request_id: &str, error: &anyhow::Error) -> Value {
     if let Some(stage) = error.downcast_ref::<vm_control::native_input::RejectionStage>() {
         reply["display_rejection"] = json!(stage);
     }
+    Refused::mark(&mut reply, error);
     reply
 }
 
+/// The helper refused a screenshot as busy. Same text as any other native failure.
+#[derive(Debug)]
+struct HelperBusy(String);
+impl std::fmt::Display for HelperBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "native operation failed: {}", self.0)
+    }
+}
+impl std::error::Error for HelperBusy {}
+/// The helper keeps its previous screenshot job until its 10 ms owner tick has seen that reply written, and refuses
+/// the next request as busy until then. Screenshots are serialized by `Native::snapshot`, so that window is the
+/// only busy it can report here: a request that follows a reply at once waits it out, at most this often.
+const HELPER_BUSY_RETRIES: usize = 4;
+const HELPER_BUSY_STEP: Duration = Duration::from_millis(4);
+// Capture::broker_scaled in vm-qemu uses 15 seconds after writing the request.
+// The wire request carries no deadline, so start the same budget when it is received.
+const SCREENSHOT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const HELPER_BUSY_MIN_ATTEMPT: Duration = Duration::from_millis(1);
+const SCREENSHOT_CANCEL_POLL: Duration = Duration::from_millis(10);
+
+#[derive(Debug, PartialEq, Eq)]
+enum ScreenshotInterrupted {
+    Cancelled,
+    Deadline,
+}
+impl std::fmt::Display for ScreenshotInterrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Cancelled => "screenshot client disconnected",
+            Self::Deadline => "screenshot request deadline exceeded",
+        })
+    }
+}
+impl std::error::Error for ScreenshotInterrupted {}
+
+// A send failure may leave the helper unfenced only if no command byte was written.
+#[derive(Debug)]
+struct ScreenshotNotSent(ScreenshotInterrupted);
+impl std::fmt::Display for ScreenshotNotSent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for ScreenshotNotSent {}
+
+struct ScreenshotBudget<'a> {
+    deadline: Instant,
+    client: &'a UnixStream,
+}
+impl ScreenshotBudget<'_> {
+    fn check_write(&self, written: usize) -> Result<()> {
+        self.check().map_err(|error| {
+            if written == 0 {
+                ScreenshotNotSent(error).into()
+            } else {
+                error.into()
+            }
+        })
+    }
+    fn check(&self) -> std::result::Result<(), ScreenshotInterrupted> {
+        if client_disconnected(self.client) {
+            return Err(ScreenshotInterrupted::Cancelled);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(ScreenshotInterrupted::Deadline);
+        }
+        Ok(())
+    }
+}
+// The connection reader is synchronous, so peek without consuming a pipelined request.
+// Capture::drop shuts down both socket directions when the worker abandons its request.
+fn client_disconnected(client: &UnixStream) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut fd = libc::pollfd {
+        fd: client.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    if unsafe { libc::poll(&mut fd, 1, 0) } > 0
+        && fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+    {
+        return true;
+    }
+    let mut byte = 0u8;
+    let result = unsafe {
+        libc::recv(
+            client.as_raw_fd(),
+            (&mut byte as *mut u8).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    result == 0
+        || (result < 0
+            && !matches!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ))
+}
+fn screenshot_retry(
+    snapshot: &Mutex<()>,
+    deadline: Instant,
+    mut call: impl FnMut(Instant) -> Result<Value>,
+    now: impl Fn() -> Instant,
+    mut sleep: impl FnMut(Duration),
+    disconnected: impl Fn() -> bool,
+) -> Result<Value> {
+    let _guard = snapshot
+        .try_lock()
+        .map_err(|_| anyhow!("screenshot busy"))?;
+    if disconnected() {
+        return Err(ScreenshotInterrupted::Cancelled.into());
+    }
+    if now() >= deadline {
+        return Err(ScreenshotInterrupted::Deadline.into());
+    }
+    let mut result = call(deadline);
+    for _ in 0..HELPER_BUSY_RETRIES {
+        if !matches!(&result, Err(error) if error.is::<HelperBusy>())
+            || disconnected()
+            || deadline.saturating_duration_since(now())
+                < HELPER_BUSY_STEP + HELPER_BUSY_MIN_ATTEMPT
+        {
+            break;
+        }
+        sleep(HELPER_BUSY_STEP);
+        // Sleep may overshoot, and the worker may have cancelled during it.
+        if disconnected() || deadline.saturating_duration_since(now()) < HELPER_BUSY_MIN_ATTEMPT {
+            break;
+        }
+        result = call(deadline);
+    }
+    result
+}
+/// `scaled` adds the four fields of the scaled-JPEG form to the helper command; `None` sends the command as before.
+/// A JPEG answer to the scaled form is checked against the request and against itself before it is forwarded. A
+/// PNG answer comes from a helper without that form and is forwarded as any PNG is; the caller reads `mime_type`.
+fn screenshot(
+    native: &Native,
+    scaled: Option<Scaled>,
+    budget: ScreenshotBudget<'_>,
+) -> Result<Value> {
+    let mut command = json!({"method":"screenshot"});
+    if let Some(scaled) = &scaled {
+        scaled.apply(&mut command);
+    }
+    screenshot_retry(
+        &native.snapshot,
+        budget.deadline,
+        |_| {
+            let value = native.call_with_budget(command.clone(), Some(&budget))?;
+            if let Some(scaled) = &scaled {
+                if value["mime_type"] != "image/png" {
+                    scaled
+                        .verify(&value)
+                        .context("native scaled screenshot invalid")?;
+                }
+            }
+            Ok(value)
+        },
+        Instant::now,
+        thread::sleep,
+        || client_disconnected(budget.client),
+    )
+}
+fn encoder_owner(native: &Native, client: u64) -> bool {
+    native
+        .owner
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|owner| owner.client == client)
+}
 fn connection(stream: UnixStream, native: Arc<Native>, client: u64) -> Result<()> {
     stream.set_nonblocking(true)?;
     let shared = Arc::new(stream.try_clone()?);
@@ -499,6 +759,7 @@ fn connection(stream: UnixStream, native: Arc<Native>, client: u64) -> Result<()
             if n > 4096 || line.last() != Some(&b'\n') {
                 bail!("invalid request frame")
             }
+            let received = Instant::now();
             let request: Request = serde_json::from_slice(&line)?;
             if request.request_id.is_empty() || request.request_id.len() > 64 {
                 bail!("invalid request identity")
@@ -520,6 +781,14 @@ fn connection(stream: UnixStream, native: Arc<Native>, client: u64) -> Result<()
                 || request.target_bps.is_some())
             {
                 bail!("unexpected rate fields")
+            }
+            if request.method != "screenshot"
+                && (request.format.is_some()
+                    || request.max_width.is_some()
+                    || request.max_height.is_some()
+                    || request.quality.is_some())
+            {
+                bail!("unexpected screenshot fields")
             }
             if request.diagnostic_id.is_some() && request.method != "validate_displayed_frame" {
                 bail!("unexpected native diagnostic identity")
@@ -593,10 +862,19 @@ fn connection(stream: UnixStream, native: Arc<Native>, client: u64) -> Result<()
                     native.call(command)
                 }
                 "frame_status" => native.call(json!({"method":"frame_status"})),
-                "screenshot" => match native.snapshot.try_lock() {
-                    Ok(_guard) => native.call(json!({"method":"screenshot"})),
-                    Err(_) => Err(anyhow!("screenshot busy")),
-                },
+                "screenshot" => {
+                    let budget = ScreenshotBudget {
+                        deadline: received + SCREENSHOT_REQUEST_TIMEOUT,
+                        client: &shared,
+                    };
+                    let result = Scaled::parse(&serde_json::from_slice::<Value>(&line)?)
+                        .and_then(|scaled| screenshot(&native, scaled, budget));
+                    // Not on an encoder owner's connection: its access units keep the default buffer.
+                    if result.is_ok() && !encoder_owner(&native, client) {
+                        vm_control::widen_send_buffer(&shared);
+                    }
+                    result
+                }
                 _ => Err(anyhow!("unsupported console operation")),
             };
             let started = request.method == "start" && result.is_ok();
@@ -662,6 +940,8 @@ fn probe(path: &Path) -> Result<Value> {
     value["broker_window_protocol"] = json!(1);
     value["broker_native_input_protocol"] = json!(1);
     value["encoder_fps_request_supported"] = json!(false);
+    // This broker forwards and checks the scaled-JPEG screenshot form; whether the helper has it shows in its reply.
+    value["broker_screenshot_scaled_protocol"] = json!(1);
     Ok(value)
 }
 
@@ -682,6 +962,7 @@ fn run() -> Result<()> {
         capabilities["broker_window_protocol"] = json!(1);
         capabilities["broker_native_input_protocol"] = json!(1);
         capabilities["encoder_fps_request_supported"] = json!(false);
+        capabilities["broker_screenshot_scaled_protocol"] = json!(1);
         println!("{capabilities}");
         return Ok(());
     }
@@ -1193,5 +1474,959 @@ mod frame_diagnostic_id_tests {
             )
             .is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod screenshot_forward_tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+    fn send_buffer(socket: &UnixStream) -> usize {
+        let mut size: libc::c_int = 0;
+        let mut length = std::mem::size_of_val(&size) as libc::socklen_t;
+        assert_eq!(
+            unsafe {
+                libc::getsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&mut size as *mut libc::c_int).cast(),
+                    &mut length,
+                )
+            },
+            0
+        );
+        size as usize
+    }
+    /// A broker around `/bin/cat` as the command pipe; `helper` is called with each forwarded command and the record
+    /// pipe until it returns false.
+    fn exchange(
+        owner: bool,
+        helper: impl FnMut(Value, &mut UnixStream) -> bool + Send + 'static,
+    ) -> (Record, usize) {
+        exchange_request(
+            owner,
+            b"{\"request_id\":\"screenshot-7\",\"method\":\"screenshot\"}\n",
+            true,
+            helper,
+        )
+    }
+    /// `exchange` with the client's request line given. `reaches_helper` is false for a request the broker must
+    /// answer by itself: the helper is then never called, and the command pipe is closed to end its reader.
+    fn exchange_request(
+        owner: bool,
+        request: &[u8],
+        reaches_helper: bool,
+        mut helper: impl FnMut(Value, &mut UnixStream) -> bool + Send + 'static,
+    ) -> (Record, usize) {
+        let mut child = OwnedChild(
+            Command::new("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let stdout = child.0.stdout.take().unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let widened = server.try_clone().unwrap();
+        let native = Arc::new(Native {
+            input: Mutex::new(child.0.stdin.take().unwrap()),
+            pending: Mutex::new(BTreeMap::new()),
+            next: AtomicU64::new(1),
+            alive: AtomicBool::new(true),
+            ready: (Mutex::new(true), Condvar::new()),
+            owner: Mutex::new(owner.then(|| Owner {
+                client: 1,
+                epoch: 0,
+                output: Output {
+                    tx: mpsc::sync_channel(1).0,
+                    socket: Arc::new(server.try_clone().unwrap()),
+                },
+                acknowledged: true,
+                native_ended: true,
+                early: Vec::new(),
+            })),
+            next_epoch: AtomicU64::new(1),
+            snapshot: Mutex::new(()),
+            capabilities: json!({}),
+        });
+        let sink = native.clone();
+        let (mut record_write, mut record_read) = UnixStream::pair().unwrap();
+        let receiver = thread::spawn(move || receive_native(&sink, &mut record_read));
+        // Helper EOF shuts an encoder owner's socket; keep the pipe open until the reply has been read.
+        let (read, hold) = mpsc::channel::<()>();
+        let helper = thread::spawn(move || {
+            let mut commands = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                if commands.read_line(&mut line).unwrap() == 0 {
+                    assert!(!reaches_helper, "command pipe closed before a command");
+                    return;
+                }
+                assert!(
+                    reaches_helper,
+                    "the broker forwarded a request it had to refuse: {line}"
+                );
+                if !helper(serde_json::from_str(&line).unwrap(), &mut record_write) {
+                    break;
+                }
+            }
+            let _ = hold.recv();
+        });
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let broker = thread::spawn(move || connection(server, native, 1));
+        client.write_all(request).unwrap();
+        let reply = read_record(&mut client).unwrap();
+        let buffer = send_buffer(&widened);
+        drop(read);
+        if !reaches_helper {
+            // Nothing was written to the command pipe; ending `cat` ends the helper's read.
+            let _ = child.0.kill();
+        }
+        helper.join().unwrap();
+        assert!(receiver.join().unwrap().is_err()); // helper EOF or refused record
+        drop(client);
+        broker.join().unwrap().unwrap();
+        (reply, buffer)
+    }
+    fn picture(bytes: usize) -> Value {
+        // No slash, quote or control byte: the serialized form of the string is the string itself.
+        json!({"byte_length":bytes,"captured_monotonic_us":2,"data_base64":"iVBORw0KGgo+".repeat(bytes.div_ceil(9)),"height":1440,"mime_type":"image/png","width":2560})
+    }
+    #[test]
+    fn screenshot_result_is_forwarded_byte_for_byte_in_the_same_record_format() {
+        for (bytes, owner) in [(21 * 1024, false), (2_900_000, false), (2_900_000, true)] {
+            let sent = picture(bytes);
+            let answer = sent.clone();
+            let (reply, buffer) = exchange(owner, move |command, records| {
+                assert_eq!(command["method"], "screenshot");
+                vm_media_local::console_wire::write_record(
+                    records,
+                    &Record::json(0, &json!({"id":command["id"],"result":answer})),
+                )
+                .unwrap();
+                false
+            });
+            assert_eq!((reply.kind, reply.epoch), (1, 0));
+            let expected =
+                serde_json::to_vec(&json!({"request_id":"screenshot-7","result":sent})).unwrap();
+            assert!(
+                reply.body == expected,
+                "forwarded record differs at {bytes} bytes"
+            );
+            // Only a connection that is not the encoder owner's gets the larger kernel buffer.
+            assert_eq!(buffer >= vm_control::LARGE_REPLY_SEND_BUFFER, !owner);
+        }
+    }
+    #[test]
+    fn helper_record_over_the_response_bound_is_still_refused_and_fences_capture() {
+        let (reply, buffer) = exchange(false, |_, records| {
+            let mut header = [0u8; 13];
+            let over = vm_media_local::console_wire::MAX_JSON_BODY as u32 + 1;
+            header[..4].copy_from_slice(&over.to_be_bytes());
+            header[4] = 1;
+            records.write_all(&header).unwrap();
+            let _ = records.write_all(&[b' '; 65536]);
+            false
+        });
+        assert_eq!(
+            reply.value().unwrap(),
+            json!({"request_id":"screenshot-7","error":"native operation failed: \"capture process unavailable\""})
+        );
+        assert!(buffer < vm_control::LARGE_REPLY_SEND_BUFFER);
+    }
+    fn busy(command: &Value, records: &mut UnixStream) {
+        assert_eq!(command["method"], "screenshot");
+        vm_media_local::console_wire::write_record(
+            records,
+            &Record::json(0, &json!({"id":command["id"],"error":{"code":"screenshot_busy","message":"screenshot_busy"}})),
+        )
+        .unwrap();
+    }
+    #[test]
+    fn helper_busy_after_its_previous_reply_is_waited_out_within_a_bound() {
+        let (sent, mut refusals, started) = (picture(21 * 1024), 2, Instant::now());
+        let answer = sent.clone();
+        let (reply, _) = exchange(false, move |command, records| {
+            if refusals > 0 {
+                refusals -= 1;
+                busy(&command, records);
+                return true;
+            }
+            vm_media_local::console_wire::write_record(
+                records,
+                &Record::json(0, &json!({"id":command["id"],"result":answer})),
+            )
+            .unwrap();
+            false
+        });
+        assert_eq!(
+            reply.value().unwrap(),
+            json!({"request_id":"screenshot-7","result":sent})
+        );
+        assert!(started.elapsed() >= 2 * HELPER_BUSY_STEP);
+        // A helper that stays busy is reported as before, after one request and the bounded retries.
+        let mut commands = 0;
+        let (reply, _) = exchange(false, move |command, records| {
+            commands += 1;
+            busy(&command, records);
+            commands <= HELPER_BUSY_RETRIES
+        });
+        assert_eq!(
+            reply.value().unwrap(),
+            json!({"request_id":"screenshot-7","error":"native operation failed: {\"code\":\"screenshot_busy\",\"message\":\"screenshot_busy\"}"})
+        );
+        assert!(HELPER_BUSY_RETRIES as u32 * HELPER_BUSY_STEP < Duration::from_millis(20));
+    }
+
+    /// SOI, one frame header, padding, EOI: what the dimension check reads. Not a picture.
+    fn jpeg(width: u16, height: u16, total: usize) -> Vec<u8> {
+        let mut out = vec![0xff, 0xd8, 0xff, 0xc0, 0, 17, 8];
+        out.extend_from_slice(&height.to_be_bytes());
+        out.extend_from_slice(&width.to_be_bytes());
+        out.extend_from_slice(&[3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]);
+        let mut left = total - out.len() - 2;
+        while left > 0 {
+            let mut take = (left - 4).min(60000);
+            if (1..4).contains(&(left - take - 4)) {
+                take -= 4;
+            }
+            out.extend_from_slice(&[0xff, 0xfe]);
+            out.extend_from_slice(&((take + 2) as u16).to_be_bytes());
+            out.extend_from_slice(&vec![b'x'; take]);
+            left -= take + 4;
+        }
+        out.extend_from_slice(&[0xff, 0xd9]);
+        assert_eq!(out.len(), total);
+        out
+    }
+    /// The helper's reply to `{format:jpeg,max_width:1280,max_height:720,quality:50}` for a 2560x1440 source.
+    fn scaled_picture(frame: (u16, u16), bytes: usize) -> Value {
+        use base64::Engine;
+        let jpeg = jpeg(frame.0, frame.1, bytes);
+        json!({"byte_length":jpeg.len(),"captured_monotonic_us":2,
+            "data_base64":base64::engine::general_purpose::STANDARD.encode(&jpeg),
+            "frame_height":720,"frame_quality":50,"frame_width":1280,"height":1440,"mime_type":"image/jpeg",
+            "scale_divisor":2,"width":2560})
+    }
+    const SCALED_REQUEST: &[u8] = b"{\"request_id\":\"screenshot-7\",\"method\":\"screenshot\",\"format\":\"jpeg\",\"max_width\":1280,\"max_height\":720,\"quality\":50}\n";
+    fn answer(records: &mut UnixStream, command: &Value, reply: Value) {
+        let mut reply = reply;
+        reply["id"] = command["id"].clone();
+        vm_media_local::console_wire::write_record(records, &Record::json(0, &reply)).unwrap();
+    }
+
+    #[test]
+    fn helper_command_without_the_scaled_form_is_exactly_what_it_was() {
+        let sent = picture(21 * 1024);
+        let answer_with = sent.clone();
+        let (reply, _) = exchange(false, move |command, records| {
+            // Two fields: the method and the broker's own request number. The serializer is deterministic, so the
+            // same value is the same bytes on the command pipe.
+            assert_eq!(command, json!({"id":"c1","method":"screenshot"}));
+            answer(records, &command, json!({"result":answer_with}));
+            false
+        });
+        assert_eq!(
+            reply.value().unwrap(),
+            json!({"request_id":"screenshot-7","result":sent})
+        );
+    }
+    #[test]
+    fn scaled_form_is_forwarded_with_its_four_fields_and_the_jpeg_comes_back_byte_for_byte() {
+        for bytes in [4096, vm_control::screenshot_scaled::MAX_BYTES] {
+            let sent = scaled_picture((1280, 720), bytes);
+            let answer_with = sent.clone();
+            let (reply, buffer) = exchange_request(
+                false,
+                SCALED_REQUEST,
+                true,
+                move |command, records| {
+                    // The helper demands exactly these six fields.
+                    assert_eq!(
+                        command,
+                        json!({"id":"c1","method":"screenshot","format":"jpeg","max_width":1280,"max_height":720,"quality":50})
+                    );
+                    answer(records, &command, json!({"result":answer_with}));
+                    false
+                },
+            );
+            let expected =
+                serde_json::to_vec(&json!({"request_id":"screenshot-7","result":sent})).unwrap();
+            assert!(
+                reply.body == expected,
+                "forwarded scaled record differs at {bytes} bytes"
+            );
+            assert!(buffer >= vm_control::LARGE_REPLY_SEND_BUFFER);
+        }
+        // A helper without the form ignores the fields and answers with its PNG: forwarded as any PNG.
+        let sent = picture(2_900_000);
+        let answer_with = sent.clone();
+        let (reply, _) = exchange_request(false, SCALED_REQUEST, true, move |command, records| {
+            answer(records, &command, json!({"result":answer_with}));
+            false
+        });
+        let expected =
+            serde_json::to_vec(&json!({"request_id":"screenshot-7","result":sent})).unwrap();
+        assert!(
+            reply.body == expected,
+            "PNG answer to the scaled form was changed"
+        );
+    }
+    #[test]
+    fn scaled_reply_that_disagrees_with_the_request_or_itself_is_not_forwarded() {
+        let over = vm_control::screenshot_scaled::MAX_BYTES + 1;
+        let cases: Vec<(&str, Value)> = vec![
+            ("real dimensions", scaled_picture((1280, 722), 4096)),
+            ("exceeds the frame bound", scaled_picture((1280, 720), over)),
+            ("scale disagrees", {
+                let mut value = scaled_picture((1280, 720), 4096);
+                value["scale_divisor"] = json!(4);
+                value
+            }),
+            ("exceeds the requested size", {
+                let mut value = scaled_picture((2560, 1440), 4096);
+                value["scale_divisor"] = json!(1);
+                value["frame_width"] = json!(2560);
+                value["frame_height"] = json!(1440);
+                value
+            }),
+            ("quality is not the requested one", {
+                let mut value = scaled_picture((1280, 720), 4096);
+                value["frame_quality"] = json!(80);
+                value
+            }),
+            ("size mismatch", {
+                let mut value = scaled_picture((1280, 720), 4096);
+                value["byte_length"] = json!(4095);
+                value
+            }),
+            ("not a JPEG", {
+                let mut value = scaled_picture((1280, 720), 4096);
+                value["mime_type"] = json!("image/webp");
+                value
+            }),
+        ];
+        for (expected, sent) in cases {
+            let (reply, _) =
+                exchange_request(false, SCALED_REQUEST, true, move |command, records| {
+                    answer(records, &command, json!({"result":sent}));
+                    false
+                });
+            let reply = reply.value().unwrap();
+            let error = reply["error"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{expected}: forwarded"));
+            assert!(
+                error.starts_with("native scaled screenshot invalid"),
+                "{expected}: {error}"
+            );
+            assert_eq!(
+                reply.as_object().unwrap().len(),
+                2,
+                "{expected}: request_id and error only"
+            );
+        }
+    }
+    #[test]
+    fn helper_refusals_of_the_scaled_form_keep_a_fixed_word_and_other_failures_do_not() {
+        let size_limit = json!({"code":"screenshot_unavailable_or_too_large","message":"screenshot_unavailable_or_too_large","diagnostic":{"version":1,"stage":"encoded_size_limit","encoded_bytes":null,"maximum_encoded_bytes":716800}});
+        let code = |code: &str| json!({"code":code,"message":code});
+        for (error, word) in [
+            (size_limit.clone(), Some("encoded_size_limit")),
+            (code("invalid_screenshot_request"), Some("invalid_request")),
+            (
+                code("screenshot_format_unavailable"),
+                Some("format_unavailable"),
+            ),
+            (
+                code("screenshot_scale_unavailable"),
+                Some("scale_unavailable"),
+            ),
+            (code("frame_unavailable"), None),
+            (
+                json!({"code":"screenshot_unavailable_or_too_large","message":"x","diagnostic":{"version":1,"stage":"jpeg_finalize_failed"}}),
+                None,
+            ),
+        ] {
+            let sent = error.clone();
+            let (reply, _) =
+                exchange_request(false, SCALED_REQUEST, true, move |command, records| {
+                    answer(records, &command, json!({"error":sent}));
+                    false
+                });
+            let mut expected = json!({"request_id":"screenshot-7","error":format!("native operation failed: {error}")});
+            if let Some(word) = word {
+                expected["screenshot_refusal"] = json!(word);
+            }
+            assert_eq!(reply.value().unwrap(), expected);
+        }
+        // The same helper error to a request without the form: the reply it always was, one error field.
+        let sent = size_limit.clone();
+        let (reply, _) = exchange(false, move |command, records| {
+            answer(records, &command, json!({"error":sent}));
+            false
+        });
+        assert_eq!(
+            reply.value().unwrap(),
+            json!({"request_id":"screenshot-7","error":format!("native operation failed: {size_limit}")})
+        );
+    }
+    #[test]
+    fn partial_or_out_of_range_scaled_request_is_refused_by_the_broker_and_never_reaches_the_helper(
+    ) {
+        for fields in [
+            r#""format":"jpeg""#,
+            r#""max_width":1280"#,
+            r#""quality":50"#,
+            r#""format":"jpeg","max_width":1280,"max_height":720"#,
+            r#""format":"png","max_width":1280,"max_height":720,"quality":50"#,
+            r#""format":"jpeg","max_width":3841,"max_height":720,"quality":50"#,
+            r#""format":"jpeg","max_width":1280,"max_height":1,"quality":50"#,
+            r#""format":"jpeg","max_width":1280,"max_height":720,"quality":0"#,
+            r#""format":"jpeg","max_width":1280,"max_height":720,"quality":101"#,
+            r#""format":"jpeg","max_width":1280.0,"max_height":720,"quality":50"#,
+            r#""format":"jpeg","max_width":"1280","max_height":720,"quality":50"#,
+            r#""format":"jpeg","max_width":1280,"max_height":720,"quality":null"#,
+        ] {
+            let request =
+                format!("{{\"request_id\":\"screenshot-7\",\"method\":\"screenshot\",{fields}}}\n");
+            let (reply, buffer) = exchange_request(false, request.as_bytes(), false, |_, _| false);
+            let reply = reply.value().unwrap();
+            assert_eq!(reply["screenshot_refusal"], "invalid_request", "{fields}");
+            assert!(
+                reply["error"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("invalid scaled screenshot request"),
+                "{fields}: {reply}"
+            );
+            assert!(buffer < vm_control::LARGE_REPLY_SEND_BUFFER);
+        }
+    }
+    #[test]
+    fn scaled_fields_on_any_other_method_end_the_connection() {
+        // As any unknown field always did: the request is not acted on and nothing is answered.
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut child = OwnedChild(
+            Command::new("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let native = Arc::new(Native {
+            input: Mutex::new(child.0.stdin.take().unwrap()),
+            pending: Mutex::new(BTreeMap::new()),
+            next: AtomicU64::new(1),
+            alive: AtomicBool::new(true),
+            ready: (Mutex::new(true), Condvar::new()),
+            owner: Mutex::new(None),
+            next_epoch: AtomicU64::new(1),
+            snapshot: Mutex::new(()),
+            capabilities: json!({}),
+        });
+        // Set while the peer is open: Darwin refuses a read timeout on a socket whose peer has closed (EINVAL).
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client
+            .write_all(b"{\"request_id\":\"s\",\"method\":\"status\",\"quality\":50}\n")
+            .unwrap();
+        let error = connection(server, native, 1).unwrap_err();
+        assert_eq!(error.to_string(), "unexpected screenshot fields");
+        assert!(read_record(&mut client).is_err(), "no record follows");
+    }
+}
+
+#[cfg(test)]
+mod screenshot_deadline_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn busy() -> Result<Value> {
+        Err(HelperBusy("screenshot_busy".into()).into())
+    }
+
+    #[test]
+    fn fast_busy_then_success_keeps_four_retries_and_four_ms_steps() {
+        let snapshot = Mutex::new(());
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let deadline = start + SCREENSHOT_REQUEST_TIMEOUT;
+        let mut attempts = 0;
+        let mut sleeps = 0;
+        let result = screenshot_retry(
+            &snapshot,
+            deadline,
+            |until| {
+                assert_eq!(until, deadline);
+                assert!(snapshot.try_lock().is_err());
+                attempts += 1;
+                if attempts <= HELPER_BUSY_RETRIES {
+                    busy()
+                } else {
+                    Ok(json!({"captured":true}))
+                }
+            },
+            || clock.get(),
+            |step| {
+                assert_eq!(step, Duration::from_millis(4));
+                sleeps += 1;
+                clock.set(clock.get() + step);
+            },
+            || false,
+        );
+        assert_eq!(result.unwrap(), json!({"captured":true}));
+        assert_eq!(attempts, 5);
+        assert_eq!(sleeps, 4);
+        assert!(snapshot.try_lock().is_ok());
+    }
+
+    #[test]
+    fn busy_until_overall_deadline_returns_typed_busy_and_releases_snapshot() {
+        let snapshot = Mutex::new(());
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let deadline = start + SCREENSHOT_REQUEST_TIMEOUT;
+        let mut attempts = 0;
+        let result = screenshot_retry(
+            &snapshot,
+            deadline,
+            |until| {
+                assert_eq!(until, deadline);
+                assert!(snapshot.try_lock().is_err());
+                attempts += 1;
+                clock.set((clock.get() + Duration::from_secs(11)).min(until));
+                busy()
+            },
+            || clock.get(),
+            |step| clock.set(clock.get() + step),
+            || false,
+        );
+        assert!(result.unwrap_err().is::<HelperBusy>());
+        assert_eq!(attempts, 2);
+        assert_eq!(clock.get(), deadline);
+        assert!(snapshot.try_lock().is_ok());
+    }
+
+    #[test]
+    fn attempt_consuming_whole_budget_starts_no_retry() {
+        let snapshot = Mutex::new(());
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let deadline = start + SCREENSHOT_REQUEST_TIMEOUT;
+        let mut attempts = 0;
+        let result = screenshot_retry(
+            &snapshot,
+            deadline,
+            |until| {
+                attempts += 1;
+                clock.set(until);
+                busy()
+            },
+            || clock.get(),
+            |_| panic!("no time to sleep or retry"),
+            || false,
+        );
+        assert!(result.unwrap_err().is::<HelperBusy>());
+        assert_eq!(attempts, 1);
+        assert!(snapshot.try_lock().is_ok());
+    }
+
+    #[test]
+    fn retry_requires_sleep_plus_minimal_useful_attempt() {
+        for remaining in [
+            HELPER_BUSY_STEP,
+            HELPER_BUSY_STEP + HELPER_BUSY_MIN_ATTEMPT - Duration::from_nanos(1),
+            HELPER_BUSY_STEP + HELPER_BUSY_MIN_ATTEMPT,
+        ] {
+            let snapshot = Mutex::new(());
+            let start = Instant::now();
+            let clock = Cell::new(start);
+            let deadline = start + SCREENSHOT_REQUEST_TIMEOUT;
+            let mut attempts = 0;
+            let result = screenshot_retry(
+                &snapshot,
+                deadline,
+                |_| {
+                    attempts += 1;
+                    if attempts == 1 {
+                        clock.set(deadline - remaining);
+                        busy()
+                    } else {
+                        Ok(json!({}))
+                    }
+                },
+                || clock.get(),
+                |step| clock.set(clock.get() + step),
+                || false,
+            );
+            let can_retry = remaining == HELPER_BUSY_STEP + HELPER_BUSY_MIN_ATTEMPT;
+            assert_eq!(result.is_ok(), can_retry);
+            assert_eq!(attempts, if can_retry { 2 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn cancellation_or_sleep_overshoot_stops_retry_and_releases_snapshot() {
+        for cancel in [false, true] {
+            let snapshot = Mutex::new(());
+            let start = Instant::now();
+            let deadline = start + SCREENSHOT_REQUEST_TIMEOUT;
+            let clock = Cell::new(start);
+            let disconnected = Cell::new(false);
+            let mut attempts = 0;
+            let result = screenshot_retry(
+                &snapshot,
+                deadline,
+                |_| {
+                    attempts += 1;
+                    busy()
+                },
+                || clock.get(),
+                |_| {
+                    if cancel {
+                        disconnected.set(true);
+                    } else {
+                        clock.set(deadline);
+                    }
+                },
+                || disconnected.get(),
+            );
+            assert!(result.unwrap_err().is::<HelperBusy>());
+            assert_eq!(attempts, 1);
+            assert!(snapshot.try_lock().is_ok());
+        }
+    }
+
+    fn native(child: &mut OwnedChild) -> Native {
+        Native {
+            input: Mutex::new(child.0.stdin.take().unwrap()),
+            pending: Mutex::new(BTreeMap::new()),
+            next: AtomicU64::new(1),
+            alive: AtomicBool::new(true),
+            ready: (Mutex::new(true), Condvar::new()),
+            owner: Mutex::new(None),
+            next_epoch: AtomicU64::new(1),
+            snapshot: Mutex::new(()),
+            capabilities: json!({}),
+        }
+    }
+
+    fn wait_pending(native: &Native, count: usize) {
+        let until = Instant::now() + Duration::from_secs(1);
+        while native.pending.lock().unwrap().len() != count {
+            assert!(Instant::now() < until, "native request did not reach send");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn interrupted_before_write_preserves_other_connection(cancel: bool) {
+        let mut child = OwnedChild(
+            Command::new("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let native = Arc::new(native(&mut child));
+        let stdout = child.0.stdout.take().unwrap();
+        // Hold the command mutex so both connections must wait before writing.
+        let input = native.input.lock().unwrap();
+        let (mut other_client, other_server) = UnixStream::pair().unwrap();
+        other_client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let other_native = native.clone();
+        let other = thread::spawn(move || connection(other_server, other_native, 1));
+        other_client
+            .write_all(b"{\"request_id\":\"other\",\"method\":\"frame_status\"}\n")
+            .unwrap();
+        wait_pending(&native, 1);
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let waiting_native = native.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiting = thread::spawn(move || {
+            done_tx
+                .send(screenshot(
+                    &waiting_native,
+                    None,
+                    ScreenshotBudget {
+                        deadline: Instant::now()
+                            + if cancel {
+                                SCREENSHOT_REQUEST_TIMEOUT
+                            } else {
+                                Duration::from_millis(200)
+                            },
+                        client: &server,
+                    },
+                ))
+                .unwrap();
+        });
+        wait_pending(&native, 2);
+        assert!(native.snapshot.try_lock().is_err());
+        if cancel {
+            client.shutdown(std::net::Shutdown::Both).unwrap();
+        }
+        let error = done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err();
+        waiting.join().unwrap();
+        assert_eq!(
+            error.downcast_ref::<ScreenshotNotSent>().unwrap().0,
+            if cancel {
+                ScreenshotInterrupted::Cancelled
+            } else {
+                ScreenshotInterrupted::Deadline
+            }
+        );
+        assert!(native.alive.load(Ordering::Acquire));
+        assert!(native.snapshot.try_lock().is_ok());
+        assert_eq!(
+            native
+                .pending
+                .lock()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            ["c1"]
+        );
+        assert!(!client_disconnected(&other_client));
+
+        let helper_native = native.clone();
+        let helper = thread::spawn(move || {
+            let mut commands = BufReader::new(stdout);
+            for (id, method, result) in [
+                ("c1", "frame_status", json!({"connected":true})),
+                ("c3", "screenshot", json!({"captured":true})),
+            ] {
+                let mut line = String::new();
+                commands.read_line(&mut line).unwrap();
+                let command: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(command["id"], id);
+                assert_eq!(command["method"], method);
+                let (_, tx) = helper_native.pending.lock().unwrap().remove(id).unwrap();
+                tx.send(json!({"id":id,"result":result})).unwrap();
+            }
+        });
+        drop(input);
+        assert_eq!(
+            read_record(&mut other_client).unwrap().value().unwrap(),
+            json!({"request_id":"other","result":{"connected":true}})
+        );
+        other_client
+            .write_all(b"{\"request_id\":\"next\",\"method\":\"screenshot\"}\n")
+            .unwrap();
+        assert_eq!(
+            read_record(&mut other_client).unwrap().value().unwrap(),
+            json!({"request_id":"next","result":{"captured":true}})
+        );
+        assert!(native.alive.load(Ordering::Acquire));
+        assert!(native.pending.lock().unwrap().is_empty());
+        assert!(native.snapshot.try_lock().is_ok());
+        helper.join().unwrap();
+        drop(other_client);
+        other.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn disconnect_before_write_preserves_other_connection_and_next_screenshot() {
+        interrupted_before_write_preserves_other_connection(true);
+    }
+
+    #[test]
+    fn deadline_before_write_preserves_other_connection_and_next_screenshot() {
+        interrupted_before_write_preserves_other_connection(false);
+    }
+
+    struct PartialWrite<'a> {
+        input: &'a mut ChildStdin,
+        cancel: Option<&'a UnixStream>,
+        written: usize,
+    }
+    impl Write for PartialWrite<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.written != 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+            }
+            let n = self.input.write(&bytes[..1])?;
+            self.written += n;
+            if let Some(client) = self.cancel {
+                client.shutdown(std::net::Shutdown::Both)?;
+            }
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.input.flush()
+        }
+    }
+    impl std::os::fd::AsRawFd for PartialWrite<'_> {
+        fn as_raw_fd(&self) -> std::os::fd::RawFd {
+            self.input.as_raw_fd()
+        }
+    }
+
+    fn partial_write_fences(cancel: bool) {
+        let mut child = OwnedChild(
+            Command::new("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let native = native(&mut child);
+        let (client, server) = UnixStream::pair().unwrap();
+        let budget = ScreenshotBudget {
+            deadline: Instant::now() + SCREENSHOT_REQUEST_TIMEOUT,
+            client: &server,
+        };
+        let error = screenshot_retry(
+            &native.snapshot,
+            budget.deadline,
+            |_| {
+                native.call_with_writer(
+                    json!({"method":"screenshot"}),
+                    Some(&budget),
+                    |input, command, budget| {
+                        let mut writer = PartialWrite {
+                            input,
+                            cancel: cancel.then_some(&client),
+                            written: 0,
+                        };
+                        let result = native_write(&mut writer, command, budget);
+                        assert_eq!(writer.written, 1);
+                        result
+                    },
+                )
+            },
+            Instant::now,
+            thread::sleep,
+            || client_disconnected(&server),
+        )
+        .unwrap_err();
+        assert!(!error.is::<ScreenshotNotSent>());
+        if cancel {
+            assert_eq!(
+                error.downcast_ref::<ScreenshotInterrupted>(),
+                Some(&ScreenshotInterrupted::Cancelled)
+            );
+        } else {
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::BrokenPipe
+            );
+        }
+        assert!(!native.alive.load(Ordering::Acquire));
+        assert!(native.pending.lock().unwrap().is_empty());
+        assert!(native.snapshot.try_lock().is_ok());
+        let mut prefix = [0];
+        child
+            .0
+            .stdout
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut prefix)
+            .unwrap();
+        assert_eq!(&prefix, b"{");
+    }
+
+    #[test]
+    fn cancellation_after_partial_write_fences_native() {
+        partial_write_fences(true);
+    }
+
+    #[test]
+    fn broken_pipe_after_partial_write_fences_native() {
+        partial_write_fences(false);
+    }
+
+    #[test]
+    fn native_receive_uses_remaining_budget_and_still_fences_timeout() {
+        let mut child = OwnedChild(
+            Command::new("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let native = native(&mut child);
+        let (_client, server) = UnixStream::pair().unwrap();
+        let started = Instant::now();
+        let result = screenshot(
+            &native,
+            None,
+            ScreenshotBudget {
+                deadline: started + Duration::from_millis(30),
+                client: &server,
+            },
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "native response deadline exceeded; capture owner fenced"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(native.next.load(Ordering::Relaxed), 2);
+        assert!(native.pending.lock().unwrap().is_empty());
+        assert!(!native.alive.load(Ordering::Acquire));
+        assert!(native.snapshot.try_lock().is_ok());
+    }
+
+    #[test]
+    fn disconnected_client_interrupts_native_wait_and_releases_snapshot() {
+        let mut child = OwnedChild(
+            Command::new("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let native = native(&mut child);
+        let stdout = child.0.stdout.take().unwrap();
+        let (client, server) = UnixStream::pair().unwrap();
+        let cancel = thread::spawn(move || {
+            let mut line = String::new();
+            BufReader::new(stdout).read_line(&mut line).unwrap();
+            assert!(line.contains("screenshot"));
+            client.shutdown(std::net::Shutdown::Both).unwrap();
+        });
+        let started = Instant::now();
+        let result = screenshot(
+            &native,
+            None,
+            ScreenshotBudget {
+                deadline: started + SCREENSHOT_REQUEST_TIMEOUT,
+                client: &server,
+            },
+        );
+        cancel.join().unwrap();
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "screenshot client disconnected"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(native.next.load(Ordering::Relaxed), 2);
+        assert!(native.pending.lock().unwrap().is_empty());
+        assert!(native.alive.load(Ordering::Acquire));
+        assert!(native.snapshot.try_lock().is_ok());
+    }
+
+    #[test]
+    fn disconnect_probe_preserves_queued_request_bytes() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        assert!(!client_disconnected(&server));
+        client.write_all(b"next\n").unwrap();
+        assert!(!client_disconnected(&server));
+        let mut bytes = [0; 5];
+        server.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"next\n");
+        client.write_all(b"queued\n").unwrap();
+        client.shutdown(std::net::Shutdown::Both).unwrap();
+        assert!(client_disconnected(&server));
     }
 }

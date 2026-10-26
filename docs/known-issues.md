@@ -48,6 +48,36 @@
 - Hard links whose target is hidden by a later layer are skipped during
   flattening (reported as a warning).
 
+## Checkpoints, rollback and forks
+
+- Memory is saved only on Apple Virtualization, for containers created since
+  warm checkpoints (they need a persistent machine identifier and fixed MAC).
+  QEMU checkpoints are disk-only because virgl and Venus block migration;
+  rolling back to a disk-only checkpoint cold-boots and runs the entrypoint
+  again (about 0.8 s on Apple Virtualization, 1.3 s on QEMU/virgl, alpine).
+- Warm restore is for rollback only. VZ restores a state file only with the
+  source's MAC and machine identifier, and the guest cannot change its MAC
+  without losing its DHCP lease, so forks always cold-boot.
+- The state file is about the size of the guest memory in use (34 MiB idle at
+  512 MiB, 1.1 GiB with 1 GiB of tmpfs) and costs about 1.2 s per GiB to save
+  or restore; past roughly half a GiB in use, warm rollback is slower than a
+  cold boot. Saving pauses the VM for that time.
+- After a warm rollback the wall clock is stepped to host time by the guest
+  agent; the monotonic clock resumes from the checkpoint, and open TCP
+  connections to the outside have usually timed out. Guests whose agent
+  predates `clock_sync` keep the checkpoint's time.
+- A checkpoint of a running container is crash-consistent (guest `sync`, then
+  one atomic APFS clone), not application-consistent: a database that has
+  not flushed its own buffers recovers as after a power cut.
+- Host bind mounts (`-v`) are shared between a container and its forks, not
+  copied; only the writable layer is forked.
+- Linux micro-VM containers only: macOS containers, the shared engine and
+  `machine`s have no checkpoints.
+- A layer first booted by an agent older than the fork-aware one has no owner
+  record, so its first fork keeps `/etc/machine-id`; later forks reset it.
+  Images that ship `/etc/machine-id` in their read-only root keep that value
+  in every container, as with Docker.
+
 ## macOS containers
 
 - Each Tart image takes ~26 GB on disk (Tahoe vanilla: 22 GB download, 46 GB
@@ -191,6 +221,189 @@
   user networking (DNS through slirp) or Apple NAT like containers do.
 - Fedora's GRUB prints `serial port 'auto'` errors on QEMU (Anaconda adds a
   serial terminal because of `console=ttyAMA0`); boot is unaffected.
+
+## Windows 11 ARM64 machines
+
+- **Verified once (2026-10-26, Apple M3 Pro, macOS 27, UTM 5.0.5 QEMU
+  runtime, `Windows11_Client_arm64_en-us_26300_9457.iso`, an Insider build):**
+  `scripts/install-distro.py windows` with the virtio-win ISO. edk2 boots the
+  ISO from the USB CD-ROM, the Enter taps get past "Press any key to boot from
+  CD or DVD", Setup reads `Autounattend.xml` from the VEYNODEWIN seed CD,
+  partitions the NVMe disk, installs Windows 11 Pro without a TPM or Secure
+  Boot (LabConfig bypass) and reboots into Windows Boot Manager from the disk.
+  After `machine eject`, the installed disk boots to the automatically logged-in
+  desktop of local administrator `veynode`. The virtio-win NetKVM driver is
+  installed, and the "Red Hat VirtIO Ethernet Adapter" gets a QEMU
+  user-network DHCP lease (10.0.2.15). Evidence is screenshots only:
+  `.local/evidence/windows-installed.png`.
+- **That run was not fully unattended.** About 25 minutes into Setup, Windows
+  recorded bugcheck `0x6B` (PROCESS1_INITIALIZATION_FAILED, parameter
+  `0xC0000185`, STATUS_IO_DEVICE_ERROR) in its UEFI variables and reset. From
+  then on, edk2 hung on its logo before choosing a boot entry (one vCPU spinning
+  in firmware), across `system_reset` and a fresh QEMU process. Moving
+  `efi-vars.fd` aside (the worker recreates it from the template) let edk2 boot
+  the disk through the removable-media path, and Setup then finished: the
+  first logon powered the machine off. The cause, and whether it recurs, is
+  unknown. No second install was run, because the host had 4.7 GiB free.
+- **SSH into the guest:** `install-distro.py windows` now installs Windows'
+  OpenSSH Server at first logon (a Windows Update download), authorizes a key
+  it generates in the work dir and creates the machine with `--publish
+  2222:22`. That sequence was verified by hand on `win11v` (`ssh -p 2222
+  veynode@127.0.0.1` lands in PowerShell as the local administrator), not yet
+  through a fresh unattended install. QMP `send-key` typing dropped characters
+  and once left a key repeating at 40 ms holds 60 ms apart; it now uses 80 ms
+  holds 180 ms apart.
+- **Second install, virtio devices (verified once, 2026-10-26, same host and
+  ISO):** machine `win11v` with the default virtio-blk disk and virtio-win
+  0.1.302 (`.local/iso/virtio-win-0.1.302.iso`, SHA-256
+  `303f7ae4…867949d`, computed locally: Fedora publishes no checksum for the
+  ISO, only per-RPM ones). Setup loads viostor/vioscsi/NetKVM from the
+  answer file's `PnpCustomizationsWinPE` DriverPaths, sees the virtio disk in
+  WinPE and installs to it; the other drivers come from `offlineServicing`.
+  On the installed desktop, `Get-PnpDevice -PresentOnly` reports Status OK
+  for: Red Hat VirtIO SCSI controller and disk (viostor, the boot disk), Red Hat
+  VirtIO Ethernet Adapter (NetKVM, DHCP lease 10.0.2.15), VirtIO Serial
+  Driver, VirtIO Balloon Driver, VirtIO RNG Device, VirtIO Input Driver
+  (keyboard and tablet), QEMU PVPanic Device. Evidence:
+  `.local/evidence/windows-virtio-desktop.png` and
+  `windows-virtio-devices.png`. Not exercised: vioscsi with a virtio-scsi
+  disk, viosock, viofs (needs virtiofsd and WinFsp), viomem, and anything
+  over virtio-serial: **qemu-guest-agent has no ARM64 Windows build** in
+  virtio-win (x86/x64 MSIs only), so there is no guest agent. Display stays
+  on Basic Display unless the Neptune profile below is used; viogpudo is
+  never installed. `--disk-bus nvme` keeps the inbox NVMe driver as an
+  alternative (the first install used it).
+- **Warm guest reboots hang edk2; reboots are cold.** In both installs, the
+  reboot from WinPE into the installed system (a guest reset inside the same
+  QEMU process) left vCPU0 spinning in firmware at the same PC
+  (`0x23f6b0924`, the other vCPUs at 0), while a new QEMU process booted the
+  same disk and variables normally. UTM users report the same restart hang.
+  For `guest: windows`, the worker passes `-action reboot=shutdown`; when
+  QEMU exits after a SHUTDOWN event with reason `guest-reset`, `vm-qemu`
+  emits state `starting` (reason `guest-reset`) and re-execs itself with the
+  same arguments, so the PID and daemon pipe stay and a fresh QEMU starts.
+  Verified once: `Restart-Computer` in the guest came back to the desktop
+  with a new QEMU PID. `scripts/install-distro.py` also samples vCPU PCs over
+  QMP and reports a hang when they don't move for 4 minutes.
+- UTM's `edk2-arm-vars.fd` template is qcow2, not raw; it is now decoded
+  (`qemu_uefi::template_flash`) into the 64 MiB variable store. The first
+  install's store was a raw copy of the qcow2 bytes, which may explain that
+  run's edk2 hang below.
+- Devices: the ISO and seed images are USB CD-ROMs (`usb-bot` + `scsi-cd`),
+  because Setup reads the answer file before any virtio driver is loaded.
+  The display is UTM's `virtio-ramfb` (plain `ramfb` makes SPICE log
+  "Setting device address of a display device: Not a PCI device"), Windows
+  Basic Display at 800x600 as observed.
+- **GPU (`--gpus neptune`, experimental): D3D11 is hardware-accelerated.** The
+  `neptune-dxmt-experimental` profile matches UTM 5.0.5's default Triton
+  arguments (`Configuration/UTMQemuConfiguration+Arguments.swift`):
+  `virtio-ramfb-gl,hostmem=8G,blob=on,venus=on,neptune=on`, `-accel
+  hvf,ipa-granule-size=4096`, SPICE `gl=es` with ANGLE on Metal,
+  `VK_DRIVER_FILES` at UTM's MoltenVK ICD, and `NPT_BACKEND=dxmt` with the
+  `NPT_*_LIBRARY_PATH` variables at `dxmt-native.framework`. The render
+  server is the reviewed Venus registration's `virgl_render_server` (built
+  from virglrenderer `482f9d8b`, the commit UTM 5.0.5 ships, with Neptune);
+  UTM's own `QEMURenderServer` is App-Sandbox-signed and traps in
+  `_libsecinit_appsandbox` outside UTM's QEMUHelper, so it is not used.
+  Findings from `win11v` (M3 Pro, macOS 27, 4 vCPUs, 8 GiB), 2026-10-26:
+  - **Driver version must match the host.** Guest tools 0.1.274 (the file
+    UTM's "latest" link points to) speak Neptune wire format 2; the UTM 5.0.5
+    runtime speaks format 1 (`neptune: virtgpu: wire format mismatch
+    host=0x00000001 guest=0x00000002`). Use **0.1.273**
+    (`.local/iso/utm-guest-tools-0.1.273.iso`, SHA-256 `7d2c0343…c2f04601`
+    from GitHub's asset digest, viogpu3d DriverVer 08/30/2026).
+  - viogpu3d is the only display adapter: dxdiag in the desktop session
+    names "Red Hat VirtIO GPU 3D controller", chip "QEMU VIRTIO GPU",
+    `neptune_umd.dll`, driver 100.6.101.58000, WDDM 2.2, DDI 11.1, feature
+    levels 11_1 down to 9_1, 1024x768 at 60 Hz
+    (`.local/evidence/windows-neptune-dxdiag.txt`).
+  - **Pixel check passes** (`guest/windows/d3d11-pixel-test.c`, feature level
+    11_1 on that adapter, WARP refused): a red triangle over a known clear
+    colour, centre and corner pixels exact
+    (`.local/evidence/windows-d3d11-triangle.png` and `.json`). D3D only works
+    in the interactive desktop session (run it as a scheduled task with an
+    Interactive principal); over plain SSH the user-mode driver can't open the
+    GPU.
+  - **Benchmark** (`guest/windows/d3d11-bench.c`, offscreen 1920x1080,
+    10 warm-up frames, each measurement ended by reading back one pixel,
+    because a D3D11 event query reports completion at once under DXMT; p50
+    frame time, ranges over 3 runs):
+
+    | Workload | Neptune/DXMT | WARP (CPU, same guest) |
+    |---|---|---|
+    | `fill` (full-screen, 64-step sin/cos per pixel), wait every frame | 298–320 FPS, 3.0 ms | 3.0–3.2 FPS, 304–332 ms |
+    | `fill`, wait every 4th frame | 475–545 FPS, 1.88–1.97 ms | — |
+    | `draws` (2000 draws, a constant-buffer map per draw), every frame | 213–455 FPS, 1.75–3.5 ms | 122 FPS |
+    | `draws`, every 4th frame | 493–745 FPS, 1.21–1.66 ms | — |
+    | `present` (flip swapchain, 1024x768 window), no vsync | 370–857 FPS, 0.96–1.53 ms | — |
+    | `present`, vsync | 58.5–59.4 FPS, 16.2–16.4 ms | — |
+
+    Every synchronous guest→host→guest round trip costs about 1.4 ms (64x64
+    `fill`: 619 FPS, 1.40 ms; 3840x2160: 145 FPS, 6.5 ms), so a game that
+    waits on the GPU each frame loses that much; pipelined frames hide it.
+    No host-only run of the same D3D11 workload exists (macOS has no D3D
+    without Wine/DXMT); WARP in the guest is the baseline. Run-to-run noise
+    is ±15% (Windows background work).
+  - **Tuning, one change at a time** against the 4-vCPU/8G/ramfb baseline
+    (pipelined 1080p `fill`/`draws` p50): 8 vCPUs 1.90–1.99/1.10–2.24 ms,
+    `hostmem=2G` 1.95–2.06/1.38–1.91 ms, `virtio-gpu-gl-pci` instead of
+    `virtio-ramfb-gl` 1.99–2.04/1.56–1.82 ms: none is better beyond the noise,
+    so the profile keeps UTM's values (ramfb also gives the firmware and
+    Setup a display). Blob resources can't be turned off (Venus and Neptune
+    need them). D3DMetal (`NPT_BACKEND=d3dmetal`) doesn't work with this
+    render server: Apple's D3DMetal is x86_64-only and the render server
+    would have to be a universal binary running that slice under Rosetta; the
+    arm64 slice of `d3dmetal-native` exports no D3D entry points, so the guest
+    falls back to Basic Render. DXMT has no steady-state performance option
+    (its variables cover logging, frame capture, the shader cache, BC
+    emulation and MetalFX upscaling); its log now goes to the worker's
+    runtime directory (`DXMT_LOG_PATH`) instead of the current directory.
+  - **Windows Fast Startup aborts QEMU.** Booting after a clean shutdown (a
+    hybrid resume) hit `Assertion failed: (isv), function hvf_vcpu_exec, file
+    hvf.c, line 2295` in 4 of 5 boots once viogpu3d was installed; boots
+    after a crash (cold) were fine. With `powercfg /hibernate off` 3 of 3
+    shutdown/start cycles booted, and `install-distro.py windows` now runs
+    that at first logon. The same assert hit once more at the final power-off
+    of a requested shutdown (2026-10-26, Neptune profile), after Windows had
+    logged a clean shutdown (events 1074 and 6006, no 41/6008); the daemon
+    reported `crashed`, the next boot was clean and the next shutdown stopped
+    normally.
+  - Uninstalling the active viogpu3d driver (`pnputil /delete-driver
+    /uninstall`) hung the guest; restore a pre-driver clone instead. Plain
+    `virtio-ramfb` is the same PCI device (1AF4:1050), so viogpu3d also binds
+    to it when the Neptune profile is off.
+  Not established: D3D12, real games, frames on the console (the swapchain
+  paces at 60 Hz, but nobody looked at the window), long runs, and the
+  redistribution rights of the guest tools and DXMT. See
+  [decision 0001](decisions/0001-windows-gpu.md).
+- Not established: TPM (UTM's swtpm framework exists in the runtime but isn't
+  wired), Secure Boot, activation (the generic Pro key doesn't activate),
+  Windows Update, resolution changes, audio, the native console or web
+  desktop for a Windows guest, MCP screenshots and input (the install script
+  uses QMP `screendump` and `send-key`), clipboard and shared folders, and
+  Windows 11 release builds (only 26300 was installed). Apple Virtualization
+  cannot run Windows.
+- **MCP over the guest's OpenSSH Server** (`vm_exec`, file tools, desktop and
+  accessibility tools; see
+  [Windows machines over SSH](../crates/control/README.md#windows-machines-over-ssh)):
+  live on one machine through the daemon socket: exec with exit codes,
+  `cmd`, quoted PowerShell, a missing program and a timeout; a 63 KB file
+  round trip byte-exact, no overwrite, not-found and bad names; desktop
+  state, Start menu apps, launching Notepad, its UIA tree, `set_text`,
+  `do`, window minimize/maximize/activate/move. No scheduled task or request
+  directory is left afterwards. Calls take 1.2 to 3.8 s. Non-ASCII text
+  (`äöü é 你好 🙂`) passes both ways: exec argv and stdout, a missing
+  program's error, a file's name and content, `set_text`, tree and find
+  (before the scripts set UTF-8 console encoding, the SSH console's OEM code
+  page broke any desktop reply holding such text). The first desktop
+  call 30 s after boot timed out once; later ones worked. Not tried: other
+  apps' UIA trees beyond Notepad, several desktop calls at once,
+  a locked screen or a user without automatic logon.
+- The CD loader's "Press any key" prompt appears only on the screen (with
+  `virtio-ramfb`, edk2's serial copy shows only `BdsDxe` lines), so the script
+  taps Enter for 8 seconds after edk2 starts the first boot entry. With 20
+  seconds, a late Enter hit Setup's focused Cancel button and opened "Are you
+  sure you want to quit?" (Enter again chose the focused No).
 
 ## Full system containers (`--init systemd`)
 

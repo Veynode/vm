@@ -22,4 +22,6 @@ vm-control = { path = "../control" }
 [dev-dependencies]
 p256 = { version = "0.13", features = ["ecdsa"] }
 tempfile = "3"
+# Paused-time tests of the media session cap; adds no crate, only a tokio feature.
+tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }

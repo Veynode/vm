@@ -31,9 +31,21 @@ use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::{Mutex, Notify, OnceCell, Semaphore},
+    sync::{mpsc, oneshot, Mutex, Notify, OnceCell, OwnedMutexGuard, Semaphore},
+    task::JoinHandle,
     time::timeout,
 };
+use vm_control::mcp_events::{resource_vm, Resource};
+
+/// Server-to-client notifications queued per session for its GET stream. A
+/// slow or absent reader loses the oldest ones, never grows memory.
+const MAX_QUEUED_EVENTS: usize = 256;
+const MAX_QUEUED_EVENT_BYTES: usize = 1024 * 1024;
+const MAX_EVENT_BYTES: usize = 64 * 1024;
+/// Screen subscriptions across all HTTPS sessions: each one keeps a daemon
+/// connection busy most of the time, and the daemon serves 32 at once.
+const MAX_SCREEN_SUBSCRIPTIONS: usize = 8;
+const KEEPALIVE: Duration = Duration::from_secs(15);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,6 +68,9 @@ struct Principal {
     scopes: Vec<String>,
     #[serde(default)]
     vm_ids: Vec<String>,
+    /// Tool groups to list (`vm-control mcp --tools`); empty lists every permitted group.
+    #[serde(default)]
+    tools: Vec<String>,
 }
 fn default_bind() -> SocketAddr {
     "127.0.0.1:8443".parse().unwrap()
@@ -72,48 +87,199 @@ struct Session {
 }
 struct Lifecycle {
     child: Mutex<Child>,
-    stdout: Mutex<BufReader<ChildStdout>>,
     stdin: Mutex<Option<ChildStdin>>,
     retired: AtomicBool,
     outcome: OnceCell<bool>,
+    inbox: Arc<Inbox>,
+    reader: std::sync::Mutex<Option<JoinHandle<()>>>,
+}
+/// Everything the MCP child writes, routed by one reader task: the response
+/// to the single in-flight request (and its progress), and notifications the
+/// principal may observe, queued for the session's GET stream.
+#[derive(Default)]
+struct Inbox {
+    pending: std::sync::Mutex<Option<Pending>>,
+    events: std::sync::Mutex<Queue>,
+    changed: Notify,
+    closed: AtomicBool,
+}
+struct Pending {
+    id: Value,
+    token: Option<Value>,
+    progress: Option<mpsc::Sender<Value>>,
+    response: oneshot::Sender<(Value, usize)>,
+}
+#[derive(Default)]
+struct Queue {
+    events: std::collections::VecDeque<String>,
+    bytes: usize,
+    dropped: u64,
+    next_id: u64,
+}
+impl Queue {
+    fn push(&mut self, event: String) {
+        if event.len() > MAX_EVENT_BYTES {
+            self.dropped += 1;
+            return;
+        }
+        self.bytes += event.len();
+        self.events.push_back(event);
+        while self.events.len() > MAX_QUEUED_EVENTS || self.bytes > MAX_QUEUED_EVENT_BYTES {
+            let old = self.events.pop_front().unwrap();
+            self.bytes -= old.len();
+            self.dropped += 1;
+        }
+    }
+    /// The next SSE frame: a drop notice first when events were lost.
+    fn pop(&mut self) -> Option<String> {
+        let data = if self.dropped > 0 {
+            let notice = json!({"jsonrpc":"2.0","method":"notifications/veynode/events_dropped","params":{"dropped":self.dropped}}).to_string();
+            self.dropped = 0;
+            notice
+        } else {
+            let event = self.events.pop_front()?;
+            self.bytes -= event.len();
+            event
+        };
+        self.next_id += 1;
+        Some(sse_frame(Some(self.next_id), &data))
+    }
+}
+fn sse_frame(id: Option<u64>, data: &str) -> String {
+    match id {
+        Some(id) => format!("id: {id}\nevent: message\ndata: {data}\n\n"),
+        None => format!("event: message\ndata: {data}\n\n"),
+    }
+}
+/// Whether a child notification may reach this principal: its own tool list
+/// changing (after vm_tools_enable), or resource updates for an allowlisted VM.
+/// Anything else from the child is dropped.
+fn observable(principal: &Principal, notification: &Value) -> bool {
+    notification["method"] == "notifications/tools/list_changed"
+        || notification["method"] == "notifications/resources/updated"
+            && notification["params"]["uri"]
+                .as_str()
+                .and_then(resource_vm)
+                .is_some_and(|vm| principal.vm_ids.contains(&vm))
+}
+async fn read_child(stdout: ChildStdout, inbox: Arc<Inbox>, principal: Principal) {
+    let mut reader = BufReader::new(stdout);
+    let limit = vm_control::MAX_SCREENSHOT_RESPONSE + 1;
+    let mut broken = false;
+    loop {
+        let mut line = Vec::new();
+        let read = match (&mut reader)
+            .take(limit as u64)
+            .read_until(b'\n', &mut line)
+            .await
+        {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        // After a malformed frame keep draining, so the child can reach its
+        // EOF cleanup, but route nothing: the stream is out of step.
+        if broken {
+            continue;
+        }
+        let value = match serde_json::from_slice::<Value>(&line) {
+            Ok(value) if line.last() == Some(&b'\n') => value,
+            _ => {
+                broken = true;
+                inbox.pending.lock().unwrap().take();
+                continue;
+            }
+        };
+        if value.get("method").is_some() {
+            if value["method"] == "notifications/progress" {
+                let pending = inbox.pending.lock().unwrap();
+                if let Some(Pending {
+                    token: Some(token),
+                    progress: Some(progress),
+                    ..
+                }) = pending.as_ref()
+                {
+                    if value["params"]["progressToken"] == *token {
+                        let _ = progress.try_send(value);
+                    }
+                }
+            } else if observable(&principal, &value) {
+                inbox.events.lock().unwrap().push(value.to_string());
+                inbox.changed.notify_waiters();
+            }
+            continue;
+        }
+        let mut pending = inbox.pending.lock().unwrap();
+        if pending.as_ref().is_some_and(|p| p.id == value["id"]) {
+            let _ = pending.take().unwrap().response.send((value, read));
+        }
+    }
+    inbox.closed.store(true, Ordering::Release);
+    inbox.pending.lock().unwrap().take();
+    inbox.changed.notify_waiters();
 }
 struct Bridge {
     lifecycle: Arc<Lifecycle>,
 }
 impl Bridge {
-    async fn exchange(&mut self, request: &Value) -> Result<Option<Value>> {
+    async fn exchange(
+        &mut self,
+        request: &Value,
+        progress: Option<mpsc::Sender<Value>>,
+    ) -> Result<Option<Value>> {
         let mut bytes = serde_json::to_vec(request)?;
         bytes.push(b'\n');
+        let inbox = &self.lifecycle.inbox;
+        let response = if let Some(id) = request.get("id") {
+            let (sender, receiver) = oneshot::channel();
+            *inbox.pending.lock().unwrap() = Some(Pending {
+                id: id.clone(),
+                token: Some(request["params"]["_meta"]["progressToken"].clone())
+                    .filter(|t| !t.is_null()),
+                progress,
+                response: sender,
+            });
+            Some(receiver)
+        } else {
+            None
+        };
         {
             let mut stdin = self.lifecycle.stdin.lock().await;
-            if self.lifecycle.retired.load(Ordering::Acquire) {
+            if self.lifecycle.retired.load(Ordering::Acquire)
+                || inbox.closed.load(Ordering::Acquire)
+            {
                 bail!("session is retired")
             }
             let stdin = stdin.as_mut().context("session is closed")?;
             stdin.write_all(&bytes).await?;
             stdin.flush().await?;
         }
-        if request.get("id").is_none() {
+        let Some(response) = response else {
             return Ok(None);
-        }
-        let limit = vm_control::mcp_response_limit(request);
-        let mut line = Vec::new();
-        let mut stdout = self.lifecycle.stdout.lock().await;
-        let read = (&mut *stdout)
-            .take((limit + 1) as u64)
-            .read_until(b'\n', &mut line)
-            .await?;
-        if read == 0 || read > limit || line.last() != Some(&b'\n') {
+        };
+        let (response, read) = response.await.context("invalid stdio bridge response")?;
+        if read > vm_control::mcp_response_limit(request) {
             bail!("invalid stdio bridge response")
-        }
-        let response: Value = serde_json::from_slice(&line)?;
-        if response["id"] != request["id"] {
-            bail!("stdio response identity mismatch")
         }
         Ok(Some(response))
     }
 }
 impl Lifecycle {
+    fn new(mut child: Child, principal: Principal) -> Arc<Self> {
+        let inbox = Arc::new(Inbox::default());
+        let reader = tokio::spawn(read_child(
+            child.stdout.take().unwrap(),
+            inbox.clone(),
+            principal,
+        ));
+        Arc::new(Lifecycle {
+            stdin: Mutex::new(child.stdin.take()),
+            retired: AtomicBool::new(false),
+            outcome: OnceCell::new(),
+            child: Mutex::new(child),
+            inbox,
+            reader: std::sync::Mutex::new(Some(reader)),
+        })
+    }
     async fn close(&self) -> bool {
         *self
             .outcome
@@ -126,19 +292,11 @@ impl Lifecycle {
                 .await
                 .is_ok();
                 let mut child = self.child.lock().await;
-                // Once the in-flight reader yields, drain responses that no HTTP
-                // caller consumes. Do not let a bounded response fill the pipe and
-                // prevent the MCP child from reaching its EOF cleanup.
-                let drain = async {
-                    let mut stdout = self.stdout.lock().await;
-                    let _ = tokio::io::copy(&mut *stdout, &mut tokio::io::sink()).await;
-                };
-                let result = {
-                    let wait = timeout(Duration::from_secs(42), child.wait());
-                    tokio::pin!(wait);
-                    tokio::select! { result = &mut wait => result, _ = drain => wait.await }
-                };
-                match result {
+                // The reader task keeps draining output no HTTP caller consumes,
+                // so a full pipe cannot keep the MCP child from its EOF cleanup.
+                let result = timeout(Duration::from_secs(42), child.wait()).await;
+                self.inbox.changed.notify_waiters();
+                let clean = match result {
                     Ok(Ok(status)) => eof && status.success(),
                     _ => {
                         // SIGKILL/reaping is resource cleanup, never Guest cleanup proof.
@@ -146,7 +304,13 @@ impl Lifecycle {
                         let _ = timeout(Duration::from_secs(1), child.wait()).await;
                         false
                     }
+                };
+                let reader = self.reader.lock().unwrap().take();
+                if let Some(reader) = reader {
+                    // A grandchild holding stdout open must not pin cleanup.
+                    let _ = timeout(Duration::from_secs(1), reader).await;
                 }
+                clean
             })
             .await
     }
@@ -161,6 +325,8 @@ struct App {
     closing: AtomicBool,
     cleanup_failed: AtomicBool,
     changed: Notify,
+    /// Subscribed screen URIs per session, for MAX_SCREEN_SUBSCRIPTIONS.
+    screens: std::sync::Mutex<BTreeMap<String, BTreeSet<String>>>,
 }
 impl App {
     // Spawned once, tracked in sessions until completion. Request cancellation,
@@ -169,6 +335,8 @@ impl App {
         if lifecycle.retired.swap(true, Ordering::AcqRel) {
             return;
         }
+        lifecycle.inbox.changed.notify_waiters();
+        self.screens.lock().unwrap().remove(&id);
         let app = self.clone();
         tokio::spawn(async move {
             if !lifecycle.close().await {
@@ -272,12 +440,25 @@ fn mime_list(header: Option<&HeaderValue>, mime: &str) -> bool {
     })
 }
 fn remote_authorized(principal: &Principal, request: &Value) -> bool {
+    if [
+        "resources/read",
+        "resources/subscribe",
+        "resources/unsubscribe",
+    ]
+    .iter()
+    .any(|m| request["method"] == *m)
+    {
+        return request["params"]["uri"]
+            .as_str()
+            .and_then(resource_vm)
+            .is_some_and(|vm| principal.vm_ids.contains(&vm));
+    }
     if request["method"] != "tools/call" {
         return true;
     }
     match request["params"]["name"].as_str().unwrap_or("") {
         "vm_create" => false,
-        "vm_list" | "vm_capabilities" => true,
+        "vm_list" | "vm_capabilities" | "vm_tools_enable" => true,
         _ => request["params"]["arguments"]["id"]
             .as_str()
             .is_some_and(|id| principal.vm_ids.iter().any(|allowed| allowed == id)),
@@ -324,7 +505,70 @@ fn filter_reply(principal: &Principal, request: &Value, mut reply: Value) -> Val
             tools.retain(|tool| tool["name"] != "vm_create");
         }
     }
+    if request["method"] == "resources/list" {
+        if let Some(resources) = reply["result"]["resources"].as_array_mut() {
+            resources.retain(|r| {
+                r["uri"]
+                    .as_str()
+                    .and_then(resource_vm)
+                    .is_some_and(|vm| principal.vm_ids.contains(&vm))
+            });
+        }
+    }
+    if request["method"] == "resources/read"
+        && matches!(
+            request["params"]["uri"].as_str().and_then(Resource::parse),
+            Some(Resource::Status(_))
+        )
+    {
+        // The status resource is vm_status: the same public projection applies.
+        if let Some(contents) = reply["result"]["contents"].as_array_mut() {
+            for content in contents {
+                let public = content["text"]
+                    .as_str()
+                    .and_then(|t| serde_json::from_str::<Value>(t).ok())
+                    .map(|mut value| {
+                        public_vm(&mut value);
+                        value.to_string()
+                    });
+                content["text"] = json!(public.unwrap_or_default());
+            }
+        }
+    }
     let name = request["params"]["name"].as_str().unwrap_or("");
+    if request["method"] == "tools/call" && name == "vm_tools_enable" {
+        if let Some(text) = reply["result"]["content"][0]["text"].as_str() {
+            if let Ok(mut value) = serde_json::from_str::<Value>(text) {
+                if let Some(added) = value["added_tools"].as_array_mut() {
+                    added.retain(|tool| tool != "vm_create");
+                }
+                reply["result"]["content"][0]["text"] = json!(value.to_string());
+            }
+        }
+    }
+    if request["method"] == "tools/call" && name.starts_with("vm_snapshot_") {
+        // Snapshot receipts contain host paths, backend details and artifact
+        // identities. Only the fixed public projection crosses this boundary.
+        if reply["result"]["isError"] != false {
+            reply = json!({"jsonrpc":"2.0","id":reply["id"],"result":{"isError":true,"content":[{"type":"text","text":"Snapshot operation refused or failed. Local diagnostics contain the detailed reason."}]}});
+        } else if let Some(raw) = reply["result"]["content"][0]["text"].as_str() {
+            let public = serde_json::from_str::<Value>(raw)
+                .ok()
+                .filter(|v| {
+                    v.is_object()
+                        || v.as_array()
+                            .is_some_and(|rows| rows.iter().all(Value::is_object))
+                })
+                .map(|v| public_snapshot(&v));
+            if let Some(public) = public {
+                reply = json!({"jsonrpc":"2.0","id":reply["id"],"result":{"isError":false,"content":[{"type":"text","text":public.to_string()}]}});
+            } else {
+                reply = json!({"jsonrpc":"2.0","id":reply["id"],"result":{"isError":true,"content":[{"type":"text","text":"Invalid snapshot response."}]}});
+            }
+        } else {
+            reply = json!({"jsonrpc":"2.0","id":reply["id"],"result":{"isError":true,"content":[{"type":"text","text":"Invalid snapshot response."}]}});
+        }
+    }
     if request["method"] == "tools/call"
         && ["vm_list", "vm_status", "vm_start"].contains(&name)
         && reply["result"]["isError"] == false
@@ -350,6 +594,81 @@ fn filter_reply(principal: &Principal, request: &Value, mut reply: Value) -> Val
         }
     }
     reply
+}
+fn public_snapshot(value: &Value) -> Value {
+    match value {
+        Value::Array(rows) => Value::Array(rows.iter().map(public_snapshot).collect()),
+        Value::Object(fields) => {
+            let mut result = serde_json::Map::new();
+            for key in [
+                "id",
+                "vm",
+                "name",
+                "kind",
+                "operation_id",
+                "state",
+                "phase",
+                "created_unix_ms",
+                "capture_verified",
+                "restore_verified",
+                "deleted",
+                "completed",
+                "requires_recovery",
+            ] {
+                if let Some(v) = fields.get(key) {
+                    if v.is_string() || v.is_boolean() || v.is_u64() {
+                        result.insert(key.into(), v.clone());
+                    }
+                }
+            }
+            for key in ["snapshots", "result"] {
+                if let Some(v) = fields.get(key) {
+                    result.insert(key.into(), public_snapshot(v));
+                }
+            }
+            for key in [
+                "reconciled",
+                "restored",
+                "source_resumed",
+                "source_already_running",
+                "source_running_confirmed",
+                "source_resume_pending",
+                "source_channel_released",
+                "native_io_retirement_verified",
+                "snapshot_result_verified",
+            ] {
+                if let Some(v) = fields.get(key).and_then(Value::as_bool) {
+                    result.insert(key.into(), json!(v));
+                }
+            }
+            if let Some(v) = fields
+                .get("action")
+                .and_then(Value::as_str)
+                .filter(|v| matches!(*v, "create" | "restore" | "delete"))
+            {
+                result.insert("action".into(), json!(v));
+            }
+            if let Some(v) = fields
+                .get("error_code")
+                .and_then(Value::as_str)
+                .filter(|v| {
+                    !v.is_empty()
+                        && v.len() <= 128
+                        && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                })
+            {
+                result.insert("error_code".into(), json!(v));
+            }
+            if fields.contains_key("error") {
+                result.insert(
+                    "error".into(),
+                    json!("Snapshot operation failed; inspect local diagnostics."),
+                );
+            }
+            Value::Object(result)
+        }
+        _ => Value::Null,
+    }
 }
 async fn admission(State(app): State<Arc<App>>, request: Request, next: Next) -> Response {
     if app.closing.load(Ordering::Acquire) {
@@ -541,18 +860,14 @@ async fn dispatch(
         if principal.scopes.iter().any(|s| s == "files") {
             command.arg("--allow-files");
         }
-        let mut child = match command.spawn() {
+        if !principal.tools.is_empty() {
+            command.arg("--tools").arg(principal.tools.join(","));
+        }
+        let child = match command.spawn() {
             Ok(c) => c,
             Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "Cannot start MCP session"),
         };
-        let stdout = BufReader::new(child.stdout.take().unwrap());
-        let lifecycle = Arc::new(Lifecycle {
-            stdout: Mutex::new(stdout),
-            stdin: Mutex::new(child.stdin.take()),
-            retired: AtomicBool::new(false),
-            outcome: OnceCell::new(),
-            child: Mutex::new(child),
-        });
+        let lifecycle = Lifecycle::new(child, principal.clone());
         let bridge = Arc::new(Mutex::new(Bridge {
             lifecycle: lifecycle.clone(),
         }));
@@ -576,7 +891,7 @@ async fn dispatch(
             armed: true,
         };
         let reply = match timeout(Duration::from_secs(5), async {
-            bridge.lock().await.exchange(&request).await
+            bridge.lock().await.exchange(&request, None).await
         })
         .await
         {
@@ -600,6 +915,11 @@ async fn dispatch(
             return Json(reply).into_response();
         }
         guard.armed = false;
+        let mut reply = reply;
+        // This transport drops server notifications, so it cannot honour listChanged.
+        if reply["result"]["capabilities"]["tools"]["listChanged"] == true {
+            reply["result"]["capabilities"]["tools"]["listChanged"] = json!(false);
+        }
         let mut r = Json(reply).into_response();
         r.headers_mut().insert(
             "mcp-session-id",
@@ -649,7 +969,13 @@ async fn dispatch(
     }
     drop(sessions);
     if *method == Method::GET {
-        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        if !mime_list(headers.get("accept"), "text/event-stream") {
+            return error(
+                StatusCode::NOT_ACCEPTABLE,
+                "Accept must include text/event-stream",
+            );
+        }
+        return event_stream(app.clone(), session_id.into(), lifecycle);
     }
     let request = request.unwrap();
     if request.get("method").is_none() {
@@ -658,8 +984,18 @@ async fn dispatch(
     if !remote_authorized(principal, &request) {
         return Json(json!({"jsonrpc":"2.0","id":request.get("id").cloned().unwrap_or(Value::Null),"error":{"code":-32602,"message":"Tool or VM is not authorized for this principal"}})).into_response();
     }
+    let screen = screen_subscription(&request);
+    if let Some((true, uri)) = &screen {
+        let screens = app.screens.lock().unwrap();
+        let subscribed = screens.get(session_id).is_some_and(|s| s.contains(uri));
+        if !subscribed
+            && screens.values().map(BTreeSet::len).sum::<usize>() >= MAX_SCREEN_SUBSCRIPTIONS
+        {
+            return Json(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32002,"message":"screen subscription limit reached on this server"}})).into_response();
+        }
+    }
     // Reject concurrent messages in the same session rather than queueing stale control operations.
-    let mut io = match bridge.try_lock() {
+    let io = match bridge.try_lock_owned() {
         Ok(io) => io,
         Err(_) => {
             return error(
@@ -668,28 +1004,171 @@ async fn dispatch(
             )
         }
     };
+    // A request that goes away after its command was written still retires
+    // the session (the guard), as before; the exchange task owns the bridge
+    // until the child answers or the session ends.
+    let streamed = request["params"]["_meta"]["progressToken"].is_string()
+        || request["params"]["_meta"]["progressToken"].is_i64()
+        || request["params"]["_meta"]["progressToken"].is_u64();
+    let (progress, updates) = if streamed {
+        let (sender, receiver) = mpsc::channel(16);
+        (Some(sender), Some(receiver))
+    } else {
+        (None, None)
+    };
     let mut guard = ExchangeGuard {
         app: app.clone(),
         id: session_id.into(),
         lifecycle: lifecycle.clone(),
         armed: true,
     };
-    let exchange = timeout(Duration::from_secs(40), io.exchange(&request)).await;
-    if matches!(exchange, Ok(Ok(_))) {
-        guard.armed = false;
-    }
-    match exchange {
-        Ok(Ok(Some(reply))) => Json(filter_reply(principal, &request, reply)).into_response(),
-        Ok(Ok(None)) => StatusCode::ACCEPTED.into_response(),
-        _ => {
-            app.retire(session_id.into(), lifecycle.clone());
-            let _ = lifecycle.close().await;
-            error(
-                StatusCode::BAD_GATEWAY,
-                "MCP session failed; initialize a new session",
-            )
+    let exchange = tokio::spawn(forward(
+        app.clone(),
+        session_id.to_string(),
+        lifecycle,
+        io,
+        request.clone(),
+        progress,
+        screen,
+    ));
+    if let Some(updates) = updates {
+        if request.get("id").is_some() {
+            return progress_stream(principal.clone(), request, updates, exchange, guard);
         }
     }
+    let result = exchange.await;
+    guard.armed = false;
+    match result {
+        Ok(Ok(Some(reply))) => Json(filter_reply(principal, &request, reply)).into_response(),
+        Ok(Ok(None)) => StatusCode::ACCEPTED.into_response(),
+        _ => error(
+            StatusCode::BAD_GATEWAY,
+            "MCP session failed; initialize a new session",
+        ),
+    }
+}
+/// `Some((subscribe, uri))` for a screen subscribe or unsubscribe request.
+fn screen_subscription(request: &Value) -> Option<(bool, String)> {
+    let subscribe = match request["method"].as_str()? {
+        "resources/subscribe" => true,
+        "resources/unsubscribe" => false,
+        _ => return None,
+    };
+    let uri = request["params"]["uri"].as_str()?;
+    matches!(Resource::parse(uri)?, Resource::Screen(_)).then(|| (subscribe, uri.to_string()))
+}
+async fn forward(
+    app: Arc<App>,
+    session_id: String,
+    lifecycle: Arc<Lifecycle>,
+    mut io: OwnedMutexGuard<Bridge>,
+    request: Value,
+    progress: Option<mpsc::Sender<Value>>,
+    screen: Option<(bool, String)>,
+) -> Result<Option<Value>> {
+    match timeout(Duration::from_secs(40), io.exchange(&request, progress)).await {
+        Ok(Ok(reply)) => {
+            if let (Some((subscribe, uri)), Some(reply)) = (screen, &reply) {
+                if reply.get("result").is_some() && !lifecycle.retired.load(Ordering::Acquire) {
+                    let mut screens = app.screens.lock().unwrap();
+                    let uris = screens.entry(session_id).or_default();
+                    if subscribe {
+                        uris.insert(uri);
+                    } else {
+                        uris.remove(&uri);
+                    }
+                }
+            }
+            Ok(reply)
+        }
+        _ => {
+            drop(io);
+            app.retire(session_id, lifecycle.clone());
+            let _ = lifecycle.close().await;
+            bail!("MCP session failed")
+        }
+    }
+}
+fn sse_response(body: axum::body::Body) -> Response {
+    let mut response = Response::new(body);
+    response.headers_mut().insert(
+        "content-type",
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response
+}
+/// A POST that carries a progress token: its progress notifications, then
+/// its response, as one SSE stream.
+fn progress_stream(
+    principal: Principal,
+    request: Value,
+    updates: mpsc::Receiver<Value>,
+    exchange: JoinHandle<Result<Option<Value>>>,
+    guard: ExchangeGuard,
+) -> Response {
+    // Dropping the stream before the response (the client went away) drops
+    // the armed guard, which retires the session as a cancelled POST does.
+    let state = Some((updates, exchange, guard));
+    let stream = futures_util::stream::unfold(state, move |state| {
+        let (principal, request) = (principal.clone(), request.clone());
+        async move {
+            let (mut updates, mut exchange, mut guard) = state?;
+            tokio::select! {
+                biased;
+                Some(update) = updates.recv() => {
+                    let frame = sse_frame(None, &update.to_string());
+                    Some((Ok::<_, std::convert::Infallible>(frame), Some((updates, exchange, guard))))
+                }
+                result = &mut exchange => {
+                    guard.armed = false;
+                    let reply = match result {
+                        Ok(Ok(Some(reply))) => filter_reply(&principal, &request, reply),
+                        _ => json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32603,"message":"MCP session failed; initialize a new session"}}),
+                    };
+                    Some((Ok(sse_frame(None, &reply.to_string())), None))
+                }
+            }
+        }
+    });
+    sse_response(axum::body::Body::from_stream(stream))
+}
+/// The session's GET stream: queued notifications, then new ones as they
+/// arrive, with a keepalive comment every 15 s that also counts as session
+/// activity. It ends when the session ends; idle and absolute limits still
+/// apply.
+fn event_stream(app: Arc<App>, session_id: String, lifecycle: Arc<Lifecycle>) -> Response {
+    let stream = futures_util::stream::unfold(
+        (app, session_id, lifecycle),
+        |(app, session_id, lifecycle)| async move {
+            let inbox = lifecycle.inbox.clone();
+            loop {
+                let changed = inbox.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if lifecycle.retired.load(Ordering::Acquire) || inbox.closed.load(Ordering::Acquire)
+                {
+                    return None;
+                }
+                let next = inbox.events.lock().unwrap().pop();
+                if let Some(frame) = next {
+                    return Some((
+                        Ok::<_, std::convert::Infallible>(frame),
+                        (app, session_id, lifecycle),
+                    ));
+                }
+                tokio::select! {
+                    _ = &mut changed => continue,
+                    _ = tokio::time::sleep(KEEPALIVE) => {
+                        if let Some(session) = app.sessions.lock().await.get_mut(&session_id) {
+                            session.touched = Instant::now();
+                        }
+                        return Some((Ok(": keepalive\n\n".to_string()), (app, session_id, lifecycle)));
+                    }
+                }
+            }
+        },
+    );
+    sse_response(axum::body::Body::from_stream(stream))
 }
 #[tokio::main]
 async fn main() {
@@ -720,7 +1199,14 @@ async fn run() -> Result<()> {
     if fs::metadata(&path)?.len() > 65536 {
         bail!("config too large")
     }
-    let config: Config = serde_json::from_slice(&fs::read(path)?)?;
+    // serde's message quotes the offending value; a misplaced raw token must not reach stderr.
+    let config: Config = serde_json::from_slice(&fs::read(path)?).map_err(|e| {
+        anyhow::anyhow!(
+            "config does not match the expected schema at line {} column {}",
+            e.line(),
+            e.column()
+        )
+    })?;
     private_file(&config.tls_key)?;
     if config.principals.is_empty()
         || config.principals.len() > 128
@@ -747,6 +1233,7 @@ async fn run() -> Result<()> {
             || p.scopes.iter().any(|s| {
                 !["observe", "lifecycle", "execute", "files", "input"].contains(&s.as_str())
             })
+            || (!p.tools.is_empty() && vm_control::tool_groups::parse(&p.tools.join(",")).is_err())
         {
             bail!("invalid or duplicate principal definition")
         }
@@ -778,6 +1265,7 @@ async fn run() -> Result<()> {
         closing: AtomicBool::new(false),
         cleanup_failed: AtomicBool::new(false),
         changed: Notify::new(),
+        screens: std::sync::Mutex::new(BTreeMap::new()),
     });
     let shutdown_signal = install_shutdown_signal()?;
     let cleaner = app.clone();
@@ -857,7 +1345,73 @@ mod tests {
             token_sha256: "a".repeat(64),
             scopes: vec!["observe".into(), "lifecycle".into()],
             vm_ids: vec!["allowed".into()],
+            tools: vec![],
         }
+    }
+    #[test]
+    fn snapshot_remote_projection_keeps_scope_and_removes_all_host_receipts() {
+        let p = principal();
+        for tool in [
+            "vm_snapshot_create",
+            "vm_snapshot_list",
+            "vm_snapshot_status",
+            "vm_snapshot_delete",
+            "vm_snapshot_restore",
+            "vm_snapshot_reconcile",
+            "vm_snapshot_resume_source",
+        ] {
+            let request =
+                json!({"method":"tools/call","params":{"name":tool,"arguments":{"id":"allowed"}}});
+            assert!(remote_authorized(&p, &request));
+            let denied =
+                json!({"method":"tools/call","params":{"name":tool,"arguments":{"id":"other"}}});
+            assert!(!remote_authorized(&p, &denied));
+            let private = json!({"vm":"allowed","name":"checkpoint","operation_id":"abc","state":"failed","error":"secret /private/disk.raw","compatibility":{"backend_sha256":"secret"},"result":{"capture_verified":true,"disk":"/private/disk.raw"}});
+            let reply = filter_reply(
+                &p,
+                &request,
+                json!({"jsonrpc":"2.0","id":7,"result":{"isError":false,"content":[{"type":"text","text":private.to_string()},{"type":"text","text":"secret"}],"structuredContent":{"secret":"secret"}}}),
+            );
+            assert!(!reply.to_string().contains("secret"));
+            assert!(!reply.to_string().contains("/private"));
+            assert_eq!(reply["result"]["content"].as_array().unwrap().len(), 1);
+            let value: Value =
+                serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(value["name"], "checkpoint");
+            assert_eq!(value["result"]["capture_verified"], true);
+            for bad in [
+                json!({"error":{"message":"secret"}}),
+                json!({"result":{"isError":true,"content":[{"text":"secret"}]}}),
+                json!({"result":{"isError":false,"content":[{"text":"not-json secret"}]}}),
+                json!({"result":{"isError":false,"structuredContent":{"secret":"secret"}}}),
+                json!({"result":{"isError":false,"content":[{"text":"null"}]}}),
+                json!({"result":{"isError":false,"content":[{"text":"[1]"}]}}),
+            ] {
+                let cleaned = filter_reply(&p, &request, bad);
+                assert!(!cleaned.to_string().contains("secret"));
+                assert_eq!(cleaned["result"]["isError"], true);
+            }
+        }
+    }
+    #[test]
+    fn snapshot_recovery_projection_preserves_typed_outcome_without_private_details() {
+        let value = public_snapshot(
+            &json!({"action":"create","state":"failed","error_code":"capture_source_resumed",
+            "source_resume_pending":true,"result":{"source_resumed":true,"restored":false,"snapshot_result_verified":false,
+                "native_io_retirement_verified":true,"private":"/private/secret"}}),
+        );
+        assert_eq!(value["error_code"], "capture_source_resumed");
+        assert_eq!(value["action"], "create");
+        assert_eq!(value["source_resume_pending"], true);
+        assert_eq!(value["result"]["source_resumed"], true);
+        assert_eq!(value["result"]["restored"], false);
+        assert!(!value.to_string().contains("secret"));
+        let bad = public_snapshot(
+            &json!({"action":"/private/secret","error_code":"/private/secret",
+            "source_resumed":"secret","native_io_retirement_verified":1}),
+        );
+        assert_eq!(bad, json!({}));
     }
     #[test]
     fn remote_lifecycle_cannot_configure_host_paths_or_touch_other_vms() {
@@ -890,6 +1444,31 @@ mod tests {
         assert_eq!(reply["result"]["tools"], json!([{"name":"vm_status"}]));
     }
     #[test]
+    fn tool_groups_enable_needs_no_vm_and_never_names_remote_create() {
+        let p = principal();
+        let request = json!({"method":"tools/call","params":{"name":"vm_tools_enable","arguments":{"groups":["core"]}}});
+        assert!(remote_authorized(&p, &request));
+        let result = json!({"enabled":["core"],"added_tools":["vm_start","vm_create"]});
+        let reply = filter_reply(
+            &p,
+            &request,
+            json!({"result":{"isError":false,"content":[{"type":"text","text":result.to_string()}]}}),
+        );
+        let value: Value =
+            serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(value["added_tools"], json!(["vm_start"]));
+        let mut bad = principal();
+        bad.tools = vec!["core".into(), "shell".into()];
+        assert!(vm_control::tool_groups::parse(&bad.tools.join(",")).is_err());
+    }
+    #[test]
+    fn tool_list_changes_reach_the_event_stream() {
+        let notice = json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"});
+        assert!(observable(&principal(), &notice));
+        let other = json!({"jsonrpc":"2.0","method":"notifications/message","params":{}});
+        assert!(!observable(&principal(), &other));
+    }
+    #[test]
     fn window_observation_is_still_vm_allowlisted() {
         let mut p = principal();
         p.scopes = vec!["observe".into()];
@@ -918,6 +1497,104 @@ mod tests {
         let values: Value = serde_json::from_str(text).unwrap();
         assert_eq!(values[0]["config"]["memory_mib"], 1024);
         assert_eq!(values[0]["runtime"]["state"], "error");
+    }
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+    fn principal() -> Principal {
+        Principal {
+            name: "agent".into(),
+            token_sha256: "a".repeat(64),
+            scopes: vec!["observe".into()],
+            vm_ids: vec!["allowed".into()],
+            tools: vec![],
+        }
+    }
+    #[test]
+    fn resources_and_notifications_follow_the_vm_allowlist() {
+        let p = principal();
+        for method in [
+            "resources/read",
+            "resources/subscribe",
+            "resources/unsubscribe",
+        ] {
+            let request = |uri: &str| json!({"method":method,"params":{"uri":uri}});
+            assert!(remote_authorized(
+                &p,
+                &request("veynode://vm/allowed/status")
+            ));
+            assert!(!remote_authorized(
+                &p,
+                &request("veynode://vm/other/screen")
+            ));
+            assert!(!remote_authorized(&p, &request("veynode://vm/../status")));
+            assert!(!remote_authorized(
+                &p,
+                &json!({"method":method,"params":{}})
+            ));
+        }
+        assert!(remote_authorized(&p, &json!({"method":"resources/list"})));
+        let updated = |uri: &str| json!({"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":uri}});
+        assert!(observable(&p, &updated("veynode://vm/allowed/log/worker")));
+        assert!(!observable(&p, &updated("veynode://vm/other/status")));
+        assert!(!observable(
+            &p,
+            &json!({"method":"notifications/message","params":{"uri":"veynode://vm/allowed/status"}})
+        ));
+        let list = filter_reply(
+            &p,
+            &json!({"method":"resources/list"}),
+            json!({"jsonrpc":"2.0","id":1,"result":{"resources":[{"uri":"veynode://vm/allowed/status"},{"uri":"veynode://vm/other/status"}]}}),
+        );
+        assert_eq!(list["result"]["resources"].as_array().unwrap().len(), 1);
+        let status = json!({"config":{"id":"allowed","disk":"/Users/me/disk.img","kernel_cmdline":"secret"},"pid":42,"runtime":{"state":"running","serial_log":"/Users/me/serial.log"}});
+        let read = filter_reply(
+            &p,
+            &json!({"method":"resources/read","params":{"uri":"veynode://vm/allowed/status"}}),
+            json!({"jsonrpc":"2.0","id":1,"result":{"contents":[{"uri":"veynode://vm/allowed/status","text":status.to_string()}]}}),
+        );
+        let text = read["result"]["contents"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("/Users/") && !text.contains("secret") && !text.contains("42"));
+        assert!(text.contains("running"));
+    }
+    #[test]
+    fn event_queue_is_bounded_and_reports_drops() {
+        let mut queue = Queue::default();
+        for index in 0..MAX_QUEUED_EVENTS + 10 {
+            queue.push(json!({"n":index}).to_string());
+        }
+        queue.push("x".repeat(MAX_EVENT_BYTES + 1));
+        assert_eq!(queue.events.len(), MAX_QUEUED_EVENTS);
+        let first = queue.pop().unwrap();
+        assert!(first.starts_with("id: 1\nevent: message\ndata: "));
+        assert!(first.contains("events_dropped") && first.contains("\"dropped\":11"));
+        assert!(queue.pop().unwrap().contains("{\"n\":10}"));
+        for _ in 0..MAX_QUEUED_EVENT_BYTES / MAX_EVENT_BYTES + 4 {
+            queue.push("y".repeat(MAX_EVENT_BYTES));
+        }
+        assert!(queue.bytes <= MAX_QUEUED_EVENT_BYTES);
+        assert!(queue.dropped > 0);
+    }
+    #[test]
+    fn screen_subscriptions_are_recognized_for_the_global_bound() {
+        assert_eq!(
+            screen_subscription(
+                &json!({"method":"resources/subscribe","params":{"uri":"veynode://vm/a/screen"}})
+            ),
+            Some((true, "veynode://vm/a/screen".into()))
+        );
+        assert_eq!(
+            screen_subscription(
+                &json!({"method":"resources/unsubscribe","params":{"uri":"veynode://vm/a/screen"}})
+            ),
+            Some((false, "veynode://vm/a/screen".into()))
+        );
+        assert!(screen_subscription(
+            &json!({"method":"resources/subscribe","params":{"uri":"veynode://vm/a/status"}})
+        )
+        .is_none());
     }
 }
 

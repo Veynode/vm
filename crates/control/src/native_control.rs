@@ -25,6 +25,9 @@ struct Session {
 }
 impl Session {
     fn bound<'a>(&self, m: &'a mut Manager) -> Result<&'a mut Running> {
+        if m.snapshot_ops.active_vm(&self.attach.id) {
+            bail!("VM control is fenced by a snapshot operation")
+        }
         if m.native_connections
             .get(&self.attach.id)
             .is_none_or(|(owner, worker)| {
@@ -208,14 +211,29 @@ impl Drop for Session {
 }
 fn line(stream: &mut UnixStream) -> Result<Option<Vec<u8>>> {
     // One absolute deadline for the entire frame; a slow byte stream cannot renew it.
-    let deadline = Instant::now() + Duration::from_secs(2);
+    line_until(
+        stream,
+        Instant::now() + Duration::from_secs(2),
+        Instant::now,
+    )
+}
+fn line_until(
+    stream: &mut UnixStream,
+    deadline: Instant,
+    mut now: impl FnMut() -> Instant,
+) -> Result<Option<Vec<u8>>> {
     let mut bytes = Vec::new();
     loop {
-        stream.set_read_timeout(Some(
+        // Darwin refuses the option with EINVAL once the peer has closed; the read below then reports that close at
+        // once, so it is not an error of its own. Any earlier timeout on this stream came from the same deadline.
+        match stream.set_read_timeout(Some(
             deadline
-                .checked_duration_since(Instant::now())
+                .checked_duration_since(now())
                 .context("native channel idle")?,
-        ))?;
+        )) {
+            Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {}
+            other => other?,
+        }
         let mut b = [0];
         match stream.read(&mut b) {
             Ok(0) => {
@@ -228,6 +246,9 @@ fn line(stream: &mut UnixStream) -> Result<Option<Vec<u8>>> {
             Err(e) => return Err(e.into()),
         }
         if b[0] == b'\n' {
+            if now() >= deadline {
+                bail!("native channel idle")
+            }
             return Ok(Some(bytes));
         }
         bytes.push(b[0]);
@@ -415,6 +436,45 @@ pub(super) fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_control_completed_frame_after_deadline_is_idle() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        let start = Instant::now();
+        let mut calls = 0;
+        // Advance the clock past the short deadline only after the successful read.
+        let now = || {
+            calls += 1;
+            if calls <= 1 {
+                start
+            } else {
+                start + Duration::from_millis(200)
+            }
+        };
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5));
+            writer.write_all(b"\n").unwrap();
+        });
+        let error = line_until(&mut reader, start + Duration::from_millis(100), now).unwrap_err();
+        writer.join().unwrap();
+        assert_eq!(error.to_string(), "native channel idle");
+    }
+
+    #[test]
+    fn native_control_frame_before_deadline_and_idle_deadline() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(b"{}\n").unwrap();
+        let now = Instant::now();
+        assert_eq!(
+            line_until(&mut reader, now + Duration::from_secs(1), || now).unwrap(),
+            Some(b"{}".to_vec())
+        );
+        assert_eq!(
+            line_until(&mut reader, now, || now + Duration::from_nanos(1))
+                .unwrap_err()
+                .to_string(),
+            "native channel idle"
+        );
+    }
     struct Fixture {
         manager: Arc<Mutex<Manager>>,
         stop: Arc<AtomicBool>,
@@ -436,7 +496,7 @@ mod tests {
             let listener = UnixListener::bind(dir.path().join("control.sock")).unwrap();
             listener.set_nonblocking(true).unwrap();
             let mut m = Manager::load(
-                dir.path().into(),
+                crate::test_private_state(dir.path()),
                 "/unused".into(),
                 MemoryBudget::new(16 * 1024 * 1024 * 1024, None).unwrap(),
             )
@@ -504,6 +564,7 @@ for line in sys.stdin:
                     assigned_memory_mib: 512,
                     expected_exit: false,
                     execution_quiescing: false,
+                    guest_async_timeout: Arc::new(Mutex::new(GuestAsyncTimeout::default())),
                     exit_status: None,
                     disk_identity: None,
                     state: Arc::new(Mutex::new(json!({"state":"running"}))),

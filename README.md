@@ -40,8 +40,16 @@ veynodevm run -d --init systemd --desktop --name gnome veynodevm/ubuntu-gnome   
 veynodevm desktop gnome; veynodevm exec gnome systemctl status gdm
 veynodevm stop gnome                           # systemctl poweroff inside the guest
 
+# Checkpoints and forks (Linux containers): APFS clones of the writable layer,
+# plus memory on Apple Virtualization (--disk-only to skip it)
+veynodevm checkpoint create web before-upgrade # ~0.25 s for a 512 MiB guest, no disk data copied
+veynodevm rollback web before-upgrade          # restore it with processes running (~0.4 s; --cold boots it)
+veynodevm fork -n 3 --checkpoint before-upgrade web   # 3 containers, fresh id/hostname/MAC/ports
+veynodevm fork rm web                          # remove every fork of web
+
 veynodevm ui --open                            # TanStack Start web UI on 127.0.0.1
 veynodevm mcp --lifecycle                      # stdio MCP server
+veynodevm mcp --input --tools core,screen,input  # list only some tool groups
 ```
 
 State lives in `~/Library/Application Support/VeynodeVM` (override with `VEYNODEVM_HOME`).
@@ -74,6 +82,18 @@ scripts/install-distro.py fedora --name fedora --iso .local/iso/Fedora-Everythin
 
 Verified: Ubuntu Desktop 24.04.5 arm64 and Fedora Workstation 44 aarch64 install unattended and boot from disk into GNOME with the virgl renderer; see [known issues](docs/known-issues.md#full-linux-distributions-uefi-machines) for what is verified and the limits.
 
+## Windows 11 ARM64 (UEFI machine)
+
+Windows runs as a QEMU/HVF machine installed from your own Windows 11 ARM64 ISO (Apple Virtualization has no Windows support). `--os windows` puts the ISO and seed images on USB CD-ROMs (Setup reads them before any driver loads), the disk on virtio-blk (`--disk-bus nvme` for the inbox NVMe driver instead), and adds virtio-net, virtio-serial, balloon, RNG, virtio keyboard/tablet and pvpanic; their drivers come from the virtio-win ISO. The display is UTM's `virtio-ramfb` (Basic Display, no GPU acceleration); `--gpus neptune` is an experimental Triton profile with hardware D3D11 through DXMT on Metal, pixel-checked and benchmarked, which needs UTM's guest tools 0.1.273 in the guest. Guest reboots restart QEMU, because edk2 hangs after an in-process reset. `install-distro.py windows` also sets up Windows' OpenSSH Server with a generated key, forwarded to `127.0.0.1:2222` (`machine create --publish HOST:GUEST`), and records that login (`veynodevm machine ssh-key`) so the MCP tools `vm_exec`, file transfer, `vm_desktop_state`, window actions, app launch and the UI Automation accessibility tree work over it, without installing anything in the guest. There is no TPM, no Secure Boot key enrolment and no guest agent, so Setup's Windows 11 checks are bypassed by the answer file.
+
+```sh
+scripts/install-distro.py windows --name win11 --iso ~/Downloads/Windows11_Client_arm64_en-us.iso \
+    --drivers-iso virtio-win.iso --evidence .local/evidence/windows-installed.png
+# or by hand: veynodevm machine create win11 --os windows --iso WIN.iso --attach answer.iso --monitor
+```
+
+The script writes an `Autounattend.xml` seed (Windows 11 Pro with the generic, non-activating key unless `--edition`/`--product-key` say otherwise; local administrator `veynode` with automatic logon), taps Enter for the CD's "Press any key" prompt, loads the virtio storage and network drivers in Setup and the rest offline, waits for the first logon to power off, ejects the media and boots the disk. See [known issues](docs/known-issues.md#windows-11-arm64-machines) for what is verified.
+
 ## Pieces
 
 | Area | Path | State |
@@ -94,7 +114,8 @@ Verified: Ubuntu Desktop 24.04.5 arm64 and Fedora Workstation 44 aarch64 install
 | Native desktop console (AppKit/Metal) | `native/console`, `native/tools/spice-console.m` | implemented |
 | GPU runtime fetch/build (UTM QEMU, virglrenderer, SPICE) | `runtime/` | development only |
 | macOS containers (Tart OCI images, SSH exec/cp, Screen Sharing MCP) | `crates/oci/src/tart.rs`, `crates/cli/src/macos.rs`, `native/worker/ScreenSharing.swift` | implemented; Metal at game load verified on Tahoe 26.6 (99% of host offscreen, 60 fps on screen); OpenGL is software-only; `native/guest-metal-fix` works around a paravirtual `baseVertex` bug that breaks MoltenVK games |
-| Windows guests; signed-in macOS Guest service | `native/guest-macos`, `native/guest-launcher` | reserved, not on main path |
+| Windows 11 ARM64 machines (QEMU/HVF, unattended install from the user's ISO) | `crates/cli/src/machine.rs`, `crates/control/src/qemu_uefi.rs`, `scripts/install-distro.py` | implemented; see known issues for what is verified |
+| Signed-in macOS Guest service | `native/guest-macos`, `native/guest-launcher` | reserved, not on main path |
 
 Experiments, benchmarks and validation evidence from the earlier phase are in [`archive/`](archive/README.md).
 
@@ -107,12 +128,14 @@ Host: Apple Silicon, macOS 14+ (Venus requires macOS 26+). Install the Swift com
 ./scripts/check.sh --real     # also builds the kernel and boots real containers (and the engine if docker is installed)
 ```
 
+Day to day, `scripts/check-changed.py` runs only the checks that the files changed against `main` need (`--quick` while editing, `--dry-run` to see the plan); see [AGENTS.md](AGENTS.md#verification).
+
 For the browser desktop on Apple Virtualization containers, build the host
 encoder and register it (QEMU desktops use the console helper below):
 
 ```sh
 ./native/tools/build-vz-desktop-stream.sh   # → .local/bin/vz-desktop-stream
-./native/tools/build-vm-vision.sh           # → .local/bin/vm-vision (vm_screen_text)
+./native/tools/build-vm-vision.sh           # → .local/bin/vm-vision (vm_screen_text, scaled screenshots, observe)
 ./native/tools/build-vm-macos-desktop.sh    # → .local/bin/vm-macos-desktop (macOS desktop/accessibility tools)
 python3 scripts/install-dev-runtime.py
 ```

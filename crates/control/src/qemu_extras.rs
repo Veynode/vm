@@ -6,6 +6,10 @@ use anyhow::{bail, Result};
 /// `-nic` value; port forwards become slirp `hostfwd` rules.
 pub fn nic(config: &Config) -> String {
     let mut nic = String::from("user,model=virtio-net-pci");
+    // Validated as a locally administered unicast address (no commas).
+    if let Some(mac) = &config.mac_address {
+        nic.push_str(&format!(",mac={mac}"));
+    }
     for port in &config.ports {
         nic.push_str(&format!(
             ",hostfwd={}:{}:{}-:{}",
@@ -39,10 +43,7 @@ pub fn arguments(config: &Config) -> Result<Vec<String>> {
             "driver":"raw","node-name":format!("veynode-extra{index}"),
             "file":format!("veynode-extra{index}-file"),"read-only":true
         }))?);
-        args.push("-device".into());
-        args.push(format!(
-            "virtio-blk-pci,drive=veynode-extra{index},id=veynode-extra{index}-device"
-        ));
+        args.extend(crate::qemu_uefi::extra_disk_devices(config, index));
     }
     for share in &config.shares {
         let path = option_value(share.path.to_str().unwrap_or(","))?;
@@ -90,6 +91,11 @@ mod tests {
             nic(&c),
             "user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:8080-:80,hostfwd=udp:0.0.0.0:5353-:53"
         );
+    }
+    #[test]
+    fn fixed_mac_address_is_passed_to_the_nic() {
+        let c = config(serde_json::json!({"mac_address":"02:11:22:33:44:55"}));
+        assert_eq!(nic(&c), "user,model=virtio-net-pci,mac=02:11:22:33:44:55");
     }
     #[test]
     fn extra_disks_and_shares_are_ordered_and_read_only() {
