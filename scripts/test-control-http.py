@@ -94,14 +94,14 @@ with tempfile.TemporaryDirectory(prefix='vm-https-') as tmp:
         inputter=initialize('inputter')
         _,input_tools,_=request(data=rpc('tools/list'),principal='inputter',session=inputter)
         input_names=[t['name'] for t in input_tools['result']['tools']]
-        assert 'vm_input_click' in input_names and 'vm_acquire_control' in input_names and not any(n in input_names for n in ['vm_exec','vm_start','vm_file_download_begin']);record('independent HTTPS input scope',input_names)
+        assert 'vm_input_click' in input_names and not any(n in input_names for n in ['vm_exec','vm_start','vm_file_download_begin']);record('independent HTTPS input scope',input_names)
         for principal,session in [('observer',observer),('operator',operator)]:
             status,denied,_=request(data=rpc('tools/call',params={'name':'vm_input_click','arguments':{'id':'https-smoke'}}),principal=principal,session=session)
             assert status==200 and denied['error']['code']==-32602,(status,denied)
         record('observe and execute scopes cannot input')
         status,denied,_=request(data=rpc('tools/call',params={'name':'vm_input_click','arguments':{'id':'not-authorized'}}),principal='inputter',session=inputter)
         assert status==200 and denied['error']['code']==-32602;record('input scope preserves VM allowlist')
-        status,routed,_=request(data=rpc('tools/call',params={'name':'vm_acquire_control','arguments':{'id':'https-smoke'}}),principal='inputter',session=inputter)
+        status,routed,_=request(data=rpc('tools/call',params={'name':'vm_input_key','arguments':{'id':'https-smoke','keys':['esc'],'frame_id':'00000000-0000-0000-0000-000000000000','source_generation':0,'width':1,'height':1}}),principal='inputter',session=inputter)
         assert status==200 and routed['result']['isError'] and 'VM not found' in routed['result']['content'][0]['text'];record('input principal routes to real daemon without fake VM success')
         assert request('DELETE',principal='inputter',session=inputter)[0]==204
         listed=tool(observer,'vm_list',{},principal='observer');record('HTTPS → stdio → daemon actual list',listed)
@@ -142,7 +142,6 @@ with tempfile.TemporaryDirectory(prefix='vm-https-') as tmp:
                 assert request('DELETE',principal='filer',session=filer)[0]==204
                 policy=tool(operator,'vm_guest_info',{'id':vm['id']})['result']['file_policy'];assert policy['active_transfers']==0 and policy['staged_upload_files']==0,policy
                 record('independent files scope over verified HTTPS roundtrip and DELETE cleanup',{'bytes':len(blob),'sha256':digest,'policy':policy})
-            record('HTTPS control lease',tool(operator,'vm_acquire_control',{'id':vm['id']}))
             executed=tool(operator,'vm_exec',{'id':vm['id'],'argv':['/bin/uname','-m'],'timeout_ms':5000});assert executed['result']['stdout']=='aarch64\n';record('HTTPS actual guest execution',executed)
             for closing in ['DELETE', 'idle-expiry']:
                 unique=secrets.token_hex(8);ready=f'/tmp/veynode-http-sync-{unique}-ready';late=f'/tmp/veynode-http-sync-{unique}-late'
@@ -159,7 +158,7 @@ with tempfile.TemporaryDirectory(prefix='vm-https-') as tmp:
                     elapsed=time.monotonic()-action_started
                     assert elapsed < (4 if closing=='DELETE' else 7),elapsed
                 assert request(data=rpc('ping'),principal='operator',session=old_sync)[0]==404
-                operator=initialize('operator');tool(operator,'vm_acquire_control',{'id':vm['id']})
+                operator=initialize('operator')
                 time.sleep(3.2)
                 absent=tool(operator,'vm_exec',{'id':vm['id'],'argv':['/bin/sh','-c',f'test -f {ready} && test ! -e {late}']})
                 assert absent['result']['exit_code']==0,absent
@@ -172,7 +171,7 @@ with tempfile.TemporaryDirectory(prefix='vm-https-') as tmp:
                 time.sleep(.02)
             else:raise AssertionError('HTTP marker job never started')
             assert request('DELETE',principal='operator',session=operator)[0]==204
-            operator=initialize('operator');record('DELETE releases control lease',tool(operator,'vm_acquire_control',{'id':vm['id']}))
+            operator=initialize('operator')
             time.sleep(2.2)
             absent=tool(operator,'vm_exec',{'id':vm['id'],'argv':['/bin/sh','-c',f'test ! -e {late}']})
             assert absent['result']['exit_code']==0,absent;record('HTTPS DELETE cancels actual running guest job',{'job_id':started['result']['job_id'],'late_marker_absent':True})
@@ -186,9 +185,9 @@ with tempfile.TemporaryDirectory(prefix='vm-https-') as tmp:
             else:raise AssertionError('expiry marker job did not start')
             expired_operator=operator;time.sleep(8.5)
             assert request(data=rpc('ping'),principal='operator',session=expired_operator)[0]==404
-            operator=initialize('operator');tool(operator,'vm_acquire_control',{'id':'https-smoke'})
+            operator=initialize('operator')
             absent=tool(operator,'vm_exec',{'id':'https-smoke','argv':['/bin/sh','-c',f'test ! -e {late}']})
-            assert absent['result']['exit_code']==0,absent;record('HTTPS idle expiry cancels actual running job and releases lease',True)
+            assert absent['result']['exit_code']==0,absent;record('HTTPS idle expiry cancels actual running job',True)
         old=operator;assert request('DELETE',principal='operator',session=operator)[0]==204
         assert request(data=rpc('ping'),principal='operator',session=old)[0]==404;record('deleted session rejected')
         if args.sdk:

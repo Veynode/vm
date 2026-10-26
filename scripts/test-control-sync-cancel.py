@@ -120,59 +120,41 @@ def main():
                 raise AssertionError('Guest service unavailable')
             assert info['capabilities']['async_exec'], info
             record('real installed Guest identity and capabilities', info)
-            tool(owner, 'vm_acquire_control')
             normal = execute(owner, ['/bin/sh', '-c', 'printf "你好 ✓"; exit 7'])
             assert normal['stdout'] == '你好 ✓' and normal['exit_code'] == 7 and not normal['cancelled'], normal
             record('synchronous Unicode and nonzero exit preserve API', normal)
             timed = execute(owner, ['/bin/sleep', '10'], 150)
             assert timed['timed_out'] and not timed['cancelled'], timed
             record('synchronous timeout retains actual terminal semantics', timed)
-            for case in ['takeover', 'stdin-eof', 'broken-stdout']:
-                if case != 'takeover':
-                    owner = client()
-                    tool(owner, 'vm_acquire_control')
+            for case in ['stdin-eof', 'broken-stdout']:
+                owner = client()
                 argv, ready, late = command()
                 owner.begin_tool('vm_exec', {'id': config['id'], 'argv': argv, 'timeout_ms': 10000})
                 time.sleep(.6)
                 started = time.monotonic()
-                if case == 'takeover':
-                    takeover = local('human_takeover', {'id': config['id']})
-                    assert takeover['job_cancellation']['attempted'] == 1, takeover
-                    terminal = owner.finish_tool(timeout=4)['result']
-                    assert terminal['cancelled'] and not terminal['timed_out'], terminal
-                    owner.tool('vm_exec', {'id': config['id'], 'argv': ['/bin/true']}, denied=True)
-                    local('human_release', {'id': config['id']})
+                if case == 'stdin-eof':
+                    owner.process.stdin.close()
                 else:
-                    if case == 'stdin-eof':
-                        owner.process.stdin.close()
-                    else:
-                        owner.process.stdout.close()
-                    assert owner.process.wait(timeout=4) == (0 if case == 'stdin-eof' else 1)
-                    terminal = {'client_exit_code': owner.process.returncode}
+                    owner.process.stdout.close()
+                assert owner.process.wait(timeout=4) == (0 if case == 'stdin-eof' else 1)
+                terminal = {'client_exit_code': owner.process.returncode}
                 elapsed = time.monotonic() - started
                 assert elapsed < 4, elapsed
                 verifier = client()
-                tool(verifier, 'vm_acquire_control')
                 time.sleep(3.1)
                 verify_markers(verifier, ready, late)
-                tool(verifier, 'vm_release_control')
                 record(case + ' stops synchronous command and ordinary descendant',
                        {'terminal': terminal, 'elapsed_after_action_seconds': elapsed, 'ready_present_late_absent': True})
 
-            raw_owner = uuid.uuid4().hex * 2
-            epoch = local('acquire_control', {'id': config['id'], 'owner': raw_owner})['epoch']
             argv, ready, late = command()
             raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             raw.connect(str(state / 'control.sock'))
-            raw.sendall((json.dumps({'method': 'exec', 'arguments': {'id': config['id'], 'owner': raw_owner,
-                         'epoch': epoch, 'argv': argv, 'timeout_ms': 10000}}) + '\n').encode())
+            raw.sendall((json.dumps({'method': 'exec', 'arguments': {'id': config['id'],
+                         'argv': argv, 'timeout_ms': 10000}}) + '\n').encode())
             time.sleep(.6)
             raw.close()
             time.sleep(3.1)
-            local('release_control', {'id': config['id'], 'owner': raw_owner, 'epoch': epoch})
-            tool(verifier, 'vm_acquire_control')
             verify_markers(verifier, ready, late)
-            tool(verifier, 'vm_release_control')
             record('direct daemon Unix client disconnect stops synchronous descendant', True)
             assert tool(life, 'vm_shutdown', mode='guest')['result']['requested']
             for _ in range(150):

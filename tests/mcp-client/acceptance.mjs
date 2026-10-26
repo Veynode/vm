@@ -20,7 +20,7 @@ try {
   const checks=['initialize','tools/list','vm_list'];
   if(vm){
     let guestInfo;
-    for(const [name,args] of [['vm_guest_info',{id:vm}],['vm_acquire_control',{id:vm}],['vm_exec',{id:vm,argv:['/bin/uname','-m'],timeout_ms:5000}]]){
+    for(const [name,args] of [['vm_guest_info',{id:vm}],['vm_exec',{id:vm,argv:['/bin/uname','-m'],timeout_ms:5000}]]){
       const result=await client.callTool({name,arguments:args});
       assert(!result.isError,JSON.stringify(result));
       if(name==='vm_guest_info') guestInfo=JSON.parse(result.content[0].text).result;
@@ -49,8 +49,6 @@ try {
       assert.equal(finished.result.timed_out,false);
       checks.push('vm_exec_start','vm_exec_cancel','vm_exec_poll actual cancelled completion');
     }
-    const release=await client.callTool({name:'vm_release_control',arguments:{id:vm}});
-    assert(!release.isError);checks.push('vm_release_control');
   }
   if(mode==='https'){await transport.terminateSession();checks.push('DELETE session');}
   console.log(JSON.stringify({passed:true,client:'official @modelcontextprotocol/sdk 1.32.1',transport:mode,checks}));

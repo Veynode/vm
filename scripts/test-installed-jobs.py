@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Actual rootless Linux commands/cancellation/revocation via stdio MCP.
+"""Actual rootless Linux commands/cancellation/disconnect cleanup via stdio MCP.
 
 Use a NEW repository-created fixture from provision-linux-qemu.py. This test
 does not replace real Windows/macOS integration, desktop input or sandbox tests.
@@ -115,7 +115,6 @@ with tempfile.TemporaryDirectory(prefix='vm-installed-jobs-') as directory:
         record('installed service actual identity/capabilities', info)
         life.tool('vm_exec_start', {'id': config['id'], 'argv': ['/bin/true']}, denied=True)
         record('lifecycle-only client denied command job', True)
-        tool(owner, 'vm_acquire_control')
         identity = execute(owner, ['/bin/sh', '-eu', '-c', 'id; printf "HOME=%s\nPWD=%s\n" "$HOME" "$PWD"; test "$(id -u)" = 1000; test "$(id -G)" = 1000'])
         assert identity['exit_code'] == 0 and 'HOME=/home/veynode' in identity['stdout'], identity
         record('actual child UID/GID/groups/home are unprivileged', identity)
@@ -130,9 +129,9 @@ with tempfile.TemporaryDirectory(prefix='vm-installed-jobs-') as directory:
         execute(owner, ['/bin/rm', '-f', marker])
         job = tool(owner, 'vm_exec_start', argv=['/bin/sh', '-c',
             '(sleep 1; printf leaked > "$1") & wait', 'cancel-test', marker], timeout_ms=10000)['result']['job_id']
-        other.tool('vm_exec_poll', {'id': config['id'], 'job_id': job}, denied=True)
-        other.tool('vm_exec_cancel', {'id': config['id'], 'job_id': job}, denied=True)
-        record('other MCP owner cannot observe or cancel job', True)
+        denied = other.tool('vm_exec_poll', {'id': config['id'], 'job_id': '0' * 32}, denied=True)
+        assert 'job is unknown or expired on this VM' in json.dumps(denied), denied
+        record('unknown job refused', True)
         assert tool(owner, 'vm_exec_cancel', job_id=job)['result']['cancel_requested']
         result = finish(owner, job)
         assert result['cancelled'] and not result['timed_out'], result
@@ -144,27 +143,12 @@ with tempfile.TemporaryDirectory(prefix='vm-installed-jobs-') as directory:
         result = finish(owner, completed)
         assert result['stdout'] == '你好, VM' and result['exit_code'] == 7 and not result['cancelled'], result
         record('normal async Unicode/nonzero completion', result)
-        job = tool(owner, 'vm_exec_start', argv=['/bin/sh', '-c',
-            '(sleep 2; printf leaked > "$1") & wait', 'takeover-test', marker], timeout_ms=10000)['result']['job_id']
-        takeover = local('human_takeover', {'id': config['id']})
-        record('human takeover response', takeover)
-        owner.tool('vm_exec_start', {'id': config['id'], 'argv': ['/bin/true'], 'timeout_ms': 1000}, denied=True)
-        other.tool('vm_acquire_control', {'id': config['id']}, denied=True)
-        result = finish(owner, job)
-        assert result['cancelled'], result
-        record('takeover cancels active job and rejects old authority', result)
-        local('human_release', {'id': config['id']})
-        tool(other, 'vm_acquire_control')
-        time.sleep(2.1)
-        assert execute(other, ['/bin/sh', '-c', 'test ! -e "$1"', 'marker-test', marker])['exit_code'] == 0
         tool(other, 'vm_exec_start', argv=['/bin/sh', '-c',
             '(sleep 2; printf leaked > "$1") & wait', 'disconnect-test', marker], timeout_ms=10000)
         other.close()
-        tool(owner, 'vm_acquire_control')
         time.sleep(2.1)
         assert execute(owner, ['/bin/sh', '-c', 'test ! -e "$1"', 'marker-test', marker])['exit_code'] == 0
-        record('MCP disconnect cancels active job and releases control', True)
-        tool(owner, 'vm_release_control')
+        record('MCP disconnect cancels active job', True)
         assert tool(life, 'vm_shutdown', mode='guest')['result']['requested']
         for _ in range(150):
             if local('status', {'id': config['id']})['state'] == 'stopped':
@@ -195,4 +179,4 @@ with tempfile.TemporaryDirectory(prefix='vm-installed-jobs-') as directory:
                 output = output.with_suffix('.failed.json')
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_text(json.dumps(evidence, indent=2) + '\n')
-print('Actual rootless Linux MCP jobs, cancellation, takeover and normal shutdown passed')
+print('Actual rootless Linux MCP jobs, cancellation, disconnect and normal shutdown passed')

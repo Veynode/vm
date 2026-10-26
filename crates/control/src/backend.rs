@@ -95,19 +95,25 @@ impl QemuRegistration {
 pub fn capabilities(backend: Backend) -> Value {
     match backend {
         Backend::AppleVirtualization => {
-            json!({"guest_os":["linux","macos"],"lifecycle":true,"native_window":true,"window_enumeration":true,"window_enumeration_requirements":"macOS Guest --allow-observe with existing Screen Recording permission and eligible console; no titles or input authority; query vm_guest_info capabilities.windows","screenshot":true,"screenshot_requirements":"macOS Guest service --allow-observe with existing Guest Screen Recording permission; Apple Linux screenshot unsupported","input":true,"input_requirements":"macOS Guest --allow-observe --allow-input with existing Screen Recording and Accessibility permissions; Apple Linux input unsupported","guest_integration":"enabled Linux or macOS Guest service over host-only vsock; query vm_guest_info for actual availability","command_execution":true,"command_execution_requirements":"MCP requires enabled Linux async jobs for cancellation; macOS service legacy exec is not exposed by current MCP execution API","gpu":"requires actual Guest measurements"})
+            json!({"guest_os":["linux","macos"],"boot":["kernel","uefi"],"uefi":"Linux: VZEFIBootLoader with per-VM efi_vars, cdrom as read-only USB mass storage","lifecycle":true,"native_window":true,"window_enumeration":true,"window_enumeration_requirements":"macOS Guest --allow-observe with existing Screen Recording permission and eligible console; no titles or input authority; query vm_guest_info capabilities.windows","screenshot":true,"screenshot_requirements":"macOS Guest service --allow-observe with existing Guest Screen Recording permission; Linux desktop containers (--desktop) through the guest agent's DRM scanout","input":true,"input_requirements":"macOS Guest --allow-observe --allow-input with existing Screen Recording and Accessibility permissions; Linux desktop containers through the guest agent's uinput keyboard and tablet","guest_integration":"enabled Linux or macOS Guest service over host-only vsock; query vm_guest_info for actual availability","command_execution":true,"command_execution_requirements":"MCP requires enabled Linux async jobs for cancellation; macOS service legacy exec is not exposed by current MCP execution API","gpu":"requires actual Guest measurements"})
         }
         Backend::QemuHvf => {
-            json!({"guest_os":["linux"],"lifecycle":true,"native_window":false,"window_enumeration":false,"screenshot":false,"input":false,"guest_integration":"observer-only private virtio-serial; requires enabled Linux service, query vm_guest_info for actual readiness; no reconnect in this worker incarnation","command_execution":false,"file_transfer":false,"guest_ready":false,"normal_shutdown":"QMP power button request only; requires Guest support; acknowledgement is not completion","storage":"Linux direct kernel boot with optional private pinned raw disk; inherited device/inode sidecar lock and QEMU locking, APFS cloning is an independent image operation","initial_display_dimensions":{"supported":true,"default_width":1280,"default_height":800,"maximum_width":3840,"maximum_height":2160,"paired_even_dimensions_required":true,"semantics":"initial EDID preference; actual Guest mode must be measured"},"dynamic_resolution":false,"gpu":"experimental virtio-gpu-gl / virgl / ANGLE Metal; SPICE connection does not establish acceleration or release quality"})
+            json!({"guest_os":["linux"],"lifecycle":true,"native_window":false,"window_enumeration":false,"screenshot":false,"input":false,"guest_integration":"observer-only private virtio-serial; requires enabled Linux service, query vm_guest_info for actual readiness; no reconnect in this worker incarnation","command_execution":false,"file_transfer":false,"guest_ready":false,"normal_shutdown":"QMP power button request only; requires Guest support; acknowledgement is not completion","boot":["kernel","uefi"],"uefi":"edk2 pflash with per-VM efi_vars, read-only cdrom on virtio-scsi, USB keyboard/tablet","storage":"Linux direct kernel or UEFI boot with optional private pinned raw disk; inherited device/inode sidecar lock and QEMU locking, APFS cloning is an independent image operation","initial_display_dimensions":{"supported":true,"default_width":1280,"default_height":800,"maximum_width":3840,"maximum_height":2160,"paired_even_dimensions_required":true,"semantics":"initial EDID preference; actual Guest mode must be measured"},"dynamic_resolution":false,"gpu":"experimental virtio-gpu-gl / virgl / ANGLE Metal; SPICE connection does not establish acceleration or release quality"})
         }
     }
 }
 pub fn guest_capabilities(backend: Backend, guest: &str) -> Value {
     let mut value = capabilities(backend);
     if backend == Backend::AppleVirtualization {
-        value["screenshot"] = json!(guest == "macos");
+        // Linux: desktop containers only (the agent runs with --desktop-stream);
+        // vm_guest_info reports whether this Guest has it.
+        value["screenshot"] = json!(true);
         value["window_enumeration"] = json!(guest == "macos");
-        value["input"] = json!(guest == "macos");
+        value["input"] = json!(true);
+        if guest == "linux" {
+            value["screenshot_requirements"] = json!("Linux desktop container (--desktop): guest agent DRM scanout, PNG (JPEG when large); vm_guest_info capabilities.screenshot");
+            value["input_requirements"] = json!("Linux desktop container (--desktop): guest agent uinput keyboard and absolute tablet; fresh screenshot anchor and current control lease required");
+        }
         if guest == "macos" {
             value["input_requirements"] = json!("Guest service --allow-observe --allow-input with existing Guest Screen Recording and Accessibility permissions; fresh screenshot anchor and current control lease required; vm_guest_info reports actual permission availability");
             value["text_input"] = json!(false);
@@ -175,7 +181,9 @@ pub fn validate_pacing_capabilities(value: &Value) -> Result<()> {
         let encoder = cap("encoder_limit_fps", 60)?;
         cap("idle_encode_interval_ms", 10000)?;
         cap("display_refresh_preference_hz", 240)?;
-        if window > capture || background > window || encoder > background {
+        // A browser stream captures at the window cadence even while the
+        // window is hidden, so the encoder bound follows the window limit.
+        if window > capture || background > window || encoder > window {
             bail!("inconsistent capture/encoder limits")
         }
         if let Some(current) = value.get("capture_current_limit_fps") {
@@ -378,10 +386,13 @@ mod window_tests {
         let caps = json!({"capture_limit_fps":60,"native_window_capture_limit_fps":60,"background_capture_limit_fps":30,"encoder_limit_fps":30,"idle_encode_interval_ms":1000,"display_refresh_preference_hz":60,"capture_current_limit_fps":60});
         assert!(validate_pacing_capabilities(&caps).is_ok());
         assert!(validate_pacing_capabilities(&json!({"capture_limit_fps":30})).is_ok());
+        let mut streaming = caps.clone();
+        streaming["encoder_limit_fps"] = json!(60);
+        assert!(validate_pacing_capabilities(&streaming).is_ok());
         for (field, value) in [
             ("encoder_limit_fps", json!(true)),
             ("encoder_limit_fps", json!(30.0)),
-            ("encoder_limit_fps", json!(60)),
+            ("encoder_limit_fps", json!(120)),
             ("capture_current_limit_fps", json!(45)),
             ("background_capture_limit_fps", json!(0)),
             ("capture_limit_fps", json!(30)),

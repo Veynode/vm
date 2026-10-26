@@ -200,7 +200,6 @@ def main():
             and info.get('execution_identity', {}).get('rootless') is True
             and info.get('capabilities', {}).get('descendant_containment') is True, 'actual v2 containment precondition failed')
         record('actual guest info', info)
-        record('initial lease', tool(owner, 'acquire_control'))
         nonce = uuid.uuid4().hex
         marker = '/home/veynode/guardian-ready-' + nonce
         command = ['/bin/sh', '-eu', '-c', 'test "$(id -u)" = 1000; '
@@ -346,16 +345,6 @@ def main():
         denied = owner.tool('exec_start', {'id': vm, 'argv': ['/bin/true'], 'timeout_ms': 1000}, denied=True)
         require('Invalid tool arguments' not in json.dumps(denied), 'invalid arguments are not execution fencing')
         record('old execution rejected', denied)
-        # Existing semantics allow same-owner renewal until scope retirement is
-        # requested; worker death alone is deliberately not a cleanup proof.
-        denied = owner.tool('release_control', {'id': vm}, denied=True)
-        text = json.dumps(denied).lower()
-        require('cleanup' in text and 'unconfirmed' in text, 'release did not retain unknown original-scope cleanup')
-        record('original scope retirement remains explicitly unconfirmed', denied)
-        denied = owner.tool('acquire_control', {'id': vm}, denied=True)
-        require('previous execution scope cleanup unconfirmed; acquire denied' in json.dumps(denied),
-            'new lease not fenced by unresolved original scope')
-        record('old lease renewal rejected after retirement attempt', denied)
         outcomes = [close_client(client) for client in clients]
         clients.clear()
         require(not any(x['forced'] for x in outcomes), 'MCP EOF deadline required forced child termination')

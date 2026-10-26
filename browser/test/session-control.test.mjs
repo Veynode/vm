@@ -9,7 +9,7 @@ import { AuthenticatedReceiver } from '../dist/native-auth.js';
 
 const pairBinary = process.env.VEYNODE_PAIR_BIN ?? new URL('../../target/debug/vm-pair', import.meta.url).pathname;
 const frame = { frame_id: '12345678-1234-4234-8234-123456789abc', source_generation: 1, width: 1280, height: 800 };
-const click = () => ({ kind: 'click', epoch: 1, frame: structuredClone(frame), x: 25, y: 40, button: 'left' });
+const click = () => ({ kind: 'click', frame: structuredClone(frame), x: 25, y: 40, button: 'left' });
 const sdp = byte => `v=0\r\na=fingerprint:sha-256 ${Array(32).fill(byte).join(':')}\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n`;
 const png = { ...frame, mime_type: 'image/png', byte_length: 8, data_base64: Buffer.from('\x89PNG\r\n\x1a\n', 'latin1').toString('base64') };
 
@@ -40,7 +40,7 @@ async function fixture(scopes = ['input', 'observe']) {
       await verifyControl(body, state.transcript, device.publicKey, Math.floor(Date.now() / 1000)); state.controls.push(body);
       if (state.controlReply) return (await state.controlReply(body)).json();
       const action = body.request.action;
-      const result = action.kind === 'acquire' ? { epoch: 1, expires_in_seconds: 60 } : action.kind === 'release' ? { released: true, note: 'synthetic' } : action.kind === 'observe_frame' ? png : { dispatched: true, guest_delivery_confirmed: false };
+      const result = action.kind === 'observe_frame' ? png : { dispatched: true, guest_delivery_confirmed: false };
       return { sequence: body.request.sequence, result };
   });
   return { host, device, receiver, state, calls, fetcher };
@@ -53,7 +53,7 @@ async function withSession(callback, scopes) {
 
 test('Rust golden canonical bytes and P256 signatures match every browser control variant', async () => {
   const golden = JSON.parse(await readFile(new URL('../../crates/session-auth/tests/control-golden.json', import.meta.url), 'utf8'));
-  assert.equal(golden.cases.length, 7);
+  assert.equal(golden.cases.length, 5);
   for (const item of golden.cases) {
     assert.equal(hex(controlBytes(item.signed.request)), item.canonical_hex, item.signed.request.action.kind);
     await verifyControl(item.signed, golden.transcript, golden.device_public_key, golden.now);
@@ -76,16 +76,16 @@ test('strict action schema, safe integers, bounded coordinates, keys and short e
     const now = Math.floor(Date.now() / 1000), signed = await signControl(f.device, f.state.transcript, click(), { sequence: 1, now });
     for (const mutate of [r => r.extra = true, r => r.sequence = 0, r => r.sequence = 2 ** 53, r => r.sequence = true,
       r => r.session_id = 'bad/session', r => r.transcript_sha256 = 'AA'.repeat(32), r => r.action.extra = true,
-      r => r.action.epoch = 0, r => r.action.x = 1280, r => r.action.y = -1, r => r.action.x = .5,
+      r => r.action.epoch = 1, r => r.action.x = 1280, r => r.action.y = -1, r => r.action.x = .5,
       r => r.action.button = 'back', r => r.action.frame.extra = true, r => r.action.frame.frame_id = frame.frame_id.toUpperCase(),
       r => r.action.frame.source_generation = -1, r => r.action.frame.width = 8193,
-      r => r.action = { kind: 'release', epoch: 0 }, r => r.action = { kind: 'acquire', epoch: 1 },
+      r => r.action = { kind: 'release' }, r => r.action = { kind: 'acquire' },
       r => r.action = { kind: 'text', text: 'not-supported' },
-      r => r.action = { kind: 'key', epoch: 1, frame, keys: [''] },
-      r => r.action = { kind: 'key', epoch: 1, frame, keys: ['ctrl', 'ctrl'] },
-      r => r.action = { kind: 'key', epoch: 1, frame, keys: ['a'.repeat(17)] },
-      r => r.action = { kind: 'key', epoch: 1, frame, keys: ['A'] },
-      r => r.action = { kind: 'scroll', epoch: 1, frame, x: 0, y: 0, direction: 'up', ticks: 21 }]) {
+      r => r.action = { kind: 'key', frame, keys: [''] },
+      r => r.action = { kind: 'key', frame, keys: ['ctrl', 'ctrl'] },
+      r => r.action = { kind: 'key', frame, keys: ['a'.repeat(17)] },
+      r => r.action = { kind: 'key', frame, keys: ['A'] },
+      r => r.action = { kind: 'scroll', frame, x: 0, y: 0, direction: 'up', ticks: 21 }]) {
       const changed = structuredClone(signed.request); mutate(changed); assert.throws(() => controlBytes(changed));
     }
     for (const expires_at of [now, now + 6, Number.MAX_SAFE_INTEGER + 1]) await assert.rejects(signControl(f.device, f.state.transcript, click(), { sequence: 1, now, expires_at }));
@@ -98,21 +98,21 @@ test('strict action schema, safe integers, bounded coordinates, keys and short e
     await signControl(f.device, f.state.transcript, click(), { sequence: 2, now: now + 120 });
   });
 });
-test('control requires confirmed session, fixed scopes, and all seven action variants work', async () => {
+test('control requires confirmed session, fixed scopes, and every action variant works', async () => {
   await withSession(async f => {
-    await assert.rejects(f.receiver.control({ kind: 'acquire' }), /confirmed/);
+    await assert.rejects(f.receiver.control({ kind: 'observe_frame' }), /confirmed/);
     f.state.confirm = false; await assert.rejects(f.receiver.confirm(), /not acknowledged/);
-    await assert.rejects(f.receiver.control({ kind: 'acquire' }), /confirmed/);
+    await assert.rejects(f.receiver.control({ kind: 'observe_frame' }), /confirmed/);
     f.state.confirm = true; await f.receiver.confirm();
-    const actions = [{ kind: 'acquire' }, { kind: 'observe_frame' }, click(),
+    const actions = [{ kind: 'observe_frame' }, click(),
       { ...click(), kind: 'drag', end_x: 30, end_y: 50 },
-      { kind: 'scroll', epoch: 1, frame, x: 0, y: 0, direction: 'down', ticks: 2 },
-      { kind: 'key', epoch: 1, frame, keys: ['ctrl', 'a'] }, { kind: 'release', epoch: 1 }];
+      { kind: 'scroll', frame, x: 0, y: 0, direction: 'down', ticks: 2 },
+      { kind: 'key', frame, keys: ['ctrl', 'a'] }];
     for (const action of actions) await f.receiver.control(action);
-    assert.deepEqual(f.state.controls.map(s => s.request.sequence), [1, 2, 3, 4, 5, 6, 7]);
+    assert.deepEqual(f.state.controls.map(s => s.request.sequence), [1, 2, 3, 4, 5]);
     assert.deepEqual(screenshotAnchor((await f.receiver.control({ kind: 'observe_frame' })).result), frame);
   });
-  await withSession(async f => { await f.receiver.confirm(); await assert.rejects(f.receiver.control({ kind: 'acquire' }), /scope/); assert.equal(f.state.controls.length, 0); await f.receiver.control({ kind: 'observe_frame' }); }, ['observe']);
+  await withSession(async f => { await f.receiver.confirm(); await assert.rejects(f.receiver.control(click()), /scope/); assert.equal(f.state.controls.length, 0); await f.receiver.control({ kind: 'observe_frame' }); }, ['observe']);
 });
 test('pending control excludes close/second control; caller mutation cannot alter signed action', async () => {
   await withSession(async f => {
@@ -153,8 +153,6 @@ test('screenshot bounds/base64/type and dispatch/lease/release outcomes fail clo
     r => r.result.source_generation = -1, r => r.result.width = 0]) {
     const changed = structuredClone(response); mutate(changed); assert.throws(() => validateControlResponse(changed, 1, { kind: 'observe_frame' }));
   }
-  assert.throws(() => validateControlResponse({ sequence: 1, result: { released: false } }, 1, { kind: 'release', epoch: 1 }));
-  assert.throws(() => validateControlResponse({ sequence: 1, result: { epoch: 1, expires_in_seconds: 600 } }, 1, { kind: 'acquire' }));
   assert.throws(() => validateControlResponse({ sequence: 1, result: { dispatched: true, guest_delivery_confirmed: true } }, 1, click()));
   // Protocol size/header boundary, not a PNG-decoder or Guest acceptance test.
   const maximum = Buffer.alloc(SCREENSHOT_MAX_BYTES); Buffer.from('\x89PNG\r\n\x1a\n', 'latin1').copy(maximum);

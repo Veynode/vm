@@ -1,0 +1,3 @@
+# The micro-VM's virtio disks (writable layer, image, config, kernel modules)
+# are managed by VeynodeVM; keep them out of the desktop's drive list.
+SUBSYSTEM=="block", KERNEL=="vd[a-d]*", ENV{UDISKS_IGNORE}="1"

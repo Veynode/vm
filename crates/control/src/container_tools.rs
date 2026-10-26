@@ -136,6 +136,21 @@ fn strings(args: &Value, key: &str) -> Result<Vec<String>> {
     }
 }
 
+/// A desktop or accessibility method of a macOS container: the CLI runs its
+/// helper in the Guest over SSH (`veynodevm __desktop`).
+pub fn desktop(dir: &Path, vm: &str, method: &str, arguments: &Value) -> Result<Value> {
+    run(
+        dir,
+        &[
+            "__desktop".into(),
+            vm.into(),
+            method.into(),
+            arguments.to_string(),
+        ],
+        Duration::from_secs(30),
+    )
+}
+
 pub fn call(dir: &Path, name: &str, args: &Value) -> Result<Value> {
     let quick = Duration::from_secs(30);
     match name {

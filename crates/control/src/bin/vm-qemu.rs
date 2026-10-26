@@ -71,7 +71,13 @@ impl RuntimeDirectory {
 impl Drop for RuntimeDirectory {
     fn drop(&mut self) {
         // Never recursively remove an externally provided location.
-        for name in ["qmp.sock", "spice.sock", "console.sock", "agent.sock"] {
+        for name in [
+            "qmp.sock",
+            "monitor.sock",
+            "spice.sock",
+            "console.sock",
+            "agent.sock",
+        ] {
             let _ = fs::remove_file(self.0.join(name));
         }
         let _ = fs::remove_dir(&self.0);
@@ -299,8 +305,6 @@ impl Qmp {
 }
 #[derive(Default)]
 struct InputState {
-    revoked_through: u64,
-    active_epoch: Option<u64>,
     completed_operations: std::collections::VecDeque<String>,
     operation: Option<String>,
     until: Option<Instant>,
@@ -322,7 +326,6 @@ impl InputState {
                 self.completed_operations.pop_front();
             }
         }
-        self.active_epoch = None;
         self.until = None;
         Ok(())
     }
@@ -344,20 +347,6 @@ impl InputState {
             );
         }
         bail!("unknown input operation; cleanup is unconfirmed")
-    }
-    fn revoke(&mut self, args: &Value, qmp: &mut Qmp) -> Result<Value> {
-        let through = args["through_epoch"]
-            .as_u64()
-            .filter(|epoch| *epoch > 0)
-            .context("positive revoke epoch required")?;
-        // Fence before any fallible I/O. Failure retains held-state for retry.
-        self.revoked_through = self.revoked_through.max(through);
-        if self.active_epoch.is_some_and(|epoch| epoch <= through) {
-            self.cleanup(qmp)?;
-        }
-        Ok(
-            json!({"released":true,"synthetic_release_dispatched":true,"through_epoch":through,"guest_delivery_confirmed":false}),
-        )
     }
     fn send_events(&mut self, events: &[Value], qmp: &mut Qmp) -> Result<()> {
         self.send_events_before(events, qmp, None)
@@ -402,16 +391,6 @@ impl InputState {
         console: &Path,
         qmp: &mut Qmp,
     ) -> Result<Value> {
-        let epoch = args["epoch"]
-            .as_u64()
-            .filter(|epoch| *epoch > 0)
-            .context("positive checked input epoch required")?;
-        if epoch <= self.revoked_through {
-            bail!("input epoch has been revoked")
-        }
-        if self.active_epoch.is_some_and(|active| active != epoch) {
-            bail!("input operation belongs to another epoch")
-        }
         let operation = args["operation_id"]
             .as_str()
             .context("missing input operation")?;
@@ -443,7 +422,6 @@ impl InputState {
                 bail!("input operation was already completed")
             }
             self.operation = Some(operation.into());
-            self.active_epoch = Some(epoch);
             self.until = Some(Instant::now() + Duration::from_secs(4));
         }
         self.send_events(events, qmp)?;
@@ -909,8 +887,6 @@ fn run() -> Result<()> {
             "--control-socket",
             "--vm-id",
             "--worker-instance",
-            "--guest-worker-instance",
-            "--exec-witness-fd",
             "--config",
             "--launcher",
             "--library",
@@ -1013,35 +989,13 @@ fn run() -> Result<()> {
     let spice_path = runtime.0.join("spice.sock");
     let console_path = runtime.0.join("console.sock");
     let agent_path = runtime.0.join("agent.sock");
+    let uefi = config.boot == vm_control::BootMode::Uefi;
+    let monitor_path = config.qemu_monitor.then(|| runtime.0.join("monitor.sock"));
     let disk_guard = config
         .disk
         .as_deref()
         .map(vm_control::qemu_disk::DiskGuard::open)
         .transpose()?;
-    let exec_instance = options
-        .get("--guest-worker-instance")
-        .and_then(|p| p.to_str());
-    if config.qemu_guest_exec && exec_instance.is_none_or(|s| !vm_control::native_input::hex(s, 64))
-    {
-        bail!("serial execution requires worker incarnation")
-    }
-    let witness = if config.qemu_guest_exec {
-        let fd: i32 = options
-            .get("--exec-witness-fd")
-            .and_then(|v| v.to_str())
-            .context("execution witness descriptor required")?
-            .parse()?;
-        Some(vm_control::exec_witness::Witness::inherited(
-            fd,
-            &config.id,
-            exec_instance.unwrap(),
-        )?)
-    } else {
-        if options.contains_key("--exec-witness-fd") {
-            bail!("unexpected execution witness")
-        }
-        None
-    };
     let guardian = if config.qemu_guest_exec {
         Some(guardian::Parent::new()?)
     } else {
@@ -1063,8 +1017,6 @@ fn run() -> Result<()> {
         .arg(library)
         .arg("-L")
         .arg(&resources)
-        .arg("-bios")
-        .arg(resources.join("edk2-aarch64-code.fd"))
         .args(config.qemu_graphics_profile.machine_arguments())
         .args([
             "-cpu",
@@ -1085,12 +1037,6 @@ fn run() -> Result<()> {
                 .qemu_graphics_profile
                 .device(config.width, config.height)?,
         )
-        .args([
-            "-device",
-            "virtio-keyboard-pci",
-            "-device",
-            "virtio-tablet-pci",
-        ])
         .arg("-m")
         .arg(format!("{}M", config.memory_mib))
         .arg("-smp")
@@ -1102,23 +1048,45 @@ fn run() -> Result<()> {
             "unix=on,addr={},disable-ticketing=on,gl=es",
             spice_path.display()
         ))
-        .arg("-kernel")
-        .arg(config.kernel.as_ref().unwrap())
-        .arg("-append")
-        .arg(config.command_line.as_deref().unwrap_or("console=ttyAMA0"))
         .env("ANGLE_DEFAULT_PLATFORM", "metal")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if options.contains_key("--console-broker")
-        || disk_guard.is_some()
-        || witness.is_some()
-        || venus.is_some()
-    {
+    if options.contains_key("--console-broker") || disk_guard.is_some() || venus.is_some() {
         command.arg("-S");
     }
-    if let Some(initrd) = &config.initrd {
-        command.arg("-initrd").arg(initrd);
+    if uefi {
+        vm_control::qemu_uefi::prepare_vars(
+            &resources.join(vm_control::qemu_uefi::VARS_TEMPLATE_FILE),
+            config.efi_vars.as_deref().context("efi_vars required")?,
+        )?;
+        command.args(vm_control::qemu_uefi::arguments(
+            &config,
+            &resources,
+            monitor_path.as_deref(),
+        )?);
+    } else {
+        command
+            .arg("-bios")
+            .arg(resources.join("edk2-aarch64-code.fd"))
+            .args([
+                "-device",
+                "virtio-keyboard-pci",
+                "-device",
+                "virtio-tablet-pci",
+            ])
+            .arg("-kernel")
+            .arg(config.kernel.as_ref().context("kernel required")?)
+            .arg("-append")
+            .arg(config.command_line.as_deref().unwrap_or("console=ttyAMA0"));
+        if let Some(initrd) = &config.initrd {
+            command.arg("-initrd").arg(initrd);
+        }
+        if let Some(path) = &monitor_path {
+            command
+                .arg("-qmp")
+                .arg(format!("unix:{},server=on,wait=off", path.display()));
+        }
     }
     command
         .args(["-device", "virtio-serial-pci,id=veynode-serial", "-chardev"])
@@ -1137,9 +1105,6 @@ fn run() -> Result<()> {
         disk.configure_command(&mut command)?;
     }
     command.args(vm_control::qemu_extras::arguments(&config)?);
-    if let Some(witness) = &witness {
-        witness.configure_qemu(&mut command)?;
-    }
     let mut child = QemuChild(
         command.spawn().context("starting QEMU/HVF runtime")?,
         guardian,
@@ -1186,9 +1151,6 @@ fn run() -> Result<()> {
     if let Some(disk) = &disk_guard {
         disk.verify_fdsets(&qmp.call("query-fdsets")?)?;
     }
-    if let Some(witness) = &witness {
-        witness.verify_fdsets(&qmp.call("query-fdsets")?)?;
-    }
     if venus.is_some() {
         vm_control::qemu_graphics::verify_gpu_properties(|method, args| {
             qmp.arguments(method, args)
@@ -1201,7 +1163,10 @@ fn run() -> Result<()> {
     };
     let guest_exec = config
         .qemu_guest_exec
-        .then(|| guest_exec::Transport::start(&agent_path, exec_instance.unwrap().into()));
+        .then(|| {
+            guest_transport::nonce().map(|host| guest_exec::Transport::start(&agent_path, host))
+        })
+        .transpose()?;
     let mut exec_pending: Vec<(Value, guest_exec::Pending)> = Vec::new();
     let mut guest_pending: Option<(Value, guest_transport::Pending)> = None;
     let mut broker = if let Some(binary) = options.get("--console-broker") {
@@ -1232,6 +1197,8 @@ fn run() -> Result<()> {
         let identity = disk.identity();
         state["disk_provenance"] = json!({"device":identity.device,"inode":identity.inode,"descriptor_backed":true,"qmp_fdsets_verified_at_start":true});
     }
+    state["boot"] = json!(config.boot);
+    state["monitor_socket"] = monitor_path.as_ref().map_or(Value::Null, |p| json!(p));
     state["console_socket"] = if broker.is_some() {
         json!(console_path)
     } else {
@@ -1255,14 +1222,10 @@ fn run() -> Result<()> {
     state["native_window_available"] = json!(broker
         .as_ref()
         .is_some_and(|b| vm_control::backend::window_supported(&b.capabilities)));
-    if let Some(witness) = &witness {
-        state["execution_witness"] = serde_json::to_value(&witness.identity)?;
-        state["execution_witness"]["qmp_fdsets_verified_at_start"] = json!(true);
-    }
     publish_startup_then_resume(
         &mut qmp,
         &mut state,
-        broker.is_some() || disk_guard.is_some() || witness.is_some() || venus.is_some(),
+        broker.is_some() || disk_guard.is_some() || venus.is_some(),
         emit,
     )?;
     let mut status_poll = Instant::now();
@@ -1326,11 +1289,6 @@ fn run() -> Result<()> {
             }
         }
         if input.until.is_some_and(|until| Instant::now() >= until) {
-            if native_input.active(&input) {
-                if let Some(epoch) = input.active_epoch {
-                    input.revoked_through = input.revoked_through.max(epoch);
-                }
-            }
             input.cleanup(&mut qmp)?;
         }
         if let Some((id, pending)) = &mut guest_pending {
@@ -1396,8 +1354,7 @@ fn run() -> Result<()> {
                 }
             }
             if let Some(exec) = &guest_exec {
-                // Lets the daemon refuse execution before recording a scope that
-                // an unready transport could only retire by terminating QEMU.
+                // Lets the daemon refuse execution while the transport is not ready.
                 updated["guest_integration_state"] = json!(exec.state());
             }
             if updated != state {
@@ -1417,11 +1374,11 @@ fn run() -> Result<()> {
                 request["method"].as_str(),
                 Some(
                     "guest_request"
-                        | "guest_scope_revoke"
                         | "native_begin"
                         | "native_heartbeat"
                         | "native_event"
                         | "input_step"
+                        | "desktop_input"
                 )
             )
         {
@@ -1429,9 +1386,9 @@ fn run() -> Result<()> {
             continue;
         }
         let result: Result<Value> = match request["method"].as_str() {
-            Some("guest_request" | "guest_scope_revoke") => {
+            Some("guest_request") => {
                 if let Some(exec)=&guest_exec {
-                    match exec.request_before(request["request"].clone(), { let remaining=request["qemu_exec_deadline_ns"].as_u64().unwrap_or(vm_control::exec_scope::monotonic_ns()?+1_000_000_000).saturating_sub(vm_control::exec_scope::monotonic_ns()?); Instant::now()+Duration::from_nanos(remaining.min(5_000_000_000)) }){Ok(pending)=>{exec_pending.push((id.clone(),pending));continue},Err(error)=>Err(error)}
+                    match exec.request_before(request["request"].clone(), Instant::now()+Duration::from_secs(1)){Ok(pending)=>{exec_pending.push((id.clone(),pending));continue},Err(error)=>Err(error)}
                 } else if guest_pending.is_some() {Err(anyhow::anyhow!("guest integration busy: one request per VM"))}
                 else {match guest.as_ref().unwrap().request(request["request"].clone()) {Ok(pending)=>{guest_pending=Some((id.clone(),pending));continue},Err(error)=>Err(error)}}
             },
@@ -1450,7 +1407,11 @@ fn run() -> Result<()> {
                     match Capture::start(helper, &spice_path, id.clone()) { Ok(started) => { capture = Some(started); continue; }, Err(error) => Err(error) }
                 } else { Err(anyhow::anyhow!("unsupported: screenshot helper is not registered")) }
             }
-            Some(method @ ("native_begin" | "native_heartbeat" | "native_event")) => native_input.handle(method,&request["arguments"],&mut input,&console_path,&mut qmp),
+            Some("frame_status") => {
+                if broker.is_none() { Err(anyhow::anyhow!("console broker unavailable")) }
+                else { console_frame_status(&console_path) }
+            },
+            Some(method @ ("native_begin" | "native_heartbeat" | "native_event" | "native_end")) => native_input.handle(method,&request["arguments"],&mut input,&console_path,&mut qmp),
             Some("input_step") => {
                 if broker.is_none() {Err(anyhow::anyhow!("persistent console unavailable"))}
                 else {input.step(&request["arguments"],&frames,&console_path,&mut qmp)}
@@ -1458,13 +1419,26 @@ fn run() -> Result<()> {
             Some("input_cleanup") => {
                 input.cleanup_operation(&request["arguments"], &mut qmp)
             },
-            Some("input_revoke") => input.revoke(&request["arguments"], &mut qmp),
+            Some("desktop_input") => {
+                // The daemon validated and translated the batch; MCP or native
+                // window operations in flight keep exclusive use of the devices.
+                if input.operation.is_some() || native_input.active(&input) {
+                    Err(anyhow::anyhow!("desktop input busy: another input operation is active"))
+                } else {
+                    let events = request["arguments"]["events"].clone();
+                    if events.as_array().is_none_or(|e| e.is_empty() || e.len() > 4 * vm_control::desktop_input::MAX_EVENTS) {
+                        Err(anyhow::anyhow!("invalid desktop input batch"))
+                    } else {
+                        qmp.arguments("input-send-event", json!({"events":events})).map(|_| json!({"sent":true}))
+                    }
+                }
+            }
             Some("status") => qmp.call("query-status").map(|status|json!({"qmp_status":status,"guest_ready":null,"vm_id":config.id,"disk_provenance":state.get("disk_provenance"),"guest_integration_state":guest.as_ref().map(|g|g.state()).unwrap_or_else(||guest_exec.as_ref().unwrap().state())})),
             Some("shutdown") => {
-                let prepared = if let Some(exec) = &guest_exec {
-                    execution_shutdown.begin(&request["execution_scopes_empty"],exec_pending.len(),exec.state(),Instant::now())
-                } else { Ok(()) };
-                prepared.and_then(|_| request_powerdown(&mut qmp, &mut input, guest_exec.is_some())).map(|_|json!({"requested":true,"mechanism":"qmp-system-powerdown","completed":false,"requires_guest_power_button_support":true,"execution_quiescing":execution_shutdown.active(),"shutdown_timeout_seconds":if execution_shutdown.active(){json!(60)}else{Value::Null}}))
+                if guest_exec.is_some() {
+                    execution_shutdown.begin(Instant::now());
+                }
+                request_powerdown(&mut qmp, &mut input, guest_exec.is_some()).map(|_|json!({"requested":true,"mechanism":"qmp-system-powerdown","completed":false,"requires_guest_power_button_support":true,"execution_quiescing":execution_shutdown.active(),"shutdown_timeout_seconds":if execution_shutdown.active(){json!(60)}else{Value::Null}}))
             },
             Some("stop") => { emit(json!({"id":id,"result":{"requested":true,"forced":true}}))?; break },
             _ => Err(anyhow::anyhow!("unsupported QEMU worker operation")),
@@ -1505,36 +1479,20 @@ fn run() -> Result<()> {
 }
 fn request_powerdown(qmp: &mut Qmp, input: &mut InputState, retire_input: bool) -> Result<Value> {
     if retire_input {
-        if let Some(epoch) = input.active_epoch {
-            input.revoked_through = input.revoked_through.max(epoch);
-        }
         input
             .cleanup(qmp)
             .context("shutdown input cleanup unconfirmed")?;
     }
     qmp.call("system_powerdown")
 }
-/// Only trusted controller proof plus drained local RPCs may relax serial liveness.
+/// A guest powering down drops serial execution; the deadline bounds the wait.
 #[derive(Default)]
 struct ExecutionShutdown {
     deadline: Option<Instant>,
 }
 impl ExecutionShutdown {
-    fn begin(
-        &mut self,
-        proof: &Value,
-        pending: usize,
-        transport: &str,
-        now: Instant,
-    ) -> Result<()> {
-        if self.deadline.is_some() {
-            return Ok(());
-        }
-        if proof != &json!(true) || pending != 0 || transport != "ready" {
-            bail!("execution shutdown requires confirmed empty scopes, drained requests and ready transport")
-        }
-        self.deadline = Some(now + Duration::from_secs(60));
-        Ok(())
+    fn begin(&mut self, now: Instant) {
+        self.deadline.get_or_insert(now + Duration::from_secs(60));
     }
     fn active(&self) -> bool {
         self.deadline.is_some()
@@ -1648,7 +1606,7 @@ mod tests {
         let status = json!({"native_window":true,"native_window_protocol":2,"native_input_protocol":1,
             "native_input_supported":true,"native_input_available":false,"input_enabled":false,"display_only":true,
             "window_open":true,"display_instance":"a".repeat(32),"native_input_state":"connecting",
-            "native_input_ready":false,"native_human_hold":false,"native_release_confirmed":true,"native_input_epoch":null});
+            "native_input_ready":false,"native_release_confirmed":true,"native_input_epoch":null});
         for field in [
             None,
             Some("native_input_available"),
@@ -1738,7 +1696,7 @@ mod tests {
         }
     }
     #[test]
-    fn qmp_process_epoch_fence_releases_held_state_and_rejects_stale_steps() {
+    fn qmp_process_cleanup_releases_held_state_and_retries_failed_release() {
         // Actual child process + Unix QMP framing; synthetic QMP, not a Guest.
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("qmp.sock");
@@ -1813,21 +1771,15 @@ f.close();c.close();s.close()
         frames.record(&anchor, Instant::now());
         let mut args = anchor.clone();
         args["operation_id"] = json!("a".repeat(32));
-        args["epoch"] = json!(3);
         args["begin"] = json!(true);
         args["events"] = json!([vm_control::input::button("left", true)]);
         let mut state = InputState::default();
         assert!(state.step(&args, &frames, &console, &mut qmp).is_ok());
-        assert!(state.revoke(&json!({"through_epoch":4}), &mut qmp).is_err());
-        assert_eq!(state.revoked_through, 4);
-        assert_eq!(state.held.len(), 1);
-        assert!(state
-            .step(&args, &frames, &console, &mut qmp)
-            .unwrap_err()
-            .to_string()
-            .contains("revoked"));
+        assert!(state.step(&args, &frames, &console, &mut qmp).is_err());
+        assert!(state.cleanup_operation(&args, &mut qmp).is_err());
+        assert_eq!(state.held.len(), 1, "a failed release is retried");
         assert_eq!(
-            state.revoke(&json!({"through_epoch":4}), &mut qmp).unwrap()["released"],
+            state.cleanup_operation(&args, &mut qmp).unwrap()["released"],
             true
         );
         assert!(state.held.is_empty());
@@ -1836,13 +1788,7 @@ f.close();c.close();s.close()
             true
         );
         args["operation_id"] = json!("b".repeat(32));
-        args["epoch"] = json!(5);
         assert!(state.step(&args, &frames, &console, &mut qmp).is_ok());
-        assert_eq!(
-            state.revoke(&json!({"through_epoch":4}), &mut qmp).unwrap()["released"],
-            true
-        );
-        assert_eq!(state.active_epoch, Some(5));
         assert_eq!(state.held.len(), 1);
         assert_eq!(
             state
@@ -1858,10 +1804,9 @@ f.close();c.close();s.close()
         assert!(state
             .cleanup_operation(&json!({"operation_id":"c".repeat(32)}), &mut qmp)
             .is_err());
-        assert!(state.revoke(&json!({"through_epoch":0}), &mut qmp).is_err());
         assert_eq!(
-            state.revoke(&json!({"through_epoch":5}), &mut qmp).unwrap()["through_epoch"],
-            5
+            state.cleanup_operation(&args, &mut qmp).unwrap()["released"],
+            true
         );
         assert!(state.held.is_empty());
         console_thread.join().unwrap();
@@ -1902,7 +1847,6 @@ f.close();c.close();s.close()
             reply_prefix: Vec::new(),
         };
         let mut state = InputState {
-            active_epoch: Some(1),
             operation: Some("a".repeat(32)),
             until: Some(Instant::now()),
             held: std::collections::BTreeMap::from([(
@@ -2006,26 +1950,14 @@ f.close();c.close();s.close()
         assert_eq!(&contents[contents.len() - 128..], &[b'x'; 128]);
     }
     #[test]
-    fn execution_shutdown_requires_strict_proof_drained_ready_and_never_extends_deadline() {
+    fn execution_shutdown_never_extends_deadline() {
         let now = Instant::now();
-        for (proof, pending, transport) in [
-            (json!(null), 0, "ready"),
-            (json!(1), 0, "ready"),
-            (json!(true), 1, "ready"),
-            (json!(true), 0, "fenced"),
-            (json!(true), 0, "starting"),
-        ] {
-            let mut state = ExecutionShutdown::default();
-            assert!(state.begin(&proof, pending, transport, now).is_err());
-            assert!(!state.active());
-        }
         let mut state = ExecutionShutdown::default();
-        state.begin(&json!(true), 0, "ready", now).unwrap();
-        assert!(state.active()); // Only this state permits Guest service EOF.
+        assert!(!state.active());
+        state.begin(now);
+        assert!(state.active());
         state.check(now + Duration::from_secs(59)).unwrap();
-        state
-            .begin(&json!(true), 0, "fenced", now + Duration::from_secs(59))
-            .unwrap();
+        state.begin(now + Duration::from_secs(59));
         assert!(state
             .check(now + Duration::from_secs(60))
             .unwrap_err()
@@ -2062,17 +1994,13 @@ f.close();c.close();s.close()
                 .spawn()
                 .unwrap();
             let mut qmp = Qmp::connect(&path, &mut child).unwrap();
-            let mut input = InputState {
-                active_epoch: Some(7),
-                ..Default::default()
-            };
+            let mut input = InputState::default();
             input.held.insert(
                 "btn:left".into(),
                 json!({"type":"btn","data":{"button":"left","down":false}}),
             );
             let result = request_powerdown(&mut qmp, &mut input, true);
             assert_eq!(result.is_err(), fail_release);
-            assert_eq!(input.revoked_through, 7);
             assert_eq!(input.held.is_empty(), !fail_release);
             if fail_release {
                 assert!(result

@@ -50,17 +50,13 @@ with tempfile.TemporaryDirectory(prefix='vm-persist-')as tmp:
   executor=MCP(state,True);clients.append(executor)
   executor.tool('vm_start',{'id':config['id']});info=wait_guest(executor)
   assert info['result']['capabilities']['shutdown'] is True,info;record('installed service advertises independent normal shutdown',info)
-  executor.tool('vm_acquire_control',{'id':config['id']})
   script=f"command -v fsck.ext4; grep '/dev/vda / ext4' /proc/mounts; printf %s {marker} > {shlex.quote(args.marker_path)}; sync"
   write=executor.tool('vm_exec',{'id':config['id'],'argv':['/bin/sh','-eu','-c',script],'timeout_ms':5000})
   assert write['result']['exit_code']==0,write;record('installed ext4 root, fsck and persistent write',write)
-  executor.tool('vm_release_control',{'id':config['id']})
   record('lifecycle-only MCP normal shutdown',normal_stop(life))
   life.tool('vm_start',{'id':config['id']});wait_guest(executor)
-  executor.tool('vm_acquire_control',{'id':config['id']})
   read=executor.tool('vm_exec',{'id':config['id'],'argv':['/bin/cat',args.marker_path],'timeout_ms':5000})
   assert read['result']['stdout']==marker and read['result']['exit_code']==0,read;record('data survives real clean shutdown and reboot',True)
-  executor.tool('vm_release_control',{'id':config['id']})
   record('second clean shutdown',normal_stop(life));evidence['passed']=True
  except Exception as e:evidence.update(passed=False,error=str(e));raise
  finally:

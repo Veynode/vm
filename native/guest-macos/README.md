@@ -271,7 +271,7 @@ For a daemon already running the updated code, start MCP with:
 .local/macos-input-target/debug/vm-control mcp --state-dir /absolute/private/state --allow-input
 ```
 
-Acquire control, take a fresh screenshot, and pass its `frame_id`,
+Take a fresh screenshot and pass its `frame_id`,
 `source_generation`, `width`, and `height` to `vm_input_click`, `vm_input_drag`,
 `vm_input_scroll`, or `vm_input_key`. A screenshot has an input anchor only when
 `input_anchor_available` is true. Observation still succeeds when input registration
@@ -286,21 +286,18 @@ bounds. Display-reconfiguration notifications invalidate cached anchors, includi
 a transient configuration change that returns to the same geometry. A capture that
 crossed such a notification cannot become an input anchor.
 
-Internal Guest methods are `input_step`, `input_cleanup`, and `input_revoke`, with
+Internal Guest methods are `input_step` and `input_cleanup`, with
 nested `arguments`. Only one operation is active, with16 events per step, a4s total
 deadline and a1s inter-step watchdog checked every100ms. Absolute movement must be
 paired x/y and precede mouse buttons or scrolling within the same operation. The
 physical key map is explicit; `insert`, text and Unicode/layout translation remain
 unsupported. Whole batches validate before any event is posted.
 
-The controller fences leases before requesting Guest `input_revoke{through_epoch}`.
-The Guest commits that monotonic fence before attempting release, so late old vsock
-requests cannot resume input. The fence is not reset automatically. Only states
-posted by this service are released; it does not issue an all-physical-key reset.
+Only states posted by this service are released; it does not issue an all-physical-key reset.
 Normal completion, failed continuations, failed response writes, the watchdog,
 display changes, SIGTERM/SIGINT and service errors run cleanup. A successful
 per-request vsock response is followed by normal socket EOF and is not itself a
-session cancellation; host MCP EOF invokes lease retirement/revoke. An incomplete
+session cancellation. An incomplete
 request that disconnects before identifying its operation is bounded by the1s
 watchdog (plus its100ms check interval), not an immediate global key reset. A failed release
 latches input disabled, and requires explicit service restart after permission is
@@ -308,16 +305,13 @@ restored. SIGKILL/Guest crash cannot execute cleanup and is not claimed to do so
 
 `dispatched` and `synthetic_release_dispatched` mean public CGEvent posting completed;
 CGEventPost has no application-delivery receipt. `guest_delivery_confirmed` remains
-false. Lease cleanup returns confirmed only after the matching Guest epoch ACK;
-permission/transport failures remain explicit errors. Human takeover retains its
-`epoch` and `human_control` response fields. An observe-only VM with no attempted
-input requires no Guest revoke method, preserving older service compatibility.
+false. Permission/transport failures remain explicit errors.
 
 Host self-tests use a synthetic sink and never post host input. They cover2x Retina
 and negative-origin pixel-centre mapping, batch denial, stale/cache/generation
-fencing, different-operation/owner denial, synthetic release, failed-release latch,
+fencing, different-operation denial, synthetic release, failed-release latch,
 watchdog, display invalidation and disabled/host guards. Controller tests cover
-strict ACKs, lease retirement, and actual child-pipe routing with a synthetic Guest
+strict ACKs and actual child-pipe routing with a synthetic Guest
 permission denial. These are not real Guest input acceptance; actual permission,
 click/key/drag/scroll behavior and Retina positioning remain to be tested in Guest.
 
@@ -365,7 +359,7 @@ this first adapter's main-display-only screenshot/input contract.
 
 Suggested actual acceptance sequence:
 
-1. Verify `vm_guest_info.input_policy.available`, acquire a lease, capture a new
+1. Verify `vm_guest_info.input_policy.available`, capture a new
    screenshot with `input_anchor_available:true`, and choose coordinates inside
    the green target using that screenshot's physical-pixel dimensions. Use only
    that capture's frame UUID/generation; do not use a video frame as an anchor.
@@ -379,8 +373,7 @@ Suggested actual acceptance sequence:
    released buttons; AppKit may coalesce motion, so event count need not equal
    the number of transmitted movement steps.
 5. After a screenshot is older than5s, verify input rejection and no corresponding
-   new event. For takeover during a bounded operation, inspect both controller
-   revoke ACK and actual observed releases; neither alone proves the other.
+   new event.
 6. Close the oracle's window or wait its configured timeout. The terminal regains
    its prompt. Inspect the private log inside Guest with
    `tail -n 40 "$HOME/veynode-input-oracle-01.jsonl"` if needed. Do not expand Guest

@@ -165,7 +165,6 @@ mod golden_tests {
                 case["canonical_hex"]
             );
             assert_eq!(signed.request.action.required_scope(), "files");
-            assert!(signed.request.action.epoch().is_none());
             crate::verify(
                 value["device_public_key"].as_str().unwrap(),
                 &signed.request.canonical().unwrap(),

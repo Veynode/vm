@@ -123,8 +123,7 @@ pub struct Transport {
     tx: mpsc::SyncSender<Task>,
     state: Arc<Mutex<&'static str>>,
     stop: Arc<AtomicBool>,
-    ordinary: Arc<AtomicBool>,
-    revoke: Arc<AtomicBool>,
+    lane: Arc<AtomicBool>,
     stream: Arc<Mutex<super::guest_transport::Lifetime>>,
 }
 impl Transport {
@@ -333,8 +332,7 @@ impl Transport {
             tx,
             state,
             stop,
-            ordinary: Arc::new(AtomicBool::new(false)),
-            revoke: Arc::new(AtomicBool::new(false)),
+            lane: Arc::new(AtomicBool::new(false)),
             stream,
         }
     }
@@ -348,33 +346,19 @@ impl Transport {
         }
 
         let method = request["method"].as_str().context("method required")?;
-        if ![
-            "info",
-            "exec_start",
-            "exec_poll",
-            "exec_cancel",
-            "scope_revoke",
-        ]
-        .contains(&method)
-        {
+        if !["info", "exec_start", "exec_poll", "exec_cancel"].contains(&method) {
             bail!("unsupported serial execution method")
         }
         if self.state() != "ready" || self.stop.load(Ordering::Acquire) {
             bail!("serial execution unavailable or fenced")
         }
-        let lane = if method == "scope_revoke" {
-            self.revoke.clone()
-        } else {
-            self.ordinary.clone()
-        };
+        let lane = self.lane.clone();
         if lane.swap(true, Ordering::AcqRel) {
             bail!("serial execution busy")
         }
         let (tx, rx) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
-        let deadline = admitted_deadline.min(
-            Instant::now() + Duration::from_secs(if method == "scope_revoke" { 5 } else { 1 }),
-        );
+        let deadline = admitted_deadline.min(Instant::now() + Duration::from_secs(1));
         if self
             .tx
             .try_send(Task {
@@ -413,9 +397,6 @@ fn validate_reply(method: &str, response: &Value) -> Result<()> {
     let r = &response["result"];
     match method {
         "heartbeat" if r != &json!({"alive":true}) => bail!("invalid serial heartbeat proof"),
-        "scope_revoke" if r != &json!({"revoked":true,"pending_starts":0,"cgroup_empty":true}) => {
-            bail!("serial scope cleanup unconfirmed")
-        }
         "info"
             if r["transport"] != "virtio-serial-private-exec-v2"
                 || r["execution_containment"] != "cgroup-v2-clone3-kill"
@@ -498,7 +479,7 @@ mod tests {
         }
     }
     #[test]
-    fn heartbeat_and_revoke_progress_while_start_is_pending() {
+    fn heartbeat_progresses_while_start_is_pending() {
         let d = tempfile::Builder::new()
             .prefix("v2-")
             .tempdir_in("/tmp")
@@ -510,9 +491,8 @@ mod tests {
             let (g, h) = hello(&mut s);
             let mut held = None;
             let mut hb = 0;
-            let mut revoke = false;
             let mut last = 0;
-            while !revoke || held.is_some() || hb < 1 {
+            while held.is_none() || hb < 2 {
                 let r = initial(&mut s, Instant::now() + Duration::from_secs(2)).unwrap();
                 assert_eq!(r.sequence, Some(last + 1));
                 last += 1;
@@ -522,30 +502,16 @@ mod tests {
                         reply(&mut s, &g, &h, r, json!({"alive":true}));
                     }
                     "exec_start" => held = Some(r),
-                    "scope_revoke" => {
-                        revoke = true;
-                        reply(
-                            &mut s,
-                            &g,
-                            &h,
-                            r,
-                            json!({"revoked":true,"pending_starts":0,"cgroup_empty":true}),
-                        );
-                    }
                     _ => panic!("unexpected"),
                 };
-                if revoke && hb > 0 {
-                    if let Some(r) = held.take() {
-                        reply(
-                            &mut s,
-                            &g,
-                            &h,
-                            r,
-                            json!({"job_id":"b".repeat(32),"state":"running"}),
-                        );
-                    }
-                }
             }
+            reply(
+                &mut s,
+                &g,
+                &h,
+                held.unwrap(),
+                json!({"job_id":"b".repeat(32),"state":"running"}),
+            );
             thread::sleep(Duration::from_millis(30));
         });
         let t = Transport::start(&path, "c".repeat(64));
@@ -554,26 +520,19 @@ mod tests {
             assert!(Instant::now() < until);
             thread::sleep(Duration::from_millis(2));
         }
-        let scope = json!({"owner":"d".repeat(64),"epoch":1});
-        let mut start=t.request(json!({"id":"start","method":"exec_start","scope":scope,"argv":["true"],"timeout_ms":1000})).unwrap();
-        assert!(t.request(json!({"id":"other","method":"info"})).is_err());
-        let mut revoke = t
-            .request(json!({"id":"retire","method":"scope_revoke","scope":scope}))
+        let mut start = t
+            .request_before(
+                json!({"id":"start","method":"exec_start","argv":["true"],"timeout_ms":1000}),
+                Instant::now() + Duration::from_secs(5),
+            )
             .unwrap();
-        assert!(poll(&mut revoke).unwrap()["result"]["cgroup_empty"] == true);
+        assert!(t.request(json!({"id":"other","method":"info"})).is_err());
         assert_eq!(poll(&mut start).unwrap()["id"], "start");
         server.join().unwrap();
     }
     #[test]
-    fn scope_proof_requires_every_exact_field() {
-        for value in [
-            json!({}),
-            json!({"revoked":true,"pending_starts":1,"cgroup_empty":true}),
-            json!({"revoked":true,"pending_starts":0,"cgroup_empty":false}),
-            json!({"revoked":true,"pending_starts":0,"cgroup_empty":true,"extra":1}),
-        ] {
-            assert!(validate_reply("scope_revoke", &json!({"result":value})).is_err())
-        }
+    fn heartbeat_requires_exact_proof() {
+        assert!(validate_reply("heartbeat", &json!({"result":{}})).is_err());
         assert!(validate_reply("heartbeat", &json!({"error":{"code":"timeout"}})).is_err());
     }
     #[test]
@@ -616,22 +575,17 @@ mod tests {
             thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(transport.state(), "ready");
-        let scope = json!({"owner":"d".repeat(64),"epoch":7});
-        let mut start=transport.request(json!({"id":"start","method":"exec_start","scope":scope,"argv":["/bin/sh","-c","sleep 20"],"timeout_ms":30000})).unwrap();
+        let mut start=transport.request(json!({"id":"start","method":"exec_start","argv":["/bin/sh","-c","sleep 20"],"timeout_ms":30000})).unwrap();
         let started = poll(&mut start).unwrap();
         let id = started["result"]["job_id"]
             .as_str()
             .expect("real Go start returned no job");
-        let mut revoke = transport
-            .request(json!({"id":"retire","method":"scope_revoke","scope":scope}))
+        let mut cancel = transport
+            .request(json!({"id":"cancel","method":"exec_cancel","job_id":id}))
             .unwrap();
-        let r = poll(&mut revoke).unwrap();
-        assert_eq!(
-            r["result"],
-            json!({"revoked":true,"pending_starts":0,"cgroup_empty":true})
-        );
+        poll(&mut cancel).unwrap();
         let mut job = transport
-            .request(json!({"id":"poll","method":"exec_poll","scope":scope,"job_id":id}))
+            .request(json!({"id":"poll","method":"exec_poll","job_id":id}))
             .unwrap();
         let result = poll(&mut job).unwrap();
         assert_eq!(result["result"]["state"], "finished");
@@ -758,7 +712,7 @@ mod tests {
             Ok(())
         });
         ready.recv_timeout(Duration::from_secs(2)).unwrap();
-        let mut pending=transport.request_before(json!({"id":"start","method":"exec_start","scope":{"owner":"d".repeat(64),"epoch":1},"argv":["/bin/echo","x".repeat(7000),"y".repeat(7000),"z".repeat(7000),"w".repeat(7000)],"timeout_ms":1000}),Instant::now()+Duration::from_millis(20)).unwrap();
+        let mut pending=transport.request_before(json!({"id":"start","method":"exec_start","argv":["/bin/echo","x".repeat(7000),"y".repeat(7000),"z".repeat(7000),"w".repeat(7000)],"timeout_ms":1000}),Instant::now()+Duration::from_millis(20)).unwrap();
         // Reader resumes at 50ms, between the 20ms dispatch deadline and the old
         // independently reset 100ms write deadline. Old behavior completes this frame.
         resume.send(()).unwrap();

@@ -7,8 +7,8 @@ import ImageIO
 // (VNC/RFB) server. screensharingd is an Apple system daemon, so nothing in the
 // Guest needs Screen Recording or Accessibility grants. The worker answers the
 // Guest-service methods `info`, `screenshot` and `input_*` itself with the same
-// envelopes and frame/operation/epoch rules as native/guest-macos, so the
-// controller's lease, frame and cleanup checks apply unchanged.
+// envelopes and frame/operation rules as native/guest-macos, so the
+// controller's frame and cleanup checks apply unchanged.
 
 struct ScreenSharingError: LocalizedError {
     let code: String
@@ -318,9 +318,6 @@ final class ScreenSharingGuest {
     private var generation: UInt64 = 0
     private var geometry: (Int, Int)?
     private var operation: String?
-    private var owner: String?
-    private var epoch: UInt64 = 0
-    private var revokedThrough: UInt64 = 0
     private var deadline: UInt64 = 0
     private var keys: Set<String> = []
     private var mask: UInt8 = 0
@@ -328,7 +325,7 @@ final class ScreenSharingGuest {
     private var positioned = false
 
     init(mac: String, loginFile: String) { self.mac = mac; self.loginFile = loginFile }
-    static func handles(_ method: String) -> Bool { ["info", "screenshot", "input_step", "input_cleanup", "input_revoke"].contains(method) }
+    static func handles(_ method: String) -> Bool { ["info", "screenshot", "input_step", "input_cleanup"].contains(method) }
     func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
 
     func session() throws -> RFBClient {
@@ -359,7 +356,6 @@ final class ScreenSharingGuest {
                 case "screenshot": result = try self.screenshot()
                 case "input_step": result = try self.step(try self.arguments(request))
                 case "input_cleanup": result = try self.cleanup(try self.arguments(request))
-                case "input_revoke": result = try self.revoke(try self.arguments(request))
                 default: throw ScreenSharingError(code: "unsupported", message: "method unsupported over Screen Sharing")
                 }
                 reply(["id": id, "result": result])
@@ -438,7 +434,7 @@ final class ScreenSharingGuest {
     }
     /// Release everything this operation holds (key-ups, then all buttons up).
     @discardableResult func release() -> Bool {
-        defer { operation = nil; owner = nil; keys.removeAll(); mask = 0; positioned = false }
+        defer { operation = nil; keys.removeAll(); mask = 0; positioned = false }
         guard let client, operation != nil || !keys.isEmpty || mask != 0 else { return true }
         do {
             for key in keys { if let sym = screenSharingKeysyms[key] { try client.key(sym, down: false) } }
@@ -452,26 +448,17 @@ final class ScreenSharingGuest {
         guard release() else { throw ScreenSharingError(code: "input_cleanup_unconfirmed", message: "synthetic release could not be sent") }
         return ["released": true, "synthetic_release_dispatched": true, "guest_delivery_confirmed": false]
     }
-    func revoke(_ args: [String: Any]) throws -> [String: Any] {
-        guard let through = unsigned(args["through_epoch"]) else { throw ScreenSharingError(code: "invalid_request", message: "through_epoch must be a safe unsigned integer") }
-        revokedThrough = max(revokedThrough, through) // the fence is committed before any release
-        if operation != nil && epoch <= revokedThrough && !release() {
-            throw ScreenSharingError(code: "input_cleanup_unconfirmed", message: "synthetic release could not be sent")
-        }
-        return ["released": true, "through_epoch": through, "synthetic_release_dispatched": true, "guest_delivery_confirmed": false]
-    }
     func step(_ args: [String: Any]) throws -> [String: Any] {
-        guard let op = hex(args["operation_id"], 32), let requestedEpoch = unsigned(args["epoch"]), requestedEpoch > revokedThrough,
-              let requestedOwner = hex(args["owner"], 64), let begin = args["begin"] as? Bool, let frameID = args["frame_id"] as? String,
+        guard let op = hex(args["operation_id"], 32), let begin = args["begin"] as? Bool, let frameID = args["frame_id"] as? String,
               let requestedGeneration = unsigned(args["source_generation"]), let width = unsigned(args["width"]), let height = unsigned(args["height"]),
               let events = args["events"] as? [[String: Any]], !events.isEmpty, events.count <= 16 else {
-            throw ScreenSharingError(code: "invalid_request", message: "Invalid bounded physical input request or revoked epoch")
+            throw ScreenSharingError(code: "invalid_request", message: "Invalid bounded physical input request")
         }
         guard let frame = frames.first(where: { $0.id == frameID }), now() - frame.captured <= 5_000_000_000, frame.generation == requestedGeneration,
               UInt64(frame.width) == width, UInt64(frame.height) == height, let client, client.width == frame.width, client.height == frame.height else {
             throw ScreenSharingError(code: "stale_frame", message: "Capture a fresh screenshot after display or geometry changes")
         }
-        guard begin ? operation == nil : (operation == op && owner == requestedOwner && epoch == requestedEpoch && now() < deadline) else {
+        guard begin ? operation == nil : (operation == op && now() < deadline) else {
             throw ScreenSharingError(code: "input_busy_or_expired", message: "Input operation is active, replaced, or expired")
         }
         // Validate the whole batch before sending any element.
@@ -516,7 +503,7 @@ final class ScreenSharingGuest {
                 }
             }
         }
-        if begin { positioned = false; operation = op; owner = requestedOwner; epoch = requestedEpoch; deadline = now() + 4_000_000_000 }
+        if begin { positioned = false; operation = op; deadline = now() + 4_000_000_000 }
         do {
             for plan in plans {
                 switch plan {

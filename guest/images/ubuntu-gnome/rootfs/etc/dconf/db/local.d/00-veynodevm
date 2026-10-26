@@ -1,0 +1,14 @@
+# A micro-VM desktop: no screen blanking, lock or idle suspend.
+[org/gnome/desktop/session]
+idle-delay=uint32 0
+
+[org/gnome/desktop/interface]
+# VTE renders the default variable "Ubuntu Sans Mono" as missing glyphs here.
+monospace-font-name='DejaVu Sans Mono 12'
+
+[org/gnome/desktop/screensaver]
+lock-enabled=false
+
+[org/gnome/settings-daemon/plugins/power]
+sleep-inactive-ac-type='nothing'
+sleep-inactive-battery-type='nothing'

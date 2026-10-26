@@ -980,15 +980,9 @@ async fn confirmed_retry_preserves_adapter_identity_and_revalidates_signature_an
             reader.read_line(&mut line).await.unwrap();
             let request: Value = serde_json::from_str(&line).unwrap();
             let reply = match request["method"].as_str().unwrap() {
-                "capabilities" => {
-                    requests.fetch_add(1, Ordering::SeqCst);
-                    json!({"control_session_fencing":{"retired_owner_ttl_seconds":120,"request_dispatch_deadline_seconds":30}})
-                }
                 "status" => {
+                    requests.fetch_add(1, Ordering::SeqCst);
                     json!({"config":{"id":vm,"backend":"qemu-hvf"},"state":"running","capabilities":{"input":true},"runtime":{"console_socket":console_path},"pid":123})
-                }
-                "session_end" => {
-                    json!({"closed":true,"retired_owner":true,"retired_owner_ttl_seconds":120,"released_vm_ids":[]})
                 }
                 _ => panic!("unexpected controller fixture request"),
             };
@@ -1079,7 +1073,7 @@ async fn confirmed_retry_preserves_adapter_identity_and_revalidates_signature_an
         .gate
         .authorize_active(&answer.transcript.session_id, "observe")
         .is_err());
-    original.end().await.unwrap();
+    original.end();
     worker.abort();
     drop(console);
 }
@@ -1160,14 +1154,6 @@ async fn closing_dispatch_during_confirm_attach_revokes_before_book_unlock() {
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
     let worker = tokio::spawn(async move {
-        let (socket, _) = controller.accept().await.unwrap();
-        let mut reader = tokio::io::BufReader::new(socket);
-        let mut line = String::new();
-        reader.read_line(&mut line).await.unwrap();
-        let request: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(request["method"], "capabilities");
-        reader.get_mut().write_all(format!("{}\n",json!({"result":{"control_session_fencing":{"retired_owner_ttl_seconds":120,"request_dispatch_deadline_seconds":30}}})).as_bytes()).await.unwrap();
-        drop(reader);
         let (socket, _) = controller.accept().await.unwrap();
         let mut reader = tokio::io::BufReader::new(socket);
         let mut line = String::new();

@@ -16,18 +16,14 @@ fn main() -> Result<()> {
         height: 800,
     };
     let actions = vec![
-        ControlAction::Acquire,
-        ControlAction::Release { epoch: 7 },
         ControlAction::ObserveFrame,
         ControlAction::Click {
-            epoch: 7,
             frame: frame.clone(),
             x: 200,
             y: 200,
             button: "left".into(),
         },
         ControlAction::Drag {
-            epoch: 7,
             frame: frame.clone(),
             x: 0,
             y: 0,
@@ -36,7 +32,6 @@ fn main() -> Result<()> {
             button: "right".into(),
         },
         ControlAction::Scroll {
-            epoch: 7,
             frame: frame.clone(),
             x: 640,
             y: 400,
@@ -44,7 +39,6 @@ fn main() -> Result<()> {
             ticks: 3,
         },
         ControlAction::Key {
-            epoch: 7,
             frame,
             keys: vec!["ctrl".into(), "a".into()],
         },

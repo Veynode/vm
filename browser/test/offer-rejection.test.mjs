@@ -27,7 +27,7 @@ test('verified non-admission stays fenced until close, cleans local channel, ret
   try {
     await assert.rejects(f.receiver.offer(sdp, 'request-1', 'h265'), error => error instanceof SessionAuthError && /not admit/.test(error.message));
     assert.equal(f.receiver.offerTransmissionState, 'rejected'); assert.equal(f.receiver.controlConfirmed, false);
-    await assert.rejects(f.receiver.confirm(), /No verified/); await assert.rejects(f.receiver.control({ kind: 'acquire' }), /confirmed/);
+    await assert.rejects(f.receiver.confirm(), /No verified/); await assert.rejects(f.receiver.control({ kind: 'observe_frame' }), /confirmed/);
     await assert.rejects(f.receiver.signedClose(), /No verified/);
     await assert.rejects(f.receiver.acceptGrant(f.signedGrant), /uncertain/);
     await assert.rejects(f.receiver.offer(sdp, 'request-2', 'h264'), /uncertain/);
@@ -36,7 +36,7 @@ test('verified non-admission stays fenced until close, cleans local channel, ret
     assert.throws(() => f.receiver.clearUnopenedControlTransport(), /admission/);
     assert.deepEqual(await f.receiver.close(), { code: 'guest_display_asleep' }); assert.equal(closed, 1);
     assert.equal(f.receiver.offerTransmissionState, 'not-sent'); assert.equal(await f.receiver.close(), null);
-    assert.equal(closed, 1); await assert.rejects(f.receiver.control({ kind: 'acquire' }), /confirmed/);
+    assert.equal(closed, 1); await assert.rejects(f.receiver.control({ kind: 'observe_frame' }), /confirmed/);
     await assert.rejects(f.receiver.confirm(), /No verified/); await f.receiver.acceptGrant(f.signedGrant);
     await assert.rejects(f.receiver.offer(sdp, 'request-2', 'h264'), /not admit/);
     assert.deepEqual(await f.receiver.close(), { code: 'guest_display_asleep' }); f.receiver.dispose();
@@ -73,7 +73,7 @@ for (const [name, transform] of Object.entries(mutations)) test(`invalid rejecti
     await assert.rejects(f.receiver.offer(sdp, 'uncertain', 'h265'));
     assert.equal(f.receiver.offerTransmissionState, 'uncertain'); await assert.rejects(f.receiver.close(), /unconfirmed/);
     await assert.rejects(f.receiver.offer(sdp, 'retry', 'h264'), /uncertain/); await assert.rejects(f.receiver.acceptGrant(f.signedGrant), /uncertain/);
-    await assert.rejects(f.receiver.confirm(), /No verified/); await assert.rejects(f.receiver.control({ kind: 'acquire' }), /confirmed/);
+    await assert.rejects(f.receiver.confirm(), /No verified/); await assert.rejects(f.receiver.control({ kind: 'observe_frame' }), /confirmed/);
     assert.throws(() => f.receiver.dispose(), /Close/); assert.equal(f.calls.length, 2);
   } finally { globalThis.fetch = original; }
 });

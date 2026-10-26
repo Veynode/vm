@@ -132,8 +132,8 @@ def main():
     fd=os.open(a.output,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
     report={'passed':False,'cleanup_confirmed':False,'run_id':a.run_id,'checks':[],
         'scope':'Actual own-window AppKit delivery through stdio MCP; not Unicode/layout/browser/performance acceptance',
-        'synthetic_provenance_authenticated':False,'active_operation_takeover_tested':False}
-    client=None; lease=False; error=None
+        'synthetic_provenance_authenticated':False}
+    client=None; error=None
     try:
         report['controller_sha256']=hashlib.sha256(a.binary.read_bytes()).hexdigest()
         client=Client(a.binary.resolve(),a.state_dir.resolve())
@@ -192,7 +192,7 @@ def main():
         left,right=target(geometry,anchor['width'],anchor['height'])
         report['target_pixels']={'click':left,'drag_end':right,'width':anchor['width'],'height':anchor['height']}
         report['initial_revision']=baseline['revision']
-        acquired=value('acquire_control'); require(type(acquired.get('epoch')) is int and acquired['epoch']>0,'lease_epoch'); lease=True; record('permission_geometry_nonce_and_lease')
+        record('permission_geometry_and_nonce')
         def action(name,payload,predicate):
             before=snapshot(); frame=shot()
             require((frame['width'],frame['height'])==(anchor['width'],anchor['height']),'capture_geometry_changed')
@@ -216,8 +216,6 @@ def main():
             require(after['revision']==before['revision'],'rejected_input_observed_events')
             record(name,{'error':message,'unchanged_revision':after['revision']})
         expired=shot(); time.sleep(5.3); denial('stale_frame_no_delivery',expired)
-        released=value('release_control'); require(released.get('released') is True,'release_unconfirmed'); lease=False
-        denial('released_lease_no_delivery',shot())
         deadline=time.monotonic()+a.wait_ended
         while True:
             final=snapshot(); ended=[e for e in final['events'] if e.get('event')=='ended']
@@ -235,12 +233,11 @@ def main():
     finally:
         if client:
             try:
-                if lease: client.value('release_control',{'id':a.id})
                 client.close(); report['cleanup_confirmed']=True
             except BaseException as exc:
                 report['cleanup_error']=str(exc) if isinstance(exc,ValueError) else type(exc).__name__
                 error=error or exc
-                # Even a failed release must close/reap the scoped adapter.
+                # Even a failed close must reap the scoped adapter.
                 try: client.close()
                 except BaseException: pass
         report['passed']=error is None and report.get('delivery_checks_passed') is True and report['cleanup_confirmed']
@@ -261,8 +258,8 @@ class PureTests(unittest.TestCase):
         with self.assertRaises(ValueError):validate_snapshot(json.dumps(v).encode(),nonce)
     def test_controller_and_guest_envelopes_are_distinct(self):
         client=object.__new__(Client)
-        client.request=lambda name,args: {'content':[{'text':json.dumps({'epoch':7})}]}
-        self.assertEqual(client.value('acquire_control',{}),{'epoch':7})
+        client.request=lambda name,args: {'content':[{'text':json.dumps({'dispatched':True})}]}
+        self.assertEqual(client.value('input_click',{}),{'dispatched':True})
         client.request=lambda name,args: {'content':[{'text':json.dumps({'result':{'token':'a'*32}})}]}
         self.assertEqual(client.value('file_download_begin',{}),{'token':'a'*32})
     def test_geometry_uses_actual_physical_bounds(self):

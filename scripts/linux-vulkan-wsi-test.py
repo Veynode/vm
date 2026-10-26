@@ -123,10 +123,8 @@ def main():
   BASE.require(checked is not None and proof is not None,'graphics readiness deadline')
   BASE.require(captured,'no actual WSI screenshot');record('actual host admission',proof);record('actual GPU workloads',checked)
   info=client.tool('guest_info',{'id':vm})['result'];guest_observer(info);record('actual observer info',info)
-  client.tool('acquire_control',{'id':vm})
   for name,payload in [('exec_start',{'argv':['/bin/true'],'timeout_ms':1000}),('file_upload_begin',{'path':'must-not-exist','size':0,'sha256':'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'})]:
    denial=client.tool(name,{'id':vm,**payload},denied=True);BASE.require('unsupported' in json.dumps(denial).lower(),'backend capability denial missing');record(name+' denied',denial)
-  client.tool('release_control',{'id':vm})
   shutdown=client.tool('shutdown',{'id':vm});record('shutdown request',shutdown)
   BASE.require(shutdown.get('requested') is True and shutdown.get('completed') is False and shutdown.get('mechanism')=='qmp-system-powerdown','wrong shutdown mechanism')
   status=terminal(45);record('terminal before assertion',status)

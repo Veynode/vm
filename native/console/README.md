@@ -64,7 +64,7 @@ A completed close means the window is closed; `display_gpu_inflight` can remain
 true until its previously submitted command completes. Initial Metal pipeline
 creation and AppKit work have not been demonstrated to meet a latency bound;
 the broker must retain its bounded timeout and treat missing ACK as uncertain.
-No window request changes an encoding epoch, control lease or human takeover.
+No window request changes an encoding epoch or native input state.
 
 The content view does not accept or forward keys, mouse buttons, wheel,
 clipboard or accessibility operations. The title says “View Only”. Native
@@ -177,7 +177,7 @@ Additional capabilities (all limits/preferences, not observed performance):
   "capture_limit_fps": 60,
   "native_window_capture_limit_fps": 60,
   "background_capture_limit_fps": 30,
-  "encoder_limit_fps": 30,
+  "encoder_limit_fps": 60,
   "idle_encode_interval_ms": 1000,
   "display_refresh_preference_hz": 60,
   "presented_time_sample_limit": 120,
@@ -283,7 +283,7 @@ See [component schema, mapping and verification](../../archive/docs-evidence/qem
 Stage8r3 adds read-only actual-presented provenance and pure backing-to-Guest
 coordinate conversion. No native input/authority RPC is implemented or enabled.
 
-## Stage 9: explicit native control through the controller
+## Stage 9: focus-driven native control through the controller
 
 The optional trusted broker arguments are `SOCKET --persistent --control-socket
 ABSOLUTE_CONTROL_SOCKET --vm-id ID --worker-instance 64_LOWERCASE_HEX`. With no
@@ -296,23 +296,29 @@ user. No public listener is added.
 
 `native_window_protocol:2`, `native_input_protocol:1`, and
 `native_input_supported:true` describe the compiled path. `native_input_available`
-requires an attached healthy controller connection. `input_enabled` only becomes
-true after a successful explicit **Take Control** ACK. AppKit then makes the
-image view first responder. **Return to Agent** is the only UI action that ends
-the human hold. No global key hook, Accessibility API, host CGEvent synthesis,
+requires an attached healthy controller connection. Input follows focus: when the
+window is the key window of the active application, visible and not miniaturized,
+with no modifier keys held, the view becomes first responder and the client sends
+`begin`. `input_enabled` becomes true after a successful `begin` ACK. Focus loss
+sends `suspend`. No global key hook, Accessibility API, host CGEvent synthesis,
 SPICE input channel, or direct QMP input is used.
 
+The native wire messages are `begin`, `heartbeat`, `event`, `suspend` and
+`detach`. Each `begin` ACK carries a new activation `epoch`, a per-connection
+counter that rejects stale frames and events from an earlier activation; it is
+not a lease. States are `connecting`, `view_only`, `beginning`, `active`,
+`suspending`, `suspended` and `cleanup_unconfirmed`.
+
 `window_status` separates `native_input_state`, `native_input_ready`,
-`native_human_hold`, `native_release_confirmed`, and `native_input_epoch` from
-window visibility. Human-hold/epoch fields are last confirmed local observations;
-when state is `cleanup_unconfirmed`, they cannot prove the controller's current
-authority state. Closing the window synchronously disables local input and
-queues release-only suspension; its window ACK **does not confirm input release**.
-The independently received suspend ACK confirms release and supplies a new human
-epoch retained for Return to Agent after reopening. Focus loss, miniaturization,
-geometry/source invalidation, input queue overflow, and semantic event denial
-likewise suspend. Protocol/connection/cleanup failure permanently fences this
-client connection; no implicit retry/reacquisition occurs. Helper process EOF
+`native_release_confirmed`, and `native_input_epoch` from window visibility.
+These are last confirmed local observations; when state is
+`cleanup_unconfirmed`, they cannot prove the controller's current state.
+Closing the window synchronously disables local input and queues release-only
+suspension; its window ACK **does not confirm input release**. The independently
+received `suspend` ACK confirms release and echoes the current activation epoch.
+Focus loss, miniaturization, geometry/source invalidation, input queue overflow,
+and semantic event denial likewise suspend. Protocol/connection/cleanup failure
+permanently fences this client connection; no implicit retry occurs. Helper process EOF
 lets the controller perform its connection cleanup, and does not itself attest
 release success.
 
@@ -321,9 +327,9 @@ bound; idle heartbeats are scheduled every 500 ms. This is not a hard release
 latency guarantee. At most 32 transition items and one coalesced move are pending.
 Buttons/scroll carry their own position, so dropping an obsolete pending move
 cannot relocate a click. Overflow clears pending work, disables input and requests
-release; it does not silently drop an up event while leaving authority active.
-Queued events older than 200 ms are rejected locally. A late takeover ACK after
-focus cancellation is immediately suspended instead of rearming.
+release; it does not silently drop an up event while leaving input active.
+Queued events older than 200 ms are rejected locally. A late `begin` ACK after
+focus loss is immediately suspended instead of rearming.
 
 The event captures the immutable presented record at AppKit event receipt and
 maps its backing coordinate through that record's viewport. Letterbox/outside
@@ -333,24 +339,23 @@ record without inventing a new capture time. Any source/window/layout invalidati
 clears all of them. `validate_displayed_frame` returns `{valid:true,frame,current}`
 only for an exact eight-field token (display instance, presentation serial,
 window/invalidation epoch, source generation/sequence, source width/height).
-This check supplies provenance; the controller still owns authority and epoch
-validation. Static frames do not expire merely because the desktop is unchanged.
+This check supplies provenance; the controller still validates the activation
+epoch. Static frames do not expire merely because the desktop is unchanged.
 
 Supported physical key codes are the existing controller subset (letters, digits,
 navigation, Return/Escape/Tab/Space, modifiers and F1–F12). Repeat downs are ignored;
 Guest typematic behavior is not a Unicode/text-input guarantee. Side-specific
 modifier flags use public SDK `IOKit/hidsystem/IOLLEvent.h` definitions
 (`NX_DEVICEL/R*KEYMASK`), rather than conflating left/right aggregate modifiers.
-Only presses tracked by this view can generate corresponding releases. Modifier
-keys must be released before Take Control. OS-reserved shortcuts and broader
+Only presses tracked by this view can generate corresponding releases. Input does
+not begin while modifier keys are held. OS-reserved shortcuts and broader
 keyboard layouts remain compatibility work.
 
 `test.sh` includes real private Unix sockets with a scripted controller peer:
-blocked event ACK, 1,000 move coalescing, transition overflow, release ACK with new
-epoch, explicit Return, late takeover cancellation, and malformed sequence fencing.
+blocked event ACK, 1,000 move coalescing, transition overflow, suspend ACK epoch
+echo, late `begin` cancellation, and malformed sequence fencing.
 These tests do not establish Guest input delivery. Actual Guest button/key receipt,
-window-close held-button cleanup, and previous MCP owner fencing require the root
-Agent's separate disposable-VM acceptance. CUA's complete-key API cannot establish
+and window-close held-button cleanup require the root Agent's separate disposable-VM acceptance. CUA's complete-key API cannot establish
 an independently held physical key; no such actual held-key claim is made here.
 
 Runtime JSON booleans are explicit `@YES`/`@NO`. In Objective-C, boxing a C
@@ -367,10 +372,10 @@ typed BOOL variables for GPU in-flight/visibility remain Boolean fields. Numeric
 
 ### Application activation and input focus
 
-Take Control requires both an active application and its key window. Event
-admission additionally requires the image view to be first responder. A successful
-initial takeover ACK sets that first responder once; it does not repeatedly steal
-focus back. Subsequent first-responder loss suspends, as do
+`begin` requires both an active application and its key window. Event
+admission additionally requires the image view to be first responder, which the
+window sets before `begin` and again on the first ready update; it does not
+repeatedly steal focus back. Subsequent first-responder loss suspends, as do
 `applicationDidResignActive:` and the existing key-window/visibility callbacks.
 The 50 ms common-mode UI timer and status query recheck the same state. These are
 local event-loop checks, not a hard OS scheduling/remote release deadline.
@@ -379,7 +384,8 @@ local event-loop checks, not a hard OS scheduling/remote release deadline.
 `application_active`, `window_key`, `first_responder` (specifically the image
 view), and `input_target_focused`. Root's earlier target-window AX Raise is not
 proof that the native application actually deactivated; the new fields permit a
-separate actual check. Returning to the application does not reacquire authority.
+separate actual check. Returning focus to the window begins a new activation
+(at most once per second).
 
 Public references: [Apple NSWindow.isKeyWindow](https://developer.apple.com/documentation/appkit/nswindow/iskeywindow)
 defines the key window relative to the application;
@@ -389,7 +395,7 @@ nil. The installed macOS SDK `AppKit.framework/Headers/NSApplication.h` provides
 `isActive` and `applicationDidResignActive:`, and `NSWindow.h` provides
 `firstResponder`. Pure policy tests cover inactive-but-key and active/key with
 wrong first responder; existing real Unix cancellation tests cover queued and
-in-flight authority cancellation. They are not an actual GUI deactivation test.
+in-flight input cancellation. They are not an actual GUI deactivation test.
 
 ### Passive copy timing (native helper only)
 
@@ -419,8 +425,8 @@ encoder/scheduling change, or altered producer ACK ordering. Headless compilatio
 excludes this module and instrumentation.
 
 Native input diagnostics expose `native_input_suspension_count` and the latest
-at most eight `native_input_suspensions` through `window_status`. Each explicit
-Take Control starts a new first-cause record: subsequent release/focus callbacks
+at most eight `native_input_suspensions` through `window_status`. Each `begin`
+starts a new first-cause record: subsequent release/focus callbacks
 do not overwrite that cause. Fixed reason labels distinguish focus, source,
 layout, queue overflow/age, unsupported key and remote rejection. The optional
 `queue_age_ms` is sampled at dequeue, before RPC, and is not end-to-end latency.
@@ -428,5 +434,5 @@ An optional `remote_diagnostic` contains only version 1, an allowlisted stage an
 bounded integer worker elapsed milliseconds. Neither record contains keys,
 coordinates, frame payloads, identities or arbitrary peer messages. Invalid
 remote diagnostics are omitted; the original rejection and cleanup still occur.
-These observations do not alter the 200ms queue age, frame validation, authority,
-focus or release-ACK rules and do not prove guest delivery.
+These observations do not alter the 200ms queue age, frame validation, focus or
+release-ACK rules and do not prove guest delivery.

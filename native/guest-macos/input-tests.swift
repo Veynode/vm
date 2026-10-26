@@ -21,15 +21,15 @@ private final class InputTestSink:GuestInputSink {
 func inputSelfTest() {
     let sink=InputTestSink();var clock:UInt64=10_000_000_000
     let service=GuestInputCoordinator(sink:sink,now:{clock})
-    let owner=String(repeating:"a",count:64),op=String(repeating:"b",count:32)
+    let op=String(repeating:"b",count:32)
     var frame="12345678-1234-1234-1234-123456789abc"
     func capture(_ id:String?=nil)throws -> UInt64 {
         if id==nil {frame=UUID().uuidString.lowercased()}
         let d=sink.display!
         return try service.record(["frame_id":id ?? frame,"display_id":d.display,"width":d.width,"height":d.height,"captured_monotonic_us":clock/1000,"desktop_bounds_points":["x":CGFloat(d.x),"y":CGFloat(d.y),"width":CGFloat(d.pointsWidth),"height":CGFloat(d.pointsHeight)],"console_identity":sink.consoleIdentity()!.wire])
     }
-    func args(_ events:[[String:Any]],begin:Bool=true,epoch:UInt64=1,operation:String=op)->[String:Any] {
-        ["owner":owner,"epoch":epoch,"operation_id":operation,"begin":begin,"frame_id":frame,"source_generation":1,"width":2560,"height":1440,"events":events]
+    func args(_ events:[[String:Any]],begin:Bool=true,operation:String=op)->[String:Any] {
+        ["operation_id":operation,"begin":begin,"frame_id":frame,"source_generation":1,"width":2560,"height":1440,"events":events]
     }
     func key(_ name:String,_ down:Bool)->[String:Any] {["type":"key","data":["key":["type":"qcode","data":name],"down":down]]}
     func button(_ down:Bool)->[String:Any] {["type":"btn","data":["button":"left","down":down]]}
@@ -47,43 +47,42 @@ func inputSelfTest() {
     // A stale operation's cleanup cannot release the current owner.
     let stale=try! service.cleanup(["operation_id":String(repeating:"c",count:32)])
     precondition(stale["released"] as? Bool==false && sink.events.count==2)
-    _=try! service.revoke(["through_epoch":1])
+    _=try! service.cleanup(["operation_id":op])
     precondition(sink.events.count==4)
-    denied {_=try service.step(args([key("a",true)]))}
-    _=try! service.step(args([key("a",true)],epoch:2))
+    _=try! service.step(args([key("a",true)]))
     // Watchdog releases synthetic state without waiting for the host client.
     clock+=1_100_000_000;service.tick()
     precondition(sink.events.count==6)
     _=try! service.cleanup(["operation_id":op])
     _=try! capture()
-    denied {_=try service.step(args([button(true)],epoch:2))}
+    denied {_=try service.step(args([button(true)]))}
     let abs:[[String:Any]]=[["type":"abs","data":["axis":"x","value":16384]],["type":"abs","data":["axis":"y","value":16384]]]
-    _=try! service.step(args(abs,epoch:2))
-    _=try! service.step(args([button(true)],begin:false,epoch:2))
+    _=try! service.step(args(abs))
+    _=try! service.step(args([button(true)],begin:false))
     _=try! service.cleanup(["operation_id":op])
     let before=sink.events.count
-    denied {_=try service.step(args([key("a",true),key("insert",true)],epoch:2))}
+    denied {_=try service.step(args([key("a",true),key("insert",true)]))}
     precondition(sink.events.count==before,"invalid batch must post nothing")
-    _=try! service.step(args([key("a",true)],epoch:2))
-    var wrongOwner=args([key("a",false)],begin:false,epoch:2);wrongOwner["owner"]=String(repeating:"c",count:64)
-    denied {_=try service.step(wrongOwner)}
+    _=try! service.step(args([key("a",true)]))
+    var wrongOperation=args([key("a",false)],begin:false);wrongOperation["operation_id"]=String(repeating:"c",count:32)
+    denied {_=try service.step(wrongOperation)}
     _=try! service.cleanup(["operation_id":op])
     clock+=5_000_000_001
-    denied {_=try service.step(args([key("a",true)],epoch:3))}
+    denied {_=try service.step(args([key("a",true)]))}
     _=try! capture()
-    _=try! service.step(args([key("a",true)],epoch:3))
+    _=try! service.step(args([key("a",true)]))
     sink.display=GuestDisplayGeometry(display:8,width:2560,height:1440,x:0,y:0,pointsWidth:1280,pointsHeight:720)
     service.tick()
-    denied {_=try service.step(args([key("a",false)],begin:false,epoch:3))}
+    denied {_=try service.step(args([key("a",false)],begin:false))}
     precondition(try! capture()==2,"display change invalidates generation")
     // Old frame removed after the bounded metadata cache is full.
     for n in 0..<17 {_=try! capture("cache-\(n)")}
-    denied {_=try service.step(args([button(true)],epoch:4))}
+    denied {_=try service.step(args([button(true)]))}
     let oldToken=service.captureToken()
     service.invalidate()
     denied {_=try service.record([:],captureToken:oldToken)}
     precondition(service.shutdown())
-    denied {_=try service.step(args([key("a",true)],epoch:9_007_199_254_740_991))}
+    denied {_=try service.step(args([key("a",true)]))}
     let failedSink=InputTestSink()
     failedSink.permission=false
     let permissionDenied=GuestInputCoordinator(sink:failedSink,now:{clock})
@@ -95,10 +94,10 @@ func inputSelfTest() {
     _=try! failService.record(["frame_id":frame,"display_id":g.display,"width":g.width,"height":g.height,"captured_monotonic_us":clock/1000,"desktop_bounds_points":["x":g.x,"y":g.y,"width":g.pointsWidth,"height":g.pointsHeight],"console_identity":errorSink.consoleIdentity()!.wire])
     _=try! failService.step(args([key("a",true)]))
     errorSink.failPost=true
-    denied {_=try failService.revoke(["through_epoch":1])}
+    denied {_=try failService.cleanup(["operation_id":op])}
     precondition(failService.blockedReason()=="synthetic_release_unconfirmed")
     errorSink.failPost=false
-    denied {_=try failService.step(args([key("b",true)],epoch:2))} // cleanup failure remains latched
+    denied {_=try failService.step(args([key("b",true)]))} // cleanup failure remains latched
     precondition(failService.shutdown()) // explicit retry releases only its recorded key
     precondition(errorSink.events.count==2 && failService.blockedReason()=="synthetic_release_unconfirmed")
     let geometryService=GuestInputCoordinator(sink:InputTestSink(),now:{clock})
@@ -112,13 +111,13 @@ func inputSelfTest() {
         let d=identitySink.display!,originalIdentity=identitySink.consoleIdentity()!
         let metadata:[String:Any]=["frame_id":frame,"display_id":d.display,"width":d.width,"height":d.height,"captured_monotonic_us":clock/1000,"desktop_bounds_points":["x":CGFloat(d.x),"y":CGFloat(d.y),"width":CGFloat(d.pointsWidth),"height":CGFloat(d.pointsHeight)],"console_identity":originalIdentity.wire]
         _=try! guarded.record(metadata)
-        _=try! guarded.step(args([key("a",true)],epoch:1))
+        _=try! guarded.step(args([key("a",true)]))
         if changedSession {identitySink.sessionID=43} else {identitySink.uid=502}
         let sent=identitySink.events.count
-        denied {_=try guarded.step(args([key("a",false)],begin:false,epoch:1))}
+        denied {_=try guarded.step(args([key("a",false)],begin:false))}
         precondition(identitySink.events.count==sent,"Neither input nor release may target a different login")
         precondition(guarded.blockedReason()=="synthetic_release_unconfirmed")
-        denied {_=try guarded.revoke(["through_epoch":1])}
+        denied {_=try guarded.cleanup(["operation_id":op])}
         identitySink.sessionID=42;identitySink.uid=501
         precondition(guarded.shutdown(),"Original console restored permits explicit release retry")
         precondition(identitySink.events.count==sent+1 && guarded.blockedReason() != nil)
@@ -135,7 +134,7 @@ func inputSelfTest() {
     precondition(sampledSink.identityReads-initialReads==2,"Idle anchor identity polling must be at most2Hz")
     sampledSink.identityAvailable=false
     clock+=500_000_000;sampled.tick()
-    denied {_=try sampled.step(args([key("a",true)],epoch:1))}
+    denied {_=try sampled.step(args([key("a",true)]))}
     precondition(sampledSink.events.isEmpty,"No input from an unavailable identity")
     let idleReads=sampledSink.identityReads
     for _ in 0..<10 {clock+=100_000_000;sampled.tick()}
@@ -147,13 +146,13 @@ func inputSelfTest() {
         let coordinator=GuestInputCoordinator(sink:raceSink,now:{clock}),d=raceSink.display!
         _=try! coordinator.record(["frame_id":frame,"display_id":d.display,"width":d.width,"height":d.height,"captured_monotonic_us":clock/1000,"desktop_bounds_points":["x":CGFloat(d.x),"y":CGFloat(d.y),"width":CGFloat(d.pointsWidth),"height":CGFloat(d.pointsHeight)],"console_identity":raceSink.consoleIdentity()!.wire])
         if switchDuringRelease {
-            _=try! coordinator.step(args([key("a",true),key("b",true)],epoch:1))
+            _=try! coordinator.step(args([key("a",true),key("b",true)]))
             raceSink.afterPost={raceSink.sessionID=43}
-            denied {_=try coordinator.revoke(["through_epoch":1])}
+            denied {_=try coordinator.cleanup(["operation_id":op])}
             precondition(raceSink.events.count==3,"Only first release may post before session drift")
         } else {
             raceSink.afterPost={raceSink.sessionID=43}
-            denied {_=try coordinator.step(args([key("a",true),key("b",true)],epoch:1))}
+            denied {_=try coordinator.step(args([key("a",true),key("b",true)]))}
             precondition(raceSink.events.count==1,"Second batch element and wrong-session cleanup must not post")
         }
         precondition(coordinator.blockedReason()=="synthetic_release_unconfirmed")
@@ -161,11 +160,11 @@ func inputSelfTest() {
         let count=raceSink.events.count
         precondition(coordinator.shutdown() && raceSink.events.count==count+1,"Only the still-held original key is released on explicit retry")
     }
-    let disabled=handle(["id":"test","method":"input_revoke","arguments":["through_epoch":1]],allowExec:false)
+    let disabled=handle(["id":"test","method":"input_cleanup","arguments":["operation_id":op]],allowExec:false)
     precondition((disabled["error"] as? [String:String])?["code"]=="forbidden")
     if !systemString("hw.model").hasPrefix("VirtualMac") {
-        let guarded=handle(["id":"test","method":"input_revoke","arguments":["through_epoch":1]],allowExec:false,allowObserve:true,allowInput:true)
+        let guarded=handle(["id":"test","method":"input_cleanup","arguments":["operation_id":op]],allowExec:false,allowObserve:true,allowInput:true)
         precondition((guarded["error"] as? [String:String])?["code"]=="virtual_guest_required")
     }
-    print("PASS: synthetic input policy: Retina pixel centres/origin, whole-batch validation, stale metadata, bounded cache, operation/owner fencing, epoch revocation, watchdog release, geometry/console invalidation, same-geometry login/UID mismatch, unsafe cleanup refusal/original-session retry, at-most2Hz active-anchor identity polling and zero idle polling, disabled/physical-host guards. No desktop input posted.")
+    print("PASS: synthetic input policy: Retina pixel centres/origin, whole-batch validation, stale metadata, bounded cache, operation fencing, watchdog release, geometry/console invalidation, same-geometry login/UID mismatch, unsafe cleanup refusal/original-session retry, at-most2Hz active-anchor identity polling and zero idle polling, disabled/physical-host guards. No desktop input posted.")
 }

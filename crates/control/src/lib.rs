@@ -1,21 +1,20 @@
 pub mod backend;
 pub mod bridge;
 pub mod container_tools;
-mod exec_journal;
-pub mod exec_scope;
-pub mod exec_witness;
+pub mod desktop_input;
+pub mod desktop_tools;
 pub mod home;
-mod input_retirement;
-use input_retirement::InputRetirement;
 pub mod input;
 mod jobs;
-mod lease;
 mod native_control;
 pub mod native_input;
 pub mod qemu_disk;
 pub mod qemu_extras;
 pub mod qemu_graphics;
+pub mod qemu_uefi;
 mod resources;
+pub mod screen_text;
+pub mod screen_wait;
 mod windows;
 use anyhow::{bail, Context, Result};
 use backend::{Backend, QemuRegistration};
@@ -77,6 +76,21 @@ pub struct Config {
     pub command_line: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk: Option<PathBuf>,
+    /// `kernel` (default): direct kernel boot of `kernel`/`initrd`. `uefi`:
+    /// firmware boot of the distribution's own bootloader from `disk` or `cdrom`.
+    #[serde(default, skip_serializing_if = "BootMode::is_kernel")]
+    pub boot: BootMode,
+    /// Per-VM UEFI variable store (boot entries). Created on first start; the
+    /// file format is backend specific (QEMU pflash image, VZ variable store).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub efi_vars: Option<PathBuf>,
+    /// Read-only installer medium (ISO 9660 image) for UEFI boot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cdrom: Option<PathBuf>,
+    /// QEMU only: also expose a private QMP monitor socket (published in the VM
+    /// state as `monitor_socket`) for scripted installer automation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub qemu_monitor: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restore_image: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -115,6 +129,20 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screen_sharing_login: Option<PathBuf>,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BootMode {
+    #[default]
+    Kernel,
+    Uefi,
+}
+impl BootMode {
+    pub fn is_kernel(&self) -> bool {
+        *self == Self::Kernel
+    }
+}
+/// Largest accepted installer image (DVD images are well below this).
+pub const MAX_CDROM_BYTES: u64 = 64 << 30;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExtraDisk {
@@ -172,8 +200,12 @@ impl Config {
                 || self.restore_image.is_some()
                 || self.machine_identity_dir.is_some())
         {
-            bail!("unsupported QEMU configuration: this revision supports Linux ARM direct boot, optional explicitly raw disk, and SPICE; host sharing and other Guest backends are not integrated")
+            bail!("unsupported QEMU configuration: this revision supports Linux ARM direct or UEFI boot, optional explicitly raw disk, and SPICE; host sharing and other Guest backends are not integrated")
         }
+        if self.qemu_monitor && self.backend != Backend::QemuHvf {
+            bail!("qemu_monitor requires QEMU/HVF")
+        }
+        self.validate_boot()?;
         if self.backend == Backend::QemuHvf {
             backend::qemu_display_size(self.width, self.height)?;
             if let Some(disk) = &self.disk {
@@ -186,7 +218,7 @@ impl Config {
         if !(1..=128).contains(&self.cpus) || !(256..=1048576).contains(&self.memory_mib) {
             bail!("invalid CPU or memory allocation")
         }
-        if self.guest == "linux" && self.kernel.is_none() {
+        if self.guest == "linux" && self.boot == BootMode::Kernel && self.kernel.is_none() {
             bail!("Linux direct boot requires kernel")
         }
         if self.guest == "macos" && (self.disk.is_none() || self.machine_identity_dir.is_none()) {
@@ -286,6 +318,94 @@ impl Config {
         Ok(())
     }
 }
+impl Config {
+    fn validate_boot(&self) -> Result<()> {
+        if self.boot == BootMode::Kernel {
+            if self.efi_vars.is_some() || self.cdrom.is_some() {
+                bail!("efi_vars and cdrom require boot \"uefi\"")
+            }
+            return Ok(());
+        }
+        if self.guest != "linux" {
+            bail!("UEFI boot is supported for Linux guests only")
+        }
+        if self.kernel.is_some() || self.initrd.is_some() || self.command_line.is_some() {
+            bail!("UEFI boot uses the guest's own bootloader; kernel, initrd and command_line are not allowed")
+        }
+        if self.qemu_guest_exec {
+            bail!("qemu_guest_exec needs the VeynodeVM guest agent and is unavailable for UEFI-booted distributions")
+        }
+        if self.disk.is_none() && self.cdrom.is_none() {
+            bail!("UEFI boot requires a disk or a cdrom")
+        }
+        let vars = self
+            .efi_vars
+            .as_deref()
+            .context("UEFI boot requires efi_vars (per-VM firmware variable store)")?;
+        validate_private_output(vars, "efi_vars")?;
+        if let Some(cdrom) = &self.cdrom {
+            if !cdrom.is_absolute() {
+                bail!("cdrom must be an absolute path")
+            }
+            let metadata = fs::symlink_metadata(cdrom)
+                .with_context(|| format!("cdrom image missing: {}", cdrom.display()))?;
+            if !metadata.is_file() {
+                bail!("cdrom must be a regular file, not a symbolic link or directory")
+            }
+            if metadata.len() == 0 || metadata.len() > MAX_CDROM_BYTES {
+                bail!("cdrom image must be 1 byte through 64 GiB")
+            }
+        }
+        if [&self.disk, &self.cdrom, &self.efi_vars]
+            .into_iter()
+            .flatten()
+            .any(|p| p.to_str().is_none_or(|s| s.contains(',')))
+        {
+            bail!("UEFI disk, cdrom and efi_vars paths must be UTF-8 without commas")
+        }
+        if [&self.disk, &self.cdrom]
+            .into_iter()
+            .flatten()
+            .any(|p| Some(p) == self.efi_vars.as_ref())
+        {
+            bail!("efi_vars must be a separate file")
+        }
+        Ok(())
+    }
+}
+/// A file a worker may create: absolute and normalized, in an existing
+/// directory owned by the user that others cannot write, and, when it already
+/// exists, a private regular file (never a symbolic link).
+pub fn validate_private_output(path: &Path, name: &str) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
+    {
+        bail!("{name} must be an absolute normalized path")
+    }
+    let parent = path
+        .parent()
+        .with_context(|| format!("{name} needs a parent directory"))?;
+    let directory = fs::metadata(parent)
+        .with_context(|| format!("{name} directory missing: {}", parent.display()))?;
+    let uid = unsafe { libc::geteuid() };
+    if !directory.is_dir() || directory.uid() != uid || directory.mode() & 0o022 != 0 {
+        bail!("{name} directory must be an existing directory owned by you and not group/other writable")
+    }
+    match fs::symlink_metadata(path) {
+        Ok(existing) => {
+            if !existing.is_file() || existing.uid() != uid || existing.mode() & 0o077 != 0 {
+                bail!("{name} must be a private (0600) regular file owned by you")
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
 pub fn validate_id(id: &str) -> Result<()> {
     if id.is_empty()
         || id.len() > 64
@@ -323,8 +443,10 @@ fn validate_local_stream_bridge(
     backend: Backend,
     guest: &str,
 ) -> Result<()> {
-    if backend != Backend::AppleVirtualization || guest != "macos" {
-        bail!("unsupported: Guest stream bridge requires Apple macOS")
+    // macOS guests stream through Screen Sharing capture; Linux guests
+    // through the agent's desktop stream (browser desktop).
+    if backend != Backend::AppleVirtualization || !matches!(guest, "macos" | "linux") {
+        bail!("unsupported: Guest stream bridge requires Apple Virtualization")
     }
     let allowed = if method == "guest_stream_bridge_binding" {
         vec!["id", "worker_instance", "bridge_instance"]
@@ -419,7 +541,6 @@ fn replace_runtime_state(current: &mut Value, mut next: Value) {
     for field in [
         "disk_provenance",
         "graphics_profile",
-        "execution_witness",
         "execution_guardian",
         "backend_pid",
         "vm_id",
@@ -559,18 +680,18 @@ enum JobPost {
     GuestInput {
         guest_wrapped: bool,
         method: String,
-        through_epoch: Option<u64>,
     },
     Screenshot {
         guest_wrapped: bool,
+        baselines: Arc<Mutex<screen_wait::Baselines>>,
+        vm: String,
     },
+    /// A guest agent reply `{"id","result"}` returned as its result.
+    GuestResult,
     Start {
         reservation: jobs::Reservation,
         vm: String,
         owner: String,
-        epoch: u64,
-        dir: PathBuf,
-        leases: Arc<Mutex<lease::Leases>>,
     },
     Poll {
         jobs: Arc<Mutex<jobs::Jobs>>,
@@ -579,21 +700,28 @@ enum JobPost {
     },
 }
 enum Completion {
-    RecoveryFence(Box<Completion>),
     Backend(Pending),
-    HumanRelease {
-        cleanup: Box<Completion>,
-        leases: Arc<Mutex<lease::Leases>>,
-        vm: String,
-        epoch: u64,
-    },
     Input {
         dir: PathBuf,
         arguments: Value,
         method: String,
+        evdev: bool,
+    },
+    ScreenWait {
+        dir: PathBuf,
+        vm: String,
+        probe: screen_wait::Probe,
+        arguments: Value,
+        baseline: Option<Value>,
     },
     Synchronous {
         dir: PathBuf,
+        arguments: Value,
+    },
+    MacDesktop {
+        dir: PathBuf,
+        vm: String,
+        method: String,
         arguments: Value,
     },
     CancelJobs {
@@ -601,117 +729,46 @@ enum Completion {
         response: Value,
         jobs: Vec<jobs::Job>,
         file_sessions: Vec<Value>,
-        input_revocations: Vec<InputRetirement>,
-        input_retirements: Arc<Mutex<input_retirement::Retirements>>,
-        exec_retirements: Arc<Mutex<exec_scope::Ledger>>,
-        exec_revocations: Vec<exec_scope::Scope>,
     },
 }
 impl Completion {
     fn wait(self, peer: &UnixStream) -> Result<Value> {
         match self {
-            Self::RecoveryFence(cleanup) => {
-                cleanup.wait(peer)?;
-                bail!("execution cleanup unconfirmed: durable prior-daemon scope requires reconciliation")
-            }
             Self::Backend(p) => p.wait(),
-            Self::HumanRelease {
-                cleanup,
-                leases,
-                vm,
-                epoch,
-            } => {
-                let mut response = cleanup.wait(peer)?;
-                let next = leases.lock().unwrap().human_release_after_cleanup(
-                    &vm,
-                    epoch,
-                    std::time::Instant::now(),
-                )?;
-                response["epoch"] = json!(next);
-                response["human_control"] = json!(false);
-                Ok(response)
-            }
             Self::Input {
                 dir,
                 arguments,
                 method,
-            } => desktop_input(&dir, &method, arguments, peer),
+                evdev,
+            } => desktop_input(&dir, &method, arguments, evdev, peer),
+            Self::ScreenWait {
+                dir,
+                vm,
+                probe,
+                arguments,
+                baseline,
+            } => screen_wait::run(&dir, &vm, probe, &arguments, baseline, peer),
             Self::Synchronous { dir, arguments } => synchronous_exec(&dir, arguments, peer),
+            Self::MacDesktop {
+                dir,
+                vm,
+                method,
+                arguments,
+            } => container_tools::desktop(&dir, &vm, &method, &arguments),
             Self::CancelJobs {
                 dir,
                 mut response,
                 jobs,
                 file_sessions,
-                input_revocations,
-                input_retirements,
-                exec_retirements,
-                exec_revocations,
             } => {
-                let jobs = jobs
-                    .into_iter()
-                    .filter(|job| {
-                        !exec_revocations.iter().any(|scope| {
-                            scope.vm == job.vm
-                                && scope.owner == job.owner
-                                && scope.epoch == job.epoch
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                let mut cleanup_error =
-                    retire_exec_scopes(&dir, exec_revocations, &exec_retirements).err();
-                // Leases are already fenced while holding Manager's lock. Guest ACK is
-                // separate evidence that queued old epochs and synthetic downs are retired.
-                let input_count = input_revocations.len();
-                let input_vm_count = input_revocations
-                    .iter()
-                    .map(|record| &record.vm)
-                    .collect::<BTreeSet<_>>()
-                    .len();
-                let (input_tx, input_rx) = mpsc::channel();
-                let input_deadline = std::time::Instant::now() + Duration::from_secs(5);
-                let queue = Arc::new(Mutex::new(std::collections::VecDeque::from(
-                    input_revocations,
-                )));
-                for _ in 0..input_count.min(8) {
-                    let tx = input_tx.clone();
-                    let dir = dir.clone();
-                    let ledger = input_retirements.clone();
-                    let queue = queue.clone();
-                    thread::spawn(move || {
-                        loop {
-                            let record = {
-                                let mut queue = queue.lock().unwrap();
-                                if std::time::Instant::now() >= input_deadline {
-                                    break;
-                                }
-                                queue.pop_front()
-                            };
-                            let Some(record) = record else {
-                                break;
-                            };
-                            if std::time::Instant::now() >= input_deadline {
-                                break;
-                            }
-                            let result = retire_input(&dir, &record, &ledger);
-                            if tx.send(result).is_err() {
-                                break;
-                            }
-                        }
-                        // Undispatched obligations remain in the independent ledger.
-                    });
-                }
-                drop(input_tx);
                 let count = jobs.len();
                 let (tx, rx) = mpsc::channel();
                 for job in jobs {
                     let tx = tx.clone();
                     let dir = dir.clone();
                     thread::spawn(move || {
-                        let result = call(
-                            &dir,
-                            "exec_cancel",
-                            json!({"id":job.vm,"job_id":job.id,"owner":job.owner,"epoch":job.epoch}),
-                        );
+                        let result =
+                            call(&dir, "exec_cancel", json!({"id":job.vm,"job_id":job.id}));
                         let outcome = match result {
                             Ok(result) => json!({"job_id":job.id,"result":result}),
                             Err(error) => json!({"job_id":job.id,"error":error.to_string()}),
@@ -756,63 +813,11 @@ impl Completion {
                     }
                 }
                 response["file_cancellation"] = json!({"attempted":file_count,"unconfirmed_requests":file_count-file_outcomes.len(),"outcomes":file_outcomes});
-                if input_count > 0 {
-                    let mut input_confirmed = true;
-                    for _ in 0..input_count {
-                        if let Err(error) = input_rx
-                            .recv_timeout(
-                                input_deadline.saturating_duration_since(std::time::Instant::now()),
-                            )
-                            .map_err(anyhow::Error::from)
-                            .and_then(|result| result)
-                            .context(
-                                "control is fenced, but synthetic input release is unconfirmed",
-                            )
-                        {
-                            input_confirmed = false;
-                            if cleanup_error.is_none() {
-                                cleanup_error = Some(error)
-                            }
-                        }
-                    }
-                    if input_confirmed {
-                        response["input_release"] = json!({"confirmed":true,"vm_count":input_vm_count,"guest_delivery_confirmed":false});
-                    }
-                }
-                if let Some(error) = cleanup_error {
-                    return Err(error.context("session cleanup unconfirmed"));
-                }
                 response["note"]=json!("Cancellation is best effort, not rollback. Poll asynchronous jobs or inspect the synchronous command's terminal result to confirm termination.");
                 Ok(response)
             }
         }
     }
-}
-fn retire_input(
-    dir: &Path,
-    record: &InputRetirement,
-    ledger: &Arc<Mutex<input_retirement::Retirements>>,
-) -> Result<Value> {
-    if !ledger.lock().unwrap().contains(record) {
-        return Ok(json!({"confirmed":true,"already_confirmed":true}));
-    }
-    let result = call(
-        dir,
-        "input_revoke",
-        json!({"id":record.vm,"through_epoch":record.epoch,"worker_instance":record.worker_instance}),
-    ).and_then(|value| {
-        if value["released"] != true || value["synthetic_release_dispatched"] != true || value["through_epoch"].as_u64() != Some(record.epoch) {
-            bail!("input release acknowledgement is unconfirmed")
-        }
-        Ok(value)
-    });
-    if result.is_ok() {
-        ledger.lock().unwrap().complete(record);
-    } else if !ledger.lock().unwrap().contains(record) {
-        // Another exact-tuple release ACK or verified process reap completed it.
-        return Ok(json!({"confirmed":true,"concurrently_confirmed":true}));
-    }
-    result
 }
 fn peer_disconnected(fds: &[std::os::fd::RawFd]) -> bool {
     let mut descriptors: Vec<libc::pollfd> = fds
@@ -835,57 +840,6 @@ fn peer_disconnected(fds: &[std::os::fd::RawFd]) -> bool {
         && descriptors
             .iter()
             .any(|fd| fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0)
-}
-fn retire_exec_scopes(
-    dir: &Path,
-    records: Vec<exec_scope::Scope>,
-    ledger: &Arc<Mutex<exec_scope::Ledger>>,
-) -> Result<()> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(7);
-    let count = records.len();
-    let queue = Arc::new(Mutex::new(std::collections::VecDeque::from(records)));
-    let (tx, rx) = mpsc::channel();
-    for _ in 0..count.min(8) {
-        let tx = tx.clone();
-        let queue = queue.clone();
-        let dir = dir.to_owned();
-        let ledger = ledger.clone();
-        thread::spawn(move || loop {
-            if std::time::Instant::now() >= deadline {
-                break;
-            }
-            let Some(scope) = queue.lock().unwrap().pop_front() else {
-                break;
-            };
-            if std::time::Instant::now() >= deadline {
-                break;
-            }
-            let args = json!({"id":scope.vm,"worker_instance":scope.worker_instance,"owner":scope.owner,"epoch":scope.epoch});
-            let result = call(&dir, "exec_scope_revoke", args.clone()).and_then(|r| {
-                if r == json!({"incarnation_terminated":true})
-                    || r["result"] == json!({"revoked":true,"pending_starts":0,"cgroup_empty":true})
-                {
-                    Ok(())
-                } else {
-                    bail!("execution scope cleanup unconfirmed")
-                }
-            });
-            let result = match result {
-                Ok(()) => ledger.lock().unwrap().complete(&scope),
-                Err(error) => {
-                    let _ = call(&dir, "exec_scope_abort", args);
-                    Err(error)
-                }
-            };
-            let _ = tx.send(result);
-        });
-    }
-    drop(tx);
-    for _ in 0..count {
-        rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-            .context("execution scope cleanup unconfirmed")??;
-    }
-    Ok(())
 }
 fn completed_exec_result(reply: &Value) -> Result<Option<Value>> {
     match reply["result"]["state"].as_str() {
@@ -910,9 +864,18 @@ fn desktop_input(
     dir: &Path,
     method: &str,
     mut arguments: Value,
+    evdev: bool,
     peer: &UnixStream,
 ) -> Result<Value> {
-    let steps = input::plan(method, &arguments)?;
+    let mut steps = input::plan(method, &arguments)?;
+    let first_gap = input::first_gap_ms(method, &arguments)?;
+    if evdev {
+        // Apple Virtualization Linux: the guest agent drives uinput devices.
+        steps = steps
+            .iter()
+            .map(|events| desktop_input::planned_evdev(events))
+            .collect::<Result<_>>()?;
+    }
     let mut random = [0u8; 16];
     File::open("/dev/urandom")?.read_exact(&mut random)?;
     arguments["operation_id"] = json!(random
@@ -925,12 +888,16 @@ fn desktop_input(
             if peer_disconnected(&[peer.as_raw_fd()]) {
                 bail!("input client disconnected")
             }
+            if events.is_empty() {
+                continue; // a wheel release has no evdev event
+            }
             arguments["begin"] = json!(index == 0);
             arguments["events"] = json!(events);
             call(dir, "input_step", arguments.clone())?;
             sent += 1;
             if index + 1 < steps.len() {
-                thread::sleep(Duration::from_millis(20));
+                let gap = if index == 0 { first_gap } else { 20 };
+                thread::sleep(Duration::from_millis(gap));
             }
         }
         Ok(())
@@ -947,15 +914,15 @@ fn desktop_input(
     )
 }
 fn synchronous_exec(dir: &Path, arguments: Value, peer: &UnixStream) -> Result<Value> {
-    // Every command uses the same registered, epoch-bound Guest job path. Never fall back
-    // to legacy uncancellable exec when an older Guest lacks asynchronous integration.
+    // Every command uses the same registered Guest job path. Never fall back to
+    // legacy uncancellable exec when an older Guest lacks asynchronous integration.
     let started = call(dir, "exec_start", arguments.clone()).map_err(|error| anyhow::anyhow!(
         "synchronous command start failed (Guest exec_start/exec_poll/exec_cancel support required): {error}"
     ))?;
     let job_id = started["result"]["job_id"]
         .as_str()
         .context("guest returned no job identity")?;
-    let job = json!({"id":arguments["id"],"owner":arguments["owner"],"epoch":arguments["epoch"],"job_id":job_id});
+    let job = json!({"id":arguments["id"],"job_id":job_id});
     let deadline = std::time::Instant::now() + Duration::from_secs(35);
     let result = (|| loop {
         if peer_disconnected(&[peer.as_raw_fd()]) {
@@ -1013,49 +980,21 @@ impl Pending {
                     Some(JobPost::GuestInput {
                         guest_wrapped,
                         method,
-                        through_epoch,
                     }) => {
-                        result =
-                            normalize_backend_input(result, &method, through_epoch, guest_wrapped)?;
+                        result = normalize_backend_input(result, &method, guest_wrapped)?;
                     }
                     Some(JobPost::Start {
                         reservation,
                         vm,
                         owner,
-                        epoch,
-                        dir,
-                        leases,
                     }) => {
                         if result["result"]["state"] != "running" {
                             bail!("guest returned invalid asynchronous start state")
                         }
                         let job_id = result["result"]["job_id"]
                             .as_str()
-                            .context("guest returned no asynchronous job id")?
-                            .to_owned();
-                        reservation.register(
-                            &vm,
-                            &job_id,
-                            &owner,
-                            epoch,
-                            std::time::Instant::now(),
-                        )?;
-                        let revoked = leases
-                            .lock()
-                            .unwrap()
-                            .check(&vm, &owner, epoch, std::time::Instant::now())
-                            .is_err();
-                        if revoked {
-                            result["result"]["control_revoked"] = json!(true);
-                            result["result"]["cancellation"] = match call(
-                                &dir,
-                                "exec_cancel",
-                                json!({"id":vm,"job_id":job_id,"owner":owner,"epoch":epoch}),
-                            ) {
-                                Ok(v) => v,
-                                Err(e) => json!({"error":e.to_string()}),
-                            };
-                        }
+                            .context("guest returned no asynchronous job id")?;
+                        reservation.register(&vm, job_id, &owner, std::time::Instant::now())?;
                     }
                     Some(JobPost::Poll { jobs, vm, id }) => {
                         let state = result["result"]["state"]
@@ -1072,8 +1011,19 @@ impl Pending {
                             bail!("invalid guest job state")
                         }
                     }
-                    Some(JobPost::Screenshot { guest_wrapped }) => {
+                    Some(JobPost::Screenshot {
+                        guest_wrapped,
+                        baselines,
+                        vm,
+                    }) => {
                         result = normalize_screenshot(result, guest_wrapped)?;
+                        baselines.lock().unwrap().record(&vm, &result);
+                    }
+                    Some(JobPost::GuestResult) => {
+                        result = result
+                            .get("result")
+                            .cloned()
+                            .context("guest reply missing result")?;
                     }
                     None => {}
                 }
@@ -1086,12 +1036,7 @@ impl Pending {
         }
     }
 }
-fn normalize_backend_input(
-    value: Value,
-    method: &str,
-    through_epoch: Option<u64>,
-    guest_wrapped: bool,
-) -> Result<Value> {
+fn normalize_backend_input(value: Value, method: &str, guest_wrapped: bool) -> Result<Value> {
     if !guest_wrapped && method == "input_cleanup" && value["released"] != true {
         bail!("QEMU input operation cleanup is unconfirmed")
     }
@@ -1102,10 +1047,9 @@ fn normalize_backend_input(
             json!({"result":value})
         },
         method,
-        through_epoch,
     )
 }
-fn normalize_guest_input(value: Value, method: &str, through_epoch: Option<u64>) -> Result<Value> {
+fn normalize_guest_input(value: Value, method: &str) -> Result<Value> {
     let result = value
         .get("result")
         .cloned()
@@ -1120,14 +1064,6 @@ fn normalize_guest_input(value: Value, method: &str, through_epoch: Option<u64>)
         }
         if result["released"] == true && result["synthetic_release_dispatched"] != true {
             bail!("Guest synthetic release is unconfirmed")
-        }
-    } else if method == "input_revoke" {
-        if through_epoch.is_none()
-            || result["released"] != true
-            || result["synthetic_release_dispatched"] != true
-            || result["through_epoch"].as_u64() != through_epoch
-        {
-            bail!("Guest epoch fence/synthetic release is unconfirmed")
         }
     } else {
         bail!("unexpected Guest input reply")
@@ -1199,11 +1135,9 @@ struct Manager {
     qemu_window: Value,
     native_connections: BTreeMap<String, (String, String)>,
     configs: BTreeMap<String, Config>,
-    leases: Arc<Mutex<lease::Leases>>,
     jobs: Arc<Mutex<jobs::Jobs>>,
     file_sessions: FileSessionRoutes,
-    input_retirements: Arc<Mutex<input_retirement::Retirements>>,
-    exec_retirements: Arc<Mutex<exec_scope::Ledger>>,
+    baselines: Arc<Mutex<screen_wait::Baselines>>,
     running: BTreeMap<String, Running>,
 }
 impl Manager {
@@ -1224,8 +1158,6 @@ impl Manager {
                 bail!("registry identity mismatch")
             }
         }
-        let exec_retirements =
-            exec_scope::Ledger::open(&dir, configs.values().any(|c| c.qemu_guest_exec))?;
         Ok(Self {
             memory,
             dir,
@@ -1234,34 +1166,11 @@ impl Manager {
             qemu_window: json!({"native_window":false,"display_only":true,"input_enabled":false}),
             native_connections: BTreeMap::new(),
             configs,
-            leases: Arc::new(Mutex::new(lease::Leases::default())),
             jobs: Arc::new(Mutex::new(jobs::Jobs::default())),
             file_sessions: BTreeMap::new(),
-            input_retirements: Arc::new(Mutex::new(input_retirement::Retirements::default())),
-            exec_retirements: Arc::new(Mutex::new(exec_retirements)),
+            baselines: Arc::new(Mutex::new(screen_wait::Baselines::default())),
             running: BTreeMap::new(),
         })
-    }
-    fn prune_input_retirements(&mut self) -> Result<()> {
-        let records = self.input_retirements.lock().unwrap().records(None, None);
-        for record in records {
-            if let Some(run) = self.running.get_mut(&record.vm) {
-                // Replacing a Running is allowed only after its old process was reaped.
-                let replaced = run.bridge.lock().unwrap().worker_instance != record.worker_instance;
-                if replaced || run.poll_exit()?.is_some() {
-                    self.input_retirements.lock().unwrap().complete(&record);
-                }
-            }
-        }
-        Ok(())
-    }
-    fn input_revocations(
-        &mut self,
-        owner: Option<&str>,
-        vm: Option<&str>,
-    ) -> Result<Vec<InputRetirement>> {
-        self.prune_input_retirements()?;
-        Ok(self.input_retirements.lock().unwrap().records(owner, vm))
     }
     fn assigned_memory_mib(&mut self) -> Result<u64> {
         self.running.values_mut().try_fold(0u64, |sum, runtime| {
@@ -1273,56 +1182,13 @@ impl Manager {
             }
         })
     }
-    fn reconcile_normal_execution_exit(&mut self, id: &str) -> Result<()> {
-        let exit = self
-            .running
-            .get_mut(id)
-            .map(Running::poll_exit)
-            .transpose()?
-            .flatten();
-        self.reconcile_observed_normal_execution_exit(id, exit)
-    }
-    fn reconcile_observed_normal_execution_exit(
-        &mut self,
-        id: &str,
-        exit: Option<std::process::ExitStatus>,
-    ) -> Result<()> {
-        if !exit.is_some_and(|s| s.success())
-            || !self.configs.get(id).is_some_and(|c| c.qemu_guest_exec)
-        {
-            return Ok(());
-        }
-        let Some(run) = self.running.get(id) else {
-            return Ok(());
-        };
-        let instance = run.bridge.lock().unwrap().worker_instance.clone();
-        if !self
-            .exec_retirements
-            .lock()
-            .unwrap()
-            .current_launch(id, &instance)
-        {
-            return Ok(());
-        }
-        // Directly owned successful child exit is eligibility only. The exact original
-        // witness must still become exclusively lockable and removal durably commit.
-        self.exec_retirements
-            .lock()
-            .unwrap()
-            .reconcile(&self.dir, id, &instance)
-    }
     fn view(&mut self, id: &str) -> Result<Value> {
-        // Sample once: a later poll must not render a terminal state that skipped
-        // reconciliation because an earlier poll still observed a live child.
         let exit = self
             .running
             .get_mut(id)
             .map(Running::poll_exit)
             .transpose()?
             .flatten();
-        let automatic_cleanup_failed = self
-            .reconcile_observed_normal_execution_exit(id, exit)
-            .is_err();
         let config = self.configs.get(id).context("VM not found")?;
         let mut result = json!({"config":config,"state":"stopped","capabilities":backend::guest_capabilities(config.backend,&config.guest)});
         if config.backend == Backend::AppleVirtualization && config.guest == "macos" {
@@ -1342,7 +1208,7 @@ impl Manager {
                 .qemu
                 .as_ref()
                 .is_some_and(|q| q.console_broker.is_some()));
-            result["capabilities"]["input_scope"] = json!("absolute click/drag/discrete wheel/explicit qcode only; snapshot <=5s, generation and current lease required; no text/layout translation");
+            result["capabilities"]["input_scope"] = json!("absolute click/drag/discrete wheel/explicit qcode only; snapshot <=5s and matching generation required; no text/layout translation");
             result["capabilities"]["screenshot"] =
                 json!(self.qemu.as_ref().is_some_and(|q| q.has_screenshot()));
         }
@@ -1375,23 +1241,6 @@ impl Manager {
                 result["pid"] = json!(runtime.child.id());
             }
         }
-        if automatic_cleanup_failed {
-            result["execution_reconciliation_status"] = json!("unconfirmed");
-        }
-        let incarnations = self.exec_retirements.lock().unwrap().incarnations(id);
-        if !incarnations.is_empty() {
-            result["execution_incarnations"] = serde_json::to_value(&incarnations)?;
-            result["execution_reconciliation_required"] = json!(result.get("pid").is_none());
-        }
-        if self
-            .exec_retirements
-            .lock()
-            .unwrap()
-            .recovery_required(None, Some(id))
-        {
-            result["state"] = json!("recovery_required");
-            result["execution_recovery_required"] = json!(true);
-        }
         Ok(result)
     }
     fn dispatch(&mut self, request: Value, deferred: &mut Option<Completion>) -> Result<Value> {
@@ -1403,21 +1252,8 @@ impl Manager {
             if owner.len() != 64 || !owner.bytes().all(|b| b.is_ascii_hexdigit()) {
                 bail!("invalid session owner")
             }
-            let released = self
-                .leases
-                .lock()
-                .unwrap()
-                .retire_owner(owner, std::time::Instant::now());
             *deferred = Some(Completion::CancelJobs {
                 dir: self.dir.clone(),
-                input_revocations: self.input_revocations(Some(owner), None)?,
-                exec_revocations: self
-                    .exec_retirements
-                    .lock()
-                    .unwrap()
-                    .begin(Some(owner), None),
-                exec_retirements: self.exec_retirements.clone(),
-                input_retirements: self.input_retirements.clone(),
                 file_sessions: self
                     .file_sessions
                     .remove(owner)
@@ -1426,23 +1262,13 @@ impl Manager {
                     .into_iter()
                     .map(|vm| json!({"id":vm,"owner":owner}))
                     .collect(),
-                response: json!({"closed":true,"retired_owner":true,"retired_owner_ttl_seconds":120,"released_vm_ids":released}),
+                response: json!({"closed":true}),
                 jobs: self.jobs.lock().unwrap().owned_running(
                     owner,
                     None,
                     std::time::Instant::now(),
                 ),
             });
-            if self
-                .exec_retirements
-                .lock()
-                .unwrap()
-                .recovery_required(Some(owner), None)
-            {
-                *deferred = Some(Completion::RecoveryFence(Box::new(
-                    deferred.take().unwrap(),
-                )));
-            }
             return Ok(Value::Null);
         }
         if method == "list" {
@@ -1469,7 +1295,7 @@ impl Manager {
             qemu_capabilities["screenshot"] =
                 json!(self.qemu.as_ref().is_some_and(|q| q.has_screenshot()));
             return Ok(
-                json!({"resource_admission":{"physical_memory_mib":self.memory.physical_memory_mib,"vm_memory_budget_mib":self.memory.vm_memory_budget_mib,"active_assigned_memory_mib":assigned,"remaining_budget_mib":self.memory.vm_memory_budget_mib.saturating_sub(assigned),"explicitly_configured":self.memory.explicitly_configured,"scope":"assigned guest RAM in this daemon; excludes VM overhead, other daemons and unrelated host workloads; not a host pressure guarantee"},"backends":{"apple-virtualization":backend::capabilities(Backend::AppleVirtualization),"qemu-hvf":{"registered":self.qemu.is_some(),"capabilities":qemu_capabilities}},"backend":"apple-virtualization","guests":["linux","macos"],"windows":false,"window_enumeration":"macOS Guest --allow-observe with existing Screen Recording permission and eligible console; no titles/AX tree/input authority; other backends unsupported","lifecycle":true,"native_window":true,"screenshot":true,"screenshot_requirements":"macOS Guest --allow-observe and existing Guest Screen Recording permission, or registered QEMU capture; Apple Linux screenshot unsupported","input":true,"input_requirements":"registered QEMU persistent console or macOS Guest --allow-observe --allow-input with existing Guest Screen Recording/Accessibility permissions; independent MCP input permission, current lease and recent matching screenshot; Apple Linux input unsupported","command_execution":"Apple Linux backend requires enabled async Guest jobs; macOS legacy exec is not exposed; QEMU requires explicit qemu_guest_exec v2 and rootless cgroup-v2 Guest service","async_commands":"Apple Linux backend requires exec_start/exec_poll/exec_cancel support; owned jobs are VM/client/original-epoch bound; QEMU default observer transport has no command capability; explicit exec v2 uses registered original-worker scopes and confirmed scope revocation","file_transfer":"Apple backend requires enabled Guest files integration: Linux dedicated non-root files account or macOS opt-in same-UID private root; QEMU private serial transports have no file capability; query vm_guest_info for current capabilities and file_policy; single filenames, 8MiB max","control_session_fencing":{"retired_owner_ttl_seconds":120,"request_dispatch_deadline_seconds":30},"remote_desktop":false,"guest_integration":"Apple backend uses enabled Linux/macOS host-only vsock service; QEMU private virtio-serial defaults to observer-only v1; explicit qemu_guest_exec selects v2 requiring rootless cgroup-v2 Guest execution; query vm_guest_info for actual availability and capabilities","guest_shutdown":"Apple Linux integration requires explicit shutdown enablement; QEMU guest-service shutdown is unsupported and QMP power-button requests remain separate; request acceptance is not shutdown completion","gpu":"requires guest measurements; no performance claim"}),
+                json!({"resource_admission":{"physical_memory_mib":self.memory.physical_memory_mib,"vm_memory_budget_mib":self.memory.vm_memory_budget_mib,"active_assigned_memory_mib":assigned,"remaining_budget_mib":self.memory.vm_memory_budget_mib.saturating_sub(assigned),"explicitly_configured":self.memory.explicitly_configured,"scope":"assigned guest RAM in this daemon; excludes VM overhead, other daemons and unrelated host workloads; not a host pressure guarantee"},"backends":{"apple-virtualization":backend::capabilities(Backend::AppleVirtualization),"qemu-hvf":{"registered":self.qemu.is_some(),"capabilities":qemu_capabilities}},"backend":"apple-virtualization","guests":["linux","macos"],"windows":false,"window_enumeration":"macOS Guest --allow-observe with existing Screen Recording permission and eligible console; no titles/AX tree/input authority; other backends unsupported","lifecycle":true,"native_window":true,"screenshot":true,"screenshot_requirements":"macOS Guest --allow-observe and existing Guest Screen Recording permission, registered QEMU capture, or an Apple Virtualization Linux desktop container","input":true,"input_requirements":"registered QEMU persistent console, macOS Guest --allow-observe --allow-input with existing Guest Screen Recording/Accessibility permissions, or an Apple Virtualization Linux desktop container; independent MCP input permission and a recent matching screenshot","screen_wait":"every screenshot backend; changed regions on Apple Virtualization Linux desktops","screen_text":"every screenshot backend; host Apple Vision through the registered vm-vision helper","desktop_windows":"Apple Virtualization Linux desktop containers through the guest agent (X11/EWMH), and veynodevm macOS containers through the Accessibility API over SSH: state and apps observe; window actions and app launch need input permission","accessibility":"Apple Virtualization Linux desktop containers whose image runs at-spi2 (AT-SPI over the desktop's accessibility bus), and veynodevm macOS containers (the macOS Accessibility API over SSH, granted at first boot): tree and find observe; element actions need input permission","command_execution":"Apple Linux backend requires enabled async Guest jobs; macOS legacy exec is not exposed; QEMU requires explicit qemu_guest_exec v2 and rootless cgroup-v2 Guest service","async_commands":"Apple Linux backend requires exec_start/exec_poll/exec_cancel support; jobs are bound to their VM, run under a guest timeout and are killed with their process group when they time out, are cancelled or their MCP session ends; QEMU default observer transport has no command capability","file_transfer":"Apple backend requires enabled Guest files integration: Linux dedicated non-root files account or macOS opt-in same-UID private root; QEMU private serial transports have no file capability; query vm_guest_info for current capabilities and file_policy; single filenames, 8MiB max","remote_desktop":false,"guest_integration":"Apple backend uses enabled Linux/macOS host-only vsock service; QEMU private virtio-serial defaults to observer-only v1; explicit qemu_guest_exec selects v2 requiring rootless cgroup-v2 Guest execution; query vm_guest_info for actual availability and capabilities","guest_shutdown":"Apple Linux integration requires explicit shutdown enablement; QEMU guest-service shutdown is unsupported and QMP power-button requests remain separate; request acceptance is not shutdown completion","gpu":"requires guest measurements; no performance claim"}),
             );
         }
         if method == "create" {
@@ -1504,14 +1330,6 @@ impl Manager {
                 if run.poll_exit()?.is_none() {
                     bail!("VM is running; stop it before delete")
                 }
-            }
-            if self
-                .exec_retirements
-                .lock()
-                .unwrap()
-                .recovery_required(None, Some(id))
-            {
-                bail!("execution recovery required; original scope cleanup unconfirmed")
             }
             let mut next = self.configs.clone();
             let removed = next.remove(id).context("VM not found")?;
@@ -1556,140 +1374,35 @@ impl Manager {
                 &self.configs[id].guest,
             )?;
         }
-        if method == "reconcile_execution" {
-            let instance = args["worker_instance"]
-                .as_str()
-                .context("original worker instance required")?;
-            if !native_input::hex(instance, 64) {
-                bail!("invalid original worker instance")
+        let mut desktop_events = None;
+        if method == "desktop_input" {
+            let apple_linux = self.configs[id].backend == Backend::AppleVirtualization
+                && self.configs[id].guest == "linux";
+            if self.configs[id].backend != Backend::QemuHvf && !apple_linux {
+                bail!("unsupported: desktop_input needs a Linux desktop on QEMU/HVF or Apple Virtualization")
             }
-            self.exec_retirements
-                .lock()
-                .unwrap()
-                .reconcile(&self.dir, id, instance)?;
-            return Ok(
-                json!({"reconciled":true,"basis":"original_incarnation_witness_exclusive","id":id,"worker_instance":instance}),
-            );
+            if args
+                .as_object()
+                .is_none_or(|a| a.len() != 2 || !a.contains_key("id") || !a.contains_key("events"))
+            {
+                bail!("desktop_input accepts only id and events")
+            }
+            let events = desktop_input::parse(&args["events"])?;
+            if apple_linux {
+                // The guest agent's uinput devices are reached through the
+                // caller's desktop stream.
+                return Ok(json!({"sent":false,"inject":"stream"}));
+            }
+            desktop_events = Some(desktop_input::qmp(&events)?);
         }
         let now = std::time::Instant::now();
-        if self
-            .exec_retirements
-            .lock()
-            .unwrap()
-            .recovery_required(None, Some(id))
-            && (matches!(
-                method,
-                "start"
-                    | "acquire_control"
-                    | "release_control"
-                    | "shutdown"
-                    | "human_takeover"
-                    | "human_release"
-                    | "input_step"
-            ) || method.starts_with("exec")
-                && !matches!(method, "exec_scope_revoke" | "exec_scope_abort"))
-        {
-            bail!("execution recovery required; original scope cleanup unconfirmed")
-        }
         if self
             .running
             .get(id)
             .is_some_and(|run| run.execution_quiescing)
-            && (method == "acquire_control"
-                || method.starts_with("exec_") && method != "exec_scope_abort"
-                || method == "input_step")
+            && (method.starts_with("exec") || method == "input_step" || desktop_tools::acts(method))
         {
-            bail!("VM execution is quiescing for shutdown; new authority denied")
-        }
-        if method == "acquire_control" {
-            let owner = args["owner"].as_str().context("missing control owner")?;
-            if !self
-                .exec_retirements
-                .lock()
-                .unwrap()
-                .acquire_allowed(id, owner)
-            {
-                bail!("previous execution scope cleanup unconfirmed; acquire denied")
-            }
-            for scope in self
-                .exec_retirements
-                .lock()
-                .unwrap()
-                .records(Some(owner), Some(id))
-            {
-                self.leases.lock().unwrap().check(id,owner,scope.epoch,now).context("previous execution epoch expired; scope cleanup unconfirmed, acquire denied")?;
-            }
-            let epoch = self.leases.lock().unwrap().acquire(id, owner, now)?;
-            return Ok(json!({"epoch":epoch,"expires_in_seconds":60}));
-        }
-        if method == "release_control" {
-            self.leases.lock().unwrap().release(
-                id,
-                args["owner"].as_str().context("missing control owner")?,
-                args["epoch"].as_u64().context("missing control epoch")?,
-                now,
-            )?;
-            *deferred = Some(Completion::CancelJobs {
-                dir: self.dir.clone(),
-                file_sessions: Vec::new(),
-                input_revocations: self.input_revocations(args["owner"].as_str(), Some(id))?,
-                exec_revocations: self
-                    .exec_retirements
-                    .lock()
-                    .unwrap()
-                    .begin(args["owner"].as_str(), Some(id)),
-                exec_retirements: self.exec_retirements.clone(),
-                input_retirements: self.input_retirements.clone(),
-                response: json!({"released":true}),
-                jobs: self.jobs.lock().unwrap().owned_running(
-                    args["owner"].as_str().unwrap(),
-                    Some(id),
-                    now,
-                ),
-            });
-            return Ok(Value::Null);
-        }
-        if method == "human_takeover" || method == "human_release" {
-            let epoch = self.leases.lock().unwrap().human(id, true, now)?;
-            if method == "human_takeover" {
-                *deferred = Some(Completion::CancelJobs {
-                    dir: self.dir.clone(),
-                    file_sessions: Vec::new(),
-                    input_revocations: self.input_revocations(None, Some(id))?,
-                    exec_revocations: self.exec_retirements.lock().unwrap().begin(None, Some(id)),
-                    exec_retirements: self.exec_retirements.clone(),
-                    input_retirements: self.input_retirements.clone(),
-                    response: json!({"epoch":epoch,"human_control":true}),
-                    jobs: self.jobs.lock().unwrap().running(id, now),
-                });
-                return Ok(Value::Null);
-            }
-            *deferred = Some(Completion::HumanRelease {
-                cleanup: Box::new(Completion::CancelJobs {
-                    dir: self.dir.clone(),
-                    file_sessions: Vec::new(),
-                    input_revocations: self.input_revocations(None, Some(id))?,
-                    exec_revocations: self.exec_retirements.lock().unwrap().begin(None, Some(id)),
-                    exec_retirements: self.exec_retirements.clone(),
-                    input_retirements: self.input_retirements.clone(),
-                    response: json!({}),
-                    jobs: Vec::new(),
-                }),
-                leases: self.leases.clone(),
-                vm: id.into(),
-                epoch,
-            });
-            return Ok(Value::Null);
-        }
-        if ["exec", "exec_start"].contains(&method) {
-            self.leases.lock().unwrap().check(
-                id,
-                args["owner"]
-                    .as_str()
-                    .context("acquire control before executing commands")?,
-                args["epoch"].as_u64().context("missing control epoch")?,
-                now,
-            )?;
+            bail!("VM execution is quiescing for shutdown")
         }
         if method == "exec" {
             *deferred = Some(Completion::Synchronous {
@@ -1699,48 +1412,26 @@ impl Manager {
             return Ok(Value::Null);
         }
         if ["exec_poll", "exec_cancel"].contains(&method) {
-            self.jobs.lock().unwrap().owned(
+            self.jobs.lock().unwrap().known(
                 id,
                 args["job_id"].as_str().context("missing job_id")?,
-                args["owner"].as_str().context("missing job owner")?,
-                args["epoch"].as_u64().context("missing job epoch")?,
                 now,
             )?;
         }
-        if method == "input_revoke" {
-            if let Some(expected) = args.get("worker_instance") {
-                self.prune_input_retirements()?;
-                let run = self
-                    .running
-                    .get(id)
-                    .context("input cleanup worker unavailable")?;
-                if expected.as_str() != Some(run.bridge.lock().unwrap().worker_instance.as_str()) {
-                    bail!("input cleanup worker instance changed")
-                }
-            }
-        }
-        let mac_input = method.starts_with("input_")
-            && self.configs[id].backend == Backend::AppleVirtualization
-            && self.configs[id].guest == "macos";
+        // Apple Virtualization Guests take input through their own service:
+        // macOS through Screen Sharing, Linux desktops through the agent.
+        let apple_guest = self.configs[id].backend == Backend::AppleVirtualization
+            && ["macos", "linux"].contains(&self.configs[id].guest.as_str());
+        let guest_input = method.starts_with("input_") && apple_guest;
         if method.starts_with("input_") {
-            if !mac_input
+            if !guest_input
                 && (self.configs[id].backend != Backend::QemuHvf
                     || self
                         .qemu
                         .as_ref()
                         .is_none_or(|q| q.console_broker.is_none()))
             {
-                bail!("unsupported: desktop input requires QEMU persistent console or enabled macOS Guest input service")
-            }
-            if !["input_cleanup", "input_revoke"].contains(&method) {
-                self.leases.lock().unwrap().check(
-                    id,
-                    args["owner"]
-                        .as_str()
-                        .context("acquire control before input")?,
-                    args["epoch"].as_u64().context("missing control epoch")?,
-                    now,
-                )?;
+                bail!("unsupported: desktop input requires QEMU persistent console, a macOS Guest input service or an Apple Virtualization Linux desktop")
             }
             if ["input_click", "input_drag", "input_scroll", "input_key"].contains(&method) {
                 input::plan(method, args)?;
@@ -1748,25 +1439,74 @@ impl Manager {
                     dir: self.dir.clone(),
                     arguments: args.clone(),
                     method: method.into(),
+                    evdev: apple_guest && self.configs[id].guest == "linux",
                 });
                 return Ok(Value::Null);
             }
         }
-        let guest_screenshot = method == "screenshot"
-            && self.configs[id].backend == Backend::AppleVirtualization
-            && self.configs[id].guest == "macos";
-        if method == "screenshot"
-            && !guest_screenshot
-            && (self.configs[id].backend != Backend::QemuHvf
-                || self.qemu.as_ref().is_none_or(|q| !q.has_screenshot()))
-        {
-            bail!("unsupported: screenshot requires QEMU capture or enabled macOS Guest observation service")
+        let mut desktop_arguments = None;
+        if desktop_tools::METHODS.contains(&method) {
+            let macos = self.configs[id].guest == "macos";
+            if self.configs[id].backend != Backend::AppleVirtualization
+                || !(macos || self.configs[id].guest == "linux")
+            {
+                bail!("unsupported: desktop window and application tools require an Apple Virtualization Linux desktop or macOS container")
+            }
+            let arguments = desktop_tools::arguments(method, args)?;
+            if macos {
+                *deferred = Some(Completion::MacDesktop {
+                    dir: self.dir.clone(),
+                    vm: id.into(),
+                    method: desktop_tools::guest_method(method).into(),
+                    arguments,
+                });
+                return Ok(Value::Null);
+            }
+            desktop_arguments = Some(arguments);
+        }
+        let guest_screenshot = method == "screenshot" && apple_guest;
+        let qemu_capture = self.configs[id].backend == Backend::QemuHvf
+            && self.qemu.as_ref().is_some_and(|q| q.has_screenshot());
+        if method == "screenshot" && !guest_screenshot && !qemu_capture {
+            bail!("unsupported: screenshot requires QEMU capture, a macOS Guest observation service or an Apple Virtualization Linux desktop")
+        }
+        if method == "frame_status" && !qemu_capture {
+            bail!("unsupported: frame_status requires QEMU console capture")
+        }
+        let mut guest_wait = None;
+        if method == "screen_wait" {
+            let arguments = screen_wait::arguments(args)?;
+            if self.configs[id].backend == Backend::AppleVirtualization
+                && self.configs[id].guest == "linux"
+            {
+                guest_wait = Some(arguments);
+            } else {
+                let probe = if qemu_capture {
+                    screen_wait::Probe::Sequence
+                } else if apple_guest {
+                    screen_wait::Probe::Digest
+                } else {
+                    bail!("unsupported: screen_wait requires a screenshot-capable desktop")
+                };
+                let baseline = self
+                    .baselines
+                    .lock()
+                    .unwrap()
+                    .get(id, &arguments["frame_id"]);
+                *deferred = Some(Completion::ScreenWait {
+                    dir: self.dir.clone(),
+                    vm: id.into(),
+                    probe,
+                    arguments,
+                    baseline,
+                });
+                return Ok(Value::Null);
+            }
         }
         if method == "status" {
             return self.view(id);
         }
         if method == "start" {
-            self.reconcile_normal_execution_exit(id)?;
             let config = self.configs.get(id).context("VM not found")?.clone();
             config.validate()?;
             if config.backend == Backend::QemuHvf {
@@ -1783,12 +1523,6 @@ impl Manager {
                 if run.poll_exit()?.is_none() {
                     bail!("VM process already active")
                 }
-            }
-            if config.qemu_guest_exec && self.exec_retirements.lock().unwrap().pending_launch(id) {
-                bail!("original incarnation requires explicit reconciliation before restart")
-            }
-            if config.qemu_guest_exec {
-                self.leases.lock().unwrap().fence_for_shutdown(id, now)?;
             }
             let assigned = self.assigned_memory_mib()?;
             self.memory.admit(assigned, config.memory_mib)?;
@@ -1815,30 +1549,6 @@ impl Manager {
                 Backend::QemuHvf => backend::require_registration(&self.qemu)?.command(),
             };
             let bridge = Arc::new(Mutex::new(bridge::State::new()?));
-            let witness = if config.qemu_guest_exec {
-                self.exec_retirements
-                    .lock()
-                    .unwrap()
-                    .admit_launch(id, &bridge.lock().unwrap().worker_instance)?;
-                let witness = exec_witness::Witness::create(
-                    &self.dir.join("exec-journal"),
-                    id,
-                    &bridge.lock().unwrap().worker_instance,
-                )?;
-                self.exec_retirements
-                    .lock()
-                    .unwrap()
-                    .launch(witness.identity.clone())?;
-                witness.configure_worker(&mut command)?;
-                Some(witness)
-            } else {
-                None
-            };
-            if config.qemu_guest_exec {
-                command
-                    .arg("--guest-worker-instance")
-                    .arg(&bridge.lock().unwrap().worker_instance);
-            }
             if config.backend == Backend::QemuHvf
                 && self.qemu_window["native_input_supported"] == true
             {
@@ -1860,7 +1570,6 @@ impl Manager {
                 .spawn()
                 .context("starting VM backend")?;
             drop(command);
-            drop(witness);
             let stdin = child.stdin.take().unwrap();
             let stdout = child.stdout.take().unwrap();
             let state = Arc::new(Mutex::new(json!({"state":"starting"})));
@@ -1939,42 +1648,6 @@ impl Manager {
             );
             return self.view(id);
         }
-        if ["exec_scope_revoke", "exec_scope_abort"].contains(&method) {
-            if !self.configs[id].qemu_guest_exec {
-                bail!("unsupported execution scope transport")
-            }
-            let expected = args["worker_instance"]
-                .as_str()
-                .context("scope worker identity required")?;
-            let run = self
-                .running
-                .get_mut(id)
-                .context("execution scope worker unavailable")?;
-            if run.bridge.lock().unwrap().worker_instance != expected || run.poll_exit()?.is_some()
-            {
-                bail!("execution scope cleanup unconfirmed: original worker no longer available")
-            }
-            if method == "exec_scope_abort" {
-                run.force_stop()?;
-                bail!("execution scope cleanup unconfirmed: forced termination requested")
-            }
-            let number = run.next;
-            run.next += 1;
-            let (tx, rx) = mpsc::channel();
-            run.pending.lock().unwrap().insert(number, tx.into());
-            write_json(
-                &mut run.stdin,
-                &json!({"id":number,"method":"guest_scope_revoke","qemu_exec_deadline_ns":exec_scope::monotonic_ns()?+5_000_000_000,"request":{"id":number.to_string(),"method":"scope_revoke","scope":{"owner":args["owner"],"epoch":args["epoch"]}}}),
-            )?;
-            *deferred = Some(Completion::Backend(Pending {
-                receiver: rx,
-                number,
-                pending: run.pending.clone(),
-                timeout: Duration::from_secs(6),
-                post: None,
-            }));
-            return Ok(Value::Null);
-        }
         if method == "force_stop" {
             if args["confirm"] != id {
                 bail!("force stop risks guest data loss; confirm must exactly equal VM id")
@@ -2040,7 +1713,16 @@ impl Manager {
                 "guest_stream_bridge_binding",
                 "input_step",
                 "input_cleanup",
-                "input_revoke",
+                "desktop_input",
+                "frame_status",
+                "screen_wait",
+                "desktop_state",
+                "desktop_apps",
+                "window_action",
+                "app_launch",
+                "accessibility_tree",
+                "accessibility_find",
+                "accessibility_action",
                 "guest_info",
                 "windows",
                 "exec_start",
@@ -2054,26 +1736,13 @@ impl Manager {
                 bail!("VM process has exited")
             }
             if method == "shutdown" && self.configs[id].qemu_guest_exec {
-                if !self
-                    .exec_retirements
-                    .lock()
-                    .unwrap()
-                    .records(None, Some(id))
-                    .is_empty()
-                {
-                    bail!("shutdown refused: execution scope cleanup unconfirmed; release control or end sessions first")
-                }
-                // Under the Manager lock: no start can register between this check and fencing.
+                // Under the Manager lock: no exec can start after this.
                 run.execution_quiescing = true;
-                self.leases.lock().unwrap().fence_for_shutdown(id, now)?;
             }
             let number = run.next;
             run.next += 1;
             let (tx, rx) = mpsc::channel();
             let mut command = json!({"id":number,"method":method});
-            if method == "shutdown" && self.configs[id].qemu_guest_exec {
-                command["execution_scopes_empty"] = json!(true);
-            }
             let mut bridge_post = None;
             if method == "stop_guest_stream_bridge" {
                 run.bridge.lock().unwrap().invalidate();
@@ -2106,8 +1775,11 @@ impl Manager {
                     start: method == "start_guest_stream_bridge",
                 });
             }
+            if let Some(events) = desktop_events.take() {
+                command["arguments"] = json!({"events":events});
+            }
             if method.starts_with("input_") {
-                if mac_input {
+                if guest_input {
                     command["method"] = json!("guest_request");
                     command["request"] =
                         json!({"id":number.to_string(),"method":method,"arguments":args});
@@ -2135,6 +1807,15 @@ impl Manager {
             if guest_screenshot {
                 command["method"] = json!("guest_request");
                 command["request"] = json!({"id":number.to_string(),"method":"screenshot"});
+            }
+            if let Some(arguments) = guest_wait.take() {
+                command["method"] = json!("guest_request");
+                command["request"] =
+                    json!({"id":number.to_string(),"method":"screen_wait","arguments":arguments});
+            }
+            if let Some(arguments) = desktop_arguments.take() {
+                command["method"] = json!("guest_request");
+                command["request"] = json!({"id":number.to_string(),"method":desktop_tools::guest_method(method),"arguments":arguments});
             }
             if method == "windows" {
                 command["method"] = json!("guest_request");
@@ -2176,24 +1857,24 @@ impl Manager {
                 bridge_post
             } else if method.starts_with("input_") {
                 Some(JobPost::GuestInput {
-                    guest_wrapped: mac_input,
+                    guest_wrapped: guest_input,
                     method: method.into(),
-                    through_epoch: args["through_epoch"].as_u64(),
                 })
             } else if method == "windows" {
                 Some(JobPost::Windows)
             } else if method == "screenshot" {
                 Some(JobPost::Screenshot {
                     guest_wrapped: guest_screenshot,
+                    baselines: self.baselines.clone(),
+                    vm: id.into(),
                 })
+            } else if method == "screen_wait" || desktop_tools::METHODS.contains(&method) {
+                Some(JobPost::GuestResult)
             } else if method == "exec_start" {
                 Some(JobPost::Start {
                     reservation: jobs::Jobs::reserve(&self.jobs, now)?,
                     vm: id.into(),
-                    owner: args["owner"].as_str().unwrap().into(),
-                    epoch: args["epoch"].as_u64().unwrap(),
-                    dir: self.dir.clone(),
-                    leases: self.leases.clone(),
+                    owner: args["owner"].as_str().unwrap_or_default().into(),
                 })
             } else if method == "exec_poll" {
                 Some(JobPost::Poll {
@@ -2213,52 +1894,11 @@ impl Manager {
                 }
                 command["data"] = json!(data);
             }
-            if method == "input_step" {
-                self.input_retirements
-                    .lock()
-                    .unwrap()
-                    .record(InputRetirement {
-                        owner: args["owner"]
-                            .as_str()
-                            .context("input owner required")?
-                            .into(),
-                        vm: id.into(),
-                        epoch: args["epoch"].as_u64().context("input epoch required")?,
-                        worker_instance: run.bridge.lock().unwrap().worker_instance.clone(),
-                    })?;
-            }
             if self.configs[id].qemu_guest_exec
-                && ["exec_start", "exec_poll", "exec_cancel"].contains(&method)
+                && method == "exec_start"
+                && run.state.lock().unwrap()["guest_integration_state"] != "ready"
             {
-                let owner = args["owner"]
-                    .as_str()
-                    .context("execution scope owner required")?;
-                if !native_input::hex(owner, 64) {
-                    bail!("invalid execution scope owner")
-                }
-                let epoch = args["epoch"]
-                    .as_u64()
-                    .filter(|e| *e > 0 && *e <= 9007199254740991)
-                    .context("execution scope epoch invalid")?;
-                if method == "exec_start" {
-                    // Nothing has been dispatched yet: refusing here records no scope,
-                    // so a booting Guest is not terminated to confirm cleanup.
-                    if run.state.lock().unwrap()["guest_integration_state"] != "ready" {
-                        bail!("guest execution service is not ready yet; retry after the Guest finishes starting")
-                    }
-                    self.exec_retirements
-                        .lock()
-                        .unwrap()
-                        .record(exec_scope::Scope {
-                            vm: id.into(),
-                            worker_instance: run.bridge.lock().unwrap().worker_instance.clone(),
-                            owner: owner.into(),
-                            epoch,
-                        })?;
-                }
-                command["qemu_exec_deadline_ns"] =
-                    json!(exec_scope::monotonic_ns()? + 1_000_000_000);
-                command["request"]["scope"] = json!({"owner":owner,"epoch":epoch});
+                bail!("guest execution service is not ready yet; retry after the Guest finishes starting")
             }
             run.pending.lock().unwrap().insert(
                 number,
@@ -2276,10 +1916,12 @@ impl Manager {
                 receiver: rx,
                 number,
                 pending: run.pending.clone(),
-                timeout: Duration::from_secs(if mac_input {
+                timeout: Duration::from_secs(if guest_input {
                     4
                 } else if method == "screenshot" {
                     17
+                } else if method == "screen_wait" {
+                    30
                 } else if method == "windows" {
                     12
                 } else if method.ends_with("guest_stream_bridge")
@@ -2370,7 +2012,7 @@ fn handle_connection(
 ) -> Result<()> {
     // Darwin may return EINVAL when setting socket options after its peer closed.
     // A disconnected socket cannot block reads: drain its already-buffered cleanup
-    // request, but continue to reject acquire below. Other option failures are fatal.
+    // request. Other option failures are fatal.
     for result in [
         stream.set_read_timeout(Some(Duration::from_secs(15))),
         stream.set_write_timeout(Some(Duration::from_secs(15))),
@@ -2391,13 +2033,9 @@ fn handle_connection(
         .map_err(anyhow::Error::from)
         .and_then(|req: Value| {
             let mut manager = manager.lock().unwrap();
-            // Include socket reads and queue/manager-lock delay. A late request
-            // cannot outlive the 120s closed-owner fence and acquire a fresh lease.
+            // Include socket reads and queue/manager-lock delay.
             if admitted_at.elapsed() > Duration::from_secs(30) {
                 bail!("controller request expired before dispatch")
-            }
-            if req["method"] == "acquire_control" && peer_disconnected(&[stream.as_raw_fd()]) {
-                bail!("control acquisition client disconnected before dispatch")
             }
             manager.dispatch(req, &mut deferred)
         })
@@ -2441,12 +2079,16 @@ fn tools_with_input(lifecycle: bool, execute: bool, files: bool, input: bool) ->
     let id = json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false});
     let mut tools = vec![
         json!({"name":"vm_list","description":"List registered VMs and actual backend process state.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}),
-        json!({"name":"vm_screenshot","description":"Capture the same console at full source resolution: QEMU PNG or macOS Guest JPEG. Returns actual MIME, frame id, dimensions, scale and capture timing. veynodevm macOS containers are captured through the Guest's Screen Sharing server (no Guest permission grants); other macOS Guests need the opted-in Guest service with existing Screen Recording permission, never requested automatically.","inputSchema":id}),
+        json!({"name":"vm_screenshot","description":"Capture the same console at full source resolution: QEMU PNG, Apple Virtualization Linux desktop PNG (JPEG when large) or macOS Guest JPEG. Returns actual MIME, frame id, dimensions, scale and capture timing. veynodevm macOS containers are captured through the Guest's Screen Sharing server (no Guest permission grants); other macOS Guests need the opted-in Guest service with existing Screen Recording permission, never requested automatically.","inputSchema":id}),
+        json!({"name":"vm_screen_wait","description":"Wait until the VM screen changes, then optionally until it has been still for settle_ms (for example after a click, until the app has finished redrawing). Pass the frame_id of the screenshot you acted on so a change that already happened counts. Returns changed, settled, timing and, on Apple Virtualization Linux desktops, the changed regions in screenshot pixels; region limits the wait to one area there. QEMU detects console draws and macOS Guests compare screenshots, both whole-screen. Take a new screenshot afterwards before input.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"frame_id":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1,"maximum":screen_wait::MAX_TIMEOUT_MS,"default":10000},"settle_ms":{"type":"integer","minimum":0,"maximum":screen_wait::MAX_SETTLE_MS,"default":0},"region":{"type":"object","properties":{"x":{"type":"integer","minimum":0},"y":{"type":"integer","minimum":0},"width":{"type":"integer","minimum":1},"height":{"type":"integer","minimum":1}},"required":["x","y","width","height"],"additionalProperties":false}},"required":["id"],"additionalProperties":false}}),
+        json!({"name":"vm_screen_text","description":"Read the text on the VM screen without an image: takes a screenshot and runs host text recognition (Apple Vision) on it, for every backend with screenshots and nothing installed in the Guest. Returns lines in reading order with boxes and center points in screenshot pixels, plus the screenshot's frame_id, source_generation, width and height, so a recognized word can be clicked directly with the input tools. find returns each case-insensitive occurrence of a string with its own box. fast trades accuracy for speed; languages are BCP 47 codes (default automatic).","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"find":{"type":"string","minLength":1,"maxLength":256},"fast":{"type":"boolean","default":false},"languages":{"type":"array","items":{"type":"string"},"maxItems":8}},"required":["id"],"additionalProperties":false}}),
         json!({"name":"vm_windows","description":"Read macOS Guest on-screen application window metadata with existing Screen Recording permission and --allow-observe. No titles, focus, stacking order, Accessibility tree or input authority. Coordinates are Guest desktop-global points; this enumeration is not an atomic screenshot. Other Guest/backend combinations are unsupported.","inputSchema":id}),
         json!({"name":"vm_guest_info","description":"Query the real Guest service: Apple host-only vsock or QEMU private virtio-serial (default observer-only; explicit v2 permits rootless cgroup execution). Reports actual capabilities; fails if unavailable.","inputSchema":id}),
         json!({"name":"vm_status","description":"Get VM configuration and process state; running does not assert guest health.","inputSchema":id}),
         json!({"name":"vm_capabilities","description":"Report implemented operations and explicitly unsupported integrations.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}),
     ];
+    // After the screen tools, so observe-only listings keep their order.
+    tools.splice(4..4, desktop_tools::tools(input));
     if lifecycle {
         for (name, description) in [
             ("vm_start", "Start a VM in its own native backend process."),
@@ -2454,7 +2096,7 @@ fn tools_with_input(lifecycle: bool, execute: bool, files: bool, input: bool) ->
                 "vm_shutdown",
                 "Request normal shutdown via backend power button (default) or opt-in installed guest service (mode guest). Request acceptance is not completion; poll status. Never implicitly force-stops.",
             ),
-            ("vm_show_window", "Show native VM console; QEMU input requires a verified v2 helper, its bound private controller channel, and explicit local Take Control. Showing a window alone grants no input authority."),
+            ("vm_show_window", "Show native VM console; QEMU input requires a verified v2 helper and its bound private controller channel, and flows only while the window has focus."),
             (
                 "vm_close_window",
                 "Close native console while keeping VM running.",
@@ -2478,20 +2120,21 @@ fn tools_with_input(lifecycle: bool, execute: bool, files: bool, input: bool) ->
             "machine_identity_dir",
             "serial_log",
             "shared_dir",
+            "efi_vars",
+            "cdrom",
         ] {
             properties[p] = json!({"type":"string"});
         }
-        tools.push(json!({"name":"vm_create","description":"Register an existing Linux direct-boot or installed macOS VM configuration; does not install an OS or create storage.","inputSchema":{"type":"object","properties":properties,"required":["id","guest","cpus","memory_mib"],"additionalProperties":false}}));
-    }
-    if execute || input {
-        for (name,description) in [("vm_acquire_control","Acquire or renew 60-second VM control lease. Human takeover revokes it immediately for subsequent commands."),("vm_release_control","Release this MCP session's control lease.")] {tools.push(json!({"name":name,"description":description,"inputSchema":id}));}
+        properties["boot"] = json!({"type":"string","enum":["kernel","uefi"],"default":"kernel","description":"uefi boots the Linux distribution's own bootloader from disk or cdrom (installer ISO) and requires efi_vars, a per-VM firmware variable store created on first start."});
+        properties["qemu_monitor"] = json!({"type":"boolean","description":"QEMU only: expose a private QMP monitor socket in the runtime state for installer automation."});
+        tools.push(json!({"name":"vm_create","description":"Register a Linux direct-boot, Linux UEFI (distribution ISO/installed disk) or installed macOS VM configuration; does not create storage.","inputSchema":{"type":"object","properties":properties,"required":["id","guest","cpus","memory_mib"],"additionalProperties":false}}));
     }
     if execute {
         tools.push(json!({"name":"vm_exec","description":"Execute argv directly inside the VM through its guest service. No implicit shell. Output bounded by guest service; timeout enforced in guest.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"argv":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":128},"timeout_ms":{"type":"integer","minimum":1,"maximum":30000}},"required":["id","argv"],"additionalProperties":false}}));
     }
     if execute {
-        tools.push(json!({"name":"vm_exec_start","description":"Start a bounded asynchronous guest command under the current VM control lease. Returns an opaque owned job id; poll for completion.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"argv":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":128},"timeout_ms":{"type":"integer","minimum":1,"maximum":30000}},"required":["id","argv"],"additionalProperties":false}}));
-        for (name,description) in [("vm_exec_poll","Poll only a job started by this MCP connection on this VM and original lease epoch. Inspect terminal result, exit code, cancelled and timed_out."),("vm_exec_cancel","Request cancellation of this connection's guest job. Cancellation is not rollback; poll to verify the actual terminal state.")] {tools.push(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":{"id":{"type":"string"},"job_id":{"type":"string","pattern":"^[0-9a-f]{32}$"}},"required":["id","job_id"],"additionalProperties":false}}));}
+        tools.push(json!({"name":"vm_exec_start","description":"Start a bounded asynchronous guest command. Returns an opaque job id; poll for completion. The guest kills the command's process group at timeout_ms (default 5000), on cancel, or when this MCP session ends.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"argv":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":128},"timeout_ms":{"type":"integer","minimum":1,"maximum":30000}},"required":["id","argv"],"additionalProperties":false}}));
+        for (name,description) in [("vm_exec_poll","Poll a job started on this VM. Inspect terminal result, exit code, cancelled and timed_out."),("vm_exec_cancel","Kill a guest job's process group. Cancellation is not rollback; poll to verify the actual terminal state.")] {tools.push(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":{"id":{"type":"string"},"job_id":{"type":"string","pattern":"^[0-9a-f]{32}$"}},"required":["id","job_id"],"additionalProperties":false}}));}
     }
     if input {
         for (name, extra, required) in [
@@ -2512,7 +2155,7 @@ fn tools_with_input(lifecycle: bool, execute: bool, files: bool, input: bool) ->
             ),
             (
                 "input_key",
-                json!({"keys":{"type":"array","items":{"type":"string","enum":input::key_names()},"minItems":1,"maxItems":8}}),
+                json!({"keys":{"type":"array","items":{"type":"string","enum":input::key_names()},"minItems":1,"maxItems":8},"hold_ms":{"type":"integer","minimum":0,"maximum":input::MAX_HOLD_MS,"description":"Hold the keys this long before release (default a 20 ms tap); games that steer or accelerate while a key is down need a hold."}}),
                 vec!["keys"],
             ),
         ] {
@@ -2525,7 +2168,7 @@ fn tools_with_input(lifecycle: bool, execute: bool, files: bool, input: bool) ->
             }
             let mut required = required;
             required.extend(["id", "frame_id", "width", "height", "source_generation"]);
-            tools.push(json!({"name":format!("vm_{name}"),"description":"Bounded physical QEMU console or opted-in macOS Guest input. Requires current control and a screenshot younger than 5 seconds with matching VM, generation and dimensions. Backend dispatch does not prove app acceptance; no Unicode/layout translation; query Guest supported physical keys.","inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false}}));
+            tools.push(json!({"name":format!("vm_{name}"),"description":"Bounded physical input to a QEMU console, an Apple Virtualization Linux desktop or an opted-in macOS Guest. Requires a screenshot younger than 5 seconds with matching VM, generation and dimensions. Backend dispatch does not prove app acceptance; no Unicode/layout translation; query Guest supported physical keys.","inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false}}));
         }
     }
     if files {
@@ -2554,8 +2197,8 @@ struct SessionCleanupState {
     dir: PathBuf,
     owner: String,
     stopped: AtomicBool,
-    // The first cleanup owns the daemon retirement response. A second call must
-    // not replace a failed result with an empty, apparently successful response.
+    // The first cleanup owns the daemon's response. A second call must not
+    // replace a failed result with an empty, apparently successful response.
     outcome: Mutex<Option<bool>>,
 }
 impl SessionCleanupState {
@@ -2564,9 +2207,7 @@ impl SessionCleanupState {
         let mut outcome = self.outcome.lock().unwrap();
         let clean = *outcome.get_or_insert_with(|| cleanup_session(&self.dir, &self.owner).is_ok());
         if !clean {
-            bail!(
-                "session cleanup unconfirmed; authority retirement or Guest cleanup request failed"
-            )
+            bail!("session cleanup unconfirmed; a Guest cleanup request failed")
         }
         Ok(())
     }
@@ -2583,8 +2224,8 @@ fn cleanup_session(dir: &Path, owner: &str) -> Result<()> {
     validate_session_cleanup(&result)
 }
 fn validate_session_cleanup(result: &Value) -> Result<()> {
-    if result["closed"] != true || result["retired_owner"] != true {
-        bail!("session authority retirement unconfirmed")
+    if result["closed"] != true {
+        bail!("session cleanup unconfirmed")
     }
     for key in ["job_cancellation", "file_cancellation"] {
         let cancellation = &result[key];
@@ -2614,11 +2255,8 @@ fn validate_session_cleanup(result: &Value) -> Result<()> {
             bail!("Guest cleanup request failed or unconfirmed")
         }
     }
-    if result.get("input_release").is_some() && result["input_release"]["confirmed"] != true {
-        bail!("Guest input release unconfirmed")
-    }
     // A valid cancel_requested reply is not evidence that a job has reached its
-    // terminal state. This receipt covers retirement and cleanup RPC outcomes.
+    // terminal state. This receipt covers the cleanup RPC outcomes.
     Ok(())
 }
 
@@ -2664,9 +2302,6 @@ pub fn mcp_with_input(
         }
     });
     let protocol_result = (|| -> Result<()> {
-        let mut epochs: BTreeMap<String, u64> = BTreeMap::new();
-        let mut job_epochs: BTreeMap<(String, String), (u64, std::time::Instant, bool)> =
-            BTreeMap::new();
         let mut initialized = false;
         let mut ready = false;
         while let Some(bytes) = read_frame(&mut reader)? {
@@ -2719,7 +2354,7 @@ pub fn mcp_with_input(
                     )
                 } else {
                     initialized = true;
-                    json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":VERSION,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"veynode-vm","version":env!("CARGO_PKG_VERSION")},"instructions":"Local trusted-user daemon. Observe is default; lifecycle access requires server --allow-lifecycle. Command execution requires --allow-execute and enabled Linux Guest async jobs; macOS legacy execution is not exposed by vm_exec, but container_exec runs commands in veynodevm macOS containers over SSH. File transfer independently requires --allow-files and an enabled Guest files root: a dedicated Linux files account, or macOS --allow-files --files-root with a private directory owned by the service UID. macOS files are not isolated from other same-UID programs. Query vm_guest_info for actual files capability and file_policy; Guest denial is an error, not permission to use another path. Screenshot observation requires QEMU capture, a veynodevm macOS container (Guest Screen Sharing; no Guest permission grants) or macOS Guest --allow-observe with existing Guest Screen Recording permission. vm_windows uses macOS Guest observation only and returns no titles or input authority; other backends are unsupported. Physical desktop input always requires server --allow-input. Its backend must provide QEMU persistent capture, a veynodevm macOS container (Guest Screen Sharing), or macOS Guest --allow-observe --allow-input with existing Guest Screen Recording and Accessibility permissions. Apple Linux desktop input is unsupported. Query vm_guest_info for macOS permission availability and supported physical keys; Unicode text and keyboard-layout translation are unsupported. Input requires a matching screenshot younger than 5 seconds and current control. Acquire control before input or command execution; leases last 60 seconds and must be renewed. Backend input acknowledgement does not prove application acceptance. VM start returns before guest readiness."}})
+                    json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":VERSION,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"veynode-vm","version":env!("CARGO_PKG_VERSION")},"instructions":"Local trusted-user daemon. Observe is default; lifecycle access requires server --allow-lifecycle. Command execution requires --allow-execute and enabled Linux Guest async jobs; macOS legacy execution is not exposed by vm_exec, but container_exec runs commands in veynodevm macOS containers over SSH. File transfer independently requires --allow-files and an enabled Guest files root: a dedicated Linux files account, or macOS --allow-files --files-root with a private directory owned by the service UID. macOS files are not isolated from other same-UID programs. Query vm_guest_info for actual files capability and file_policy; Guest denial is an error, not permission to use another path. Screenshot observation requires QEMU capture, a veynodevm macOS container (Guest Screen Sharing; no Guest permission grants) or macOS Guest --allow-observe with existing Guest Screen Recording permission. vm_windows uses macOS Guest observation only and returns no titles or input authority; other backends are unsupported. Linux desktop containers (--desktop) on Apple Virtualization are captured and driven by the guest agent with no Guest setup. vm_screen_wait waits for the screen to change or settle; vm_screen_text reads its text with boxes in screenshot pixels. On those Linux desktops and on veynodevm macOS containers vm_desktop_state and vm_desktop_apps report windows, focus, keyboard layout and installed applications without a screenshot; with input permission vm_window_action and vm_app_launch act on them. vm_accessibility_tree and vm_accessibility_find read their accessibility tree (AT-SPI on Linux, the Accessibility API on macOS) with roles, names, states and boxes; vm_accessibility_action (input permission) clicks, focuses or fills an element by ref. Physical desktop input always requires server --allow-input. Its backend must provide QEMU persistent capture, a veynodevm macOS container (Guest Screen Sharing), an Apple Virtualization Linux desktop container, or macOS Guest --allow-observe --allow-input with existing Guest Screen Recording and Accessibility permissions. Query vm_guest_info for macOS permission availability and supported physical keys; Unicode text and keyboard-layout translation are unsupported. Input requires a matching screenshot younger than 5 seconds. Commands run under a guest timeout; the guest kills a command's process group when it times out, is cancelled or this MCP session ends. Backend input acknowledgement does not prove application acceptance. VM start returns before guest readiness."}})
                 }
             } else if method == "ping" {
                 json!({"jsonrpc":"2.0","id":id,"result":{}})
@@ -2761,82 +2396,21 @@ pub fn mcp_with_input(
                     if !valid {
                         rpc_error(id, -32602, "Invalid tool arguments")
                     } else {
-                        let vm_id = args["id"].as_str().unwrap_or("").to_owned();
-                        if name.starts_with("vm_file_") {
-                            args["owner"] = json!(owner);
-                        }
-                        if [
-                            "vm_acquire_control",
-                            "vm_release_control",
-                            "vm_exec",
-                            "vm_exec_start",
-                            "vm_exec_poll",
-                            "vm_exec_cancel",
-                        ]
-                        .contains(&name)
-                            || name.starts_with("vm_input_")
+                        // The session owner lets session_end cancel this session's
+                        // jobs and file transfers when the client goes away.
+                        if name.starts_with("vm_file_")
+                            || ["vm_exec", "vm_exec_start"].contains(&name)
                         {
                             args["owner"] = json!(owner);
-                            args["epoch"] = json!(epochs.get(&vm_id).copied().unwrap_or(0));
                         }
-                        jobs::prune_terminal(
-                            &mut job_epochs,
-                            std::time::Instant::now(),
-                            |(_, created, terminal)| (*created, *terminal),
-                        );
-                        let requested_job_id = args["job_id"].as_str().unwrap_or("").to_owned();
-                        if ["vm_exec_poll", "vm_exec_cancel"].contains(&name) {
-                            let job_id = args["job_id"].as_str().unwrap_or("").to_owned();
-                            args["epoch"] = json!(job_epochs
-                                .get(&(vm_id.clone(), job_id))
-                                .map(|(epoch, _, _)| *epoch)
-                                .unwrap_or(0));
-                        }
-                        let job_epoch = args["epoch"].as_u64().unwrap_or(0);
-                        let result = if name == "vm_exec_start"
-                            && !jobs::make_room(&mut job_epochs, 0, |(_, created, finished)| {
-                                (*created, *finished)
-                            }) {
-                            Err(anyhow::anyhow!(
-                                "MCP session job capacity reached; unresolved jobs require terminal proof"
-                            ))
-                        } else if name.starts_with("container_") || name.starts_with("image_") {
+                        let result = if name.starts_with("container_") || name.starts_with("image_")
+                        {
                             container_tools::call(dir, name, &args)
+                        } else if name == "vm_screen_text" {
+                            screen_text::run(dir, &args)
                         } else {
                             call(dir, name.strip_prefix("vm_").unwrap(), args)
                         };
-                        if name == "vm_exec_start" {
-                            if let Ok(value) = &result {
-                                if let Some(job_id) = value["result"]["job_id"].as_str() {
-                                    job_epochs.insert(
-                                        (vm_id.clone(), job_id.into()),
-                                        (job_epoch, std::time::Instant::now(), false),
-                                    );
-                                }
-                            }
-                        }
-                        if name == "vm_exec_poll"
-                            && result.as_ref().is_ok_and(|value| {
-                                matches!(completed_exec_result(value), Ok(Some(_)))
-                            })
-                        {
-                            if let Some((_, _, finished)) =
-                                job_epochs.get_mut(&(vm_id.clone(), requested_job_id))
-                            {
-                                *finished = true;
-                            }
-                        }
-
-                        if name == "vm_acquire_control" {
-                            if let Ok(value) = &result {
-                                if let Some(epoch) = value["epoch"].as_u64() {
-                                    epochs.insert(vm_id.clone(), epoch);
-                                }
-                            }
-                        }
-                        if name == "vm_release_control" && result.is_ok() {
-                            epochs.remove(&vm_id);
-                        }
                         let content = match result {
                             Ok(v) if name == "vm_screenshot" => match screenshot_content(v) {
                                 Ok(content) => content,
@@ -2864,8 +2438,6 @@ pub fn mcp_with_input(
     let cleanup_result = cleanup.state.finish();
     protocol_result.and(cleanup_result)
 }
-#[cfg(test)]
-mod input_retirement_tests;
 #[cfg(test)]
 mod mcp_cleanup_tests;
 
@@ -2944,23 +2516,17 @@ mod tests {
         }
     }
     #[test]
-    fn qemu_input_cleanup_and_fence_acknowledgements_cannot_be_empty_or_negative() {
+    fn qemu_input_cleanup_acknowledgements_cannot_be_empty_or_negative() {
         for result in [
             json!({}),
             json!({"released":false}),
             json!({"released":true}),
         ] {
-            assert!(normalize_backend_input(result, "input_cleanup", None, false).is_err());
+            assert!(normalize_backend_input(result, "input_cleanup", false).is_err());
         }
         let valid = json!({"released":true,"synthetic_release_dispatched":true});
         assert_eq!(
-            normalize_backend_input(valid.clone(), "input_cleanup", None, false).unwrap(),
-            valid
-        );
-        let valid = json!({"released":true,"synthetic_release_dispatched":true,"through_epoch":7});
-        assert!(normalize_backend_input(valid.clone(), "input_revoke", Some(6), false).is_err());
-        assert_eq!(
-            normalize_backend_input(valid.clone(), "input_revoke", Some(7), false).unwrap(),
+            normalize_backend_input(valid.clone(), "input_cleanup", false).unwrap(),
             valid
         );
     }
@@ -2971,25 +2537,20 @@ mod tests {
             json!({"dispatched":true}),
             json!({"dispatched":false,"guest_delivery_confirmed":false}),
         ] {
-            assert!(normalize_guest_input(json!({"result":result}), "input_step", None).is_err());
+            assert!(normalize_guest_input(json!({"result":result}), "input_step").is_err());
         }
         let step = json!({"dispatched":true,"guest_delivery_confirmed":false});
         assert_eq!(
-            normalize_guest_input(json!({"result":step}), "input_step", None).unwrap(),
+            normalize_guest_input(json!({"result":step}), "input_step").unwrap(),
             step
         );
         assert!(
-            normalize_guest_input(json!({"result":{"released":false}}), "input_cleanup", None)
-                .is_ok()
+            normalize_guest_input(json!({"result":{"released":false}}), "input_cleanup").is_ok()
         );
         assert!(
-            normalize_guest_input(json!({"result":{"released":true}}), "input_cleanup", None)
-                .is_err()
+            normalize_guest_input(json!({"result":{"released":true}}), "input_cleanup").is_err()
         );
-        let fenced = json!({"result":{"released":true,"synthetic_release_dispatched":true,"through_epoch":3}});
-        assert!(normalize_guest_input(fenced.clone(), "input_revoke", Some(3)).is_ok());
-        assert!(normalize_guest_input(fenced.clone(), "input_revoke", Some(4)).is_err());
-        assert!(normalize_guest_input(fenced, "input_revoke", None).is_err());
+        assert!(normalize_guest_input(json!({"result":{}}), "input_revoke").is_err());
     }
     #[test]
     fn mac_input_routes_through_guest_transport_and_preserves_guest_denial() {
@@ -3032,15 +2593,7 @@ mod tests {
                 next: 1,
             },
         );
-        let owner = "a".repeat(64);
-        let now = std::time::Instant::now();
-        let epoch = manager
-            .leases
-            .lock()
-            .unwrap()
-            .acquire("mac", &owner, now)
-            .unwrap();
-        let args = json!({"id":"mac","owner":owner,"epoch":epoch,"operation_id":"b".repeat(32),"begin":true,"events":[]});
+        let args = json!({"id":"mac","operation_id":"b".repeat(32),"begin":true,"events":[]});
         let mut completion = None;
         let dispatched = manager.dispatch(
             json!({"method":"input_step","arguments":args}),
@@ -3070,12 +2623,6 @@ mod tests {
         assert_eq!(wire["method"], "guest_request");
         assert_eq!(wire["request"]["method"], "input_step");
         assert_eq!(wire["request"]["arguments"], args);
-        assert!(!manager
-            .input_retirements
-            .lock()
-            .unwrap()
-            .records(None, Some("mac"))
-            .is_empty());
         pending.lock().unwrap().remove(&1).unwrap().send(json!({"id":1,"result":{"id":"1","error":{"code":"accessibility_permission_required","message":"denied"}}})).unwrap();
         let (peer, _) = UnixStream::pair().unwrap();
         assert!(completion
@@ -3084,123 +2631,6 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("accessibility_permission_required"));
-        assert!(
-            !manager
-                .input_retirements
-                .lock()
-                .unwrap()
-                .records(None, Some("mac"))
-                .is_empty(),
-            "permission denial must not erase attempted input cleanup tracking"
-        );
-        assert!(
-            manager
-                .input_revocations(None, Some("mac"))
-                .unwrap()
-                .is_empty(),
-            "the explicitly reaped fixture needs no Guest cleanup RPC"
-        );
-        let mut after = None;
-        manager
-            .leases
-            .lock()
-            .unwrap()
-            .human("mac", true, now)
-            .unwrap();
-        assert!(manager
-            .dispatch(json!({"method":"input_step","arguments":args}), &mut after)
-            .unwrap_err()
-            .to_string()
-            .contains("revoked"));
-    }
-    #[test]
-    fn backend_attempt_retirement_fences_before_ack_for_eof_release_and_takeover() {
-        // State-machine test, not Guest/TCC acceptance. The preceding real pipe
-        // unit verifies that a denied reply retains the exact input cleanup tuple.
-        for (backend, guest) in [("apple-virtualization", "macos"), ("qemu-hvf", "linux")] {
-            for method in ["session_end", "release_control", "human_takeover"] {
-                let temp = tempfile::tempdir().unwrap();
-                let mut manager = Manager::load(
-                    temp.path().into(),
-                    PathBuf::from("/unused"),
-                    MemoryBudget::new(16 * 1024 * 1024 * 1024, None).unwrap(),
-                )
-                .unwrap();
-                let id = "mac";
-                manager.configs.insert(
-                    id.into(),
-                    serde_json::from_value(
-                        json!({"id":id,"backend":backend,"guest":guest,"cpus":1,"memory_mib":512}),
-                    )
-                    .unwrap(),
-                );
-                let owner = "a".repeat(64);
-                let now = std::time::Instant::now();
-                let epoch = manager
-                    .leases
-                    .lock()
-                    .unwrap()
-                    .acquire(id, &owner, now)
-                    .unwrap();
-                assert!(
-                    manager
-                        .input_revocations(None, Some(id))
-                        .unwrap()
-                        .is_empty(),
-                    "observe-only VM needs no input cleanup"
-                );
-                let attempted = InputRetirement {
-                    owner: owner.clone(),
-                    vm: id.into(),
-                    epoch,
-                    worker_instance: "c".repeat(64),
-                };
-                manager
-                    .input_retirements
-                    .lock()
-                    .unwrap()
-                    .record(attempted.clone())
-                    .unwrap();
-                let mut completion = None;
-                manager
-                    .dispatch(
-                        json!({"method":method,"arguments":{"id":id,"owner":owner,"epoch":epoch}}),
-                        &mut completion,
-                    )
-                    .unwrap();
-                assert!(
-                    manager
-                        .leases
-                        .lock()
-                        .unwrap()
-                        .check(id, &owner, epoch, now)
-                        .is_err(),
-                    "authority must be fenced before waiting for Guest acknowledgement"
-                );
-                match completion.unwrap() {
-                    Completion::CancelJobs {
-                        input_revocations,
-                        response,
-                        ..
-                    } => {
-                        assert_eq!(input_revocations, vec![attempted]);
-                        assert!(
-                            response.get("input_release").is_none(),
-                            "no release attestation before Guest reply"
-                        );
-                    }
-                    _ => panic!("missing deferred cleanup"),
-                }
-                if method != "release_control" {
-                    assert!(manager
-                        .leases
-                        .lock()
-                        .unwrap()
-                        .acquire(id, &owner, now)
-                        .is_err());
-                }
-            }
-        }
     }
     #[test]
     fn apple_guest_capabilities_do_not_conflate_screenshot_and_async_execution() {
@@ -3211,8 +2641,12 @@ mod tests {
         assert_eq!(mac["async_commands"], false);
         assert!(mac["guest_integration"].as_str().unwrap().contains("macos"));
         let linux = backend::guest_capabilities(Backend::AppleVirtualization, "linux");
-        assert_eq!(linux["screenshot"], false);
-        assert_eq!(linux["input"], false);
+        assert_eq!(linux["screenshot"], true);
+        assert_eq!(linux["input"], true);
+        assert!(linux["input_requirements"]
+            .as_str()
+            .unwrap()
+            .contains("desktop container"));
         assert_eq!(linux["command_execution"], true);
         assert_eq!(linux["async_commands"], true);
     }
@@ -3228,7 +2662,7 @@ mod tests {
         assert!(!valid_local_mac("72:76:f4:5e:d8:1g"));
     }
     #[test]
-    fn guest_stream_bridge_is_strict_local_macos_only() {
+    fn guest_stream_bridge_is_strict_local_apple_only() {
         let start = json!({"id":"mac","socket_path":"/private/owner/stream.sock"});
         assert!(validate_local_stream_bridge(
             "start_guest_stream_bridge",
@@ -3249,6 +2683,13 @@ mod tests {
             &start,
             Backend::AppleVirtualization,
             "linux"
+        )
+        .is_ok());
+        assert!(validate_local_stream_bridge(
+            "start_guest_stream_bridge",
+            &start,
+            Backend::AppleVirtualization,
+            "windows"
         )
         .is_err());
         assert!(validate_local_stream_bridge(
@@ -3293,7 +2734,6 @@ mod tests {
     }
     include!("file_routes_tests.rs");
     include!("job_retention_tests.rs");
-    include!("exec_scope_tests.rs");
     #[test]
     fn synchronous_terminal_result_preserves_exit_and_cancellation() {
         assert!(
@@ -3453,6 +2893,47 @@ mod tests {
         );
     }
     #[test]
+    fn uefi_machines_register_on_both_backends_without_a_kernel() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let iso = root.join("installer.iso");
+        fs::write(&iso, vec![0u8; 2048]).unwrap();
+        let disk = root.join("disk.raw");
+        fs::write(&disk, vec![0u8; 4096]).unwrap();
+        fs::set_permissions(&disk, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::create_dir(root.join("state")).unwrap();
+        fs::set_permissions(root.join("state"), fs::Permissions::from_mode(0o700)).unwrap();
+        let mut manager = Manager::load(
+            root.join("state"),
+            "/unused".into(),
+            MemoryBudget::new(16 * 1024 * 1024 * 1024, None).unwrap(),
+        )
+        .unwrap();
+        manager.qemu = Some(QemuRegistration {
+            worker: iso.clone(),
+            launcher: iso.clone(),
+            library: iso.clone(),
+            resources: root.clone(),
+            spice_library: None,
+            screenshot_helper: None,
+            console_broker: None,
+            console_helper: None,
+            venus_runtime: None,
+        });
+        for (id, backend) in [("q", "qemu-hvf"), ("a", "apple-virtualization")] {
+            let request = json!({"method":"create","arguments":{"backend":backend,"id":id,"guest":"linux","cpus":2,"memory_mib":2048,"boot":"uefi","disk":disk,"cdrom":iso,"efi_vars":root.join(format!("{id}-vars.fd"))}});
+            let view = manager.dispatch(request, &mut None).unwrap();
+            assert_eq!(view["config"]["boot"], "uefi");
+            assert_eq!(view["capabilities"]["boot"], json!(["kernel", "uefi"]));
+            assert!(view["config"].get("kernel").is_none());
+        }
+        // The firmware store is created by the worker, never by registration.
+        assert!(!root.join("q-vars.fd").exists());
+        let bad = json!({"method":"create","arguments":{"id":"x","guest":"linux","cpus":1,"memory_mib":512,"boot":"uefi","cdrom":iso}});
+        assert!(manager.dispatch(bad, &mut None).is_err());
+    }
+    #[test]
     fn backend_selection_is_explicit_and_unsupported_qemu_features_reject() {
         let temp = tempfile::tempdir().unwrap();
         let kernel = temp.path().join("Image");
@@ -3500,7 +2981,7 @@ mod tests {
         assert!(serde_json::from_value::<Config>(value).is_err());
     }
     #[test]
-    fn queued_or_disconnected_acquire_never_mutates_lease_but_cleanup_still_runs() {
+    fn stale_requests_expire_but_disconnected_cleanup_still_runs() {
         fn await_disconnection(server: &UnixStream) {
             // Other parallel tests spawn real processes. Between fork and exec,
             // their child can briefly retain our CLOEXEC test-client socket.
@@ -3527,39 +3008,28 @@ mod tests {
             serde_json::from_value(json!({"id":"test","guest":"linux","cpus":1,"memory_mib":512}))
                 .unwrap(),
         );
-        let manager = Arc::new(Mutex::new(manager));
         let owner = "ab".repeat(32);
-        for stale in [false, true] {
-            let (mut client, server) = UnixStream::pair().unwrap();
-            write_json(
-                &mut client,
-                &json!({"method":"acquire_control","arguments":{"id":"test","owner":owner}}),
-            )
-            .unwrap();
-            let admitted =
-                std::time::Instant::now() - Duration::from_secs(if stale { 31 } else { 0 });
-            if stale {
-                handle_connection(server, manager.clone(), admitted).unwrap();
-                let reply = read_frame(&mut BufReader::new(client)).unwrap().unwrap();
-                assert!(String::from_utf8(reply)
-                    .unwrap()
-                    .contains("expired before dispatch"));
-            } else {
-                drop(client);
-                await_disconnection(&server);
-                assert!(handle_connection(server, manager.clone(), admitted).is_err());
-            }
-            assert!(manager
-                .lock()
-                .unwrap()
-                .leases
-                .lock()
-                .unwrap()
-                .check("test", &owner, 1, std::time::Instant::now())
-                .is_err());
-        }
-        // Cleanup is deliberately processed despite caller disconnect: no late acquire
-        // can then resurrect the retired owner, and a fresh owner remains usable.
+        manager
+            .file_sessions
+            .insert(owner.clone(), (std::time::Instant::now(), BTreeSet::new()));
+        let manager = Arc::new(Mutex::new(manager));
+        let (mut client, server) = UnixStream::pair().unwrap();
+        write_json(
+            &mut client,
+            &json!({"method":"status","arguments":{"id":"test"}}),
+        )
+        .unwrap();
+        handle_connection(
+            server,
+            manager.clone(),
+            std::time::Instant::now() - Duration::from_secs(31),
+        )
+        .unwrap();
+        let reply = read_frame(&mut BufReader::new(client)).unwrap().unwrap();
+        assert!(String::from_utf8(reply)
+            .unwrap()
+            .contains("expired before dispatch"));
+        // Cleanup is deliberately processed despite caller disconnect.
         let (mut client, server) = UnixStream::pair().unwrap();
         write_json(
             &mut client,
@@ -3570,14 +3040,7 @@ mod tests {
         await_disconnection(&server);
         let cleanup = handle_connection(server, manager.clone(), std::time::Instant::now());
         assert!(cleanup.is_err()); // Response write fails, but cleanup is already committed.
-        let manager = manager.lock().unwrap();
-        let mut leases = manager.leases.lock().unwrap();
-        assert!(leases
-            .acquire("test", &owner, std::time::Instant::now())
-            .is_err());
-        assert!(leases
-            .acquire("test", &"cd".repeat(32), std::time::Instant::now())
-            .is_ok());
+        assert!(manager.lock().unwrap().file_sessions.is_empty());
     }
     #[test]
     fn qemu_observer_rejects_mutation_before_retaining_cleanup_routes() {
@@ -3592,7 +3055,13 @@ mod tests {
             "exec",
         ] {
             let mut deferred = None;
-            let error=fixture.manager.dispatch(json!({"method":method,"arguments":{"id":"mac","owner":"a".repeat(64),"epoch":1}}),&mut deferred).unwrap_err();
+            let error = fixture
+                .manager
+                .dispatch(
+                    json!({"method":method,"arguments":{"id":"mac","owner":"a".repeat(64)}}),
+                    &mut deferred,
+                )
+                .unwrap_err();
             assert!(error.to_string().contains("observer-only"), "{error}");
             assert!(deferred.is_none());
             assert!(fixture.manager.file_sessions.is_empty());
@@ -3630,7 +3099,12 @@ mod tests {
     #[test]
     fn input_permission_is_independent() {
         let only = tools_with_input(false, false, false, true).to_string();
-        assert!(only.contains("vm_input_click") && only.contains("vm_acquire_control"));
+        assert!(only.contains("vm_input_click") && !only.contains("vm_acquire_control"));
+        assert!(
+            only.contains("vm_window_action")
+                && only.contains("vm_app_launch")
+                && only.contains("vm_accessibility_action")
+        );
         assert!(
             !only.contains("vm_exec")
                 && !only.contains("vm_file_")
@@ -3643,8 +3117,19 @@ mod tests {
     #[test]
     fn tool_permissions() {
         let list = tools_list(false, false);
-        // 6 observe vm_* tools plus 4 read-only container/image tools.
-        assert_eq!(list["tools"].as_array().unwrap().len(), 10);
+        // 12 observe vm_* tools plus 4 read-only container/image tools.
+        assert_eq!(list["tools"].as_array().unwrap().len(), 16);
+        assert!(
+            list.to_string().contains("vm_screen_wait")
+                && list.to_string().contains("vm_screen_text")
+                && list.to_string().contains("vm_desktop_state")
+                && list.to_string().contains("vm_desktop_apps")
+        );
+        assert!(
+            !list.to_string().contains("vm_window_action")
+                && !list.to_string().contains("vm_app_launch")
+                && !list.to_string().contains("vm_accessibility_action")
+        );
         assert!(list.to_string().contains("vm_screenshot"));
         assert!(!list.to_string().contains("vm_start"));
         assert!(tools_list(true, false).to_string().contains("vm_start"));
@@ -3847,16 +3332,6 @@ mod tests {
             assert_eq!(result.unwrap(), reply);
         }
         assert!(fixture.manager.file_sessions[&owner].1.contains("mac"));
-        assert!(
-            fixture
-                .manager
-                .leases
-                .lock()
-                .unwrap()
-                .acquire("mac", "b".repeat(64).as_str(), std::time::Instant::now())
-                .is_ok(),
-            "files do not acquire desktop control"
-        );
         let mut completion = None;
         fixture
             .manager

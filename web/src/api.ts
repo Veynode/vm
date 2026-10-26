@@ -208,6 +208,15 @@ export const openDesktop = createServerFn({ method: 'POST' })
     return { ok: true }
   })
 
+export const closeDesktop = createServerFn({ method: 'POST' })
+  .validator((input: unknown) => id(input))
+  .handler(async ({ data }) => {
+    const { veynodevm } = await import('./server/veynodevm')
+    const result = await veynodevm(['desktop', '--close', data], 30_000)
+    if (result.code !== 0) throw new Error(result.stderr.trim() || 'desktop --close failed')
+    return { ok: true }
+  })
+
 export const systemInfo = createServerFn({ method: 'GET' }).handler(async () => {
   const cli = process.env.VEYNODEVM_CLI || 'veynodevm'
   return { cli, home: process.env.VEYNODEVM_HOME ?? null }

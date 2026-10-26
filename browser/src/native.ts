@@ -38,8 +38,6 @@ function show(values: Record<string, unknown>) { report = { ...report, ...values
 const controlPanel = document.querySelector<HTMLFieldSetElement>('#desktop-control')!;
 const controlStatus = document.querySelector<HTMLElement>('#control-status')!;
 const controlFrame = document.querySelector<HTMLCanvasElement>('#control-frame')!;
-const acquireControl = document.querySelector<HTMLButtonElement>('#acquire-control')!;
-const releaseControl = document.querySelector<HTMLButtonElement>('#release-control')!;
 const refreshControlFrame = document.querySelector<HTMLButtonElement>('#refresh-control-frame')!;
 const sendPhysicalKey = document.querySelector<HTMLButtonElement>('#send-physical-key')!;
 const requestFiles = document.querySelector<HTMLInputElement>('#request-files')!;
@@ -58,11 +56,9 @@ let requestedScopes: Scope[] = ['observe'];
 let controlGeneration = 0;
 let controlReceiver: AuthenticatedReceiver | null = null;
 let pendingControl: Promise<ControlResponse> | null = null;
-let lease: { epoch: number; expires: number } | null = null;
 let observedFrame: { anchor: FrameAnchor; expires: number } | null = null;
 let dragStart: { x: number; y: number } | null = null;
 let frameExpiry: ReturnType<typeof setTimeout> | undefined;
-let leaseExpiry: ReturnType<typeof setTimeout> | undefined;
 function updateControlControls() {
   const available = controlEnabled && controlSessionReady && cleanupState === 'idle' && !pendingControl && !pendingFile;
   const filesAvailable = filesEnabled && requestedScopes.includes('files') && controlSessionReady && cleanupState === 'idle' && !!sessionFiles;
@@ -70,26 +66,23 @@ function updateControlControls() {
   uploadButton.disabled = downloadButton.disabled = !filesAvailable || !!pendingFile || !!pendingControl;
   cancelFile.disabled = !filesAvailable || !pendingFile;
   const canInput = available && requestedScopes.includes('input');
-  const owns = !!lease && performance.now() < lease.expires;
   const fresh = !!observedFrame && performance.now() < observedFrame.expires;
   controlPanel.hidden = !controlEnabled;
-  acquireControl.disabled = !canInput || owns;
-  releaseControl.disabled = !canInput || !owns;
   refreshControlFrame.disabled = !available;
-  sendPhysicalKey.disabled = !canInput || !owns || !fresh;
-  controlFrame.setAttribute('aria-disabled', String(!canInput || !owns || !fresh));
+  sendPhysicalKey.disabled = !canInput || !fresh;
+  controlFrame.setAttribute('aria-disabled', String(!canInput || !fresh));
   controlFrame.style.opacity = fresh ? '1' : '0.5';
 }
-function clearControlLease(message: string) {
-  controlGeneration++; lease = null; observedFrame = null; dragStart = null;
-  clearTimeout(frameExpiry); clearTimeout(leaseExpiry);
+function clearControlFrame(message: string) {
+  controlGeneration++; observedFrame = null; dragStart = null;
+  clearTimeout(frameExpiry);
   controlStatus.textContent = message; updateControlControls();
 }
 function endControlSession() {
   sessionFiles?.dispose(); sessionFiles = null; uploadFile.value = '';
   fileStatus.textContent = 'Disconnected. File cleanup requires the session close acknowledgment.';
   controlSessionReady = false; controlReceiver = null;
-  clearControlLease('Control is disconnected. Connect and acquire control explicitly to send input.');
+  clearControlFrame('Control is disconnected. Connect to send input.');
 }
 function controlReady() { return controlEnabled && controlSessionReady && cleanupState === 'idle' && !!controlReceiver && !pendingControl && !pendingFile; }
 async function sendControl(action: ControlAction): Promise<Record<string, unknown>> {
@@ -101,16 +94,16 @@ async function sendControl(action: ControlAction): Promise<Record<string, unknow
   pendingControl = operation; updateControlControls();
   try { const result = (await operation).result; show({ controlCompletedAt: new Date().toISOString(), controlRoundTripMs: performance.now() - requestedAt }); return result; }
   catch (error) {
-    clearControlLease('Control request failed. Refresh and acquire control explicitly before further input.');
+    clearControlFrame('Control request failed. Refresh the screenshot before further input.');
     show({ controlError: String(error), controlAction: action.kind, controlCompletedAt: new Date().toISOString(), controlRoundTripMs: performance.now() - requestedAt }); throw error;
   } finally { if (pendingControl === operation) pendingControl = null; updateControlControls(); }
 }
-function inputState(): { epoch: number; frame: FrameAnchor } | null {
-  if (!controlReady() || !requestedScopes.includes('input') || !lease || performance.now() >= lease.expires) return null;
+function inputState(): { frame: FrameAnchor } | null {
+  if (!controlReady() || !requestedScopes.includes('input')) return null;
   if (!observedFrame || performance.now() >= observedFrame.expires) {
     observedFrame = null; dragStart = null; controlStatus.textContent = 'Screenshot expired. Refresh it before sending input.'; updateControlControls(); return null;
   }
-  return { epoch: lease.epoch, frame: { ...observedFrame.anchor } };
+  return { frame: { ...observedFrame.anchor } };
 }
 async function dispatchInput(action: ControlAction) {
   const generation = controlGeneration;
@@ -120,28 +113,9 @@ async function dispatchInput(action: ControlAction) {
     observedFrame = null; dragStart = null; clearTimeout(frameExpiry);
     controlStatus.textContent = 'Input dispatched. Refresh the screenshot to check the result; application delivery is not confirmed.';
     show({ controlAction: action.kind, controlDispatched: true, guestDeliveryConfirmed: false });
-  } catch { /* sendControl already fences the lease and records a bounded error. */ }
+  } catch { /* sendControl already clears the frame and records a bounded error. */ }
   finally { updateControlControls(); }
 }
-acquireControl.addEventListener('click', () => { void (async () => {
-  if (!controlReady() || !requestedScopes.includes('input') || (lease && performance.now() < lease.expires)) return;
-  const generation = controlGeneration, started = performance.now();
-  try {
-    const result = await sendControl({ kind: 'acquire' });
-    if (generation !== controlGeneration) return;
-    lease = { epoch: result.epoch as number, expires: started + (result.expires_in_seconds as number) * 1000 };
-    clearTimeout(leaseExpiry); leaseExpiry = setTimeout(() => clearControlLease('Control lease expired. Acquire control explicitly again.'), Math.max(0, lease.expires - performance.now()));
-    controlStatus.textContent = 'Control acquired for up to 60 seconds. Refresh the screenshot before input.';
-  } catch { /* explicit reacquire remains required */ }
-  finally { updateControlControls(); }
-})(); });
-releaseControl.addEventListener('click', () => { void (async () => {
-  if (!controlReady() || !lease || !requestedScopes.includes('input')) return;
-  const epoch = lease.epoch;
-  clearControlLease('Releasing control…');
-  try { await sendControl({ kind: 'release', epoch }); controlStatus.textContent = 'Control released.'; }
-  catch { /* failed release remains locally fenced */ }
-})(); });
 refreshControlFrame.addEventListener('click', () => { void (async () => {
   if (!controlReady()) return;
   const generation = ++controlGeneration, started = performance.now();
@@ -159,8 +133,8 @@ refreshControlFrame.addEventListener('click', () => { void (async () => {
     context.drawImage(image, 0, 0, anchor.width, anchor.height); controlFrame.hidden = false;
     observedFrame = { anchor, expires: started + 4000 };
     frameExpiry = setTimeout(() => { observedFrame = null; dragStart = null; controlStatus.textContent = 'Screenshot expired. Refresh it before sending input.'; updateControlControls(); }, Math.max(0, observedFrame.expires - performance.now()));
-    controlStatus.textContent = lease ? 'Screenshot ready for 4 seconds. Choose an action and click the screenshot.' : 'Screenshot ready for observation. Acquire control explicitly to send input.';
-  } catch (error) { if (generation !== controlGeneration) return; clearControlLease('Screenshot unavailable. Refresh and acquire control explicitly before input.'); show({ controlError: String(error), controlAction: 'observe_frame' }); }
+    controlStatus.textContent = requestedScopes.includes('input') ? 'Screenshot ready for 4 seconds. Choose an action and click the screenshot.' : 'Screenshot ready for observation.';
+  } catch (error) { if (generation !== controlGeneration) return; clearControlFrame('Screenshot unavailable. Refresh it before input.'); show({ controlError: String(error), controlAction: 'observe_frame' }); }
   finally { updateControlControls(); }
 })(); });
 const physicalKeys = new Set(['ret', 'esc', 'tab', 'backspace', 'delete', 'up', 'down', 'left', 'right', 'home', 'end', 'pgup', 'pgdn', 'spc', 'ctrl,a']);

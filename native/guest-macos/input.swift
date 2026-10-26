@@ -106,7 +106,7 @@ private struct GuestInputFrame { let id:String; let geometry:GuestDisplayGeometr
 final class GuestInputCoordinator {
     private let lock = NSLock(), sink: GuestInputSink, now: () -> UInt64
     private var frames: [GuestInputFrame] = [], geometry: GuestDisplayGeometry?, generation: UInt64 = 0, configurationRevision:UInt64 = 0
-    private var operation: String?, operationOwner: String?, epoch: UInt64 = 0, revokedThrough: UInt64 = 0
+    private var operation: String?
     private var operationIdentity:GuestConsoleIdentityV1?, lastIdentityPoll:UInt64=0
     private var deadline: UInt64 = 0, lastStep: UInt64 = 0
     private var keys = Set<String>(), buttons = Set<String>(), location = CGPoint.zero
@@ -142,7 +142,7 @@ final class GuestInputCoordinator {
             catch { fault=true; if failure==nil {failure=error} }
         }
         if let failure {throw failure}
-        positioned=false; operation=nil; operationOwner=nil; operationIdentity=nil; deadline=0; lastStep=0
+        positioned=false; operation=nil; operationIdentity=nil; deadline=0; lastStep=0
     }
     func blockedReason() -> String? {lock.lock();defer{lock.unlock()};return fault ? "synthetic_release_unconfirmed":nil}
     func captureToken() -> UInt64 { lock.lock();defer{lock.unlock()};return configurationRevision }
@@ -196,7 +196,7 @@ final class GuestInputCoordinator {
         }
     }
     func shutdown() -> Bool {
-        lock.lock();defer{lock.unlock()};frames.removeAll();revokedThrough=9_007_199_254_740_991
+        lock.lock();defer{lock.unlock()};frames.removeAll()
         do {try release();return true} catch {return false}
     }
     func cleanup(_ args:[String:Any]) throws -> [String:Any] {
@@ -205,24 +205,15 @@ final class GuestInputCoordinator {
         guard operation==op else {return ["released":false,"reason":"operation is no longer active"]}
         try release();return ["released":true,"synthetic_release_dispatched":true,"guest_delivery_confirmed":false]
     }
-    func revoke(_ args:[String:Any]) throws -> [String:Any] {
-        lock.lock();defer{lock.unlock()}
-        guard let through=unsignedInput(args["through_epoch"]) else {throw inputFailure("invalid_request","through_epoch must be a safe unsigned integer")}
-        revokedThrough=max(revokedThrough,through) // Commit the fence BEFORE attempting cleanup.
-        if operation != nil && epoch<=revokedThrough {try release()}
-        return ["released":true,"through_epoch":through,"synthetic_release_dispatched":true,"guest_delivery_confirmed":false]
-    }
     func step(_ args:[String:Any]) throws -> [String:Any] {
         lock.lock();defer{lock.unlock()}
         guard !fault else {throw inputFailure("input_cleanup_unconfirmed","Earlier synthetic release failed; restart service after restoring permission")}
         guard sink.available() else {throw inputFailure("accessibility_permission_required","Existing Guest Accessibility permission is required; service does not prompt")}
         guard let op=args["operation_id"] as? String,inputHex(op,count:32),
-              let requestedEpoch=unsignedInput(args["epoch"]),requestedEpoch>revokedThrough,
-              let owner=args["owner"] as? String,inputHex(owner,count:64),
               let begin=inputBool(args["begin"]),let id=args["frame_id"] as? String,
               let requestedGeneration=unsignedInput(args["source_generation"]),
               let width=unsignedInput(args["width"]),let height=unsignedInput(args["height"]),
-              let events=args["events"] as? [[String:Any]],!events.isEmpty,events.count<=16 else {throw inputFailure("invalid_request","Invalid bounded physical input request or revoked epoch")}
+              let events=args["events"] as? [[String:Any]],!events.isEmpty,events.count<=16 else {throw inputFailure("invalid_request","Invalid bounded physical input request")}
         guard let frame=frames.first(where:{$0.id==id}), now()>=frame.captured,now()-frame.captured<=5_000_000_000,
               frame.generation==requestedGeneration,UInt64(frame.geometry.width)==width,UInt64(frame.geometry.height)==height,
               sink.geometry()==frame.geometry else {throw inputFailure("stale_frame","Capture a fresh screenshot after display or geometry changes")}
@@ -231,7 +222,7 @@ final class GuestInputCoordinator {
             do {try release()} catch {fault=true;throw error}
             throw inputFailure("input_console_identity_changed","Captured login console no longer matches; acquire a fresh screenshot")
         }
-        guard begin ? operation==nil : (operation==op && operationOwner==owner && epoch==requestedEpoch && now()<deadline) else {throw inputFailure("input_busy_or_expired","Input operation is active, replaced, or expired")}
+        guard begin ? operation==nil : (operation==op && now()<deadline) else {throw inputFailure("input_busy_or_expired","Input operation is active, replaced, or expired")}
         // Validate the ENTIRE batch before posting any element.
         var plans:[GuestInputEvent]=[], nextKeys=keys, nextButtons=buttons, point=location
         let hasPoint = !begin && positioned
@@ -263,7 +254,7 @@ final class GuestInputCoordinator {
                 } else {throw inputFailure("invalid_request","Unsupported input event")}
             }
         }
-        if begin {positioned=false;operation=op;operationOwner=owner;operationIdentity=frame.identity;epoch=requestedEpoch;deadline=now()+4_000_000_000}
+        if begin {positioned=false;operation=op;operationIdentity=frame.identity;deadline=now()+4_000_000_000}
         lastStep=now()
         do {
             for plan in plans {
@@ -299,7 +290,7 @@ func inputReply(_ id:String,method:String,args:[String:Any],enabled:Bool) -> [St
     guard getuid() != 0,systemString("hw.model").hasPrefix("VirtualMac") else{return errorReply(id,"virtual_guest_required","input is restricted to the signed-in non-root VirtualMac Guest user")}
     do {
         let result:[String:Any]
-        switch method {case "input_step":result=try guestInput.step(args);case "input_cleanup":result=try guestInput.cleanup(args);case "input_revoke":result=try guestInput.revoke(args);default:throw inputFailure("unsupported","unknown input method")}
+        switch method {case "input_step":result=try guestInput.step(args);case "input_cleanup":result=try guestInput.cleanup(args);default:throw inputFailure("unsupported","unknown input method")}
         return ["id":id,"result":result]
     } catch {
         // A failed continuation must not leave this operation's synthetic keys held.

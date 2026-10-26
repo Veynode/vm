@@ -259,7 +259,6 @@ impl Harness {
         let seen = calls.clone();
         let path = socket.clone();
         let controller = tokio::spawn(async move {
-            let mut acquired_owner: Option<String> = None;
             loop {
                 let (socket, _) = listener.accept().await.unwrap();
                 let mut reader = tokio::io::BufReader::new(socket);
@@ -269,29 +268,11 @@ impl Harness {
                 let method = req["method"].as_str().unwrap();
                 seen.lock().unwrap().push(method.into());
                 let result = match method {
-                    "capabilities" => {
-                        json!({"control_session_fencing":{"retired_owner_ttl_seconds":120,"request_dispatch_deadline_seconds":30}})
-                    }
                     "status" => {
                         json!({"config":{"id":"hostile-peer","backend":"qemu-hvf"},"state":"running","capabilities":{"input":true},"runtime":{"console_socket":path},"pid":123})
                     }
-                    "acquire_control" => {
-                        let owner = req["arguments"]["owner"].as_str().unwrap();
-                        assert_eq!(owner.len(), 64);
-                        acquired_owner = Some(owner.into());
-                        json!({"epoch":7,"expires_in_seconds":60})
-                    }
-                    "release_control" => {
-                        assert_eq!(
-                            req["arguments"]["owner"].as_str(),
-                            acquired_owner.as_deref()
-                        );
-                        assert_eq!(req["arguments"]["epoch"], 7);
-                        acquired_owner = None;
-                        json!({"released":true})
-                    }
-                    "session_end" => {
-                        json!({"closed":true,"retired_owner":true,"retired_owner_ttl_seconds":120,"released_vm_ids":[]})
+                    "screenshot" => {
+                        json!({"frame_id":"01234567-89ab-4def-8123-456789abcdef","source_generation":4,"width":1280,"height":800,"mime_type":"image/png","byte_length":1,"data_base64":"AA=="})
                     }
                     _ => panic!("unexpected controller method"),
                 };
@@ -407,7 +388,7 @@ impl Harness {
             transcript_sha256: answer.transcript.digest().unwrap(),
             sequence,
             expires_at: now().unwrap() + 5,
-            action: protocol::control::ControlAction::Acquire,
+            action: protocol::control::ControlAction::ObserveFrame,
         };
         protocol::control::SignedControl {
             signature: self.device.sign(&request.canonical().unwrap()).unwrap(),
@@ -417,12 +398,7 @@ impl Harness {
     fn assert_unstarted(&self) {
         assert!(!self.marker.exists(), "encoder must not start");
         assert!(
-            !self
-                .calls
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|v| v == "acquire_control"),
+            !self.calls.lock().unwrap().iter().any(|v| v == "screenshot"),
             "controller must not dispatch"
         );
     }
@@ -580,15 +556,9 @@ async fn hostile_signal_then_exact_peer_confirmation_controls_once() {
     .unwrap();
     let control = h.control(&answer, 1);
     client.send(&control).await;
-    assert_eq!(client.response().await["result"]["epoch"], 7);
-    let mut release = h.control(&answer, 2);
-    release.request.action = protocol::control::ControlAction::Release { epoch: 7 };
-    release.signature = h
-        .device
-        .sign(&release.request.canonical().unwrap())
-        .unwrap();
-    client.send(&release).await;
-    assert_eq!(client.response().await["result"]["released"], true);
+    assert_eq!(client.response().await["result"]["source_generation"], 4);
+    client.send(&h.control(&answer, 2)).await;
+    assert_eq!(client.response().await["result"]["width"], 1280);
     client.send(&control).await; // Same-channel replay must terminate without a second dispatch.
     tokio::time::timeout(Duration::from_secs(5), async {
         while h.app.active.lock().await.active.is_some() {
@@ -602,19 +572,9 @@ async fn hostile_signal_then_exact_peer_confirmation_controls_once() {
             .lock()
             .unwrap()
             .iter()
-            .filter(|v| *v == "acquire_control")
+            .filter(|v| *v == "screenshot")
             .count(),
-        1
-    );
-    assert!(h.calls.lock().unwrap().iter().any(|v| v == "session_end"));
-    assert_eq!(
-        h.calls
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|v| *v == "release_control")
-            .count(),
-        1
+        2
     );
     h.close(&answer).await;
     let stopped = PathBuf::from(format!("{}.stopped", h.app.socket.display()));
@@ -702,12 +662,7 @@ async fn signed_control_for_another_session_cannot_select_peer_authority() {
     })
     .await
     .unwrap();
-    assert!(!h
-        .calls
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|v| v == "acquire_control"));
+    assert!(!h.calls.lock().unwrap().iter().any(|v| v == "screenshot"));
     h.close(&answer).await;
     client.close().await;
 }
@@ -745,7 +700,7 @@ async fn local_turn_production_signed_session_reaches_encoder_and_control() {
     .is_ok();
     if started {
         client.send(&h.control(&answer, 1)).await;
-        assert_eq!(client.response().await["result"]["epoch"], 7);
+        assert_eq!(client.response().await["result"]["source_generation"], 4);
     }
     h.close(&answer).await;
     client.close().await;

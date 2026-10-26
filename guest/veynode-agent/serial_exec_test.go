@@ -16,116 +16,17 @@ import (
 	"time"
 )
 
-func scopedRequest() request {
+func sleepRequest() request {
 	return request{ID: "start", Method: "exec_start", Argv: []string{"/bin/sh", "-c", "sleep 5"}, TimeoutMS: 10000}
 }
-func scopeWait(t *testing.T, m *jobManager, key string, predicate func(*commandScopeState) bool) {
-	t.Helper()
-	until := time.Now().Add(time.Second)
-	for time.Now().Before(until) {
-		m.mu.Lock()
-		state := m.scopes[key]
-		ok := state != nil && predicate(state)
-		m.mu.Unlock()
-		if ok {
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatal("scope state not reached")
-}
-func TestScopePendingStartRetirementAndLostReply(t *testing.T) {
-	m := testManager(t)
-	entered, unblock := make(chan struct{}), make(chan struct{})
-	m.boundary = func(cmd *exec.Cmd) (jobBoundary, error) { close(entered); <-unblock; return legacyBoundary(cmd) }
-	started := make(chan response, 1)
-	go func() { started <- m.startScoped(scopedRequest(), "owner:1") }()
-	<-entered
-	revoked := make(chan bool, 1)
-	go func() { revoked <- m.revokeScope("owner:1", time.Second) }()
-	scopeWait(t, m, "owner:1", func(s *commandScopeState) bool { return s.retired && s.starting == 1 && s.active == 1 })
-	select {
-	case <-revoked:
-		t.Fatal("pending start falsely acknowledged clean")
-	default:
-	}
-	if r := m.startScoped(scopedRequest(), "owner:1"); r.Error == nil || r.Error.Code != "scope_retired" {
-		t.Fatal(r)
-	}
-	close(unblock)
-	r := <-started
-	if r.Error != nil {
-		t.Fatal(r)
-	}
-	// Deliberately discard the start reply as a caller would after losing its ACK.
-	if !<-revoked {
-		t.Fatal("real process cancellation did not drain")
-	}
-	if !m.revokeScope("owner:1", time.Second) {
-		t.Fatal("repeat clean scope changed")
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.active != 0 || m.scopes["owner:1"].starting != 0 {
-		t.Fatal("active remained")
-	}
-	for _, j := range m.jobs {
-		if !j.finished || j.result["cancelled"] != true {
-			t.Fatal("cancelled completion missing", j)
-		}
-	}
-}
-func TestScopesIsolateJobsAndNeverForgetRetirement(t *testing.T) {
-	m := testManager(t)
-	r := m.startScoped(scopedRequest(), "a:1")
-	if r.Error != nil {
-		t.Fatal(r)
-	}
-	id := r.Result.(map[string]any)["job_id"].(string)
-	for _, r := range []response{m.pollScoped(request{JobID: id}, "b:1"), m.cancelScoped(request{JobID: id}, "a:2"), m.poll(request{JobID: id})} {
-		if r.Error == nil || r.Error.Code != "not_found" {
-			t.Fatal(r)
-		}
-	}
-	if !m.revokeScope("a:1", time.Second) {
-		t.Fatal("cleanup")
-	}
-	if !m.revokeScope("never-started:1", time.Second) {
-		t.Fatal("unknown scope retirement")
-	}
-	if r := m.startScoped(scopedRequest(), "never-started:1"); r.Error == nil || r.Error.Code != "scope_retired" {
-		t.Fatal(r)
-	}
-	r = m.startScoped(scopedRequest(), "a:2")
-	if r.Error != nil {
-		t.Fatal(r)
-	}
-	if !m.revokeScope("a:2", time.Second) {
-		t.Fatal("new epoch cleanup")
-	}
-	for i := len(m.scopes); i < maxCommandScopes; i++ {
-		if !m.revokeScope(fmt.Sprintf("retired:%d", i), time.Second) {
-			t.Fatal(i)
-		}
-	}
-	if r := m.startScoped(scopedRequest(), "over-capacity"); r.Error == nil || r.Error.Code != "busy" {
-		t.Fatal(r)
-	}
-	if r := m.startScoped(scopedRequest(), "a:1"); r.Error == nil || r.Error.Code != "scope_retired" {
-		t.Fatal(r)
-	}
-	if m.revokeScope("cannot-record", time.Second) || m.stopAll(time.Second) {
-		t.Fatal("unrecordable retirement must fence")
-	}
-}
-func TestScopesShareFourCommandBudget(t *testing.T) {
+func TestJobsShareFourCommandBudget(t *testing.T) {
 	m := testManager(t)
 	for i := 0; i < 4; i++ {
-		if r := m.startScoped(scopedRequest(), fmt.Sprint(i)); r.Error != nil {
+		if r := m.start(sleepRequest()); r.Error != nil {
 			t.Fatal(r)
 		}
 	}
-	if r := m.startScoped(scopedRequest(), "fifth"); r.Error == nil || r.Error.Code != "busy" {
+	if r := m.start(sleepRequest()); r.Error == nil || r.Error.Code != "busy" {
 		t.Fatal(r)
 	}
 	if !m.stopAll(time.Second) {
@@ -136,32 +37,32 @@ func TestScopesShareFourCommandBudget(t *testing.T) {
 type failingCloseBoundary struct{ jobBoundary }
 
 func (b failingCloseBoundary) close() error { return errors.New("injected remove failure") }
-func TestScopedCleanupFailureCannotBecomeClean(t *testing.T) {
+func TestAsyncCleanupFailureCannotBecomeClean(t *testing.T) {
 	m := testManager(t)
 	m.boundary = func(c *exec.Cmd) (jobBoundary, error) { b, e := legacyBoundary(c); return failingCloseBoundary{b}, e }
-	if r := m.startScoped(scopedRequest(), "scope"); r.Error != nil {
+	if r := m.start(sleepRequest()); r.Error != nil {
 		t.Fatal(r)
 	}
-	if m.revokeScope("scope", time.Second) || m.revokeScope("scope", time.Second) || m.stopAll(time.Second) {
+	if m.stopAll(time.Second) || m.stopAll(time.Second) {
 		t.Fatal("failed containment became clean")
 	}
-	if r := m.startScoped(scopedRequest(), "next"); r.Error == nil {
+	if r := m.start(sleepRequest()); r.Error == nil {
 		t.Fatal("failure admitted start")
 	}
 }
-func TestFailedStartCleanupFencesSyncAndScoped(t *testing.T) {
-	for _, scoped := range []bool{false, true} {
-		t.Run(fmt.Sprint(scoped), func(t *testing.T) {
+func TestFailedStartCleanupFencesSyncAndAsync(t *testing.T) {
+	for _, async := range []bool{false, true} {
+		t.Run(fmt.Sprint(async), func(t *testing.T) {
 			m := testManager(t)
 			m.boundary = func(c *exec.Cmd) (jobBoundary, error) {
 				c.Path = "/nonexistent-veynode-executable"
 				b, e := legacyBoundary(c)
 				return failingCloseBoundary{b}, e
 			}
-			req := scopedRequest()
+			req := sleepRequest()
 			var r response
-			if scoped {
-				r = m.startScoped(req, "scope")
+			if async {
+				r = m.start(req)
 			} else {
 				r = m.execute(req)
 			}
@@ -228,41 +129,21 @@ func v2Read(t *testing.T, c net.Conn) serialEnvelope {
 	}
 	return r
 }
-func TestSerialV2HeartbeatDuringPendingStartAndRevoke(t *testing.T) {
+func TestSerialV2HeartbeatDuringPendingStart(t *testing.T) {
 	m := testManager(t)
 	entered, unblock := make(chan struct{}), make(chan struct{})
 	m.boundary = func(c *exec.Cmd) (jobBoundary, error) { close(entered); <-unblock; return legacyBoundary(c) }
 	c, done, base := serialExecPair(t, m)
-	scope := &serialScope{strings.Repeat("a", 64), 1}
-	r := scopedRequest()
-	r.Scope = scope
-	v2Send(t, c, base, 1, r)
+	v2Send(t, c, base, 1, sleepRequest())
 	<-entered
-	v2Send(t, c, base, 2, request{ID: "revoke", Method: "scope_revoke", Scope: scope})
-	key, _ := scope.key()
-	scopeWait(t, m, key, func(s *commandScopeState) bool { return s.retired && s.starting == 1 })
-	v2Send(t, c, base, 3, request{ID: "heart", Method: "heartbeat"})
+	v2Send(t, c, base, 2, request{ID: "heart", Method: "heartbeat"})
 	heartbeat := v2Read(t, c)
-	if heartbeat.Sequence != 3 || heartbeat.Response.ID != "heart" {
+	if heartbeat.Sequence != 2 || heartbeat.Response.ID != "heart" {
 		t.Fatal("heartbeat blocked by start", heartbeat)
 	}
 	close(unblock)
-	seen := map[uint64]bool{}
-	for i := 0; i < 2; i++ {
-		r := v2Read(t, c)
-		if r.Response.Error != nil {
-			t.Fatal(r)
-		}
-		seen[r.Sequence] = true
-		if r.Sequence == 2 {
-			b, _ := json.Marshal(r.Response.Result)
-			if string(b) != "{\"cgroup_empty\":true,\"pending_starts\":0,\"revoked\":true}" {
-				t.Fatal(string(b))
-			}
-		}
-	}
-	if !seen[1] || !seen[2] {
-		t.Fatal(seen)
+	if r := v2Read(t, c); r.Sequence != 1 || r.Response.Error != nil {
+		t.Fatal(r)
 	}
 	c.Close()
 	serialEnded(t, done)
@@ -270,9 +151,7 @@ func TestSerialV2HeartbeatDuringPendingStartAndRevoke(t *testing.T) {
 func TestSerialV2WatchdogCancelsRealJob(t *testing.T) {
 	m := testManager(t)
 	c, done, base := serialExecPair(t, m)
-	r := scopedRequest()
-	r.Scope = &serialScope{strings.Repeat("a", 64), 1}
-	v2Send(t, c, base, 1, r)
+	v2Send(t, c, base, 1, sleepRequest())
 	if reply := v2Read(t, c); reply.Response.Error != nil {
 		t.Fatal(reply)
 	}
@@ -293,7 +172,7 @@ func TestSerialV2WatchdogCancelsRealJob(t *testing.T) {
 	}
 }
 func TestSerialV2RejectsBindingAndUnknownFields(t *testing.T) {
-	for _, kind := range []string{"sequence", "nonce", "unknown", "duplicate", "scope-extra", "fractional-epoch", "old-version", "sync-exec", "files"} {
+	for _, kind := range []string{"sequence", "nonce", "unknown", "duplicate", "scope", "old-version", "sync-exec", "files"} {
 		t.Run(kind, func(t *testing.T) {
 			m := testManager(t)
 			c, done, base := serialExecPair(t, m)
@@ -310,12 +189,8 @@ func TestSerialV2RejectsBindingAndUnknownFields(t *testing.T) {
 				s = strings.Replace(s, `"method":"heartbeat"`, `"method":"heartbeat","extra":1`, 1)
 			case "duplicate":
 				s = strings.Replace(s, `"method":"heartbeat"`, `"method":"heartbeat","method":"heartbeat"`, 1)
-			case "scope-extra", "fractional-epoch":
-				scope := `{"owner":"` + strings.Repeat("a", 64) + `","epoch":1,"extra":1}`
-				if kind == "fractional-epoch" {
-					scope = `{"owner":"` + strings.Repeat("a", 64) + `","epoch":1.1}`
-				}
-				s = strings.Replace(s, `"method":"heartbeat"`, `"method":"scope_revoke","scope":`+scope, 1)
+			case "scope":
+				s = strings.Replace(s, `"method":"heartbeat"`, `"method":"scope_revoke"`, 1)
 			case "old-version":
 				s = strings.Replace(s, `"version":2`, `"version":1`, 1)
 			case "sync-exec":
@@ -336,11 +211,6 @@ func TestSerialV2PolicyAndBoundedJSON(t *testing.T) {
 	for _, s := range []string{strings.Repeat("[", 17) + "0" + strings.Repeat("]", 17), `{"a":1,"a":2}`, string([]byte{'"', 255, '"'})} {
 		if uniqueSerialJSON([]byte(s)) {
 			t.Fatal("accepted", s)
-		}
-	}
-	for _, scope := range []*serialScope{nil, {strings.Repeat("a", 64), 0}, {strings.Repeat("A", 64), 1}, {strings.Repeat("a", 64), maxScopeEpoch + 1}} {
-		if _, e := scope.key(); e == nil {
-			t.Fatal(scope)
 		}
 	}
 	m := testManager(t)
@@ -368,9 +238,8 @@ func TestSerialV2AsynchronousCleanupFailureFencesWithoutPoll(t *testing.T) {
 		return delayedFailCloseBoundary{b, release}, e
 	}
 	c, done, base := serialExecPair(t, m)
-	req := scopedRequest()
+	req := sleepRequest()
 	req.Argv = []string{"true"}
-	req.Scope = &serialScope{strings.Repeat("a", 64), 1}
 	v2Send(t, c, base, 1, req)
 	r := v2Read(t, c)
 	if r.Response.Error != nil {
@@ -414,7 +283,7 @@ func TestSerialV2CLIRejectsUnsafeModesBeforeContainment(t *testing.T) {
 	}
 }
 
-func TestSerialV2InfoAdvertisesOnlyScopedExecution(t *testing.T) {
+func TestSerialV2InfoAdvertisesExecution(t *testing.T) {
 	m := testManager(t)
 	c, done, base := serialExecPair(t, m)
 	v2Send(t, c, base, 1, request{ID: "info", Method: "info"})
@@ -434,21 +303,10 @@ func TestSerialV2InfoAdvertisesOnlyScopedExecution(t *testing.T) {
 			t.Fatal(k, caps)
 		}
 	}
-	if value["transport_max_scopes"] != float64(1024) || value["transport_heartbeat_timeout_ms"] != float64(2000) {
+	if value["transport_heartbeat_timeout_ms"] != float64(2000) {
 		t.Fatal(value)
 	}
 	c.Close()
-	serialEnded(t, done)
-}
-func TestSerialV1RejectsNewScope(t *testing.T) {
-	c, done := serialPair(t)
-	r := serialHost(t, c)
-	r.Type = "request"
-	r.Sequence = 1
-	r.Request = &request{ID: "info", Method: "info", Scope: &serialScope{strings.Repeat("a", 64), 1}}
-	if err := serialWrite(c, r); err != nil {
-		t.Fatal(err)
-	}
 	serialEnded(t, done)
 }
 
@@ -501,46 +359,32 @@ func TestSerialExecInteropProcess(t *testing.T) {
 }
 
 func TestSerialV2RejectsSecondOccupiedOperationLane(t *testing.T) {
-	for _, lane := range []string{"ordinary", "revoke"} {
-		t.Run(lane, func(t *testing.T) {
-			m := testManager(t)
-			entered, release := make(chan struct{}), make(chan struct{})
-			var once sync.Once
-			t.Cleanup(func() { once.Do(func() { close(release) }) })
-			m.boundary = func(c *exec.Cmd) (jobBoundary, error) { close(entered); <-release; return legacyBoundary(c) }
-			c, done, base := serialExecPair(t, m)
-			scope := &serialScope{strings.Repeat("a", 64), 1}
-			req := scopedRequest()
-			req.Scope = scope
-			v2Send(t, c, base, 1, req)
-			<-entered
-			if lane == "ordinary" {
-				v2Send(t, c, base, 2, request{ID: "info", Method: "info"})
-			} else {
-				v2Send(t, c, base, 2, request{ID: "revoke1", Method: "scope_revoke", Scope: scope})
-				key, _ := scope.key()
-				scopeWait(t, m, key, func(s *commandScopeState) bool { return s.retired })
-				v2Send(t, c, base, 3, request{ID: "revoke2", Method: "scope_revoke", Scope: scope})
-			}
-			until := time.Now().Add(time.Second)
-			fenced := false
-			for time.Now().Before(until) {
-				m.mu.Lock()
-				fenced = m.stopping
-				m.mu.Unlock()
-				if fenced {
-					break
-				}
-				time.Sleep(time.Millisecond)
-			}
-			once.Do(func() { close(release) })
-			if !fenced {
-				t.Fatal("second occupied lane was not fenced")
-			}
-			serialEnded(t, done)
-			if !m.stopAll(time.Second) {
-				t.Fatal("real pending command did not clean")
-			}
-		})
+	m := testManager(t)
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+	m.boundary = func(c *exec.Cmd) (jobBoundary, error) { close(entered); <-release; return legacyBoundary(c) }
+	c, done, base := serialExecPair(t, m)
+	v2Send(t, c, base, 1, sleepRequest())
+	<-entered
+	v2Send(t, c, base, 2, request{ID: "info", Method: "info"})
+	until := time.Now().Add(time.Second)
+	fenced := false
+	for time.Now().Before(until) {
+		m.mu.Lock()
+		fenced = m.stopping
+		m.mu.Unlock()
+		if fenced {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	once.Do(func() { close(release) })
+	if !fenced {
+		t.Fatal("second occupied lane was not fenced")
+	}
+	serialEnded(t, done)
+	if !m.stopAll(time.Second) {
+		t.Fatal("real pending command did not clean")
 	}
 }

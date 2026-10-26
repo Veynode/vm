@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link, createFileRoute, useNavigate, useRouter } from '@tanstack/react-router'
-import { containerAction, containerLogs, execInContainer, inspectContainer, openDesktop } from '../api'
+import { closeDesktop, containerAction, containerLogs, execInContainer, inspectContainer, openDesktop } from '../api'
 import { StatusBadge, useAction, usePoll, words } from '../ui'
 
 export const Route = createFileRoute('/containers/$id')({
@@ -23,7 +23,10 @@ function Detail() {
     if (act === 'rm') await navigate({ to: '/' })
     else await router.invalidate()
   })
+  // macOS containers always have a display; the browser desktop covers Linux only.
+  const macos = c.os === 'darwin'
   const desktop = useAction(() => openDesktop({ data: c.id }))
+  const closeWindow = useAction(() => closeDesktop({ data: c.id }))
   const logRef = useRef<HTMLPreElement>(null)
   useEffect(() => {
     const el = logRef.current
@@ -47,8 +50,21 @@ function Detail() {
           <div className="muted mono">{c.id} · {c.image}</div>
         </div>
         <div className="row">
-          {c.desktop && up && (
-            <button disabled={desktop.pending} onClick={() => desktop.run()}>Open desktop window</button>
+          {up && (
+            <Link className="button" to="/terminal/$id" params={{ id: c.name }}>
+              Terminal
+            </Link>
+          )}
+          {(c.desktop || macos) && up && (
+            <>
+              {!macos && (
+                <Link className="button primary" to="/desktop/$id" params={{ id: c.name }} search={{ codec: 'hevc' }}>
+                  Open desktop in browser
+                </Link>
+              )}
+              <button disabled={desktop.pending} onClick={() => desktop.run()}>Native window</button>
+              <button disabled={closeWindow.pending} onClick={() => closeWindow.run()}>Close window</button>
+            </>
           )}
           {up ? (
             <button disabled={action.pending} onClick={() => action.run('stop')}>Stop</button>
@@ -60,7 +76,9 @@ function Detail() {
           </button>
         </div>
       </div>
-      {(action.error || desktop.error) && <p className="error">{action.error || desktop.error}</p>}
+      {(action.error || desktop.error || closeWindow.error) && (
+        <p className="error">{action.error || desktop.error || closeWindow.error}</p>
+      )}
       {info.errors?.length > 0 && <p className="error">{info.errors.join('\n')}</p>}
       <div className="grid2">
         <section className="panel">

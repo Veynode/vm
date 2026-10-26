@@ -1,4 +1,6 @@
-//! Host ownership bookkeeping for opaque guest jobs; no command bodies or output retained.
+//! Host bookkeeping for opaque guest jobs; no command bodies or output retained.
+//! The owner is the MCP session that started a job, so ending that session can
+//! cancel what it left running.
 use anyhow::{bail, Result};
 use std::{
     collections::BTreeMap,
@@ -10,7 +12,6 @@ pub struct Job {
     pub vm: String,
     pub id: String,
     pub owner: String,
-    pub epoch: u64,
     created: Instant,
     finished: bool,
 }
@@ -19,7 +20,6 @@ pub struct Jobs {
     entries: BTreeMap<(String, String), Job>,
     reservations: usize,
 }
-// Used by both daemon ownership records and the MCP adapter's original epochs.
 // Only observed terminal jobs are eligible; cancellation acknowledgements are not terminal.
 pub(crate) fn make_room<T>(
     entries: &mut BTreeMap<(String, String), T>,
@@ -45,7 +45,6 @@ pub(crate) fn make_room<T>(
     true
 }
 // TTL is a result-retention policy, never evidence that an unobserved job ended.
-// Keep the same rule in the daemon and the MCP original-epoch cache.
 pub(crate) fn prune_terminal<T>(
     entries: &mut BTreeMap<(String, String), T>,
     now: Instant,
@@ -86,25 +85,13 @@ impl Jobs {
             active: true,
         })
     }
-    pub fn owned(
-        &mut self,
-        vm: &str,
-        id: &str,
-        owner: &str,
-        epoch: u64,
-        now: Instant,
-    ) -> Result<Job> {
+    pub fn known(&mut self, vm: &str, id: &str, now: Instant) -> Result<Job> {
         validate_job_id(id)?;
         self.prune(now);
         let job = self
             .entries
             .get(&(vm.into(), id.into()))
-            .filter(|job| job.owner == owner && job.epoch == epoch)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "job is unknown, expired or not owned by this client and lease epoch"
-                )
-            })?;
+            .ok_or_else(|| anyhow::anyhow!("job is unknown or expired on this VM"))?;
         Ok(job.clone())
     }
     pub fn finish(&mut self, vm: &str, id: &str) {
@@ -112,6 +99,7 @@ impl Jobs {
             job.finished = true
         }
     }
+    #[cfg(test)]
     pub fn running(&mut self, vm: &str, now: Instant) -> Vec<Job> {
         self.prune(now);
         self.entries
@@ -137,14 +125,7 @@ pub struct Reservation {
     active: bool,
 }
 impl Reservation {
-    pub fn register(
-        mut self,
-        vm: &str,
-        id: &str,
-        owner: &str,
-        epoch: u64,
-        now: Instant,
-    ) -> Result<()> {
+    pub fn register(mut self, vm: &str, id: &str, owner: &str, now: Instant) -> Result<()> {
         validate_job_id(id)?;
         let mut table = self.table.lock().unwrap();
         let key = (vm.into(), id.into());
@@ -157,7 +138,6 @@ impl Reservation {
                 vm: vm.into(),
                 id: id.into(),
                 owner: owner.into(),
-                epoch,
                 created: now,
                 finished: false,
             },
@@ -178,40 +158,39 @@ impl Drop for Reservation {
 mod tests {
     use super::*;
     #[test]
-    fn jobs_are_bound_to_vm_owner_and_original_epoch() {
+    fn jobs_are_bound_to_their_vm() {
         let jobs = Arc::new(Mutex::new(Jobs::default()));
         let now = Instant::now();
         let id = "a".repeat(32);
         Jobs::reserve(&jobs, now)
             .unwrap()
-            .register("vm", &id, "owner", 4, now)
+            .register("vm", &id, "owner", now)
             .unwrap();
         let mut table = jobs.lock().unwrap();
-        assert!(table.owned("vm", &id, "owner", 4, now).is_ok());
-        assert!(table.owned("other-vm", &id, "owner", 4, now).is_err());
-        assert!(table.owned("vm", &id, "other-owner", 4, now).is_err());
-        assert!(table.owned("vm", &id, "owner", 5, now).is_err());
+        assert!(table.known("vm", &id, now).is_ok());
+        assert!(table.known("other-vm", &id, now).is_err());
+        assert!(table.known("vm", &"b".repeat(32), now).is_err());
         assert!(
             table
-                .owned("vm", &id, "owner", 4, now + Duration::from_secs(331))
+                .known("vm", &id, now + Duration::from_secs(331))
                 .is_ok(),
             "elapsed time cannot erase an unresolved cleanup obligation"
         );
     }
     #[test]
-    fn finished_jobs_are_not_cancelled_by_takeover() {
+    fn finished_jobs_are_not_running() {
         let jobs = Arc::new(Mutex::new(Jobs::default()));
         let now = Instant::now();
         let id = "a".repeat(32);
         Jobs::reserve(&jobs, now)
             .unwrap()
-            .register("vm", &id, "owner", 1, now)
+            .register("vm", &id, "owner", now)
             .unwrap();
         let mut table = jobs.lock().unwrap();
         assert_eq!(table.running("vm", now).len(), 1);
         table.finish("vm", &id);
         assert!(table.running("vm", now).is_empty());
-        assert!(table.owned("vm", &id, "owner", 1, now).is_ok());
+        assert!(table.known("vm", &id, now).is_ok());
     }
     #[test]
     fn in_flight_jobs_reserve_bounded_capacity_and_release_on_failure() {
@@ -233,7 +212,7 @@ mod tests {
             let created = now + Duration::from_millis(i);
             Jobs::reserve(&jobs, created)
                 .unwrap()
-                .register("vm", &format!("{i:032x}"), "owner", 1, created)
+                .register("vm", &format!("{i:032x}"), "owner", created)
                 .unwrap();
         }
         let now = now + Duration::from_secs(1);
@@ -245,15 +224,9 @@ mod tests {
         let first = Jobs::reserve(&jobs, now).unwrap();
         {
             let mut table = jobs.lock().unwrap();
-            assert!(table
-                .owned("vm", &format!("{:032x}", 10), "owner", 1, now)
-                .is_err());
-            assert!(table
-                .owned("vm", &format!("{:032x}", 30), "owner", 1, now)
-                .is_ok());
-            assert!(table
-                .owned("vm", &format!("{:032x}", 0), "owner", 1, now)
-                .is_ok());
+            assert!(table.known("vm", &format!("{:032x}", 10), now).is_err());
+            assert!(table.known("vm", &format!("{:032x}", 30), now).is_ok());
+            assert!(table.known("vm", &format!("{:032x}", 0), now).is_ok());
         }
         let second = Jobs::reserve(&jobs, now).unwrap();
         assert!(Jobs::reserve(&jobs, now).is_err());
@@ -261,9 +234,7 @@ mod tests {
             let mut table = jobs.lock().unwrap();
             assert_eq!(table.reservations, 2);
             assert_eq!(table.running("vm", now).len(), 254);
-            assert!(table
-                .owned("vm", &format!("{:032x}", 30), "owner", 1, now)
-                .is_err());
+            assert!(table.known("vm", &format!("{:032x}", 30), now).is_err());
         }
         drop(first);
         drop(second);
@@ -288,13 +259,10 @@ mod tests {
     fn unresolved_jobs_survive_ttl_for_owner_and_vm_cleanup_until_terminal_proof() {
         let jobs = Arc::new(Mutex::new(Jobs::default()));
         let now = Instant::now();
-        for (id, owner, epoch) in [
-            ("a".repeat(32), "owner-a", 1),
-            ("b".repeat(32), "owner-b", 9),
-        ] {
+        for (id, owner) in [("a".repeat(32), "owner-a"), ("b".repeat(32), "owner-b")] {
             Jobs::reserve(&jobs, now)
                 .unwrap()
-                .register("vm", &id, owner, epoch, now)
+                .register("vm", &id, owner, now)
                 .unwrap();
         }
         let later = now + Duration::from_secs(86400);
@@ -302,25 +270,21 @@ mod tests {
         assert_eq!(table.running("vm", later).len(), 2);
         let old = table.owned_running("owner-a", None, later);
         assert_eq!(old.len(), 1);
-        assert_eq!(old[0].epoch, 1);
-        assert!(table
-            .owned("vm", &"a".repeat(32), "owner-b", 9, later)
-            .is_err());
+        assert_eq!(old[0].id, "a".repeat(32));
+        assert!(table.known("vm", &"a".repeat(32), later).is_ok());
         table.finish("vm", &"a".repeat(32));
         assert!(table.owned_running("owner-a", None, later).is_empty());
         assert_eq!(table.owned_running("owner-b", None, later).len(), 1);
-        assert!(table
-            .owned("vm", &"a".repeat(32), "owner-a", 1, later)
-            .is_err());
+        assert!(table.known("vm", &"a".repeat(32), later).is_err());
     }
     #[test]
-    fn capacity_never_discards_expired_unresolved_jobs_or_original_epochs() {
+    fn capacity_never_discards_expired_unresolved_jobs() {
         let jobs = Arc::new(Mutex::new(Jobs::default()));
         let now = Instant::now();
         for i in 0..256 {
             Jobs::reserve(&jobs, now)
                 .unwrap()
-                .register("vm", &format!("{i:032x}"), "owner", i + 1, now)
+                .register("vm", &format!("{i:032x}"), "owner", now)
                 .unwrap();
         }
         let later = now + Duration::from_secs(86400);
@@ -330,11 +294,8 @@ mod tests {
             assert_eq!(table.owned_running("owner", None, later).len(), 256);
             for i in 0..256 {
                 assert_eq!(
-                    table
-                        .owned("vm", &format!("{i:032x}"), "owner", i + 1, later)
-                        .unwrap()
-                        .epoch,
-                    i + 1
+                    table.known("vm", &format!("{i:032x}"), later).unwrap().id,
+                    format!("{i:032x}")
                 )
             }
             table.finish("vm", &format!("{:032x}", 17));
@@ -345,7 +306,7 @@ mod tests {
         drop(reservation);
     }
     #[test]
-    fn mcp_epoch_cache_retains_unknown_but_expires_confirmed_terminal() {
+    fn prune_retains_unknown_but_expires_confirmed_terminal() {
         let now = Instant::now();
         let mut entries = BTreeMap::from([
             (("vm".into(), "unknown".into()), (5u64, now, false)),

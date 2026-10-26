@@ -34,13 +34,12 @@ def integer(value):
 def validate_cleanup(reply):
     check(isinstance(reply, dict) and 'error' not in reply, 'cleanup_controller_error')
     v = reply.get('result', {})
-    check(v.get('closed') is True and v.get('retired_owner') is True
-          and v.get('retired_owner_ttl_seconds') == 120, 'cleanup_retirement_missing')
+    check(v.get('closed') is True, 'cleanup_unconfirmed')
+    check(set(v) == {'closed', 'job_cancellation', 'file_cancellation'}, 'unexpected_cleanup_fields')
     jobs = v.get('job_cancellation', {})
     check(type(jobs.get('attempted')) is int and type(jobs.get('unconfirmed_requests')) is int
           and jobs.get('attempted') == 0 and jobs.get('unconfirmed_requests') == 0
           and jobs.get('outcomes') == [], 'unexpected_jobs')
-    check('input_release' not in v, 'unexpected_input_authority')
     files = v.get('file_cancellation', {})
     outcomes = files.get('outcomes')
     check(isinstance(outcomes, list) and integer(files.get('attempted'))

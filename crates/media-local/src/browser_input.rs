@@ -62,7 +62,6 @@ struct Observation {
 }
 struct InputState {
     sequence: u64,
-    epoch: Option<u64>,
     frames: VecDeque<Observation>,
 }
 pub struct SessionInput {
@@ -70,7 +69,6 @@ pub struct SessionInput {
     session_id: String,
     transcript_sha256: String,
     device_public_key: String,
-    owner: String,
     vm_id: String,
     control: SocketIdentity,
     console: SocketIdentity,
@@ -78,7 +76,6 @@ pub struct SessionInput {
     state: Mutex<InputState>,
     closing: AtomicBool,
     cancel: watch::Sender<bool>,
-    end_lock: Mutex<Option<Value>>,
 }
 impl SessionInput {
     /// Call only on explicit control use. Failure must not tear down valid observe-only media.
@@ -114,13 +111,6 @@ impl SessionInput {
         );
         let control = SocketIdentity::read(&state_dir.join("control.sock"))?;
         let console = SocketIdentity::read(&media_console)?;
-        let capabilities = rpc(&control, "capabilities", json!({}), Duration::from_secs(3)).await?;
-        ensure!(
-            capabilities["control_session_fencing"]["retired_owner_ttl_seconds"] == 120
-                && capabilities["control_session_fencing"]["request_dispatch_deadline_seconds"]
-                    == 30,
-            "controller lacks closed-owner retirement fencing; upgrade controller first"
-        );
         let status = rpc(
             &control,
             "status",
@@ -138,18 +128,15 @@ impl SessionInput {
             session_id: session_id.into(),
             transcript_sha256,
             device_public_key,
-            owner: protocol::random32(),
             control,
             console,
             worker_pid,
             state: Mutex::new(InputState {
                 sequence: 0,
-                epoch: None,
                 frames: VecDeque::new(),
             }),
             closing: AtomicBool::new(false),
             cancel,
-            end_lock: Mutex::new(None),
         }))
     }
     /// One action in flight, zero queued actions. A consumed sequence is never retried.
@@ -216,39 +203,7 @@ impl SessionInput {
             expires_at > now()?,
             "control request expired before dispatch"
         );
-        let args = json!({"id":self.vm_id,"owner":self.owner});
         match action {
-            ControlAction::Acquire => {
-                let result = rpc(
-                    &self.control,
-                    "acquire_control",
-                    args,
-                    Duration::from_secs(3),
-                )
-                .await?;
-                let epoch = result["epoch"]
-                    .as_u64()
-                    .filter(|v| *v > 0 && *v <= protocol::MAX_SAFE_INTEGER)
-                    .context("invalid controller lease epoch")?;
-                state.epoch = Some(epoch);
-                Ok(result)
-            }
-            ControlAction::Release { epoch } => {
-                ensure!(state.epoch == Some(*epoch), "lease epoch mismatch");
-                let result = rpc(
-                    &self.control,
-                    "release_control",
-                    json!({"id":self.vm_id,"owner":self.owner,"epoch":epoch}),
-                    Duration::from_secs(4),
-                )
-                .await?;
-                ensure!(
-                    result["released"] == true,
-                    "controller release acknowledgement missing"
-                );
-                state.epoch = None;
-                Ok(result)
-            }
             ControlAction::ObserveFrame => {
                 let result = rpc(
                     &self.control,
@@ -268,11 +223,6 @@ impl SessionInput {
                 Ok(result)
             }
             _ => {
-                let epoch = action.epoch().context("lease epoch required")?;
-                ensure!(
-                    state.epoch == Some(epoch),
-                    "acquire control and use the current lease epoch"
-                );
                 let frame = action.frame().context("screenshot anchor required")?;
                 let observation = state
                     .frames
@@ -289,41 +239,18 @@ impl SessionInput {
                 );
                 let (method, mut args) = input_arguments(action)?;
                 args["id"] = json!(self.vm_id);
-                args["owner"] = json!(self.owner);
-                args["epoch"] = json!(epoch);
                 vm_control::input::plan(method, &args)?;
-                // The daemon rechecks lease epoch and source frame generation at EVERY step.
+                // The daemon rechecks the source frame generation at EVERY step.
                 // QMP acknowledgement remains distinct from actual application acceptance.
                 rpc(&self.control, method, args, Duration::from_secs(8)).await
             }
         }
     }
-    /// Called on media close/revocation/disconnect. Waits for daemon retirement/release
-    /// ACK even when an acquire RPC was cancelled; daemon tombstones reject that race.
-    pub async fn end(&self) -> Result<Value> {
+    /// Called on media close/revocation/disconnect. Cancels any in-flight RPC;
+    /// the daemon releases held input at the end of every input operation.
+    pub fn end(&self) {
         self.closing.store(true, Ordering::Release);
         let _ = self.cancel.send(true);
-        let mut receipt = self.end_lock.lock().await;
-        if let Some(value) = &*receipt {
-            return Ok(value.clone());
-        };
-        let reply = rpc(
-            &self.control,
-            "session_end",
-            json!({"owner":self.owner}),
-            Duration::from_secs(5),
-        )
-        .await?;
-        ensure!(
-            reply["closed"] == true
-                && reply["retired_owner"] == true
-                && reply["retired_owner_ttl_seconds"] == 120
-                && reply["released_vm_ids"].is_array(),
-            "controller session-end acknowledgement missing"
-        );
-        let result = json!({"lease_release_confirmed":true,"retired_owner":true,"input_cleanup":"daemon safety release may still be completing; this is not a Guest application acknowledgement"});
-        *receipt = Some(result.clone());
-        Ok(result)
     }
 }
 fn validate_status(
@@ -371,7 +298,6 @@ fn frame_from_screenshot(value: &Value) -> Result<FrameAnchor> {
         sequence: 1,
         expires_at: 0,
         action: ControlAction::Key {
-            epoch: 1,
             frame: frame.clone(),
             keys: vec!["a".into()],
         },
@@ -463,32 +389,6 @@ async fn rpc(
 impl Drop for SessionInput {
     fn drop(&mut self) {
         let _ = self.cancel.send(true);
-        if self
-            .end_lock
-            .try_lock()
-            .is_ok_and(|receipt| receipt.is_some())
-        {
-            return;
-        }
-        // Explicit end() is the awaited path. Unexpected owner drop only schedules
-        // best-effort cleanup; process/runtime loss still leaves the 60s lease bound.
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            let control = self.control.clone();
-            let owner = self.owner.clone();
-            runtime.spawn(async move {
-                if rpc(
-                    &control,
-                    "session_end",
-                    json!({"owner":owner}),
-                    Duration::from_secs(5),
-                )
-                .await
-                .is_err()
-                {
-                    eprintln!("browser input owner drop: controller cleanup unconfirmed");
-                }
-            });
-        }
     }
 }
 

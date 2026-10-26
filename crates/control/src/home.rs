@@ -54,6 +54,10 @@ pub fn images_dir() -> Result<PathBuf> {
 pub fn containers_dir() -> Result<PathBuf> {
     private_dir(&private_dir(&root()?)?.join("containers"))
 }
+/// Full-distribution machines (UEFI boot, installer ISO, persistent disk).
+pub fn machines_dir() -> Result<PathBuf> {
+    private_dir(&private_dir(&root()?)?.join("machines"))
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -108,6 +112,17 @@ pub struct Runtime {
     /// Web UI Node host (`web/server.mjs`, next to its built `dist/`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web: Option<PathBuf>,
+    /// Host encoder for Apple Virtualization Linux browser desktops
+    /// (`native/tools/guest-video-stream.m`: guest NV12 -> VideoToolbox).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vz_desktop_stream: Option<PathBuf>,
+    /// Host text recognition for `vm_screen_text` (`native/tools/vm-vision.swift`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<PathBuf>,
+    /// Desktop and accessibility helper that macOS containers run over SSH
+    /// (`native/tools/vm-macos-desktop.swift`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub macos_desktop: Option<PathBuf>,
 }
 
 impl Runtime {
@@ -166,6 +181,9 @@ impl Runtime {
             }
         }
         paths.extend(self.web.as_deref());
+        paths.extend(self.vz_desktop_stream.as_deref());
+        paths.extend(self.vision.as_deref());
+        paths.extend(self.macos_desktop.as_deref());
         for p in paths {
             if !p.is_absolute() {
                 bail!("runtime paths must be absolute: {}", p.display())

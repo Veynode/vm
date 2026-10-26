@@ -145,7 +145,7 @@ func serveSerial(s deadlineStream) error {
 		}
 		r := e.Request
 		// Exact observer request; never route other methods to handle().
-		if r.Scope != nil || r.Method != "info" || r.ID == "" || len(r.ID) > 128 || len(r.Argv) != 0 || r.TimeoutMS != 0 || r.JobID != "" || r.Owner != "" || r.Path != "" || r.Token != "" || r.Data != "" || r.Size != 0 || r.Offset != 0 || r.SHA256 != "" {
+		if r.Method != "info" || r.ID == "" || len(r.ID) > 128 || len(r.Argv) != 0 || r.TimeoutMS != 0 || r.JobID != "" || r.Owner != "" || r.Path != "" || r.Token != "" || r.Data != "" || r.Size != 0 || r.Offset != 0 || r.SHA256 != "" {
 			return fmt.Errorf("serial observer request rejected")
 		}
 		reply := handle(*r, false, false)

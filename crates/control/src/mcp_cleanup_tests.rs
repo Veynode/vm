@@ -1,20 +1,17 @@
 use super::*;
 
 fn clean() -> Value {
-    json!({"closed":true,"retired_owner":true,
+    json!({"closed":true,
         "job_cancellation":{"attempted":1,"unconfirmed_requests":0,"outcomes":[{"result":{"result":{"cancel_requested":true}}}]},
-        "file_cancellation":{"attempted":1,"unconfirmed_requests":0,"outcomes":[{"result":{"result":{"cancelled_transfers":2}}}]},
-        "input_release":{"confirmed":true}})
+        "file_cancellation":{"attempted":1,"unconfirmed_requests":0,"outcomes":[{"result":{"result":{"cancelled_transfers":2}}}]}})
 }
 
 #[test]
-fn cleanup_requires_explicit_retirement_and_typed_guest_outcomes() {
+fn cleanup_requires_closed_session_and_typed_guest_outcomes() {
     assert!(validate_session_cleanup(&clean()).is_ok());
-    for pointer in ["/closed", "/retired_owner", "/input_release/confirmed"] {
-        let mut result = clean();
-        *result.pointer_mut(pointer).unwrap() = json!(false);
-        assert!(validate_session_cleanup(&result).is_err());
-    }
+    let mut result = clean();
+    result["closed"] = json!(false);
+    assert!(validate_session_cleanup(&result).is_err());
     for key in ["job_cancellation", "file_cancellation"] {
         for mutation in ["missing", "error", "count", "unconfirmed", "malformed"] {
             let mut result = clean();

@@ -43,20 +43,14 @@ pub enum ControlAction {
     File {
         operation: super::files::FileAction,
     },
-    Acquire,
-    Release {
-        epoch: u64,
-    },
     ObserveFrame,
     Click {
-        epoch: u64,
         frame: FrameAnchor,
         x: u64,
         y: u64,
         button: String,
     },
     Drag {
-        epoch: u64,
         frame: FrameAnchor,
         x: u64,
         y: u64,
@@ -65,7 +59,6 @@ pub enum ControlAction {
         button: String,
     },
     Scroll {
-        epoch: u64,
         frame: FrameAnchor,
         x: u64,
         y: u64,
@@ -73,7 +66,6 @@ pub enum ControlAction {
         ticks: u64,
     },
     Key {
-        epoch: u64,
         frame: FrameAnchor,
         keys: Vec<String>,
     },
@@ -97,43 +89,20 @@ impl ControlAction {
             _ => None,
         }
     }
-    pub fn epoch(&self) -> Option<u64> {
-        match self {
-            Self::Release { epoch }
-            | Self::Click { epoch, .. }
-            | Self::Drag { epoch, .. }
-            | Self::Scroll { epoch, .. }
-            | Self::Key { epoch, .. } => Some(*epoch),
-            _ => None,
-        }
-    }
     fn fields(&self, c: &mut Canon) -> Result<()> {
-        if let Some(epoch) = self.epoch() {
-            ensure!(
-                (1..=MAX_SAFE_INTEGER).contains(&epoch),
-                "invalid lease epoch"
-            )
-        };
         match self {
             Self::File { operation } => {
                 c.text("file");
                 operation.fields(c)?;
             }
-            Self::Acquire => c.text("acquire"),
             Self::ObserveFrame => c.text("observe_frame"),
-            Self::Release { epoch } => {
-                c.text("release");
-                c.int(*epoch)
-            }
             Self::Click {
-                epoch,
                 frame,
                 x,
                 y,
                 button,
             } => {
                 c.text("click");
-                c.int(*epoch);
                 frame.fields(c)?;
                 point(frame, *x, *y)?;
                 valid_button(button)?;
@@ -142,7 +111,6 @@ impl ControlAction {
                 c.text(button)
             }
             Self::Drag {
-                epoch,
                 frame,
                 x,
                 y,
@@ -151,7 +119,6 @@ impl ControlAction {
                 button,
             } => {
                 c.text("drag");
-                c.int(*epoch);
                 frame.fields(c)?;
                 point(frame, *x, *y)?;
                 point(frame, *end_x, *end_y)?;
@@ -163,7 +130,6 @@ impl ControlAction {
                 c.text(button)
             }
             Self::Scroll {
-                epoch,
                 frame,
                 x,
                 y,
@@ -171,7 +137,6 @@ impl ControlAction {
                 ticks,
             } => {
                 c.text("scroll");
-                c.int(*epoch);
                 frame.fields(c)?;
                 point(frame, *x, *y)?;
                 ensure!(
@@ -184,9 +149,8 @@ impl ControlAction {
                 c.text(direction);
                 c.int(*ticks)
             }
-            Self::Key { epoch, frame, keys } => {
+            Self::Key { frame, keys } => {
                 c.text("key");
-                c.int(*epoch);
                 frame.fields(c)?;
                 ensure!(!keys.is_empty() && keys.len() <= 8, "invalid key count");
                 for (i, key) in keys.iter().enumerate() {

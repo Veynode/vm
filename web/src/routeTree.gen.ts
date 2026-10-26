@@ -15,6 +15,8 @@ import { Route as ImagesRouteImport } from './routes/images'
 import { Route as McpRouteImport } from './routes/mcp'
 import { Route as RunRouteImport } from './routes/run'
 import { Route as ContainersIdRouteImport } from './routes/containers.$id'
+import { Route as DesktopIdRouteImport } from './routes/desktop.$id'
+import { Route as TerminalIdRouteImport } from './routes/terminal.$id'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -46,6 +48,16 @@ const ContainersIdRoute = ContainersIdRouteImport.update({
   path: '/containers/$id',
   getParentRoute: () => rootRouteImport,
 } as any)
+const DesktopIdRoute = DesktopIdRouteImport.update({
+  id: '/desktop/$id',
+  path: '/desktop/$id',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const TerminalIdRoute = TerminalIdRouteImport.update({
+  id: '/terminal/$id',
+  path: '/terminal/$id',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -54,6 +66,8 @@ export interface FileRoutesByFullPath {
   '/mcp': typeof McpRoute
   '/run': typeof RunRoute
   '/containers/$id': typeof ContainersIdRoute
+  '/desktop/$id': typeof DesktopIdRoute
+  '/terminal/$id': typeof TerminalIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -62,6 +76,8 @@ export interface FileRoutesByTo {
   '/mcp': typeof McpRoute
   '/run': typeof RunRoute
   '/containers/$id': typeof ContainersIdRoute
+  '/desktop/$id': typeof DesktopIdRoute
+  '/terminal/$id': typeof TerminalIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -71,12 +87,30 @@ export interface FileRoutesById {
   '/mcp': typeof McpRoute
   '/run': typeof RunRoute
   '/containers/$id': typeof ContainersIdRoute
+  '/desktop/$id': typeof DesktopIdRoute
+  '/terminal/$id': typeof TerminalIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/engine' | '/images' | '/mcp' | '/run' | '/containers/$id'
+  fullPaths:
+    | '/'
+    | '/engine'
+    | '/images'
+    | '/mcp'
+    | '/run'
+    | '/containers/$id'
+    | '/desktop/$id'
+    | '/terminal/$id'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/engine' | '/images' | '/mcp' | '/run' | '/containers/$id'
+  to:
+    | '/'
+    | '/engine'
+    | '/images'
+    | '/mcp'
+    | '/run'
+    | '/containers/$id'
+    | '/desktop/$id'
+    | '/terminal/$id'
   id:
     | '__root__'
     | '/'
@@ -85,6 +119,8 @@ export interface FileRouteTypes {
     | '/mcp'
     | '/run'
     | '/containers/$id'
+    | '/desktop/$id'
+    | '/terminal/$id'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -94,6 +130,8 @@ export interface RootRouteChildren {
   McpRoute: typeof McpRoute
   RunRoute: typeof RunRoute
   ContainersIdRoute: typeof ContainersIdRoute
+  DesktopIdRoute: typeof DesktopIdRoute
+  TerminalIdRoute: typeof TerminalIdRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -140,6 +178,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ContainersIdRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/desktop/$id': {
+      id: '/desktop/$id'
+      path: '/desktop/$id'
+      fullPath: '/desktop/$id'
+      preLoaderRoute: typeof DesktopIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/terminal/$id': {
+      id: '/terminal/$id'
+      path: '/terminal/$id'
+      fullPath: '/terminal/$id'
+      preLoaderRoute: typeof TerminalIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
@@ -150,6 +202,8 @@ const rootRouteChildren: RootRouteChildren = {
   McpRoute: McpRoute,
   RunRoute: RunRoute,
   ContainersIdRoute: ContainersIdRoute,
+  DesktopIdRoute: DesktopIdRoute,
+  TerminalIdRoute: TerminalIdRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

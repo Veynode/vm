@@ -18,8 +18,8 @@ cargo build --bins
 Run the daemon independently of the MCP client and management window. The MCP
 adapter defaults to observe only. `--allow-lifecycle` adds start, shutdown,
 force-stop, console visibility and local configuration registration.
-`--allow-execute` separately adds commands and control leases.
-Desktop input is separately enabled with `--allow-input` on QEMU persistent capture; accessibility remains unsupported. `vm_screenshot` requires registered QEMU capture or an opted-in macOS Guest observation service with existing Guest Screen Recording permission; Apple Linux returns unsupported. Independent
+`--allow-execute` separately adds commands.
+Desktop input is separately enabled with `--allow-input` on QEMU persistent capture, Apple Virtualization Linux desktop containers and macOS Guests; accessibility remains unsupported. `vm_screenshot` requires registered QEMU capture, an Apple Virtualization Linux desktop container (`--desktop`) or a macOS Guest observation service; `vm_screen_wait` and `vm_screen_text` work wherever screenshots do. Independent
 `--allow-files` enables bounded transfer tools only when Guest files integration
 is explicitly configured. Linux uses a dedicated files account; macOS requires
 Guest `--allow-files --files-root /absolute/private/directory` and uses the service
@@ -34,8 +34,8 @@ socket/registry 0600; flock prevents two daemons owning one registry. This is a
 same-user Unix socket trust boundary, not isolation from other processes running
 as that macOS user. Local CLI/API can reference that user's files.
 
-Each VM has a separate native subprocess. MCP EOF releases its control leases,
-not its VMs. Closing the native window preserves the VM. Daemon death closes the
+Each VM has a separate native subprocess. MCP EOF ends that session's async jobs
+and file sessions, not its VMs. Closing the native window preserves the VM. Daemon death closes the
 native subprocess control pipe; native shutdown policy applies. Restart does not
 silently resume VMs. Concurrent active VMs cannot attach the same writable disk device/inode in one
 daemon, including hard-link aliases. The daemon stores the identity at start so
@@ -46,7 +46,7 @@ Normal shutdown supports `vm_shutdown {"id":"...","mode":"backend"}` (default)
 and `mode:"guest"`. Backend mode requests the framework's virtual power button;
 the guest may ignore it. Guest mode sends the dedicated shutdown operation over
 vsock to an installed Linux service started with shutdown explicitly enabled.
-It uses lifecycle permission, not command-execution permission or a control lease.
+It uses lifecycle permission, not command-execution permission.
 Both report request acceptance only: poll status for `stopped`. Neither mode
 silently escalates to force-stop. The validation initramfs is not an installed OS
 shutdown acceptance fixture.
@@ -71,34 +71,21 @@ The value must be positive and no greater than physical host memory; it may
 intentionally reduce the default host reserve. Remote MCP cannot alter it.
 The override applies to that daemon invocation and is not persisted in VM configs.
 
-## Control ownership
+## MCP sessions
 
-Before `vm_exec`, call `vm_acquire_control` with the VM id. Each MCP connection gets
-an internal random owner token. Leases last 60 seconds; repeat acquire to renew.
-`vm_release_control` releases it; clean MCP EOF also releases it. Abruptly killed
-MCP clients lose access at expiry. Owner tokens and epoch are injected by the
-adapter and cannot be supplied in MCP tool arguments.
-
-The local human can execute:
-
-```sh
-./target/debug/vm-control call --state-dir /absolute/private/state human_takeover '{"id":"linux-agent"}'
-./target/debug/vm-control call --state-dir /absolute/private/state human_release '{"id":"linux-agent"}'
-```
-
-Takeover increments the server epoch, rejects subsequent commands by the old
-holder and blocks new acquisitions until human release. It cannot retract a
-command's completed side effects. Both synchronous commands and explicit async
-jobs use registered Guest jobs with best-effort process-group cancellation as
-described below.
-There is no native UI takeover button yet.
+Each MCP connection gets an internal random owner token, its session id. The
+adapter injects it and it cannot be supplied in MCP tool arguments. There is no
+control lease: any caller with input permission and a recent matching screenshot
+can send desktop input, and any caller with execute permission can run commands.
+When the session ends, the adapter sends `session_end {"owner":...}`, which
+cancels that session's unfinished async jobs and file sessions and replies
+`{"closed":true,"job_cancellation":{...},"file_cancellation":{...}}`.
 
 ## Bounded asynchronous commands
 
 Execute-enabled MCP connections expose `vm_exec_start`, `vm_exec_poll` and
 `vm_exec_cancel`. Start takes the same argv and 1–30000 ms timeout as synchronous
-`vm_exec`, and requires current VM control. Its text result retains the Guest
-protocol wrapper:
+`vm_exec`. Its text result retains the Guest protocol wrapper:
 
 ```json
 {"id":"native-request-id","result":{"job_id":"32-lowercase-hex-characters","state":"running"}}
@@ -108,47 +95,38 @@ Poll returns `result.state` (`running` or `finished`) and, when finished,
 `result.result` with exit code, stdout/stderr, truncation flags, timeout and
 cancellation flags; internal failures instead appear as `result.error`. A poll
 reply does not mean the command succeeded: inspect the terminal result. Cancel
-returns `result.cancel_requested`; it is not rollback or proof of termination.
-Poll again to establish the actual terminal state, including completion races.
+kills the command's process group in the Guest and returns
+`result.cancel_requested`; it is not rollback. Poll again to establish the
+actual terminal state, including completion races.
 
-Jobs bind to VM id, this MCP connection's random owner and the lease epoch at
-start. Other connections cannot poll or cancel them even if they know a job id or
-later obtain VM control. This connection may still poll/cancel its previously
-authorized jobs after its lease is revoked; that grants no authority to start new
-commands. The adapter remembers original job epochs, so later lease renewal does
-not accidentally change job ownership. Synchronous `vm_exec` internally uses
+The command runs under a Guest-side timeout; the Guest kills its process group
+when the timeout expires, when it is cancelled, or when the MCP session that
+started it ends. Jobs are keyed by VM id and job id: `exec_poll` and
+`exec_cancel` take `{id, job_id}` and fail with "job is unknown or expired on
+this VM" for unknown jobs. Synchronous `vm_exec` internally uses
 `exec_start`/`exec_poll`/`exec_cancel` and preserves its existing terminal result
 wrapper; it requires these Guest capabilities and never silently falls back to
-legacy uncancellable execution. Host ownership metadata is capped at 256
-jobs including in-flight starts, contains no command bodies/output, and expires
-330 seconds after registration. At capacity, the daemon and adapter evict the
-oldest registered record known to have finished before rejecting a new start.
-Completed results can therefore expire earlier; active jobs and in-flight start
-reservations are never evicted for capacity. Cancellation acknowledgements alone
-do not mark a job finished. A restarted VM clears its job ownership records.
-Guest-side retention and execution limits may reject or expire jobs sooner.
+legacy uncancellable execution. Host job metadata is capped at 256 jobs
+including in-flight starts, contains no command bodies/output, and expires
+330 seconds after registration. At capacity, the daemon evicts the oldest
+record known to have finished before rejecting a new start. Completed results
+can therefore expire earlier; active jobs and in-flight start reservations are
+never evicted for capacity. Cancellation acknowledgements alone do not mark a
+job finished. A restarted VM clears its job records. Guest-side retention and
+execution limits may reject or expire jobs sooner.
 
-Local `human_takeover` first revokes the execution epoch, then requests cancellation
-of known unfinished jobs. The response separately reports completed cancellation
-requests, failures and unconfirmed requests after a 12-second reporting deadline.
-A start response arriving after takeover is registered and immediately receives a
-best-effort cancellation request; its response includes `control_revoked` and the
-cancellation outcome. These safeguards cannot undo completed side effects or
-guarantee termination if the Guest integration transport has failed. Guest jobs remain bounded by their original
-timeout. Transport hangup monitoring runs even while synchronous execution is
-waiting, and a scope guard runs on normal MCP EOF and read/write failures: the daemon first
-revokes all that session owner's leases, then requests cancellation of unfinished
-owned jobs. Explicit control release does the same for that VM. HTTPS DELETE and
-expiry close the stdio session even while its tool response is pending and use
-this cleanup. A disconnected direct Unix-socket synchronous caller also requests
-cancellation of its own job. An individual HTTP connection closing does not end
-its authenticated MCP session; use session DELETE or wait for its configured TTL.
-Failures remain best effort;
-SIGKILL of the MCP adapter cannot run a guard, so its lease may last until the
-60-second TTL and its guest command until its original maximum 30-second timeout.
-Async completion/output is not recoverable by a newly created connection. No job
-is automatically resumed. Prefer explicit cancel and terminal polling when
-confirmed termination is required.
+MCP EOF, read/write failures, HTTPS DELETE and session expiry all end the
+session through `session_end`, even while a tool response is pending. A
+disconnected direct Unix-socket synchronous caller also requests cancellation of
+its own job. An individual HTTP connection closing does not end its
+authenticated MCP session; use session DELETE or wait for its configured TTL.
+Cleanup is best effort; SIGKILL of the MCP adapter cannot run it, so its Guest
+commands run until their own timeout (at most 30 seconds). Async
+completion/output is not recoverable by a newly created connection. No job is
+automatically resumed. Prefer explicit cancel and terminal polling when
+confirmed termination is required. On QEMU with `qemu_guest_exec`, shutdown
+stops new commands and gives running Guest execution a 60-second quiesce
+deadline.
 
 ## APFS base images and writable clones
 
@@ -328,7 +306,7 @@ The six tools are `vm_file_upload_begin`, `vm_file_upload_write`,
 `vm_file_upload_commit`, `vm_file_download_begin`, `vm_file_download_read`, and
 `vm_file_cancel`. Consult their MCP input schemas. Every call includes the VM id;
 the adapter injects its random session owner, which the client cannot override.
-Tokens are VM/session-bound. No desktop control lease or execute permission is
+Tokens are VM/session-bound. No execute permission is
 needed for files. Chunk size is32KiB, maximum transfer8MiB, with sequential offsets,
 SHA256, no-overwrite publication and bounded lifetime. Closing the MCP session
 requests file cleanup; Guest deadlines cover unconfirmed cleanup or abrupt host
@@ -402,7 +380,7 @@ returns busy. Screenshot responses are <=3MiB, PNG <=2MiB, worker deadline 15s, 
 wait bound 17s. Shutdown/stop can be processed while capture is pending. Capture
 currently starts a short-lived SPICE consumer: a completely static desktop that
 sends no new draw can fail explicitly. Use the persistent console broker below to
-keep the capture connection from VM startup. Input uses separate current control authorization plus a recent frame observation token; a screenshot alone grants no input permission.
+keep the capture connection from VM startup. Input needs separate input permission plus a recent frame observation token; a screenshot alone grants no input permission.
 The larger response bound applies only to an outstanding screenshot request;
 ordinary replies and all incoming requests remain <=1MiB. Persistent native/broker
 records remain <=4MiB. The full-resolution lossless PNG is never resized to fit;
@@ -428,7 +406,9 @@ release packaging or licensing acceptance. See `archive/docs-evidence/control-qe
 ### Persistent console registration
 
 Register `--qemu-console-broker "$PWD/target/debug/vm-console"` and
-`--qemu-console-helper "$PWD/.local/bin/spice-console"` together to enable the
+`--qemu-console-helper "$PWD/.local/bin/VeynodeQEMUConsole.app/Contents/MacOS/spice-console"`
+(built by `runtime/build-qemu-console.sh`; the headless `.local/bin/spice-console`
+also works but has no native window) together to enable the
 persistent capture owner. These are trusted daemon options. The worker starts
 QEMU paused (`-S`), waits up to12s for the broker's verified capture connection,
 then sends QMP `cont`. Connection readiness does not assert a Guest frame exists.
@@ -467,12 +447,12 @@ script receives the private console socket and output prefix, is limited to180s,
 and is followed by another MCP screenshot and lifecycle checks. A zero exit status
 from the hook does not certify browser decoding; save separate browser evidence.
 
-### Frame-bound physical desktop input (QEMU only)
+### Frame-bound physical desktop input
 
 Start the MCP adapter with **`--allow-input`** or give a HTTPS principal the
 independent **`input`** scope alongside `observe` and an explicit VM allowlist.
-`execute`, `files` and `lifecycle` do not imply input permission. Acquire/renew the
-existing 60-second control lease, take `vm_screenshot`, then copy its `frame_id`,
+`execute`, `files` and `lifecycle` do not imply input permission. Take
+`vm_screenshot`, then copy its `frame_id`,
 `source_generation`, `width` and `height` into the input call alongside `id`:
 
 ```json
@@ -485,20 +465,20 @@ existing 60-second control lease, take `vm_screenshot`, then copy its `frame_id`
 - `vm_input_scroll`: `x`,`y`, `direction` (`up`,`down`,`left`,`right`), 1–20 discrete `ticks`.
 - `vm_input_key`: 1–8 explicit `keys` in the advertised QEMU qcode enum. These are
   physical key positions/chords interpreted by the Guest keyboard layout, **not**
-  Unicode text injection. Presses are followed by releases.
+  Unicode text injection. Presses are followed by releases, 20 ms later by default;
+  optional `hold_ms` (0–900) holds them longer, for games that steer or accelerate
+  only while a key is down. Longer holds are repeated calls.
 
-Input requires the persistent console broker and a screenshot observation younger
+On QEMU, input requires the persistent console broker and a screenshot observation younger
 than 5 seconds. Each worker keeps at most 16 observation metadata records; restarting
 the VM discards them. Static source capture timestamps may be old: expiry uses the
 host's new screenshot observation time without falsifying the original capture time.
-Every step rechecks the daemon's VM/client/epoch lease and queries the native
-capture owner's current generation/dimensions through `frame_status`; unavailable,
+Every step queries the native capture owner's current generation/dimensions through `frame_status`; unavailable,
 changed, foreign and expired frames fail closed. The currently validated mapping is
 single-display Linux Xorg/libinput, physical pixels and default calibration.
 
 Capture validation and QMP injection occur in separate processes and cannot be
-atomic; a resize or takeover can race an **already dispatched** step. Subsequent
-steps are rejected after revocation. Failed/interrupted operations release only
+atomic; a resize can race an **already dispatched** step. Failed/interrupted operations release only
 buttons/keys belonging to their opaque operation token. Concurrent operations are
 rejected while one is active. A worker safety deadline of 4 seconds is checked
 between bounded RPCs; failed QMP cleanup is reported and, on safety-deadline retry
@@ -506,9 +486,8 @@ failure, terminates the worker/VM rather than declaring release success. This do
 not undo clicks already delivered. QMP acknowledgements mean dispatch, not proof
 that an application accepted input. Guest evdev/Xorg acceptance is tested separately.
 
-The local trusted-user Unix daemon can be used for `human_takeover`/`human_release`;
-these are not remote Agent tools. Actual stdio disconnect and human takeover during
-drag release the button and prevent completing the drag. Internet browser input,
+Actual stdio disconnect during a drag releases the button and prevents completing
+the drag. Internet browser input,
 accessibility, Unicode/layout handling, Retina calibration, multiple displays,
 macOS input and Windows input are still unsupported.
 
@@ -519,6 +498,167 @@ QEMU/Alpine prerequisites and the console broker/native helper):
 cargo build -p vm-control --bins
 python3 scripts/test-control-input.py --output .local/evidence/control-input-new.json
 ```
+
+### Browser desktop input (`desktop_input`)
+
+The web UI's browser desktop (`docs/browser-desktop.md`) sends input through the
+local RPC `desktop_input` with exactly `id` and `events` (1–64 of `move`,
+`button`, `wheel`, `key`; `crates/control/src/desktop_input.rs`). On QEMU/HVF
+the worker injects through QMP `input-send-event` and is refused while a
+frame-bound input operation or the native window input is active. On Apple
+Virtualization Linux the daemon only validates the batch and replies `{"inject":"stream"}`; the caller forwards the events over the guest
+desktop stream to the agent's uinput devices. It is not an MCP tool.
+
+### Apple Virtualization Linux desktops
+
+Linux desktop containers (`veynodevm run --desktop` without `--gpus`) need no
+Guest setup for MCP: the guest agent (`--desktop-stream`, set by container-init)
+answers `screenshot`, `screen_wait` and frame-bound input over the host-only
+vsock service (`guest/veynode-agent/observe.go`). Screenshots are PNG of the
+active DRM scanout (JPEG when a busy screen exceeds 700 KiB), with a fresh
+`frame_id` and a `source_generation` that changes with the display geometry; the
+hardware cursor plane is not included. The daemon plans input as for QEMU,
+translates it to evdev codes (`desktop_input::planned_evdev`) and the agent
+checks the frame (≤5 s old, same generation and size as the current scanout)
+and the operation before writing to its uinput keyboard and absolute tablet.
+Cleanup releases what an operation holds. A wheel release has no evdev event and is not
+sent.
+
+### Waiting for screen changes (`vm_screen_wait`)
+
+`vm_screen_wait` (observe) blocks until the screen differs from a baseline, then
+optionally until it has been still for `settle_ms` (0–5000), within
+`timeout_ms` (1–25000, default 10000). The baseline is the screenshot named by
+`frame_id`, so a change that already happened after acting on it counts, or the
+screen when the call starts. It returns `changed`, `settled`, `first_change_ms`,
+`elapsed_ms` and `resized`:
+
+| Backend | Detection | Regions |
+| --- | --- | --- |
+| Apple Virtualization Linux desktop | agent, 64x64 tile hashes every 30 ms | changed areas in screenshot pixels; `region` limits the wait to one area |
+| QEMU/HVF | console `frame_status.source_sequence` (one step per SPICE draw) every 30 ms | none; `region` refused |
+| macOS Guest | screenshot SHA-256 every 250 ms | none; `region` refused |
+
+The daemon remembers the last 16 screenshot anchors per VM for QEMU and macOS
+baselines. A blinking cursor or a clock is a change; use `region` (Linux) or a
+short `settle_ms` window accordingly. Take a new screenshot before input.
+
+### Reading screen text (`vm_screen_text`)
+
+`vm_screen_text` (observe) takes a screenshot and runs the host helper
+`vm-vision` (`native/tools/vm-vision.swift`, Apple Vision text recognition;
+built by `native/tools/build-vm-vision.sh` and registered as `vision` in
+`runtime.json`) on it. It works for every backend with screenshots and needs
+nothing in the Guest. The reply carries the screenshot's `frame_id`,
+`source_generation`, `width` and `height` and `lines` in reading order, each with
+`text`, `confidence` and a box plus center point in screenshot pixels, so a
+recognized word can be clicked with the input tools directly. `find` adds
+`matches`: every case-insensitive occurrence of a string with its own box.
+(`vm-vision row --y Y --from X` is a second mode used by the macOS first-boot
+grant: the runs of pixels along a row that differ from its background, which
+finds the control at the end of a list row.)
+`fast` uses the fast recognizer; `languages` takes up to 8 BCP 47 codes (default
+automatic). The helper reads the screen in overlapping full-width bands, each
+upscaled twice: Vision skips rows of small text on a full desktop and reads
+10–12 px panel text reliably only when upscaled. A warm call takes 0.2–0.6 s;
+the first on a host loads Vision's models and can take tens of seconds (60 s
+limit). Lines beyond the 1 MiB MCP reply are truncated and
+`lines_truncated_from` gives the total.
+
+### Windows and applications (`vm_desktop_state`, `vm_window_action`, …)
+
+Apple Virtualization Linux desktop containers answer four more tools from the
+guest agent, which talks X11 (EWMH) to the container's display :0, so nothing
+is installed in the image. `vm_desktop_state` (observe) returns the screen
+size, cursor, keyboard layout (`_XKB_RULES_NAMES`), workspaces, window manager,
+the focused application and the managed windows top-most first: id, title,
+class, pid and command, type, states (`maximized_vert`, `hidden`,
+`fullscreen`, …), workspace (-1 = all), client geometry and window frame in
+screenshot pixels. `vm_desktop_apps` (observe) lists visible `.desktop`
+entries (system, `/usr/local`, flatpak exports and the session user's own).
+With input permission, `vm_window_action` asks the window
+manager to `activate`, `close`, `minimize`, `maximize`, `unmaximize`,
+`fullscreen`, `unfullscreen` or `move_resize` (`x`, `y` place the client area)
+a window and returns it as left 150 ms later (null once closed);
+`vm_app_launch` starts an entry by id as the desktop session's user, with its
+environment, in a new session (terminal entries in the installed terminal),
+then waits up to 5 s for its new window and activates it: window managers keep
+a window started without a user action from taking focus, so keys would go
+elsewhere.
+QEMU and the opted-in macOS Guest
+service return `unsupported`; `veynodevm` macOS containers answer them too (see
+below).
+
+### Accessibility tree (`vm_accessibility_tree`, `_find`, `_action`)
+
+The same containers expose their AT-SPI accessibility tree. The guest agent
+speaks D-Bus itself (`guest/veynode-agent/dbus.go`, `atspi.go`): it finds the
+desktop's accessibility bus through `org.a11y.Bus` on the session bus (or the
+`AT_SPI_BUS` root window property) and works as the desktop session's user, in
+a helper process when that is not root, since the buses admit only their
+owner. Reading sets `org.a11y.Status.IsEnabled` for the session, which Qt and
+Chromium wait for (reported once as `accessibility_enabled_now`); GTK exposes
+its widgets whenever at-spi2 runs, and `vm_app_launch` also starts
+applications with `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`. An image without
+at-spi2-core returns `accessibility_unavailable`.
+
+`vm_accessibility_tree` (observe) returns elements in tree order with `depth`,
+`role`, `name`, `text` (fields without a name; the last 40 lines of a
+terminal), `value`, `states` (only the informative ones, plus `disabled`),
+`actions`, a `box` with center point in screenshot pixels and a `ref`;
+applications carry their `pid`. Only showing elements are walked unless
+`include_hidden`; `app` limits it to one application (name substring or pid),
+`max_depth` (25) and `max_nodes` (400, at most 2000) bound it, and a walk
+stops at 6000 visited elements or 8 s (`truncated` says why). Each tree level
+is one pipelined D-Bus round trip, so a desktop with a terminal reads in about
+30 ms. `vm_accessibility_find` (observe) searches by `name` (substring of name
+or text) and/or exact `role` and returns only matches with their `context`.
+`vm_accessibility_action` (input permission) acts on a `ref`: `do`
+(the element's `action_name`, else click, activate, press, toggle or jump,
+else the first), `focus`, `set_text` or `set_value`, and returns the element
+100 ms later.
+
+### Desktop and accessibility tools in macOS containers
+
+`veynodevm` macOS containers answer the same seven tools with the macOS
+Accessibility API, which the first boot grants to the Guest's SSH sessions.
+The daemon validates the arguments as for Linux, then
+runs `veynodevm __desktop VM METHOD ARGUMENTS`, which runs
+`native/tools/vm-macos-desktop.swift` (built by
+`native/tools/build-vm-macos-desktop.sh`, registered as `macos_desktop` in
+`runtime.json`) in the Guest over SSH with the arguments on stdin. The CLI
+copies the helper to `~/.veynodevm/desktop-<hash>` on first use and whenever
+the host's copy changes. A call takes 0.15 to 0.7 s, most of it SSH.
+
+- `vm_desktop_state`: screen size, `scale`, `work_area` (the screen without
+  menu bar and Dock), cursor, keyboard input source, the focused application
+  (pid, name, bundle id, window) and every regular application's windows,
+  those on screen top-most first: id (the CGWindowID), title, app, bundle id,
+  pid, type (AX subrole in words, such as `standard window`), states
+  (`focused`, `main`, `minimized`, `fullscreen`, `modal`, `hidden`) and
+  geometry including the title bar.
+- `vm_desktop_apps`: application bundles in `/Applications`,
+  `/System/Applications`, their `Utilities` and `~/Applications`, with bundle
+  id, name, path, category and whether it runs.
+- `vm_window_action`: AX attributes and buttons. `activate` also unminimizes,
+  `maximize` fills the work area, `unmaximize` is unsupported (macOS has no
+  such state; use `move_resize`), `move_resize` places the window's origin.
+- `vm_app_launch`: `open -b BUNDLE_ID`, then waits up to 5 s for a new window
+  and activates it.
+- `vm_accessibility_tree` and `_find`: every regular application, the
+  frontmost first, with its menu bar (menus show their items once opened with
+  `do`). Roles and subroles are the AX names in words (`AXStaticText` is
+  `static text`, `AXCloseButton` is `close button`); `role` matches either.
+  Elements add `subrole`, `identifier` and `placeholder`; checkboxes, radio
+  buttons and menu items report `checked`/`mixed` states, other numeric
+  values `value`. A text area's `text` is its last 40 lines. `app` matches
+  name, pid or bundle id. The same limits apply (6000 visited, 8 s).
+- `vm_accessibility_action`: refs are `pid|child path|AX role|identifier or
+  title`. Applications add and remove elements (Calculator's AC becomes C),
+  which shifts paths: when the element at the path has another role or key,
+  the action uses the application's one element with the ref's role and key,
+  or fails as gone if there is none or several; the reply's `ref` is the
+  current one. `do` prefers press, confirm, pick, show menu, raise.
 
 ### macOS Guest screenshots
 
@@ -552,6 +692,19 @@ UUIDs, generations and input validation as the Guest service, and
 `vm_guest_info` reports transport `screen-sharing-rfb`. No TCC permission is
 needed in the Guest; it shows its "screen is being observed" indicator.
 `veynodevm` writes these fields for macOS containers.
+
+`veynodevm run` (also with `-d`) finishes a macOS container's first boot
+before returning, and part of that is granting the Guest's SSH sessions
+Accessibility and Automation of System Events, so `exec` can drive the desktop
+with AppleScript, JXA or the AX API. SIP keeps the TCC database read-only even
+for root, so the CLI uses the Guest's UI through this same daemon path: an `AXIsProcessTrusted` call over SSH lists
+`sshd-keygen-wrapper` in Privacy & Security › Accessibility; the CLI opens that
+pane, finds the row with `vm-vision text`, finds the switch at the end of the
+row with `vm-vision row`, clicks it, types the login password into the
+authorization dialog and checks the result over SSH. Then it sends System
+Events an Apple event and clicks Allow on the consent prompt. It needs the
+English UI and a password typeable on a US layout; a failure is a warning and
+the container still runs. On a fresh Tahoe image it adds 5 to 30 seconds.
 
 See [Guest service](../../native/guest-macos/README.md) for staging/restart and
 capture behavior. Registering an existing stopped macOS config does not clone,
@@ -598,7 +751,8 @@ a listener. A failed start never grants provenance. The source binding is valid
 only when freshly rechecked; there is no claim of atomicity across a later socket
 connect or input RPC. Host user/worker/controller remain trusted.
 
-macOS browser input remains disabled. Guest service/console identity must still
+Linux Apple Virtualization guests use the same bridge for the browser desktop
+(`docs/browser-desktop.md`). macOS browser input remains disabled. Guest service/console identity must still
 be checked against capture and screenshot metadata before a future media/control
 integration can authorize it. Do not use this listener proof as that identity.
 
@@ -629,7 +783,7 @@ Registration requires Apple Silicon macOS 26+ and a successful public Hypervisor
 **configuration object** 4 KiB set/readback; this probe creates no VM. Venus uses
 `-machine virt -accel hvf,ipa-granule-size=4096` and a named GPU with `blob=on`,
 `hostmem=256M`, `venus=on`. Before `cont`, the worker checks actual QMP GPU
-properties and a paused/prelaunch state, after existing disk/witness FD checks.
+properties and a paused/prelaunch state, after existing disk FD checks.
 This does not claim a QMP readback of the running Hypervisor IPA granule. The
 pinned QEMU must initialize with the requested option; startup errors stay errors.
 The 256 MiB hostmem aperture is not a measured RAM allocation.
@@ -646,6 +800,6 @@ profile, successful host admission, and `guest_verified:false`. Actual Guest
 Vulkan driver identity and application pixels must be independently measured;
 SPICE connectivity, QOM configuration, and host API support do not verify Guest
 Vulkan, native desktop scanout, conformance or performance. Existing disk locks,
-execution witness/guardian supervision, input authority and normal/forced cleanup
+execution guardian supervision, input authority and normal/forced cleanup
 are retained. New production-path runtime acceptance remains separate from
 component tests and earlier standalone renderer lifecycle tests.

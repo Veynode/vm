@@ -11,7 +11,7 @@ Each record contains:
 - `diagnostic_id`: process-local monotonically issued integer 1..9007199254740991; never reused. Exhaustion omits further IDs, without changing input policy.
 - `token`: the original eight-field token, including full unsigned integer values; it is not an authorization receipt.
 - `acquisition`: `monotonic_seconds`, `record_found`, `current`, `callback_received_monotonic_seconds`, `callback_age_ms`. The actual snapshot and observation are read under the existing publication lock during the AppKit callback. Original callback time is preserved. Ages are signed observations, not clamped or used to authorize.
-- `enqueue_epoch`: authority epoch observed under NativeControl's existing lock at queue admission.
+- `enqueue_epoch`: activation epoch observed under NativeControl's existing lock at queue admission.
 - Optional `dispatch`: actual request `sequence`, `epoch`, local monotonic time, and existing pre-exchange `queue_age_ms`. This precedes socket exchange and does not prove receipt or Guest delivery.
 - Optional `validation`: the same five observation fields at the unchanged helper validator, plus `accepted` and a fixed `reason` string (null for success). Record association requires both exact ID and exact token. A duplicate validation cannot overwrite the first; unknown/foreign matches only increment a counter.
 

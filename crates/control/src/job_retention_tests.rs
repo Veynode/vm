@@ -9,9 +9,9 @@ fn finished_containment_failure_retains_old_job_and_every_cleanup_request() {
     let now = std::time::Instant::now();
     jobs::Jobs::reserve(&fixture.manager.jobs, now - Duration::from_secs(331))
         .unwrap()
-        .register("mac", &job, &owner, 7, now - Duration::from_secs(331))
+        .register("mac", &job, &owner, now - Duration::from_secs(331))
         .unwrap();
-    let (_,reply)=fixture.forward("exec_poll",json!({"id":"mac","owner":owner,"epoch":7,"job_id":job}),
+    let (_,reply)=fixture.forward("exec_poll",json!({"id":"mac","job_id":job}),
         json!({"id":"poll","result":{"job_id":job,"state":"finished","error":{"code":"containment_failed","message":"fixture cgroup still populated"}}}));
     assert_eq!(
         reply.unwrap()["result"]["error"]["code"],
@@ -29,7 +29,6 @@ fn finished_containment_failure_retains_old_job_and_every_cleanup_request() {
     );
     let listener = UnixListener::bind(fixture.manager.dir.join("control.sock")).unwrap();
     listener.set_nonblocking(true).unwrap();
-    let expected_owner = owner.clone();
     let expected_job = job.clone();
     let server = thread::spawn(move || {
         for _ in 0..2 {
@@ -60,7 +59,7 @@ fn finished_containment_failure_retains_old_job_and_every_cleanup_request() {
             assert_eq!(wire["method"], "exec_cancel");
             assert_eq!(
                 wire["arguments"],
-                json!({"id":"mac","owner":expected_owner,"epoch":7,"job_id":expected_job})
+                json!({"id":"mac","job_id":expected_job})
             );
             write_json(
                 &mut socket,
@@ -105,9 +104,9 @@ fn malformed_finished_poll_cannot_release_retention_but_valid_terminal_can() {
     let now = std::time::Instant::now();
     jobs::Jobs::reserve(&fixture.manager.jobs, now)
         .unwrap()
-        .register("mac", &job, &owner, 4, now)
+        .register("mac", &job, &owner, now)
         .unwrap();
-    let args = json!({"id":"mac","owner":owner,"epoch":4,"job_id":job});
+    let args = json!({"id":"mac","job_id":job});
     for requested in [true, false] {
         let (_, cancelled) = fixture.forward(
             "exec_cancel",

@@ -7,6 +7,8 @@ import { dirname, extname, join, normalize } from 'node:path'
 import { Readable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 import { admit } from './auth.mjs'
+import { upgradeDesktop } from './desktop.mjs'
+import { upgradeTerminal } from './terminal.mjs'
 
 const root = dirname(fileURLToPath(import.meta.url))
 const port = Number(process.env.VEYNODEVM_UI_PORT || 3417)
@@ -94,6 +96,18 @@ const server = createServer(async (req, res) => {
     if (!res.headersSent) res.writeHead(500, { 'content-type': 'text/plain', ...SECURITY })
     res.end('Internal error\n')
   }
+})
+
+const origins = new Set([`http://127.0.0.1:${port}`, `http://localhost:${port}`])
+server.on('upgrade', (req, socket) => {
+  const decision = admit({ host: req.headers.host, url: req.url, cookie: req.headers.cookie }, { port, token })
+  if (decision.kind !== 'allow') {
+    socket.end('HTTP/1.1 401 Unauthorized\r\nconnection: close\r\ncontent-length: 0\r\n\r\n')
+    return
+  }
+  const options = { cli: process.env.VEYNODEVM_CLI || 'veynodevm', origins }
+  if (req.url.startsWith('/terminal/')) upgradeTerminal(req, socket, options)
+  else upgradeDesktop(req, socket, options)
 })
 
 server.listen(port, '127.0.0.1', () => {

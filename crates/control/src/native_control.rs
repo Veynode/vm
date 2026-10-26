@@ -1,4 +1,8 @@
 //! Same-UID private persistent native console channel, distinct from MCP/RPC EOF.
+//! The window sends `begin` when it gains keyboard focus and `suspend` when it
+//! loses it; while begun, its input goes straight to the worker. Each begin
+//! gets a new activation number (`epoch` on the wire) that binds the window's
+//! frame acquisition receipts to that focus period.
 use super::*;
 use native_input::{Attach, Message};
 use std::time::Instant;
@@ -15,7 +19,8 @@ struct Session {
     manager: Arc<Mutex<Manager>>,
     attach: Attach,
     owner: String,
-    epoch: Option<u64>,
+    epoch: u64,
+    began: bool,
     active: bool,
 }
 impl Session {
@@ -42,19 +47,6 @@ impl Session {
     fn rpc(&self, method: &str, arguments: Value) -> Result<Value> {
         let (rx, number, pending) = {
             let mut m = self.manager.lock().unwrap();
-            // Serialize the final authority check with the actual worker write.
-            // A prior check outside this lock cannot fence a concurrent human action.
-            if ["native_begin", "native_event", "native_heartbeat"].contains(&method) {
-                m.leases.lock().unwrap().native_check(
-                    &self.attach.id,
-                    &self.owner,
-                    arguments["epoch"]
-                        .as_u64()
-                        .context("native epoch missing")?,
-                    Instant::now(),
-                    true,
-                )?;
-            }
             let run = self.bound(&mut m)?;
             let number = run.next;
             run.next = run
@@ -89,113 +81,42 @@ impl Session {
             .cloned()
             .context("invalid native worker result")
     }
-    fn cleanup(&self, all: bool, stream: &UnixStream) -> Result<()> {
-        let completion = {
-            let mut m = self.manager.lock().unwrap();
-            let exec_revocations = m.exec_retirements.lock().unwrap().begin(
-                if all { None } else { Some(&self.owner) },
-                Some(&self.attach.id),
-            );
-            Completion::CancelJobs {
-                dir: m.dir.clone(),
-                file_sessions: Vec::new(),
-                input_revocations: m.input_revocations(
-                    if all { None } else { Some(&self.owner) },
-                    Some(&self.attach.id),
-                )?,
-                input_retirements: m.input_retirements.clone(),
-                exec_retirements: m.exec_retirements.clone(),
-                exec_revocations,
-                response: json!({}),
-                jobs: if all {
-                    m.jobs
-                        .lock()
-                        .unwrap()
-                        .running(&self.attach.id, Instant::now())
-                } else {
-                    Vec::new()
-                },
-            }
-        };
-        completion.wait(stream).context(CleanupUnconfirmed)?;
+    /// Releases whatever the window still holds in the guest.
+    fn release(&mut self) -> Result<()> {
+        self.active = false;
+        if !self.began {
+            return Ok(());
+        }
+        let reply = self
+            .rpc("native_end", json!({"owner":self.owner}))
+            .context(CleanupUnconfirmed)?;
+        if reply["released"] != true {
+            return Err(anyhow::anyhow!("native release unconfirmed").context(CleanupUnconfirmed));
+        }
+        self.began = false;
         Ok(())
     }
-    fn lease(&self, epoch: u64, active: bool) -> Result<()> {
-        let mut m = self.manager.lock().unwrap();
-        self.bound(&mut m)?;
-        let r = m.leases.lock().unwrap().native_check(
-            &self.attach.id,
-            &self.owner,
-            epoch,
-            Instant::now(),
-            active,
-        );
-        r
-    }
-    fn pause(&mut self) {
-        self.active = false;
-        if let Some(epoch) = self.epoch {
-            let m = self.manager.lock().unwrap();
-            let _ = m.leases.lock().unwrap().native_pause(
-                &self.attach.id,
-                &self.owner,
-                epoch,
-                Instant::now(),
-            );
-        }
-    }
-    fn handle(&mut self, message: &Message, stream: &UnixStream) -> Result<Value> {
+    fn handle(&mut self, message: &Message) -> Result<Value> {
         let sequence = message.sequence();
         match message {
-            Message::TakeControl { .. } => {
-                self.active = false;
-                let epoch = {
-                    let mut m = self.manager.lock().unwrap();
-                    self.bound(&mut m)?;
-                    let e = m.leases.lock().unwrap().native_take(
-                        &self.attach.id,
-                        &self.owner,
-                        Instant::now(),
-                    )?;
-                    e
-                };
-                self.epoch = Some(epoch);
-                self.cleanup(true, stream)?;
-                {
-                    let mut m = self.manager.lock().unwrap();
-                    self.bound(&mut m)?;
-                    // Cleanup can take seconds. Rearm only this still-owned epoch.
-                    let mut leases = m.leases.lock().unwrap();
-                    leases.native_check(
-                        &self.attach.id,
-                        &self.owner,
-                        epoch,
-                        Instant::now(),
-                        false,
-                    )?;
-                    leases.native_activate(&self.attach.id, &self.owner, epoch, Instant::now())?;
-                    m.input_retirements
-                        .lock()
-                        .unwrap()
-                        .record(InputRetirement {
-                            owner: self.owner.clone(),
-                            vm: self.attach.id.clone(),
-                            epoch,
-                            worker_instance: self.attach.worker_instance.clone(),
-                        })?;
-                }
+            Message::Begin { .. } => {
+                self.release()?;
+                self.epoch = self
+                    .epoch
+                    .checked_add(1)
+                    .context("native activation exhausted")?;
+                let epoch = self.epoch;
                 let mut args = json!({"owner":self.owner,"epoch":epoch,"sequence":sequence,"display_instance":self.attach.display_instance});
                 if let Some(mode) = self.attach.frame_acquisition_protocol {
                     args["frame_acquisition_protocol"] = json!(mode);
                 }
+                self.began = true;
                 let reply = self.rpc("native_begin", args)?;
-                self.lease(epoch, true)?;
                 if reply["ready"] != true
                     || reply["epoch"].as_u64() != Some(epoch)
                     || native_input::frame_acquisition_protocol(
                         reply.get("frame_acquisition_protocol"),
                     )? != self.attach.frame_acquisition_protocol
-                    || peer_disconnected(&[stream.as_raw_fd()])
                 {
                     bail!("native begin unconfirmed")
                 }
@@ -211,23 +132,17 @@ impl Session {
                     self.bound(&mut self.manager.lock().unwrap())?;
                     return Ok(json!({"ready":false}));
                 }
-                let epoch = epoch.context("active heartbeat requires epoch")?;
-                self.lease(epoch, true)?;
+                if *epoch != Some(self.epoch) {
+                    bail!("native heartbeat for another activation")
+                }
                 let reply = self.rpc(
                     "native_heartbeat",
-                    json!({"owner":self.owner,"epoch":epoch,"sequence":sequence}),
+                    json!({"owner":self.owner,"epoch":self.epoch,"sequence":sequence}),
                 )?;
-                if reply["ready"] != true || reply["epoch"].as_u64() != Some(epoch) {
+                if reply["ready"] != true || reply["epoch"].as_u64() != Some(self.epoch) {
                     bail!("native heartbeat rejected")
                 }
-                self.manager
-                    .lock()
-                    .unwrap()
-                    .leases
-                    .lock()
-                    .unwrap()
-                    .native_renew(&self.attach.id, &self.owner, epoch, Instant::now())?;
-                Ok(json!({"ready":true,"epoch":epoch}))
+                Ok(json!({"ready":true,"epoch":self.epoch}))
             }
             Message::Event {
                 epoch,
@@ -237,10 +152,9 @@ impl Session {
                 acquisition_receipt,
                 ..
             } => {
-                if !self.active {
+                if !self.active || *epoch != self.epoch {
                     bail!("native input suspended")
                 };
-                self.lease(*epoch, true)?;
                 if frame.display_instance != self.attach.display_instance {
                     bail!("foreign display")
                 }
@@ -257,43 +171,23 @@ impl Session {
                     args["acquisition_receipt"] = json!(receipt);
                 }
                 let result = self.rpc("native_event", args)?;
-                self.lease(*epoch, true)?;
                 if result["dispatched"] != true
                     || result["guest_delivery_confirmed"] != false
                     || result["epoch"].as_u64() != Some(*epoch)
                 {
                     bail!("invalid native event acknowledgement")
                 }
-                self.manager
-                    .lock()
-                    .unwrap()
-                    .leases
-                    .lock()
-                    .unwrap()
-                    .native_renew(&self.attach.id, &self.owner, *epoch, Instant::now())?;
                 Ok(result)
             }
-            Message::Suspend { epoch, .. } | Message::ReturnAgent { epoch, .. } => {
-                self.lease(*epoch, false)?;
-                self.pause();
-                self.cleanup(false, stream)?;
-                let m = self.manager.lock().unwrap();
-                let mut leases = m.leases.lock().unwrap();
-                let next = if matches!(message, Message::ReturnAgent { .. }) {
-                    leases.native_return(&self.attach.id, &self.owner, *epoch, Instant::now())?
-                } else {
-                    leases.native_suspend(&self.attach.id, &self.owner, *epoch, Instant::now())?
-                };
-                self.epoch = if matches!(message, Message::ReturnAgent { .. }) {
-                    None
-                } else {
-                    Some(next)
-                };
-                Ok(json!({"ready":false,"released":true,"epoch":next}))
+            Message::Suspend { epoch, .. } => {
+                if *epoch != self.epoch {
+                    bail!("native suspend for another activation")
+                }
+                self.release()?;
+                Ok(json!({"ready":false,"released":true,"epoch":self.epoch}))
             }
             Message::Detach { .. } => {
-                self.pause();
-                self.cleanup(false, stream)?;
+                self.release()?;
                 Ok(json!({"ready":false,"released":true}))
             }
         }
@@ -302,10 +196,6 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         let mut m = self.manager.lock().unwrap();
-        m.leases
-            .lock()
-            .unwrap()
-            .native_detach(&self.attach.id, &self.owner, Instant::now());
         if m.native_connections
             .get(&self.attach.id)
             .is_some_and(|(owner, worker)| {
@@ -440,7 +330,8 @@ pub(super) fn serve(
             manager: manager.clone(),
             attach,
             owner,
-            epoch: None,
+            epoch: 0,
+            began: false,
             active: false,
         };
         let status = session.rpc("window_status", json!({}))?;
@@ -484,7 +375,7 @@ pub(super) fn serve(
             expected = expected
                 .checked_add(1)
                 .context("native sequence exhausted")?;
-            let result = session.handle(&message, &stream);
+            let result = session.handle(&message);
             let detach = matches!(message, Message::Detach { .. });
             match result {
                 Ok(result) => write_json(
@@ -492,9 +383,8 @@ pub(super) fn serve(
                     &json!({"sequence":message.sequence(),"result":result}),
                 )?,
                 Err(error) => {
-                    session.pause();
                     let clean = error.downcast_ref::<CleanupUnconfirmed>().is_none()
-                        && session.cleanup(false, &stream).is_ok();
+                        && session.release().is_ok();
                     let code = if !clean {
                         "cleanup_unconfirmed"
                     } else if matches!(message, Message::Event { .. }) {
@@ -517,8 +407,7 @@ pub(super) fn serve(
         }
         Ok(())
     })();
-    session.pause();
-    let cleanup = session.cleanup(false, &stream);
+    let cleanup = session.release();
     drop(session);
     outcome.and(cleanup)
 }
@@ -534,9 +423,9 @@ mod tests {
     }
     impl Fixture {
         fn new() -> Self {
-            Self::with_revoke_failure(false)
+            Self::with_release_failure(false)
         }
-        fn with_revoke_failure(fail: bool) -> Self {
+        fn with_release_failure(fail: bool) -> Self {
             Self::with_diagnostic(fail, Value::Null)
         }
         fn with_diagnostic(fail: bool, diagnostic: Value) -> Self {
@@ -569,12 +458,12 @@ mod tests {
 for line in sys.stdin:
  r=json.loads(line);a=r.get('arguments',{});method=r['method']
  with open(sys.argv[3],'a') as log: log.write(json.dumps(r)+'\n')
- if method=='input_revoke' and sys.argv[1]=='fail':
+ if method=='native_end' and sys.argv[1]=='fail':
   print(json.dumps({'id':r['id'],'error':'injected release failure'}),flush=True);continue
  if method=='native_event' and sys.argv[2]!='null':
   print(json.dumps({'id':r['id'],'error':'SECRET must not leave worker boundary','native_input_diagnostic':json.loads(sys.argv[2])}),flush=True);continue
  if method=='window_status': out={'display_instance':'d'*32,'native_input_protocol':1}
- elif method=='input_revoke': out={'released':True,'synthetic_release_dispatched':True,'through_epoch':a['through_epoch'],'guest_delivery_confirmed':False}
+ elif method=='native_end': out={'ready':False,'released':True}
  else: out={'ready':True,'epoch':a['epoch'],'dispatched':True,'guest_delivery_confirmed':False}
  if method=='window_status' and sys.argv[4]!='null': out['native_frame_acquisition_protocol']=json.loads(sys.argv[4])
  if method=='native_begin' and sys.argv[5]!='null': out['frame_acquisition_protocol']=json.loads(sys.argv[5])
@@ -725,7 +614,7 @@ for line in sys.stdin:
                 let attached = read(&mut client);
                 assert_eq!(attached["result"]["frame_acquisition_protocol"], 1);
                 assert_eq!(attached["result"]["ready"], false);
-                let take = request(&mut client, json!({"sequence":1,"method":"take_control"}));
+                let take = request(&mut client, json!({"sequence":1,"method":"begin"}));
                 assert_eq!(take["result"]["ready"] == true, begin_ok);
                 if begin_ok {
                     assert_eq!(take["result"]["frame_acquisition_protocol"], 1);
@@ -758,7 +647,7 @@ for line in sys.stdin:
             let f = Fixture::with_acquisition(false, Value::Null, json!(1), echo);
             let (mut client, thread) = f.attach_mode(None, mode.clone());
             read(&mut client);
-            let take = request(&mut client, json!({"sequence":1,"method":"take_control"}));
+            let take = request(&mut client, json!({"sequence":1,"method":"begin"}));
             assert_eq!(take["result"]["ready"], true);
             let mut event = json!({"sequence":2,"method":"event","epoch":take["result"]["epoch"],
                 "frame":{"display_instance":"d".repeat(32),"presentation_serial":1,"window_epoch":1,"invalidation_epoch":0,"source_generation":7,"source_sequence":u64::MAX,"width":1280,"height":800},
@@ -829,7 +718,7 @@ for line in sys.stdin:
             let f = Fixture::new();
             let (mut client, thread) = f.attach(None);
             read(&mut client);
-            let take = request(&mut client, json!({"sequence":1,"method":"take_control"}));
+            let take = request(&mut client, json!({"sequence":1,"method":"begin"}));
             let mut event = json!({"sequence":2,"method":"event","epoch":take["result"]["epoch"],
                 "frame":{"display_instance":"d".repeat(32),"presentation_serial":1,"window_epoch":1,"invalidation_epoch":0,"source_generation":7,"source_sequence":42,"width":1280,"height":800},
                 "event":{"kind":"key","qcode":"ret","down":true}});
@@ -873,7 +762,7 @@ for line in sys.stdin:
             let f = Fixture::with_diagnostic(false, diagnostic.clone());
             let (mut client, thread) = f.attach(None);
             read(&mut client);
-            let take = request(&mut client, json!({"sequence":1,"method":"take_control"}));
+            let take = request(&mut client, json!({"sequence":1,"method":"begin"}));
             let epoch = take["result"]["epoch"].as_u64().unwrap();
             let reply = request(
                 &mut client,
@@ -891,98 +780,46 @@ for line in sys.stdin:
                 }
             );
             assert!(!reply.to_string().contains("SECRET"));
-            assert!(f
-                .manager
-                .lock()
-                .unwrap()
-                .input_retirements
-                .lock()
-                .unwrap()
-                .records(None, None)
-                .is_empty());
-            // Rejecting the event does not return human authority to an agent.
-            assert!(f
-                .manager
-                .lock()
-                .unwrap()
-                .leases
-                .lock()
-                .unwrap()
-                .acquire("vm", &"a".repeat(64), Instant::now())
-                .is_err());
+            // A rejected event releases what the window held.
+            assert_eq!(worker_requests(&f, "native_end").len(), 1);
             drop(client);
             thread.join().unwrap().unwrap();
         }
     }
     #[test]
-    fn persistent_native_suspend_retains_hold_return_is_explicit_and_eof_releases() {
+    fn focus_begin_suspend_and_eof_release() {
         let f = Fixture::new();
         let (mut client, thread) = f.attach(None);
         assert_eq!(read(&mut client)["result"]["ready"], false);
-        let a = request(&mut client, json!({"sequence":1,"method":"take_control"}));
+        let a = request(&mut client, json!({"sequence":1,"method":"begin"}));
         let epoch = a["result"]["epoch"].as_u64().unwrap();
         assert_eq!(a["result"]["ready"], true);
-        assert!(f
-            .manager
-            .lock()
-            .unwrap()
-            .leases
-            .lock()
-            .unwrap()
-            .acquire("vm", &"a".repeat(64), Instant::now())
-            .is_err());
         let s = request(
             &mut client,
             json!({"sequence":2,"method":"suspend","epoch":epoch}),
         );
-        let next = s["result"]["epoch"].as_u64().unwrap();
-        assert!(next > epoch);
         assert_eq!(s["result"]["released"], true);
+        assert_eq!(s["result"]["epoch"], epoch);
         assert_eq!(
             request(&mut client, json!({"sequence":3,"method":"heartbeat"}))["result"]["ready"],
             false
         );
-        assert!(f
-            .manager
-            .lock()
-            .unwrap()
-            .leases
-            .lock()
-            .unwrap()
-            .acquire("vm", &"a".repeat(64), Instant::now())
-            .is_err());
+        let second = request(&mut client, json!({"sequence":4,"method":"begin"}));
+        assert_eq!(second["result"]["ready"], true);
+        assert_eq!(second["result"]["epoch"], epoch + 1);
         assert_eq!(
             request(
                 &mut client,
-                json!({"sequence":4,"method":"return_agent","epoch":next})
-            )["result"]["released"],
-            true
+                json!({"sequence":5,"method":"heartbeat","epoch":epoch})
+            )["error"]["code"],
+            "authority_lost",
+            "a heartbeat from the previous focus period is refused"
         );
-        f.manager
-            .lock()
-            .unwrap()
-            .leases
-            .lock()
-            .unwrap()
-            .acquire("vm", &"a".repeat(64), Instant::now())
-            .unwrap();
-        let second = request(&mut client, json!({"sequence":5,"method":"take_control"}));
-        assert_eq!(second["result"]["ready"], true);
         drop(client);
         thread.join().unwrap().unwrap();
-        let m = f.manager.lock().unwrap();
-        assert!(m
-            .input_retirements
-            .lock()
-            .unwrap()
-            .records(None, None)
-            .is_empty());
-        assert!(m
-            .leases
-            .lock()
-            .unwrap()
-            .acquire("vm", &"a".repeat(64), Instant::now())
-            .is_err());
+        // Suspend and the refused heartbeat release; EOF finds nothing held.
+        assert_eq!(worker_requests(&f, "native_end").len(), 2);
+        assert_eq!(worker_requests(&f, "native_begin").len(), 2);
     }
     #[test]
     fn wrong_incarnation_and_replayed_sequence_fail_closed() {
@@ -993,29 +830,20 @@ for line in sys.stdin:
         let (mut c, t) = f.attach(None);
         read(&mut c);
         assert_eq!(
-            request(&mut c, json!({"sequence":1,"method":"take_control"}))["result"]["ready"],
+            request(&mut c, json!({"sequence":1,"method":"begin"}))["result"]["ready"],
             true
         );
         write_json(c.get_mut(), &json!({"sequence":1,"method":"heartbeat"})).unwrap();
         assert!(read_frame(&mut c).unwrap().is_none());
         assert!(t.join().unwrap().is_err());
-        assert!(f
-            .manager
-            .lock()
-            .unwrap()
-            .input_retirements
-            .lock()
-            .unwrap()
-            .records(None, None)
-            .is_empty());
+        assert_eq!(worker_requests(&f, "native_end").len(), 1);
     }
     #[test]
-    fn native_failed_suspend_never_reports_release_and_keeps_obligation() {
-        let f = Fixture::with_revoke_failure(true);
+    fn native_failed_suspend_never_reports_release() {
+        let f = Fixture::with_release_failure(true);
         let (mut c, t) = f.attach(None);
         read(&mut c);
-        let epoch = request(&mut c, json!({"sequence":1,"method":"take_control"}))["result"]
-            ["epoch"]
+        let epoch = request(&mut c, json!({"sequence":1,"method":"begin"}))["result"]["epoch"]
             .as_u64()
             .unwrap();
         let reply = request(
@@ -1026,223 +854,19 @@ for line in sys.stdin:
         assert!(reply.get("result").is_none());
         assert!(read_frame(&mut c).unwrap().is_none());
         assert!(t.join().unwrap().is_err());
-        let m = f.manager.lock().unwrap();
-        assert_eq!(
-            m.input_retirements
-                .lock()
-                .unwrap()
-                .records(None, None)
-                .len(),
-            1
-        );
-        assert!(m
-            .leases
-            .lock()
-            .unwrap()
-            .acquire("vm", &"b".repeat(64), Instant::now())
-            .is_err());
     }
     #[test]
-    fn native_idle_channel_closes_and_releases_without_returning_agent() {
+    fn native_idle_channel_closes_and_releases() {
         let f = Fixture::new();
         let (mut c, t) = f.attach(None);
         read(&mut c);
         assert_eq!(
-            request(&mut c, json!({"sequence":1,"method":"take_control"}))["result"]["ready"],
+            request(&mut c, json!({"sequence":1,"method":"begin"}))["result"]["ready"],
             true
         );
         assert!(read_frame(&mut c).unwrap().is_none());
         assert!(t.join().unwrap().is_err());
-        let m = f.manager.lock().unwrap();
-        assert!(m
-            .input_retirements
-            .lock()
-            .unwrap()
-            .records(None, None)
-            .is_empty());
-        assert!(m
-            .leases
-            .lock()
-            .unwrap()
-            .acquire("vm", &"b".repeat(64), Instant::now())
-            .is_err());
-    }
-    #[test]
-    fn takeover_between_precheck_and_worker_dispatch_cannot_write_old_event() {
-        let f = Fixture::new();
-        let owner = "b".repeat(64);
-        let (worker, epoch) = {
-            let mut m = f.manager.lock().unwrap();
-            let instance = m.running["vm"]
-                .bridge
-                .lock()
-                .unwrap()
-                .worker_instance
-                .clone();
-            m.native_connections
-                .insert("vm".into(), (owner.clone(), instance));
-            let epoch = m
-                .leases
-                .lock()
-                .unwrap()
-                .native_take("vm", &owner, Instant::now())
-                .unwrap();
-            let worker = m.running["vm"]
-                .bridge
-                .lock()
-                .unwrap()
-                .worker_instance
-                .clone();
-            (worker, epoch)
-        };
-        let s = Session {
-            manager: f.manager.clone(),
-            attach: Attach {
-                frame_acquisition_protocol: None,
-                protocol_version: 1,
-                id: "vm".into(),
-                worker_instance: worker,
-                display_instance: "d".repeat(32),
-            },
-            owner,
-            epoch: Some(epoch),
-            active: true,
-        };
-        s.lease(epoch, true).unwrap();
-        // Deterministic interleaving: the earlier check passed, then the local
-        // human action changes authority before rpc obtains the dispatch lock.
-        f.manager
-            .lock()
-            .unwrap()
-            .leases
-            .lock()
-            .unwrap()
-            .human("vm", false, Instant::now())
-            .unwrap();
-        let before = f.manager.lock().unwrap().running["vm"].next;
-        for method in ["native_event", "native_heartbeat", "native_begin"] {
-            assert!(s.rpc(method, json!({"epoch":epoch,"sequence":9})).is_err());
-        }
-        assert_eq!(
-            f.manager.lock().unwrap().running["vm"].next,
-            before,
-            "no worker request allocated or written"
-        );
-    }
-    #[test]
-    fn general_human_release_waits_for_original_worker_proof_and_cannot_clear_new_hold() {
-        for concurrent in [false, true] {
-            let f = Fixture::new();
-            let (mut c, t) = f.attach(None);
-            read(&mut c);
-            assert_eq!(
-                request(&mut c, json!({"sequence":1,"method":"take_control"}))["result"]["ready"],
-                true
-            );
-            let mut pending = None;
-            f.manager
-                .lock()
-                .unwrap()
-                .dispatch(
-                    json!({"method":"human_release","arguments":{"id":"vm"}}),
-                    &mut pending,
-                )
-                .unwrap();
-            assert!(f
-                .manager
-                .lock()
-                .unwrap()
-                .leases
-                .lock()
-                .unwrap()
-                .acquire("vm", &"a".repeat(64), Instant::now())
-                .is_err());
-            if concurrent {
-                f.manager
-                    .lock()
-                    .unwrap()
-                    .leases
-                    .lock()
-                    .unwrap()
-                    .human("vm", true, Instant::now())
-                    .unwrap();
-            }
-            let (peer, _) = UnixStream::pair().unwrap();
-            let result = pending.unwrap().wait(&peer);
-            if concurrent {
-                assert!(result.is_err());
-                assert!(f
-                    .manager
-                    .lock()
-                    .unwrap()
-                    .leases
-                    .lock()
-                    .unwrap()
-                    .acquire("vm", &"a".repeat(64), Instant::now())
-                    .is_err());
-            } else {
-                let result = result.unwrap();
-                assert_eq!(result["human_control"], false);
-                assert_eq!(result["input_release"]["confirmed"], true);
-                f.manager
-                    .lock()
-                    .unwrap()
-                    .leases
-                    .lock()
-                    .unwrap()
-                    .acquire("vm", &"a".repeat(64), Instant::now())
-                    .unwrap();
-            }
-            drop(c);
-            t.join().unwrap().unwrap();
-        }
-    }
-    #[test]
-    fn general_human_release_failure_keeps_human_hold_and_exact_obligation() {
-        let f = Fixture::with_revoke_failure(true);
-        let (mut c, t) = f.attach(None);
-        read(&mut c);
-        request(&mut c, json!({"sequence":1,"method":"take_control"}));
-        let original = f
-            .manager
-            .lock()
-            .unwrap()
-            .input_retirements
-            .lock()
-            .unwrap()
-            .records(None, None);
-        let mut pending = None;
-        f.manager
-            .lock()
-            .unwrap()
-            .dispatch(
-                json!({"method":"human_release","arguments":{"id":"vm"}}),
-                &mut pending,
-            )
-            .unwrap();
-        let (peer, _) = UnixStream::pair().unwrap();
-        assert!(pending.unwrap().wait(&peer).is_err());
-        assert_eq!(
-            f.manager
-                .lock()
-                .unwrap()
-                .input_retirements
-                .lock()
-                .unwrap()
-                .records(None, None),
-            original
-        );
-        assert!(f
-            .manager
-            .lock()
-            .unwrap()
-            .leases
-            .lock()
-            .unwrap()
-            .acquire("vm", &"a".repeat(64), Instant::now())
-            .is_err());
-        drop(c);
-        assert!(t.join().unwrap().is_err());
+        assert_eq!(worker_requests(&f, "native_end").len(), 1);
     }
     #[test]
     fn new_worker_attach_survives_old_connection_finalization() {
@@ -1264,13 +888,13 @@ for line in sys.stdin:
                 display_instance: "d".repeat(32),
             },
             owner,
-            epoch: None,
+            epoch: 0,
+            began: false,
             active: false,
         };
         let (mut c, t) = f.attach(None);
         assert_eq!(read(&mut c)["result"]["ready"], false);
-        let epoch = request(&mut c, json!({"sequence":1,"method":"take_control"}))["result"]
-            ["epoch"]
+        let epoch = request(&mut c, json!({"sequence":1,"method":"begin"}))["result"]["epoch"]
             .as_u64()
             .unwrap();
         drop(old);

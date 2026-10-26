@@ -253,16 +253,14 @@ def main():
                     ('exec', 'async_exec', 'files', 'shutdown', 'desktop', 'descendant_containment')),
                     'observer-only Guest advertises side effects')
             record(suffix + ' actual MCP Guest info', info)
-            # Explicit caller scopes are present, so these must fail by backend
-            # capability, not merely by missing permission or unknown tool.
-            client.tool('acquire_control', {'id': vm})
+            # The client holds execute and files permission, so these must fail by
+            # backend capability, not merely by missing permission or unknown tool.
             for method, payload in [('exec_start', {'argv': ['/bin/true'], 'timeout_ms': 1000}),
                     ('file_upload_begin', {'path': 'must-not-exist', 'size': 0,
                      'sha256': hashlib.sha256(b'').hexdigest()})]:
                 denied = client.tool(method, {'id': vm, **payload}, denied=True)
                 require('unsupported' in json.dumps(denied).lower(), 'denial did not identify unsupported capability')
                 record(suffix + ' ' + method + ' explicitly unsupported', denied)
-            client.tool('release_control', {'id': vm})
             image = client.tool('screenshot', {'id': vm}, raw=True)['result']['content']
             pictures = [part for part in image if part['type'] == 'image']
             metadata = [json.loads(part['text']) for part in image if part['type'] == 'text']

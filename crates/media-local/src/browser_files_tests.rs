@@ -180,9 +180,6 @@ impl Fixture {
                             }
                             json!({"result":{"binding":binding}})
                         }
-                        "capabilities" => {
-                            json!({"result":{"control_session_fencing":{"retired_owner_ttl_seconds":120,"request_dispatch_deadline_seconds":30}}})
-                        }
                         "guest_info" => {
                             json!({"result":{"id":"f","result":{"console_identity":{"version":1,"security_session_id":42,"uid":501,"console_set":null,"display_id":1,"physical_width":2560,"physical_height":1440,"display_geometry_sha256":"a".repeat(64)},"console_identity_status":{"version":1,"identity_eligible":true},"capabilities":{"files":true},"file_policy":{"max_file_bytes":8388608,"chunk_bytes":32768,"idle_timeout_seconds":60,"absolute_timeout_seconds":300,"path_scope":"single filename","ownership":"same UID","root":"SECRET_PATH"}}}})
                         }
@@ -272,7 +269,7 @@ impl Fixture {
     }
 }
 fn cleanup() -> Value {
-    json!({"closed":true,"retired_owner":true,"retired_owner_ttl_seconds":120,"job_cancellation":{"attempted":0,"unconfirmed_requests":0,"outcomes":[]},"file_cancellation":{"attempted":1,"unconfirmed_requests":0,"outcomes":[{"result":{"id":"f","result":{"cancelled_transfers":1}}}]}})
+    json!({"closed":true,"job_cancellation":{"attempted":0,"unconfirmed_requests":0,"outcomes":[]},"file_cancellation":{"attempted":1,"unconfirmed_requests":0,"outcomes":[{"result":{"id":"f","result":{"cancelled_transfers":1}}}]}})
 }
 #[tokio::test]
 async fn files_need_no_input_lease_and_errors_are_sanitized() {

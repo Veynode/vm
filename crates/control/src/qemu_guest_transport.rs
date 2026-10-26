@@ -32,7 +32,7 @@ struct Envelope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     response: Option<Value>,
 }
-fn nonce() -> Result<String> {
+pub(crate) fn nonce() -> Result<String> {
     let mut b = [0; 32];
     File::open("/dev/urandom")?.read_exact(&mut b)?;
     Ok(b.iter().map(|b| format!("{b:02x}")).collect())

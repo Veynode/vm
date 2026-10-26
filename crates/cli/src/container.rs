@@ -64,6 +64,9 @@ pub struct Container {
     pub gpus: Option<String>,
     pub desktop: bool,
     pub engine: bool,
+    /// `Some("systemd")`: the image's init is PID 1 ("full system" mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init: Option<String>,
     pub auto_remove: bool,
     pub cpus: u32,
     pub memory_mib: u64,
@@ -74,6 +77,14 @@ pub struct Container {
     pub os: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac_address: Option<String>,
+    /// QEMU's loopback forward to the guest session server (`session`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_port: Option<u16>,
+    /// Started with `-t` (entrypoint on a pty) or `-i` (stdin kept open).
+    #[serde(default)]
+    pub tty: bool,
+    #[serde(default)]
+    pub stdin: bool,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -97,7 +108,33 @@ pub struct RunOptions {
     pub engine: bool,
     pub dns: Vec<String>,
     pub mtu: Option<u16>,
+    /// `--init systemd`; `None` runs the entrypoint under the VeynodeVM init.
+    pub init: Option<String>,
     pub quiet: bool,
+    pub tty: bool,
+    pub stdin: bool,
+}
+
+/// `--init systemd` boots the image's `/sbin/init` as PID 1 instead of its
+/// Entrypoint/Cmd. A COMMAND replaces the init (absolute path plus arguments,
+/// e.g. `/lib/systemd/systemd systemd.unit=multi-user.target`).
+pub fn systemd_argv(options: &RunOptions) -> Result<Vec<String>> {
+    if options.entrypoint.is_some() {
+        bail!(
+            "--init systemd boots /sbin/init; give another init as COMMAND instead of --entrypoint"
+        )
+    }
+    if options.user.is_some() {
+        bail!("--init systemd runs init as root; -u/--user is not supported")
+    }
+    if options.tty || options.stdin {
+        bail!("--init systemd has no interactive session; drop -i/-t and use `veynodevm exec`")
+    }
+    match options.command.first() {
+        None => Ok(vec!["/sbin/init".to_owned()]),
+        Some(path) if path.starts_with('/') => Ok(options.command.clone()),
+        Some(path) => bail!("--init systemd: the init path must be absolute, got {path}"),
+    }
 }
 
 pub fn now() -> u64 {
@@ -226,7 +263,7 @@ pub fn is_active(container: &Container) -> bool {
     active(&vm_state(container))
 }
 
-fn active(state: &str) -> bool {
+pub fn active(state: &str) -> bool {
     !matches!(
         state,
         "stopped" | "crashed" | "missing" | "unknown" | "error"
@@ -403,8 +440,16 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
     let store = Store::open(&home::images_dir()?)?;
     let image = ensure_image(&store, &options.image, options.quiet)?;
     if image.config.os == "darwin" {
+        if options.init.is_some() {
+            bail!("--init systemd is for Linux images")
+        }
         return crate::macos::create_and_start(options, &store, &image);
     }
+    let systemd_init = match options.init.as_deref() {
+        None => None,
+        Some("systemd") => Some(systemd_argv(options)?),
+        Some(other) => bail!("--init accepts systemd, got {other}"),
+    };
     let runtime = home::Runtime::load()?;
     let boot = runtime
         .boot
@@ -435,7 +480,10 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
     } else {
         options.command.clone()
     };
-    let argv: Vec<String> = entrypoint.into_iter().chain(cmd).collect();
+    let argv: Vec<String> = match &systemd_init {
+        Some(init) => init.clone(),
+        None => entrypoint.into_iter().chain(cmd).collect(),
+    };
     if argv.is_empty() {
         bail!("no command specified and the image has no Entrypoint or Cmd")
     }
@@ -493,14 +541,22 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
         let rw = dir.join("rw.raw");
         private_file(&rw)?.set_len(options.disk_gib.unwrap_or(16) << 30)?;
         let transport = if qemu { "virtio-serial-exec" } else { "vsock" };
-        let guest_config = json!({
+        let session_token = random_hex(32);
+        private_file(&dir.join(crate::session::TOKEN_FILE))?.write_all(session_token.as_bytes())?;
+        let session_port = if qemu {
+            Some(crate::session::free_port()?)
+        } else {
+            None
+        };
+        let mut guest_config = json!({
             "version": 1,
             "id": id,
             "hostname": name.chars().take(63).collect::<String>(),
             "argv": argv,
             "env": env,
             "workdir": options.workdir.clone().unwrap_or_else(|| config.working_dir.clone()),
-            "user": options.user.clone().unwrap_or_else(|| config.user.clone()),
+            // systemd runs as root; the image USER does not apply to init.
+            "user": if systemd_init.is_some() { String::new() } else { options.user.clone().unwrap_or_else(|| config.user.clone()) },
             "volumes": volumes.iter().enumerate().map(|(i, v)| json!({"tag":format!("v{i}"),"target":v.target,"read_only":v.read_only,"fs":if qemu {"9p"} else {"virtiofs"}})).collect::<Vec<_>>(),
             "anonymous_volumes": anonymous,
             "transport": transport,
@@ -509,7 +565,14 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
             "dns": dns,
             "mtu": mtu,
             "desktop": options.desktop,
+            "session_token": session_token,
+            "tty": options.tty,
+            "stdin": options.stdin,
         });
+        if systemd_init.is_some() {
+            // Only sent when used: older boot assets reject unknown fields.
+            guest_config["init"] = json!("systemd");
+        }
         let mut body = CONFIG_MAGIC.to_vec();
         body.extend(serde_json::to_vec(&guest_config)?);
         body.push(b'\n');
@@ -520,10 +583,13 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
         let config_disk = dir.join("config.img");
         private_file(&config_disk)?.write_all(&body)?;
         fs::set_permissions(&config_disk, fs::Permissions::from_mode(0o400))?;
+        // A full desktop distribution (GNOME, KDE) needs more than a single app.
         let memory_mib =
             options
                 .memory_mib
-                .unwrap_or(if qemu || options.engine || options.desktop {
+                .unwrap_or(if systemd_init.is_some() && options.desktop {
+                    4096
+                } else if qemu || options.engine || options.desktop || systemd_init.is_some() {
                     2048
                 } else {
                     512
@@ -554,6 +620,9 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
         }
         if qemu {
             vm["ports"] = json!(ports);
+            if let Some(port) = session_port {
+                crate::session::add_forward(&mut vm, port);
+            }
             vm["qemu_guest_exec"] = json!(true);
             if let Some(profile) = gpu_profile {
                 vm["qemu_graphics_profile"] = json!(profile);
@@ -577,6 +646,7 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
             gpus: gpu_profile.map(str::to_owned),
             desktop: options.desktop,
             engine: options.engine,
+            init: options.init.clone(),
             auto_remove: options.auto_remove,
             cpus,
             memory_mib,
@@ -584,6 +654,9 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
             vm_id: vm_id.clone(),
             os: String::new(),
             mac_address: None,
+            session_port,
+            tty: options.tty,
+            stdin: options.stdin,
         };
         save(&container)?;
         daemon_call("create", vm)?;
@@ -695,30 +768,6 @@ pub fn wait_stopped(container: &Container, timeout: Duration) -> bool {
     false
 }
 
-/// A QEMU micro-VM stopped by force keeps its exec incarnation pending in the
-/// daemon journal. The VM, and with it every guest scope, is gone, so release
-/// it; the daemon still verifies the original worker witness before agreeing.
-fn reconcile_execution(container: &Container) -> Result<()> {
-    if container.backend != "qemu-hvf" {
-        return Ok(());
-    }
-    let status = daemon_call("status", json!({"id":container.vm_id}))?;
-    if !status["pid"].is_null() || status["execution_reconciliation_required"] != true {
-        return Ok(());
-    }
-    for incarnation in status["execution_incarnations"]
-        .as_array()
-        .into_iter()
-        .flatten()
-    {
-        daemon_call(
-            "reconcile_execution",
-            json!({"id":container.vm_id,"worker_instance":incarnation["worker_instance"]}),
-        )?;
-    }
-    Ok(())
-}
-
 /// Start a stopped container again. The previous run's console is kept as
 /// `console.prev.log` so markers (ip, exit) always describe the current run.
 pub fn start(container: &Container) -> Result<()> {
@@ -729,7 +778,7 @@ pub fn start(container: &Container) -> Result<()> {
     if dir.join("console.log").exists() {
         fs::rename(dir.join("console.log"), dir.join("console.prev.log"))?;
     }
-    reconcile_execution(container)?;
+    crate::session::refresh_forward(container)?;
     daemon_call("start", json!({"id":container.vm_id}))?;
     if container.os == "darwin" {
         crate::macos::wait_started(container)?;
@@ -744,6 +793,17 @@ pub fn start(container: &Container) -> Result<()> {
     Ok(())
 }
 
+fn systemd_poweroff() -> Vec<String> {
+    ["systemctl", "--no-block", "poweroff"]
+        .map(str::to_owned)
+        .to_vec()
+}
+
+/// `stop` without `-t`: a whole distribution needs longer than one process.
+pub fn default_stop_timeout(container: &Container) -> Duration {
+    Duration::from_secs(if container.init.is_some() { 30 } else { 10 })
+}
+
 pub fn stop(container: &Container, timeout: Duration) -> Result<()> {
     crate::proxy::stop_existing(container)?;
     if !active(&vm_state(container)) {
@@ -753,7 +813,16 @@ pub fn stop(container: &Container, timeout: Duration) -> Result<()> {
         return crate::macos::stop(container, timeout);
     }
     // The guest service powers the micro-VM off; fall back to a hard stop.
-    let _ = daemon_call("shutdown", json!({"id":container.vm_id,"mode":"guest"}));
+    // Under systemd that is `systemctl poweroff`: units stop in order. QEMU's
+    // shutdown is a power-button press the micro-VM kernel has no driver for,
+    // so ask systemd through the guest service there.
+    let asked = container.init.is_some()
+        && container.backend == "qemu-hvf"
+        && exec_once(container, &systemd_poweroff(), 10_000)
+            .is_ok_and(|r| r["exit_code"].as_i64() == Some(0));
+    if !asked {
+        let _ = daemon_call("shutdown", json!({"id":container.vm_id,"mode":"guest"}));
+    }
     if wait_stopped(container, timeout) {
         return Ok(());
     }
@@ -776,10 +845,6 @@ pub fn remove(container: &Container, force: bool) -> Result<()> {
             )
         }
         stop(container, Duration::from_secs(5))?;
-    }
-    match reconcile_execution(container) {
-        Err(e) if !e.to_string().contains("VM not found") => return Err(e),
-        _ => {}
     }
     match daemon_call(
         "delete",
@@ -821,24 +886,11 @@ pub fn exec(container: &Container, argv: &[String], timeout_ms: u64) -> Result<V
 }
 
 fn exec_once(container: &Container, argv: &[String], timeout_ms: u64) -> Result<Value> {
-    let owner = random_hex(32);
-    let lease = daemon_call(
-        "acquire_control",
-        json!({"id":container.vm_id,"owner":owner}),
-    )?;
-    let epoch = lease["epoch"]
-        .as_u64()
-        .context("daemon returned no control epoch")?;
-    let result = daemon_call(
+    // The guest kills the command's process group at the timeout.
+    let reply = daemon_call(
         "exec",
-        json!({"id":container.vm_id,"owner":owner,"epoch":epoch,"argv":argv,"timeout_ms":timeout_ms}),
-    );
-    let _ = daemon_call(
-        "release_control",
-        json!({"id":container.vm_id,"owner":owner,"epoch":epoch}),
-    );
-    let _ = daemon_call("session_end", json!({"owner":owner}));
-    let reply = result?;
+        json!({"id":container.vm_id,"argv":argv,"timeout_ms":timeout_ms}),
+    )?;
     Ok(if reply["result"].is_object() {
         reply["result"].clone()
     } else {
@@ -938,5 +990,34 @@ mod tests {
             Some(("ip", "192.168.64.5"))
         );
         assert_eq!(parse_marker("hello"), None);
+    }
+    #[test]
+    fn systemd_init_argv() {
+        let mut options = RunOptions::default();
+        assert_eq!(systemd_argv(&options).unwrap(), ["/sbin/init"]);
+        options.command = vec![
+            "/lib/systemd/systemd".into(),
+            "systemd.unit=multi-user.target".into(),
+        ];
+        assert_eq!(systemd_argv(&options).unwrap(), options.command);
+        options.command = vec!["bash".into()];
+        assert!(systemd_argv(&options).is_err());
+        options.command.clear();
+        options.user = Some("ubuntu".into());
+        assert!(systemd_argv(&options).is_err());
+        options.user = None;
+        options.entrypoint = Some(vec!["/init".into()]);
+        assert!(systemd_argv(&options).is_err());
+    }
+    #[test]
+    fn records_without_init_still_load() {
+        let record = json!({"id":"a","name":"n","image":"i","config_digest":"d","argv":["sh"],"env":[],"workdir":"","user":"","ports":[],"volumes":[],"backend":"apple-virtualization","gpus":null,"desktop":false,"engine":false,"auto_remove":false,"cpus":2,"memory_mib":512,"created_at":0,"vm_id":"c-a"});
+        let container: Container = serde_json::from_value(record).unwrap();
+        assert_eq!(container.init, None);
+        assert_eq!(default_stop_timeout(&container), Duration::from_secs(10));
+        assert!(serde_json::to_value(&container)
+            .unwrap()
+            .get("init")
+            .is_none());
     }
 }

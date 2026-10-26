@@ -499,13 +499,6 @@ mod tests {
             return;
         }
         let f = Fixture::new();
-        let witness_temp = tempfile::tempdir().unwrap();
-        let witness_dir = witness_temp.path().canonicalize().unwrap();
-        fs::set_permissions(&witness_dir, fs::Permissions::from_mode(0o700)).unwrap();
-        let unrelated =
-            crate::exec_witness::Witness::create(&witness_dir, "unrelated", &"a".repeat(64))
-                .unwrap();
-        let unrelated_id = unrelated.identity.clone();
         let guard = f.open().unwrap();
         assert_ne!(
             unsafe { libc::fcntl(guard.inner.lock.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
@@ -530,10 +523,7 @@ mod tests {
             libc::close(pipe[0]);
         }
         drop(guard);
-        drop(unrelated);
         let while_inherited = f.open();
-        let unrelated_while_inherited =
-            crate::exec_witness::ReconciliationGuard::acquire(&witness_dir, &unrelated_id);
         // Signal and reap our exact still-owned child before assertions.
         let byte = 1_u8;
         let sent = unsafe { libc::write(pipe[1], (&byte as *const u8).cast(), 1) };
@@ -552,14 +542,6 @@ mod tests {
         assert!(
             while_inherited.is_err(),
             "CLOEXEC unexpectedly released a live inherited disk lock before exec"
-        );
-        assert!(
-            unrelated_while_inherited.is_err(),
-            "fork unexpectedly did not inherit unrelated witness"
-        );
-        crate::exec_witness::ReconciliationGuard::acquire(&witness_dir, &unrelated_id).unwrap();
-        println!(
-            "unrelated witness: busy while inherited; exact child reaped; exclusive proof succeeds"
         );
         await_available(&f.disk, &f.locks);
     }

@@ -46,7 +46,7 @@ try {
   const tools=await client.listTools();
   const names=tools.tools.map(t=>t.name);
   check(names.includes('vm_windows')&&names.includes('vm_guest_info'),'observe_tools_missing');
-  check(!names.some(n=>n.startsWith('vm_input_')||n.startsWith('vm_file_')||n.startsWith('vm_exec')||['vm_start','vm_force_stop','vm_acquire_control'].includes(n)),'observe_scope_expanded');
+  check(!names.some(n=>n.startsWith('vm_input_')||n.startsWith('vm_file_')||n.startsWith('vm_exec')||['vm_start','vm_force_stop'].includes(n)),'observe_scope_expanded');
   result.observe_tools_only=true;
   async function call(name,args){
     const response=await client.callTool({name,arguments:args});

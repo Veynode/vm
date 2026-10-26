@@ -109,7 +109,6 @@ with tempfile.TemporaryDirectory(prefix='vm-cgroup-recovery-') as temp:
   else:raise TimeoutError('first real service unavailable')
   assert info['capabilities']['descendant_containment'] and info['file_policy']['uid']==1001,info
   evidence['checks'].append({'name':'first service real containment and files worker','evidence':info})
-  tool(owner,'vm_acquire_control')
   script='setsid /bin/sh -c \'(sleep 5; printf escaped > "$2") </dev/null >/dev/null 2>&1 & printf ready > "$1"; exit 0\' detached "$1" "$2" & sleep 20 & wait'
   job=tool(owner,'vm_exec_start',argv=['/bin/sh','-c',script,'test','/home/veynode/recovery-ready','/home/veynode/recovery-marker'],timeout_ms=10000)['result']['job_id']
   for _ in range(150):

@@ -10,6 +10,7 @@
 //! <container>/login                          "user\npassword" of the image login (0600)
 //! <container>/known_hosts                    Guest host key, trusted on first use
 //! <container>/setup                          first-boot root script (hostname, disk, DNS, MTU)
+//! <container>/grant                          marker: the first-boot TCC grant is still due
 //! ```
 //!
 //! The Guest address is the vmnet DHCP lease for the container's fixed MAC.
@@ -19,7 +20,9 @@
 //! `run IMAGE COMMAND` runs the command over SSH once the Guest is up (in the
 //! foreground, or with `-d` in the background with its output in
 //! `~/.veynodevm/main.log`, which `logs` reads), and `run -it IMAGE` opens a
-//! login shell.
+//! login shell. The first boot finishes inside `run` (also with `-d`): after
+//! the key and the setup script, `macos_grant` gives SSH sessions
+//! Accessibility and Automation of System Events through the Guest's screen.
 use crate::{
     container::{self, Container, RunOptions},
     daemon_call, random_hex,
@@ -149,7 +152,7 @@ fn key() -> Result<PathBuf> {
     Ok(key)
 }
 
-fn login(container: &Container) -> Result<(String, String)> {
+pub(crate) fn login(container: &Container) -> Result<(String, String)> {
     let text = fs::read_to_string(container::container_dir(&container.id)?.join("login"))?;
     let (user, password) = text.split_once('\n').context("invalid login file")?;
     Ok((user.to_owned(), password.trim_end_matches('\n').to_owned()))
@@ -280,7 +283,7 @@ fn install_key(container: &Container, user: &str, ip: &str) -> Result<()> {
 }
 
 /// Run a shell command in the Guest, returning (status, stdout, stderr).
-fn remote(
+pub(crate) fn remote(
     container: &Container,
     ip: &str,
     script: &str,
@@ -349,6 +352,13 @@ pub fn ensure_ready(container: &Container, quiet: bool) -> Result<String> {
         sudo(container, &ip, &script)?;
         fs::remove_file(&setup)?;
     }
+    // Renaming claims the one-time grant, so concurrent callers skip it.
+    let dir = container::container_dir(&container.id)?;
+    if fs::rename(dir.join("grant"), dir.join("grant.running")).is_ok() {
+        say("granting SSH sessions Accessibility and Automation");
+        crate::macos_grant::grant(container, &ip);
+        fs::remove_file(dir.join("grant.running"))?;
+    }
     for (index, volume) in container.volumes.iter().enumerate() {
         let tag = format!("v{index}");
         let target = quote(&volume.target);
@@ -416,6 +426,21 @@ pub fn exec(container: &Container, argv: &[String], tty: bool, interactive: bool
         .arg(remote_command(container, argv))
         .status()?;
     Ok(status.code().unwrap_or(255))
+}
+
+/// `ssh -tt` running `argv` (a login shell when empty), for callers that give
+/// it a terminal of their own (the web UI terminal, `session`).
+pub fn shell_command(container: &Container, argv: &[String]) -> Result<Command> {
+    let ip = ensure_ready(container, true)?;
+    let (user, _) = login(container)?;
+    let mut command = ssh_base("/usr/bin/ssh", container)?;
+    command.args(["-o", "BatchMode=yes", "-tt"]);
+    let shell = ["/bin/zsh".to_owned(), "-l".to_owned()];
+    let argv = if argv.is_empty() { &shell[..] } else { argv };
+    command
+        .arg(format!("{user}@{ip}"))
+        .arg(remote_command(container, argv));
+    Ok(command)
 }
 
 /// Start the container's COMMAND in the background; its output is appended
@@ -609,6 +634,7 @@ pub fn create_and_start(
         if !setup.is_empty() {
             fs::write(dir.join("setup"), &setup)?;
         }
+        fs::write(dir.join("grant"), "")?;
         clone_file(
             &machine.join("nvram.bin"),
             &identity.join("auxiliary-storage.bin"),
@@ -669,6 +695,10 @@ pub fn create_and_start(
             vm_id: vm_id.clone(),
             os: "darwin".into(),
             mac_address: Some(mac),
+            session_port: None,
+            init: None,
+            tty: false,
+            stdin: false,
         };
         container::save(&container)?;
         daemon_call("create", vm)?;

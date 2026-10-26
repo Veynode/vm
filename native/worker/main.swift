@@ -27,6 +27,9 @@ struct Config: Decodable {
     var initrd: String?
     var command_line: String?
     var disk: String?
+    var boot: String?
+    var efi_vars: String?
+    var cdrom: String?
     var restore_image: String?
     var machine_identity_dir: String?
     var window: Bool?
@@ -145,11 +148,19 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
         c.memorySize = config.memory_mib * 1024 * 1024
         let width = config.width ?? 2560, height = config.height ?? 1440
         guard width >= 640 && width <= 7680 && height >= 480 && height <= 4320 else { throw NativeError(message:"Invalid display dimensions") }
+        let uefi = (config.boot ?? "kernel") == "uefi"
+        guard ["kernel","uefi"].contains(config.boot ?? "kernel"), !uefi || config.guest == "linux" else { throw NativeError(message:"Unsupported boot mode") }
         if config.guest == "linux" {
-            let loader = VZLinuxBootLoader(kernelURL: URL(fileURLWithPath: try required(config.kernel,"kernel")))
-            if let initrd = config.initrd { loader.initialRamdiskURL = URL(fileURLWithPath:initrd) }
-            loader.commandLine = config.command_line ?? "console=hvc0"
-            c.bootLoader = loader
+            if uefi {
+                // The distribution's own bootloader (GRUB/shim) from disk or installer medium.
+                guard config.kernel == nil, config.initrd == nil, config.command_line == nil else { throw NativeError(message:"UEFI boot does not take kernel, initrd or command_line") }
+                c.bootLoader = try efiBootLoader(path:try required(config.efi_vars,"efi_vars"))
+            } else {
+                let loader = VZLinuxBootLoader(kernelURL: URL(fileURLWithPath: try required(config.kernel,"kernel")))
+                if let initrd = config.initrd { loader.initialRamdiskURL = URL(fileURLWithPath:initrd) }
+                loader.commandLine = config.command_line ?? "console=hvc0"
+                c.bootLoader = loader
+            }
             c.platform = VZGenericPlatformConfiguration()
             let graphics = VZVirtioGraphicsDeviceConfiguration()
             graphics.scanouts = [VZVirtioGraphicsScanoutConfiguration(widthInPixels: width, heightInPixels: height)]
@@ -228,6 +239,15 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
             let attachment = try VZDiskImageStorageDeviceAttachment(url: URL(fileURLWithPath:disk), readOnly:false)
             c.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment:attachment)]
         } else if config.guest == "macos" { throw NativeError(message:"macOS requires disk") }
+        if let cdrom = config.cdrom {
+            guard uefi else { throw NativeError(message:"cdrom requires UEFI boot") }
+            var metadata = stat()
+            guard lstat(cdrom,&metadata) == 0, metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) else { throw NativeError(message:"cdrom must be a regular file") }
+            // Installer media appear as a read-only USB stick, which both the
+            // firmware and distribution installers boot and mount.
+            let attachment = try VZDiskImageStorageDeviceAttachment(url: URL(fileURLWithPath:cdrom), readOnly:true)
+            c.storageDevices.append(VZUSBMassStorageDeviceConfiguration(attachment:attachment))
+        }
         for extra in config.extra_disks ?? [] {
             // Only read-only extras are accepted: writable images need the primary disk lock.
             guard extra.read_only else { throw NativeError(message:"extra disks must be read-only") }
@@ -250,6 +270,26 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
         }
         try c.validate()
         return c
+    }
+    /// Per-VM UEFI variable store: created private on first start, then reused
+    /// so the installed distribution's boot entries persist.
+    func efiBootLoader(path: String) throws -> VZEFIBootLoader {
+        let url = URL(fileURLWithPath:path)
+        var metadata = stat()
+        let store: VZEFIVariableStore
+        if lstat(path,&metadata) == 0 {
+            guard metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG), metadata.st_uid == getuid(), metadata.st_mode & 0o077 == 0 else {
+                throw NativeError(message:"efi_vars must be a private regular file owned by you")
+            }
+            store = VZEFIVariableStore(url:url)
+        } else {
+            guard errno == ENOENT else { throw NativeError(message:"Cannot inspect efi_vars: \(String(cString:strerror(errno)))") }
+            store = try VZEFIVariableStore(creatingVariableStoreAt:url, options:[])
+            guard chmod(path,0o600) == 0 else { throw NativeError(message:"Cannot make efi_vars private") }
+        }
+        let loader = VZEFIBootLoader()
+        loader.variableStore = store
+        return loader
     }
     func start(restore: VZMacOSRestoreImage? = nil) {
         do {
@@ -552,7 +592,7 @@ switch args[1] {
 case "framing-test": jsonFramingSelfTest()
 #endif
 case "probe":
-    emit(["backend":"apple-virtualization","protocol_version":1,"architecture":"arm64","virtualization_supported":VZVirtualMachine.isSupported,"host_os":ProcessInfo.processInfo.operatingSystemVersionString,"memory_bytes":ProcessInfo.processInfo.physicalMemory,"logical_cpus":ProcessInfo.processInfo.processorCount,"limits":["min_cpus":VZVirtualMachineConfiguration.minimumAllowedCPUCount,"max_cpus":VZVirtualMachineConfiguration.maximumAllowedCPUCount,"min_memory_bytes":VZVirtualMachineConfiguration.minimumAllowedMemorySize,"max_memory_bytes":VZVirtualMachineConfiguration.maximumAllowedMemorySize],"guests":["linux":["boot":"direct-kernel","display":"VZVirtioGraphicsDevice + VZVirtualMachineView","gpu_3d":"unverified; virtio scanout is not a 3D claim","headless_lifecycle":true],"macos":["boot":"VZMacOSBootLoader","install":"VZMacOSInstaller","display":"VZMacGraphicsDevice + VZVirtualMachineView","gpu_3d":"paravirtualized Metal (AppleParavirtGPU); compute and game-like rendering verified in a macOS 26.6 guest; 60 Hz display","headless_lifecycle":true],"windows":["supported":false]],"remote_capture":false,"snapshot_restore":"unverified","native_display":true,"guest_transport":"virtio-vsock","entitlement_required":"com.apple.security.virtualization"])
+    emit(["backend":"apple-virtualization","protocol_version":1,"architecture":"arm64","virtualization_supported":VZVirtualMachine.isSupported,"host_os":ProcessInfo.processInfo.operatingSystemVersionString,"memory_bytes":ProcessInfo.processInfo.physicalMemory,"logical_cpus":ProcessInfo.processInfo.processorCount,"limits":["min_cpus":VZVirtualMachineConfiguration.minimumAllowedCPUCount,"max_cpus":VZVirtualMachineConfiguration.maximumAllowedCPUCount,"min_memory_bytes":VZVirtualMachineConfiguration.minimumAllowedMemorySize,"max_memory_bytes":VZVirtualMachineConfiguration.maximumAllowedMemorySize],"guests":["linux":["boot":"direct-kernel","uefi_boot":"VZEFIBootLoader + per-VM VZEFIVariableStore; installer ISO as read-only USB mass storage","display":"VZVirtioGraphicsDevice + VZVirtualMachineView","gpu_3d":"unverified; virtio scanout is not a 3D claim","headless_lifecycle":true],"macos":["boot":"VZMacOSBootLoader","install":"VZMacOSInstaller","display":"VZMacGraphicsDevice + VZVirtualMachineView","gpu_3d":"paravirtualized Metal (AppleParavirtGPU); compute and game-like rendering verified in a macOS 26.6 guest; 60 Hz display","headless_lifecycle":true],"windows":["supported":false]],"remote_capture":false,"snapshot_restore":"unverified","native_display":true,"guest_transport":"virtio-vsock","entitlement_required":"com.apple.security.virtualization"])
 case "latest-restore":
     VZMacOSRestoreImage.fetchLatestSupported { result in
         switch result {

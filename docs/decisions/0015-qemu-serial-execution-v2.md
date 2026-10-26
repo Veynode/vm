@@ -1,6 +1,7 @@
 # Private QEMU serial execution v2 (implementation contract)
 
 Status: implemented with targeted real-Guest acceptance; still opt-in and not release acceptance.
+Status: superseded in part — leases, takeover, exec scopes and the exec witness were removed; exec is a guest timeout plus process-group kill.
 The measured character-device behavior in commit 952840d includes buffered bytes
 after host close, loss of an observable close edge on rapid reconnect, and Guest
 clocks that do not advance during a whole-VM pause. EOF and Guest timers alone

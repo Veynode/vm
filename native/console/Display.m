@@ -40,10 +40,10 @@ void VeynodeDisplayInvalidate(void){
 }
 BOOL VeynodeDisplayVisible(void){initializeState();[publicationLock lock];BOOL result=enabled&&visible;[publicationLock unlock];return result;}
 static NSDictionary *nativeInputStatus(void){
-    return nativeControl?[nativeControl status]:@{@"native_frame_acquisition_protocol":@1,@"native_frame_acquisition_negotiated":@NO,@"native_frame_acquisition_enabled":@NO,@"native_input_protocol":@1,@"native_input_supported":@YES,@"native_input_available":@NO,@"input_enabled":@NO,@"display_only":@YES,@"native_input_state":@"view_only",@"native_input_ready":@NO,@"native_human_hold":@NO,@"native_release_confirmed":@YES,@"native_input_epoch":[NSNull null],@"native_input_queued_transitions":@0,@"native_input_pending_move":@NO,@"native_input_transition_limit":@32};
+    return nativeControl?[nativeControl status]:@{@"native_frame_acquisition_protocol":@1,@"native_frame_acquisition_negotiated":@NO,@"native_frame_acquisition_enabled":@NO,@"native_input_protocol":@1,@"native_input_supported":@YES,@"native_input_available":@NO,@"input_enabled":@NO,@"display_only":@YES,@"native_input_state":@"view_only",@"native_input_ready":@NO,@"native_release_confirmed":@YES,@"native_input_epoch":[NSNull null],@"native_input_queued_transitions":@0,@"native_input_pending_move":@NO,@"native_input_transition_limit":@32};
 }
 NSDictionary *VeynodeDisplayCapabilities(void){
-    NSMutableDictionary *caps=[@{@"native_window":(MTLCreateSystemDefaultDevice()!=nil?@YES:@NO),@"display_instance":[displayed instance],@"native_window_protocol":@2,@"displayed_frame_protocol":@1,@"display_only":@YES,@"input_enabled":@NO,@"display_path":@"owned-BGRA-MetalKit-no-video-encoding",@"capture_limit_fps":@60,@"native_window_capture_limit_fps":@60,@"background_capture_limit_fps":@30,@"encoder_limit_fps":@30,@"idle_encode_interval_ms":@1000,@"display_refresh_preference_hz":@60,@"physical_presentation_measurement":@"unavailable",@"presented_time_sample_limit":@120,@"presented_time_source":@"CAMetalDrawable.addPresentedHandler/presentedTime",@"owned_slot_limit":@3,@"display_gpu_inflight_limit":@1} mutableCopy];
+    NSMutableDictionary *caps=[@{@"native_window":(MTLCreateSystemDefaultDevice()!=nil?@YES:@NO),@"display_instance":[displayed instance],@"native_window_protocol":@2,@"displayed_frame_protocol":@1,@"display_only":@YES,@"input_enabled":@NO,@"display_path":@"owned-BGRA-MetalKit-no-video-encoding",@"capture_limit_fps":@60,@"native_window_capture_limit_fps":@60,@"background_capture_limit_fps":@30,@"encoder_limit_fps":@60,@"idle_encode_interval_ms":@1000,@"display_refresh_preference_hz":@60,@"physical_presentation_measurement":@"unavailable",@"presented_time_sample_limit":@120,@"presented_time_source":@"CAMetalDrawable.addPresentedHandler/presentedTime",@"owned_slot_limit":@3,@"display_gpu_inflight_limit":@1} mutableCopy];
     [caps addEntriesFromDictionary:nativeInputStatus()];return caps;
 }
 
@@ -72,18 +72,16 @@ NSDictionary *VeynodeDisplayCapabilities(void){
 
 @interface VNDisplay : NSObject <NSApplicationDelegate,NSWindowDelegate,MTKViewDelegate>
 @property NSWindow *window;
-@property NSButton *takeButton,*returnButton;
 @property NSTextField *inputLabel;
 @property NSTimer *inputTimer;
 @property NSMutableSet<NSString *> *heldKeys;
 @property NSMutableSet<NSString *> *heldButtons;
 @property BOOL inputWasReady;
+@property double lastBegin;
 - (void)inputEvent:(NSEvent *)event;
 - (void)updateInput;
 - (void)suspendInput;
 - (void)suspendInputWithReason:(NSString *)reason;
-- (void)takeControl:(id)sender;
-- (void)returnAgent:(id)sender;
 @property VNReadOnlyView *view;
 @property id<MTLDevice> device;
 @property id<MTLCommandQueue> commands;
@@ -141,9 +139,7 @@ static NSString *displayMetalFailure(NSString *phase,NSError *error){
     __weak VNDisplay *weak=self;self.view.inputEvent=^(NSEvent *event){[weak inputEvent:event];};
     NSView *container=[[NSView alloc] initWithFrame:NSMakeRect(0,0,960,640)];
     self.view.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;[container addSubview:self.view];
-    self.takeButton=[NSButton buttonWithTitle:@"Take Control" target:self action:@selector(takeControl:)];self.takeButton.frame=NSMakeRect(10,605,125,28);self.takeButton.autoresizingMask=NSViewMinYMargin;self.takeButton.accessibilityLabel=@"Take Control";[container addSubview:self.takeButton];
-    self.returnButton=[NSButton buttonWithTitle:@"Return to Agent" target:self action:@selector(returnAgent:)];self.returnButton.frame=NSMakeRect(145,605,145,28);self.returnButton.autoresizingMask=NSViewMinYMargin;self.returnButton.accessibilityLabel=@"Return to Agent";[container addSubview:self.returnButton];
-    self.inputLabel=[NSTextField labelWithString:@"View Only"];self.inputLabel.frame=NSMakeRect(305,610,640,20);self.inputLabel.autoresizingMask=NSViewWidthSizable|NSViewMinYMargin;self.inputLabel.accessibilityLabel=@"Native input state";[container addSubview:self.inputLabel];
+    self.inputLabel=[NSTextField labelWithString:@"View Only"];self.inputLabel.frame=NSMakeRect(10,610,935,20);self.inputLabel.autoresizingMask=NSViewWidthSizable|NSViewMinYMargin;self.inputLabel.accessibilityLabel=@"Native input state";[container addSubview:self.inputLabel];
     self.window=[[NSWindow alloc] initWithContentRect:container.frame styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskResizable|NSWindowStyleMaskMiniaturizable backing:NSBackingStoreBuffered defer:NO];
     self.layoutObserved=NO;self.windowEpoch++;self.lastGeneration=UINT64_MAX;self.lastSequence=UINT64_MAX;self.lastDrawableSize=CGSizeZero;
     self.window.title=@"Veynode VM Console — View Only";self.window.releasedWhenClosed=NO;self.window.delegate=self;self.window.contentView=container;self.window.acceptsMouseMovedEvents=YES;
@@ -186,26 +182,29 @@ static NSString *displayMetalFailure(NSString *phase,NSError *error){
 - (void)suspendInputWithReason:(NSString *)reason{[nativeControl suspendWithReason:reason];[self.heldKeys removeAllObjects];[self.heldButtons removeAllObjects];self.inputWasReady=NO;}
 - (void)windowDidResignKey:(NSNotification *)notification{[self suspendInputWithReason:@"window_focus_lost"];}
 - (void)applicationDidResignActive:(NSNotification *)notification{[self suspendInputWithReason:@"application_focus_lost"];}
-- (void)takeControl:(id)sender{
-    if(!VNInputMayTakeControl(NSApp.active,self.window.keyWindow))return;
-    // Keys physically held before acquisition are not owned synthetic presses.
-    if(NSEvent.modifierFlags&(NSEventModifierFlagShift|NSEventModifierFlagControl|NSEventModifierFlagOption|NSEventModifierFlagCommand)){self.inputLabel.stringValue=@"Release modifier keys before Take Control";return;}
-    [nativeControl takeControl];[self updateInput];
+// Input follows focus: a focused, visible console window begins an activation
+// and losing focus suspends it, releasing anything held in the guest.
+- (void)beginIfFocused:(NSDictionary *)s{
+    if(![s[@"native_input_available"] boolValue]||![@[@"view_only",@"suspended"] containsObject:s[@"native_input_state"]])return;
+    if(!VNInputMayBegin(NSApp.active,self.window.keyWindow)||!self.window.visible||self.window.miniaturized)return;
+    // Keys physically held before the activation are not owned synthetic presses.
+    if(NSEvent.modifierFlags&(NSEventModifierFlagShift|NSEventModifierFlagControl|NSEventModifierFlagOption|NSEventModifierFlagCommand))return;
+    double now=NSProcessInfo.processInfo.systemUptime;if(now-self.lastBegin<1)return;self.lastBegin=now;
+    if(self.window.firstResponder!=self.view)[self.window makeFirstResponder:self.view];
+    [nativeControl begin];
 }
-- (void)returnAgent:(id)sender{[self.heldKeys removeAllObjects];[self.heldButtons removeAllObjects];self.inputWasReady=NO;[nativeControl returnAgent];[self updateInput];}
 - (void)updateInput{
     NSDictionary *s=nativeInputStatus();BOOL ready=[s[@"input_enabled"] boolValue];
-    if(ready&&!VNInputMayTakeControl(NSApp.active,self.window.keyWindow)){[self suspendInputWithReason:@"dispatch_focus_lost"];s=nativeInputStatus();ready=NO;}
+    if(ready&&!VNInputMayBegin(NSApp.active,self.window.keyWindow)){[self suspendInputWithReason:@"dispatch_focus_lost"];s=nativeInputStatus();ready=NO;}
+    if(!ready){[self beginIfFocused:s];s=nativeInputStatus();}
     if(ready&&!self.inputWasReady)[self.window makeFirstResponder:self.view];
     if(ready&&!VNInputMayDispatch(NSApp.active,self.window.keyWindow,self.view&&self.window.firstResponder==self.view)){[self suspendInputWithReason:@"dispatch_focus_lost"];s=nativeInputStatus();ready=NO;}
     if(!ready){[self.heldKeys removeAllObjects];[self.heldButtons removeAllObjects];}
     self.inputWasReady=ready;
     NSString *state=s[@"native_input_state"]?:@"view_only";
-    NSDictionary *labels=@{@"view_only":@"View Only",@"connecting":@"Connecting — View Only",@"human_control":@"Human Control",@"taking_control":@"Taking Control",@"suspending":@"Releasing Inputs — Human Hold",@"suspended_human_hold":@"Suspended — Human Hold",@"returning_agent":@"Returning to Agent",@"cleanup_unconfirmed":@"Cleanup Unconfirmed — Input Disabled"};
+    NSDictionary *labels=@{@"view_only":@"View Only — focus the window to type",@"connecting":@"Connecting — View Only",@"beginning":@"Connecting Input",@"active":@"Input Active",@"suspending":@"Releasing Inputs",@"suspended":@"Input Suspended — focus the window to resume",@"cleanup_unconfirmed":@"Cleanup Unconfirmed — Input Disabled"};
     NSString *label=labels[state]?:@"Input Disabled";
     self.inputLabel.stringValue=label;
-    self.takeButton.enabled=[s[@"native_input_available"] boolValue]&&!ready&&![@[@"taking_control",@"suspending",@"returning_agent"] containsObject:state];
-    self.returnButton.enabled=[s[@"native_input_available"] boolValue]&&[s[@"native_human_hold"] boolValue]&&![@[@"taking_control",@"suspending",@"returning_agent"] containsObject:state];
     self.window.title=[@"Veynode VM Console — " stringByAppendingString:label];
 }
 - (void)inputEvent:(NSEvent *)e{
@@ -405,7 +404,7 @@ int VeynodeDisplayHeadlessSelfTest(void){@autoreleasepool{
         for(int cycle=0;cycle<4;cycle++){
             NSDictionary *s=[headless status];NSData *wire=[NSJSONSerialization dataWithJSONObject:s options:0 error:nil];NSCAssert(wire,@"real status is serializable");
             NSDictionary *value=[NSJSONSerialization JSONObjectWithData:wire options:0 error:nil];
-            for(NSString *key in @[@"window_open",@"window_visible",@"native_input_ready",@"native_input_available",@"native_human_hold",@"input_enabled",@"frame_available",@"displayed_frame_available"]){NSCAssert(CFGetTypeID((__bridge CFTypeRef)value[key])==CFBooleanGetTypeID()&&![value[key] boolValue],@"headless runtime bool must remain false: %@",key);}
+            for(NSString *key in @[@"window_open",@"window_visible",@"native_input_ready",@"native_input_available",@"input_enabled",@"frame_available",@"displayed_frame_available"]){NSCAssert(CFGetTypeID((__bridge CFTypeRef)value[key])==CFBooleanGetTypeID()&&![value[key] boolValue],@"headless runtime bool must remain false: %@",key);}
             NSCAssert([value[@"native_release_confirmed"] boolValue]&&[value[@"display_only"] boolValue],@"headless owns no inputs");
             NSCAssert([value[@"native_input_state"] isEqual:phase==1?@"connecting":@"view_only"],@"actual connection state retained without a label view");
             NSCAssert(headless.window==nil&&headless.view==nil&&headless.inputLabel==nil&&NSApp==nil,@"status/close never constructs UI");

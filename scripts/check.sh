@@ -5,6 +5,10 @@ cd "$ROOT"
 export PATH="/opt/homebrew/bin:$PATH"
 export VEYNODE_PYTHON="${VEYNODE_PYTHON:-$(command -v python3.13 || command -v python3.12 || command -v python3)}"
 ./scripts/build-native.sh
+./native/tools/build-vz-desktop-stream.sh
+./native/guest-metal-fix/build.sh
+./native/tools/build-vm-vision.sh
+./native/tools/build-vm-macos-desktop.sh
 cargo fmt --check
 cargo build --locked --bins
 cargo test --locked

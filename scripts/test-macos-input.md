@@ -29,8 +29,8 @@ python3 scripts/test-macos-input.py \
 ```
 
 The script refuses unavailable input before sending anything. It checks the nonce,
-current key-window state, geometry, and actual JPEG header dimensions; acquires a
-lease; obtains a fresh screenshot for each click, key, modifier chord, drag and
+current key-window state, geometry, and actual JPEG header dimensions; obtains a
+fresh screenshot for each click, key, modifier chord, drag and
 scroll; then requires corresponding *new* AppKit receiver events. Physical-pixel
 mouse positions must match pixel centres within one pixel. AppKit may coalesce
 drag/scroll events. `CGEventPost`/controller dispatch ACK is explicitly not delivery.
@@ -50,9 +50,7 @@ Every successful download verifies <=32KiB chunks, sequential offsets, declared
 size and whole-file SHA256. This is atomic visibility, not storage durability.
 
 After the positive actions, the fixture waits5.3s for an anchor to expire and
-requires refusal with no new oracle events. It then explicitly releases the lease
-and checks another refusal with unchanged receiver revision. This validates lost
-lease refusal; it does **not** test takeover during an in-progress operation.
+requires refusal with no new oracle events. This validates stale-anchor refusal.
 The oracle exits on its own bounded timer. Its real terminal summary must report
 no held keys/buttons/modifiers, lost focus, overflow or dropped log records.
 The scoped MCP child must exit0 after EOF before the report can pass. Timeout or

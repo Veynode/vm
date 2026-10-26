@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -22,19 +23,20 @@ const maxRequest = 65536
 const maxOutput = 65536
 
 type request struct {
-	ID        string       `json:"id"`
-	Scope     *serialScope `json:"scope,omitempty"`
-	Method    string       `json:"method"`
-	Argv      []string     `json:"argv,omitempty"`
-	TimeoutMS int          `json:"timeout_ms,omitempty"`
-	JobID     string       `json:"job_id,omitempty"`
-	Owner     string       `json:"owner,omitempty"`
-	Path      string       `json:"path,omitempty"`
-	Token     string       `json:"token,omitempty"`
-	Data      string       `json:"data,omitempty"`
-	Size      int64        `json:"size,omitempty"`
-	Offset    int64        `json:"offset,omitempty"`
-	SHA256    string       `json:"sha256,omitempty"`
+	ID        string   `json:"id"`
+	Method    string   `json:"method"`
+	Argv      []string `json:"argv,omitempty"`
+	TimeoutMS int      `json:"timeout_ms,omitempty"`
+	JobID     string   `json:"job_id,omitempty"`
+	Owner     string   `json:"owner,omitempty"`
+	Path      string   `json:"path,omitempty"`
+	Token     string   `json:"token,omitempty"`
+	Data      string   `json:"data,omitempty"`
+	Size      int64    `json:"size,omitempty"`
+	Offset    int64    `json:"offset,omitempty"`
+	SHA256    string   `json:"sha256,omitempty"`
+	// Arguments carries the daemon's desktop input and wait arguments (observe.go).
+	Arguments json.RawMessage `json:"arguments,omitempty"`
 }
 type response struct {
 	ID     string    `json:"id"`
@@ -94,12 +96,47 @@ func handleWithManager(manager *jobManager, req request, allowExec bool, allowSh
 				filePolicy = reply.Result
 			}
 		}
-		return response{ID: req.ID, Result: map[string]any{"protocol_version": 1, "os": runtime.GOOS, "arch": runtime.GOARCH, "os_release": string(release), "transport": "vsock-host-only", "execution_identity": manager.identity, "execution_containment": manager.containmentMode, "service_uid": os.Geteuid(), "file_policy": filePolicy, "capabilities": map[string]bool{"exec": allowExec, "async_exec": allowExec, "descendant_containment": allowExec && manager.containmentMode == "cgroup-v2-clone3-kill", "shutdown": shutdownEnabled, "desktop": false, "files": files != nil}, "max_output_bytes_per_stream": maxOutput, "max_timeout_ms": 30000, "max_active_commands": maxActiveCommands, "max_finished_jobs": maxFinishedJobs, "finished_job_ttl_seconds": int(finishedJobTTL.Seconds())}}
+		return response{ID: req.ID, Result: map[string]any{"protocol_version": 1, "os": runtime.GOOS, "arch": runtime.GOARCH, "os_release": string(release), "transport": "vsock-host-only", "execution_identity": manager.identity, "execution_containment": manager.containmentMode, "service_uid": os.Geteuid(), "file_policy": filePolicy, "capabilities": map[string]bool{"exec": allowExec, "async_exec": allowExec, "descendant_containment": allowExec && manager.containmentMode == "cgroup-v2-clone3-kill", "shutdown": shutdownEnabled, "desktop": desktop != nil, "screenshot": desktop != nil, "input": desktop != nil, "screen_wait": desktop != nil, "desktop_windows": desktop != nil, "app_launch": desktop != nil, "accessibility": desktop != nil, "files": files != nil}, "max_output_bytes_per_stream": maxOutput, "max_timeout_ms": 30000, "max_active_commands": maxActiveCommands, "max_finished_jobs": maxFinishedJobs, "finished_job_ttl_seconds": int(finishedJobTTL.Seconds())}}
 	case "file_upload_begin", "file_upload_write", "file_upload_commit", "file_download_begin", "file_download_read", "file_cancel", "file_session_end":
 		if files == nil {
 			return failure(req.ID, "unsupported", "file integration disabled; requires Linux files worker and explicit directory")
 		}
 		return files.call(req)
+	case "screenshot", "screen_wait", "input_step", "input_cleanup":
+		if desktop == nil {
+			return failure(req.ID, "unsupported", "desktop observation requires a desktop container (--desktop-stream)")
+		}
+		return desktop.handle(req)
+	case "desktop_state", "desktop_apps", "window_action", "app_launch":
+		if desktop == nil {
+			return failure(req.ID, "unsupported", "desktop tools require a desktop container (--desktop-stream)")
+		}
+		root := manager.identity.Chroot
+		if root == "" {
+			root = "/"
+		}
+		return desktopEnv{root: root}.handle(req)
+	case "accessibility_tree", "accessibility_action":
+		if desktop == nil {
+			return failure(req.ID, "unsupported", "accessibility requires a desktop container (--desktop-stream)")
+		}
+		var args a11yArgs
+		if len(req.Arguments) > 0 && json.Unmarshal(req.Arguments, &args) != nil {
+			return failure(req.ID, "invalid_request", "invalid arguments")
+		}
+		root := manager.identity.Chroot
+		if root == "" {
+			root = "/"
+		}
+		result, err := desktopEnv{root: root}.accessibility(req.Method, args)
+		if err != nil {
+			var coded *observeError
+			if errors.As(err, &coded) {
+				return failure(req.ID, coded.code, coded.message)
+			}
+			return failure(req.ID, "accessibility_failed", err.Error())
+		}
+		return response{ID: req.ID, Result: result}
 	case "shutdown":
 		if !shutdownEnabled {
 			return failure(req.ID, "forbidden", "normal shutdown disabled or service lacks privilege")
@@ -156,6 +193,10 @@ func serve(stream io.ReadWriteCloser, allowExec bool, allowShutdown ...bool) {
 	_ = json.NewEncoder(stream).Encode(reply)
 }
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == a11yHelperArg {
+		a11yHelperMain()
+		return
+	}
 	serialExec := flag.Bool("virtio-serial-exec", false, "private v2 rootless cgroup execution; requires host incarnation guardian, no reconnect")
 	serial := flag.Bool("virtio-serial", false, "observer-only private fixed virtio port; no reconnect or mutating capabilities")
 	legacyExec := flag.Bool("legacy-exec-process-groups", false, "DEVELOPMENT ONLY: allow uncontained process-group execution; setsid descendants can escape")
@@ -168,8 +209,18 @@ func main() {
 	fileWorker := flag.Bool("file-worker", false, "internal non-root worker")
 	containerRoot := flag.String("container-root", "", "OCI micro-VM (set by container-init): run commands as root inside this root")
 	containerEnv := flag.String("container-env", "", "OCI micro-VM: JSON file with the image env and workdir")
+	desktopStream := flag.Bool("desktop-stream", false, "serve the DRM scanout and uinput input to the host on vsock 5001 (Apple Virtualization desktop)")
 	if len(os.Args) > 1 && os.Args[1] == "container-init" {
 		os.Exit(containerInit())
+	}
+	if len(os.Args) > 1 && os.Args[1] == "session-server" {
+		os.Exit(sessionServerMain(os.Args[2:]))
+	}
+	// `marker KIND VALUE` prints a host-visible console event; systemd units
+	// of --init systemd containers use it (stdout is /dev/console there).
+	if len(os.Args) == 4 && os.Args[1] == "marker" {
+		fmt.Printf("@@veynodevm %s %s\n", os.Args[2], os.Args[3])
+		return
 	}
 	flag.Parse()
 	resolveIdentity := func() (executionIdentity, error) {
@@ -182,7 +233,7 @@ func main() {
 		return resolveExecutionIdentity(*execUser)
 	}
 	if *serial {
-		if *serialExec || *allowExec || *allowShutdown || *allowFiles || *legacyExec || *execUser != "" || *filesUser != "" || *filesRoot != "" || *fileWorker {
+		if *desktopStream || *serialExec || *allowExec || *allowShutdown || *allowFiles || *legacyExec || *execUser != "" || *filesUser != "" || *filesRoot != "" || *fileWorker {
 			fmt.Fprintln(os.Stderr, "virtio-serial is observer-only; privilege options rejected")
 			os.Exit(1)
 		}
@@ -193,7 +244,7 @@ func main() {
 		return
 	}
 	if *serialExec {
-		if !*allowExec || (*execUser == "" && *containerRoot == "") || *allowShutdown || *allowFiles || *legacyExec || *filesUser != "" || *filesRoot != "" || *fileWorker {
+		if !*allowExec || (*execUser == "" && *containerRoot == "") || *desktopStream || *allowShutdown || *allowFiles || *legacyExec || *filesUser != "" || *filesRoot != "" || *fileWorker {
 			fmt.Fprintln(os.Stderr, "serial v2 requires --allow-execute and fixed --exec-user or --container-root; files/shutdown/legacy forbidden")
 			os.Exit(1)
 		}
@@ -256,6 +307,14 @@ func main() {
 		os.Exit(1)
 	}
 	installSignalCleanup(commands)
+	if *desktopStream {
+		desktop = newDesktopObserver()
+		go func() {
+			if err := listenDesktop(); err != nil {
+				fmt.Fprintln(os.Stderr, "desktop stream unavailable:", err)
+			}
+		}()
+	}
 	fmt.Fprintln(os.Stderr, "veynode guest agent protocol=1 port=5000 hostCID=2")
 	if err := listenVsock(*allowExec, *allowShutdown); err != nil {
 		commands.stopAll(time.Second)

@@ -28,6 +28,11 @@ and `command_line` (default `console=hvc0`). EFI zboot containers must first be
 extracted; the direct kernel loader cannot load them. macOS requires `disk` and
 `machine_identity_dir`; installation also requires `restore_image`.
 
+Linux with `"boot":"uefi"` instead boots the distribution's own bootloader
+through `VZEFIBootLoader`: no `kernel`/`initrd`/`command_line`; `efi_vars` is
+the per-VM `VZEFIVariableStore` (created 0600 on first start, then reused) and
+optional `cdrom` attaches an installer ISO as read-only USB mass storage.
+
 Optional config:
 
 - `window`: false by default.

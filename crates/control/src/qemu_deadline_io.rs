@@ -225,7 +225,6 @@ mod tests {
                 "held".into(),
                 vm_control::input::key("a", false),
             )]),
-            active_epoch: Some(3),
             operation: Some("a".repeat(32)),
             ..Default::default()
         };
@@ -463,7 +462,6 @@ mod release_write_tests {
         };
         let mut input = InputState {
             operation: Some("a".repeat(32)),
-            active_epoch: Some(3),
             ..Default::default()
         };
         // Synthetic held set pressures real release serialization/socket I/O;

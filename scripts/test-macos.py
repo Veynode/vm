@@ -127,13 +127,11 @@ def mcp(vm_id):
     summary['screenshot'] = {'width': frame['width'], 'height': frame['height'], 'bytes': len(image), 'path': str(shot)}
     time.sleep(3)
     before = idle_seconds()
-    tool('vm_acquire_control', id=vm_id)
     content = tool('vm_screenshot', id=vm_id)
     frame = json.loads(content[1]['text'])
     tool('vm_input_click', id=vm_id, x=frame['width'] - 10, y=frame['height'] // 2, frame_id=frame['frame_id'],
          width=frame['width'], height=frame['height'], source_generation=frame['source_generation'])
     after = idle_seconds()
-    tool('vm_release_control', id=vm_id)
     assert after < before and after < 5, (before, after)
     summary['input_click'] = {'hid_idle_before_s': round(before, 1), 'hid_idle_after_s': round(after, 1)}
     process.stdin.close()

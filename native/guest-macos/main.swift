@@ -163,7 +163,7 @@ func handle(_ request:[String:Any],allowExec:Bool,allowObserve:Bool=false,allowI
     case "windows":
         guard Set(request.keys)==Set(["id","method"]) else{return errorReply(id,"invalid_request","windows accepts only id and method")}
         return windowsReply(id,enabled:allowObserve)
-    case "input_step","input_cleanup","input_revoke":
+    case "input_step","input_cleanup":
         guard Set(request.keys)==Set(["id","method","arguments"]),let args=request["arguments"] as? [String:Any] else {return errorReply(id,"invalid_request","input requires id, method, arguments")}
         return inputReply(id,method:method,args:args,enabled:allowInput)
     case "exec":

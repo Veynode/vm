@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Actual QEMU same-console input through MCP; owned disposable RAM fixtures only."""
-import argparse,base64,concurrent.futures,hashlib,importlib.util,json,os,secrets,signal,subprocess,tempfile,time
+import argparse,base64,hashlib,importlib.util,json,os,subprocess,tempfile,time
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location('qemu_test',ROOT/'scripts/test-control-qemu.py');q=importlib.util.module_from_spec(spec);spec.loader.exec_module(q)
@@ -11,7 +11,6 @@ def parse_events(text):
  return tuple([json.loads(line.split(prefix,1)[1]) for line in lines if line.startswith(prefix)] for prefix in ['X_INPUT ','RAW_INPUT '])
 def main():
  p=argparse.ArgumentParser(description=__doc__);p.add_argument('--output',type=Path,required=True)
- p.add_argument('--cleanup-retry-fault',action='store_true',help='Temporarily SIGSTOP only the owned test worker to verify failed/concurrent cleanup receipts; always SIGCONT in finally')
  for name,default in [('control','target/debug/vm-control'),('worker','target/debug/vm-qemu'),('broker','target/debug/vm-console'),('helper','.local/bin/spice-console'),('apple-backend','.local/bin/vm-apple')]:
   p.add_argument('--'+name,type=Path,default=ROOT/default)
  a=p.parse_args();out=a.output.resolve();out.parent.mkdir(parents=True,exist_ok=True)
@@ -33,10 +32,6 @@ def main():
    return json.loads(r.stdout)
   def ok(reply):assert reply.get('isError') is False,reply;return json.loads(reply['content'][0]['text'])
   def denied(reply):assert reply.get('isError') is True,reply;return reply['content'][0]['text']
-  def release_confirmed(reply):
-   # This confirms worker/QMP dispatch, not Guest delivery; the independent oracle below proves delivery.
-   assert reply.get('input_release')=={'confirmed':True,'vm_count':1,'guest_delivery_confirmed':False},reply
-   return reply
   def client(**kwargs):c=q.MCP(binary,state,**kwargs);clients.append(c);return c
   def shot(c):
    s=c.tool('vm_screenshot',{'id':'input-vm'});assert not s['isError'],s
@@ -71,8 +66,6 @@ def main():
    else:raise TimeoutError(log[-6000:])
    assert 'Accelerated: yes' in log and 'INPUT_DEVICE' in log
    f=shot(c);record('real_xorg_evdev_console_ready',f)
-   record('no_lease_rejected',denied(c.tool('vm_input_click',{**f,'x':200,'y':200})))
-   ok(c.tool('vm_acquire_control',{'id':'input-vm'}))
    for key,value in [('frame_id','00000000-0000-0000-0000-000000000000'),('source_generation',999999),('width',f['width']+1),('x',f['width'])]:
     frame=shot(c);bad={**frame,'x':200,'y':200,key:value};record('reject_'+key,denied(c.tool('vm_input_click',bad)))
    stale=shot(c);time.sleep(5.2);record('expired_frame_rejected',denied(c.tool('vm_input_click',{**stale,'x':200,'y':200})))
@@ -80,60 +73,13 @@ def main():
    ok(c.tool('vm_input_key',{**shot(c),'keys':['a']}));x,r=wait_for(lambda x,r:any(e.get('type')==3 and e.get('keysym')==97 for e in x) and any(e=={'type':1,'code':30,'value':0} for e in r));record('physical_key_guest_layout_a',{'xorg':x[-4:],'evdev':r[-4:]})
    ok(c.tool('vm_input_drag',{**shot(c),'x':220,'y':220,'end_x':280,'end_y':260}));x,r=wait_for(lambda x,r:any(e.get('type')==6 and e.get('x')==280 and e.get('y')==260 and e.get('state',0)&256 for e in x));record('drag_actual_button_motion',x[-25:])
    ok(c.tool('vm_input_scroll',{**shot(c),'x':250,'y':250,'direction':'down','ticks':2}));x,r=wait_for(lambda x,r:sum(e.get('type')==5 and e.get('button')==5 for e in x)>=2);record('scroll_actual_guest_events',x[-8:])
-   second={**config,'id':'other-vm','memory_mib':512,'serial_log':str(state/'other.serial.log')};call('create',second);ids.append('other-vm');call('start',{'id':'other-vm'});ok(c.tool('vm_acquire_control',{'id':'other-vm'}));time.sleep(1)
+   second={**config,'id':'other-vm','memory_mib':512,'serial_log':str(state/'other.serial.log')};call('create',second);ids.append('other-vm');call('start',{'id':'other-vm'});time.sleep(1)
    record('cross_vm_frame_rejected',denied(c.tool('vm_input_click',{**shot(c),'id':'other-vm','x':200,'y':200})));call('force_stop',{'id':'other-vm','confirm':'other-vm'})
    before=len(events()[0]);f=shot(c)
-   with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-    future=pool.submit(c.tool,'vm_input_drag',{**f,'x':220,'y':220,'end_x':350,'end_y':350})
-    wait_for(lambda x,r:len(x)>before and any(e.get('type')==4 and e.get('button')==1 for e in x[before:]))
-    takeover=release_confirmed(call('human_takeover',{'id':'input-vm'}));reply=future.result(timeout=15);denied(reply)
-   x,r=wait_for(lambda x,r:any(e.get('type')==5 and e.get('button')==1 for e in x[before:]));assert not any(e.get('type')==6 and e.get('x')==350 and e.get('y')==350 for e in x[before:]);record('takeover_interrupts_drag_and_releases',{'reply':reply,'takeover':takeover,'events':x[before:]})
-   time.sleep(.2);n=len(events()[0]);record('revoked_client_rejected',denied(c.tool('vm_input_click',{**shot(c),'x':200,'y':200})));time.sleep(.2);assert len(events()[0])==n;record('revoked_request_produces_no_guest_input')
-   call('human_release',{'id':'input-vm'});ok(c.tool('vm_acquire_control',{'id':'input-vm'}))
-   before=len(events()[0]);ok(c.tool('vm_input_key',{**shot(c),'keys':['a']}))
-   x,r=wait_for(lambda x,r:any(e.get('type')==3 and e.get('keysym')==97 for e in x[before:]));record('new_epoch_actual_key_before_explicit_release',x[before:])
-   record('explicit_release_worker_dispatch_confirmed',release_confirmed(ok(c.tool('vm_release_control',{'id':'input-vm'}))))
-   ok(c.tool('vm_acquire_control',{'id':'input-vm'}));before=len(events()[0]);f=shot(c)
-   # Close stdio during an active drag. The adapter disconnect monitor revokes the lease.
+   # Close stdio during an active drag. The drag's own cleanup releases the button.
    c.number+=1;c.p.stdin.write(json.dumps({'jsonrpc':'2.0','id':c.number,'method':'tools/call','params':{'name':'vm_input_drag','arguments':{**f,'x':220,'y':220,'end_x':360,'end_y':360}}})+'\n');c.p.stdin.flush()
    wait_for(lambda x,r:any(e.get('type')==4 and e.get('button')==1 for e in x[before:]));c.p.stdin.close();c.p.wait(timeout=12);assert c.p.returncode==0,{'exit':c.p.returncode,'stderr':c.p.stderr.read()}
-   x,r=wait_for(lambda x,r:any(e.get('type')==5 and e.get('button')==1 for e in x[before:]));assert not any(e.get('type')==6 and e.get('x')==360 and e.get('y')==360 for e in x[before:]);record('stdio_disconnect_releases_drag',x[before:])
-   if a.cleanup_retry_fault:
-    owner=secrets.token_hex(32);epoch=call('acquire_control',{'id':'input-vm','owner':owner})['epoch'];f=shot(observer);before=len(events()[0])
-    # Direct local control is deliberate: a known disposable owner lets us test
-    # the daemon lifecycle independently of an adapter's own cleanup latch.
-    down={**f,'owner':owner,'epoch':epoch,'operation_id':secrets.token_hex(16),'begin':True,'events':[
-     {'type':'abs','data':{'axis':'x','value':((2*200+1)*32768)//(2*f['width'])}},
-     {'type':'abs','data':{'axis':'y','value':((2*200+1)*32768)//(2*f['height'])}},
-     {'type':'btn','data':{'button':'left','down':True}}]}
-    call('input_step',down)
-    status=call('status',{'id':'input-vm'});worker_pid=status['pid'];assert status['config']['id']=='input-vm' and type(worker_pid) is int and worker_pid>1
-    # This VM belongs to the temporary state above. Never signal an external VM.
-    stopped=False;attempts=[]
-    def end_owner():
-     result=subprocess.run([str(binary),'call','--state-dir',str(state),'session_end',json.dumps({'owner':owner})],capture_output=True,text=True,timeout=20)
-     return {'exit_code':result.returncode,'response':json.loads(result.stdout) if result.returncode==0 else None,'error':result.stderr.strip() if result.returncode else None}
-    # The worker also drains the Guest UART, so this must happen before STOP.
-    wait_for(lambda x,r:any(e.get('type')==4 and e.get('button')==1 for e in x[before:]),seconds=2)
-    try:
-     os.kill(worker_pid,signal.SIGSTOP);stopped=True
-     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-      first=pool.submit(end_owner);time.sleep(.2);second=pool.submit(end_owner)
-      attempts=[first.result(timeout=20),second.result(timeout=20)]
-    finally:
-     if stopped:
-      try:os.kill(worker_pid,signal.SIGCONT)
-      except ProcessLookupError:record('owned_worker_disappeared_before_resume',call('status',{'id':'input-vm'}))
-    # After resuming, require independent Guest release even in the failing old
-    # implementation. Do not leave the injected failure holding a test button.
-    x,r=wait_for(lambda x,r:any(e.get('type')==5 and e.get('button')==1 for e in x[before:]),seconds=10)
-    retry=call('session_end',{'owner':owner})
-    record('concurrent_failed_cleanup_raw_results',{'attempts':attempts,'retry':retry,'guest_events':x[before:],'fault':'SIGSTOP owned worker only; resumed before cleanup verification'})
-    assert all(v['exit_code']!=0 and 'unconfirmed' in v['error'] for v in attempts),attempts
-    assert retry['closed'] is True and retry['retired_owner'] is True,retry
-    record('failed_cleanup_retry_does_not_claim_success')
-    recovery=client(input=True);ok(recovery.tool('vm_acquire_control',{'id':'input-vm'}));before=len(events()[0])
-    ok(recovery.tool('vm_input_click',{**shot(recovery),'x':230,'y':230}));x,r=wait_for(lambda x,r:any(e.get('type')==5 and e.get('x')==230 and e.get('y')==230 for e in x[before:]));record('new_owner_input_after_cleanup_recovery',x[before:])
+   x,r=wait_for(lambda x,r:any(e.get('type')==5 and e.get('button')==1 for e in x[before:]));record('stdio_disconnect_leaves_no_held_button',x[before:])
    call('shutdown',{'id':'input-vm'});end=time.monotonic()+20
    while time.monotonic()<end:
     if call('status',{'id':'input-vm'})['state']=='stopped':break

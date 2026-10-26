@@ -8,13 +8,11 @@ export interface FrameAnchor { frame_id: string; source_generation: number; widt
 type Button = 'left' | 'middle' | 'right';
 export type ControlAction =
   | { kind: 'file'; operation: FileAction }
-  | { kind: 'acquire' }
-  | { kind: 'release'; epoch: number }
   | { kind: 'observe_frame' }
-  | { kind: 'click'; epoch: number; frame: FrameAnchor; x: number; y: number; button: Button }
-  | { kind: 'drag'; epoch: number; frame: FrameAnchor; x: number; y: number; end_x: number; end_y: number; button: Button }
-  | { kind: 'scroll'; epoch: number; frame: FrameAnchor; x: number; y: number; direction: 'up' | 'down' | 'left' | 'right'; ticks: number }
-  | { kind: 'key'; epoch: number; frame: FrameAnchor; keys: string[] };
+  | { kind: 'click'; frame: FrameAnchor; x: number; y: number; button: Button }
+  | { kind: 'drag'; frame: FrameAnchor; x: number; y: number; end_x: number; end_y: number; button: Button }
+  | { kind: 'scroll'; frame: FrameAnchor; x: number; y: number; direction: 'up' | 'down' | 'left' | 'right'; ticks: number }
+  | { kind: 'key'; frame: FrameAnchor; keys: string[] };
 export interface ControlRequest { session_id: string; transcript_sha256: string; sequence: number; expires_at: number; action: ControlAction }
 export interface SignedControl { request: ControlRequest; signature: string }
 export interface ControlResponse { sequence: number; result: Record<string, unknown> }
@@ -48,15 +46,14 @@ function actionFields(action: ControlAction, c: Canon) {
   ensure(action !== null && typeof action === 'object', 'Invalid control action');
   const kind = action.kind;
   if (kind === 'file') { exact(action, ['kind', 'operation']); c.text(kind); fileActionFields(action.operation, c); return; }
-  if (kind === 'acquire' || kind === 'observe_frame') { exact(action, ['kind']); c.text(kind); return; }
-  if (kind === 'release') { exact(action, ['kind', 'epoch']); integer(action.epoch, 1); c.text(kind); c.int(action.epoch); return; }
-  const common = ['kind', 'epoch', 'frame'];
+  if (kind === 'observe_frame') { exact(action, ['kind']); c.text(kind); return; }
+  const common = ['kind', 'frame'];
   if (kind === 'click') exact(action, [...common, 'x', 'y', 'button']);
   else if (kind === 'drag') exact(action, [...common, 'x', 'y', 'end_x', 'end_y', 'button']);
   else if (kind === 'scroll') exact(action, [...common, 'x', 'y', 'direction', 'ticks']);
   else if (kind === 'key') exact(action, [...common, 'keys']);
   else throw new SessionAuthError('Unsupported control action');
-  integer(action.epoch, 1); c.text(kind); c.int(action.epoch); frameFields(action.frame, c);
+  c.text(kind); frameFields(action.frame, c);
   if (action.kind === 'key') {
     ensure(Array.isArray(action.keys) && action.keys.length >= 1 && action.keys.length <= 8 && new Set(action.keys).size === action.keys.length, 'Invalid or duplicate physical keys');
     for (const key of action.keys) text(key, /^[a-z0-9_]{1,16}$/, 'Invalid physical qcode'); c.strings(action.keys); return;
@@ -75,7 +72,7 @@ export function controlBytes(request: ControlRequest): Uint8Array<ArrayBuffer> {
 }
 function current(request: ControlRequest, now: number) { integer(now); ensure(request.expires_at > now && request.expires_at - now <= 5, 'Control request expired or too far in future'); }
 /** Caller must already verify and confirm the transcript. This signer does not
- * itself establish a session or acquire a lease, and never retries a request. */
+ * itself establish a session, and never retries a request. */
 export async function signControl(identity: DeviceIdentity, transcript: AnswerTranscript, action: ControlAction, options: { sequence: number; now: number; expires_at?: number }): Promise<SignedControl> {
   const copy = structuredClone(transcript), snapshot = structuredClone(action), settings = { ...options };
   ensure(copy.intent.challenge.device_id === identity.id, 'Control belongs to another device');
@@ -107,9 +104,7 @@ export function validateControlResponse(value: unknown, sequence: number, action
   const result = value.result as Record<string, unknown>;
   if (action.kind === 'file') { validateFileResult(result, action.operation); } else if (action.kind === 'observe_frame') {
     screenshotAnchor(result); screenshotBytes(result);
-  } else if (action.kind === 'acquire') { integer(result.epoch, 1); ensure(result.expires_in_seconds === 60, 'Invalid lease lifetime'); }
-  else if (action.kind === 'release') { ensure(result.released === true, 'Control release not acknowledged'); }
-  else { ensure(result.dispatched === true && result.guest_delivery_confirmed === false, 'Input dispatch not acknowledged'); }
+  } else { ensure(result.dispatched === true && result.guest_delivery_confirmed === false, 'Input dispatch not acknowledged'); }
   return { sequence, result };
 }
 

@@ -242,7 +242,7 @@ def main():
             check(http.rpc('ping', session='missing-' + secrets.token_hex(16))[0] == 404, 'unknown_session_accepted')
             http.tool(args.id, observe, 'file_download_begin', {'path': 'denied'}, 'observer', policy_denied=True)
             for name, fields in [('exec', {'argv': ['/usr/bin/true']}), ('start', {}),
-                                 ('acquire_control', {})]:
+                                 ('input_key', {'keys': ['esc']})]:
                 http.tool(args.id, session, name, fields, policy_denied=True)
             http.tool('unauthorized-' + secrets.token_hex(12), session, 'guest_info', policy_denied=True)
             actual = http.tool(args.id, session, 'guest_info')

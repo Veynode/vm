@@ -12,7 +12,7 @@ spec.loader.exec_module(mixed)
 
 class Guards(unittest.TestCase):
     def test_mac_and_foreign_vm_mutations_always_reject(self):
-        for method in ['create', 'start', 'shutdown', 'force_stop', 'delete', 'human_takeover']:
+        for method in ['create', 'start', 'shutdown', 'force_stop', 'delete']:
             for target in ['macos-smoke', 'another-linux', None]:
                 with self.subTest(method=method, target=target), self.assertRaises(ValueError):
                     mixed.authorize(method, {'id': target, 'confirm': target}, 'mixed-owned')

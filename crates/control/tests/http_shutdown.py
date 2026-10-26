@@ -63,15 +63,13 @@ class Daemon:
                     self.calls.append(request['arguments']['owner'])
                 time.sleep(.08) # Exercise monitor/finalizer overlap.
                 self.cleaned.set()
-                result = {'closed': True, 'retired_owner': True,
+                result = {'closed': True,
                           'job_cancellation': {'attempted': 0, 'unconfirmed_requests': 0, 'outcomes': []},
                           'file_cancellation': {'attempted': 0, 'unconfirmed_requests': 0, 'outcomes': []}}
                 if self.mode == 'file_failure':
                     result['file_cancellation'] = {'attempted': 1, 'unconfirmed_requests': 0, 'outcomes': [{'error': 'fixture cleanup failed'}]}
                 if self.mode == 'malformed_file':
                     result['file_cancellation'] = {'attempted': 1, 'unconfirmed_requests': 0, 'outcomes': [{'result': {'result': {}}}]}
-                if self.mode == 'input_failure':
-                    result['input_release'] = {'confirmed': False}
                 if self.mode == 'job_failure':
                     result['job_cancellation'] = {'attempted': 1, 'unconfirmed_requests': 1, 'outcomes': []}
                 response = {'result': result}
@@ -198,10 +196,9 @@ with tempfile.TemporaryDirectory(prefix='vm-http-stop-', dir='/tmp') as tmp:
             scenario(sig,'file_failure')
             scenario(sig,'inflight')
         scenario(signal.SIGTERM,'malformed_file')
-        scenario(signal.SIGTERM,'input_failure')
         scenario(signal.SIGTERM,'job_failure')
         scenario(signal.SIGTERM,'clean',end='delete')
         scenario(signal.SIGTERM,'file_failure',end='delete')
         scenario(signal.SIGTERM,'file_failure',end='expiry')
         scenario(signal.SIGTERM,'hung')
-print(json.dumps({'passed':True,'scope':'real localhost TLS, HTTP, vm-control subprocesses and OS signals; synthetic daemon cleanup replies, no Guest/VM acceptance','cleanup_semantics':'authority/file/input cleanup and cancellation request acknowledgements; asynchronous job termination is not proven','checks':checks},indent=2))
+print(json.dumps({'passed':True,'scope':'real localhost TLS, HTTP, vm-control subprocesses and OS signals; synthetic daemon cleanup replies, no Guest/VM acceptance','cleanup_semantics':'file cleanup and job cancellation request acknowledgements; asynchronous job termination is not proven','checks':checks},indent=2))

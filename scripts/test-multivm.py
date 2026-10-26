@@ -2,7 +2,7 @@
 """Actual 3-VM Linux service isolation/fault/exec-bounds acceptance, no mocks.
 Only creates fresh diskless validation appliances; never consumes a user VM disk.
 """
-import concurrent.futures, json, os, pathlib, signal, subprocess, tempfile, time, secrets
+import concurrent.futures, json, os, pathlib, signal, subprocess, tempfile, time
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 BIN=ROOT/'target/debug/vm-control'
 CONFIG=ROOT/'.local/run/linux-agent.json'
@@ -15,13 +15,13 @@ result={'fixture':'three Linux ARM initramfs appliances, NOT three OSs or deskto
 with tempfile.TemporaryDirectory(prefix='vm-multi-') as temp:
  state=pathlib.Path(temp)/'s'
  daemon=subprocess.Popen([str(BIN),'daemon','--state-dir',str(state),'--backend',str(ROOT/'.local/bin/vm-apple')],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
- ids=['multi-a','multi-b','multi-c']; leases={}; pids={}; owner=secrets.token_hex(32)
+ ids=['multi-a','multi-b','multi-c']; pids={}
  def call(method,args={}):
   r=subprocess.run([str(BIN),'call','--state-dir',str(state),method,json.dumps(args)],capture_output=True,text=True,timeout=45)
   if r.returncode:raise RuntimeError(r.stderr)
   return json.loads(r.stdout)
  def execute(id,argv,timeout=5000):
-  return call('exec',{'id':id,'owner':owner,'epoch':leases[id],'argv':argv,'timeout_ms':timeout})['result']
+  return call('exec',{'id':id,'argv':argv,'timeout_ms':timeout})['result']
  try:
   for _ in range(100):
    if (state/'control.sock').exists():break
@@ -36,7 +36,6 @@ with tempfile.TemporaryDirectory(prefix='vm-multi-') as temp:
     except RuntimeError:time.sleep(.1)
    else:raise RuntimeError('guest not ready: '+id)
    pids[id]=call('status',{'id':id})['pid']
-   leases[id]=call('acquire_control',{'id':id,'owner':owner})['epoch']
   checks.append({'name':'three real independent guests ready','pids':pids,'guest_info':info})
   with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
    replies=list(pool.map(lambda id:execute(id,['/bin/sh','-c',f'echo {id} > /tmp/identity; cat /tmp/identity; uname -m']),ids))

@@ -135,7 +135,7 @@ def main():
         record('actual Guest identity and explicit private-root fixture', info['file_policy'])
         tool(observer, 'file_download_begin', denied=True, path='fixture-manifest.json')
         tool(files, 'exec', denied=True, argv=['/usr/bin/true'])
-        tool(files, 'acquire_control', denied=True)
+        tool(files, 'input_key', denied=True, keys=['esc'])
         tool(files, 'file_upload_begin', denied=True, path='owner-injection', size=0,
              sha256=digest(b''), owner='a' * 64)
         record('file scope independent of observation/input/execute; owner injection denied')

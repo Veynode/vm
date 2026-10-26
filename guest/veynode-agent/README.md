@@ -1,7 +1,28 @@
 # Linux Guest integration service
 
 The production listener is Linux AF_VSOCK port 5000 and accepts only host CID 2.
-No TCP listener exists. Launch flags grant independent capabilities:
+With `--desktop-stream` (set by container-init for Apple Virtualization
+desktop containers) a second listener on port 5001, also host CID 2 only,
+serves the browser desktop: DRM scanout tiles out, uinput keyboard and tablet
+events in (protocol in `desktop_linux.go`, design in `docs/browser-desktop.md`).
+The same flag enables MCP observation and input on port 5000 (`observe.go`):
+`screenshot` (PNG of the scanout, JPEG when over 700 KiB), `screen_wait`
+(64x64 tile hashes; changed regions), and frame-bound `input_step` and
+`input_cleanup` with the replies of the macOS Screen Sharing
+service. The daemon sends evdev events in `arguments`. As an X11 client of the
+container's display :0 (`x11.go`, `desktop_x11.go`; EWMH, no library),
+`desktop_state` reports screen, cursor, keyboard layout, workspaces and the
+managed windows, `desktop_apps` the visible `.desktop` entries, and
+`window_action` and `app_launch` drive the window manager and start applications as the desktop
+session's user. `accessibility_tree` and `accessibility_action` read and act on
+the AT-SPI tree over the desktop's accessibility bus (`dbus.go`, `atspi.go`;
+a helper process, `veynode-agent __accessibility`, runs as the session user
+when that is not root).
+The integration service has no TCP listener. Separately, container-init starts
+`veynode-agent session-server` in OCI micro-VMs: TCP 52022 for interactive
+`exec -it`, `run -it`, `attach` and the web terminal, gated by the
+container's random `session_token` from the config disk (protocol in
+`session.go`, server in `session_linux.go`). Launch flags grant independent capabilities:
 `--allow-execute` for commands and `--allow-shutdown` for normal init-based
 shutdown (also requires root). Without execute permission, all command/job
 methods return `forbidden`. The host still must apply per-client permissions.
@@ -209,24 +230,21 @@ process-group fallback are rejected. The service opens only the fixed private
 before emitting a fresh challenge. Do not configure automatic transport reconnect.
 
 The [v2 contract](../../docs/decisions/0015-qemu-serial-execution-v2.md) binds every
-request to both incarnation nonces. Commands also carry owner/epoch scope.
-Scope revocation seals admission before cancelling, and succeeds only after
-pending starts and real descendant cleanup finish. A lost start response cannot
-hide its scope's work. Up to 1024 scope records persist for the entire service
-lifetime; expiry of a finished job never removes a revocation fence. A failed
-boundary cleanup fences all execution, including asynchronous failure with no
-subsequent client poll. Already executed effects are not rolled back.
+request to both incarnation nonces. The one lane carries `info`, `heartbeat`,
+`exec_start`, `exec_poll` and `exec_cancel`. Each command runs under its own
+timeout; timeout or cancellation kills its process group and job cgroup. A
+failed cleanup stops all further execution. Already executed effects are not
+rolled back.
 
 The independent reader, writer and 2-second Guest heartbeat watchdog do not wait
-for a 30-second command. One ordinary operation, one revoke and eight queued
-responses bound transport work. The host sends heartbeats every 500ms. A Guest
-scope cleanup has a 3-second budget. These Guest clocks **freeze during a QEMU
+for a 30-second command. One operation lane and eight queued responses bound
+transport work. The host sends heartbeats every 500ms. A Guest
+cleanup has a 3-second budget. These Guest clocks **freeze during a QEMU
 pause**; therefore this mode must only run behind the host's independently owned
 QEMU guardian, which terminates the original incarnation on worker/transport
-failure. Closing and reopening virtio-serial is not a revocation boundary.
+failure. Closing and reopening virtio-serial is not a cleanup boundary.
 
 `go test -race ./...` includes real Unix framing, real host subprocess cancellation,
-blocked-start retirement, cross-scope rejection, lifetime capacity, sticky cleanup
-errors, watchdog cleanup and strict schema/CLI negatives. Host tests inject the
+sticky cleanup errors, watchdog cleanup and strict schema/CLI negatives. Host tests inject the
 containment policy tag at a private test seam while using host process groups;
 these are explicitly **not** Linux cgroup or real QEMU acceptance.

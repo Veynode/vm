@@ -42,7 +42,7 @@ uses Constrained Baseline level3.1, scaling larger source surfaces proportionall
 within1280×720 in the native live path. Browser control coordinates must later
 use explicit source-frame geometry instead of treating encoded dimensions as
 control coordinates. The bare diagnostic grants no input authority; the paired
-control path below separately checks scope, lease and frame identity.
+control path below separately checks scope and frame identity.
 
 The Rust sender rejects oversized/malformed/nonmonotonic access-unit headers and
 requires the first frame to be a keyframe starting at timestamp0. RTP timestamps
@@ -159,9 +159,9 @@ separate accepted paths and preserved failures.
 
 ## Paired encrypted console control
 
-With production `--console SOCKET` plus `--auth-state DIR --auth-namespace NAME --vm ID --control-state DIR`, confirmed paired sessions may use the exact reliable ordered `veynode-control-v1` / `veynode-control/v1` DataChannel on the signed peer. Observe-only grants receive fresh snapshots; input additionally requires explicit scope and current daemon control lease/frame identity. `/auth/control` is absent. Native browser code rejects a server that advertises control without this transport version. See [real acceptance and reproduction](../../archive/docs-evidence/browser-control-channel/README.md).
+With production `--console SOCKET` plus `--auth-state DIR --auth-namespace NAME --vm ID --control-state DIR`, confirmed paired sessions may use the exact reliable ordered `veynode-control-v1` / `veynode-control/v1` DataChannel on the signed peer. Observe-only grants receive fresh snapshots; input additionally requires explicit scope and a fresh screenshot's frame identity. `/auth/control` is absent. Native browser code rejects a server that advertises control without this transport version. See [real acceptance and reproduction](../../archive/docs-evidence/browser-control-channel/README.md).
 
-No command, clipboard or MCP protocol is exposed by this proprietary channel. The separate explicitly enabled `--allow-files` path requires strict Guest binding and a `files` grant; it does not acquire an input lease. See [actual file-channel evidence](../../archive/docs-evidence/browser-files-live/README.md). HTTP signaling remains loopback-only. Limits apply to application messages and RTC queues separately; this is not a claim of Internet or total-memory acceptance. Freeze a single binary for Keychain-backed pairing administration and serving; executable identity changes are a separate upgrade/signing gate.
+No command, clipboard or MCP protocol is exposed by this proprietary channel. The separate explicitly enabled `--allow-files` path requires strict Guest binding and a `files` grant; it grants no input authority. See [actual file-channel evidence](../../archive/docs-evidence/browser-files-live/README.md). HTTP signaling remains loopback-only. Limits apply to application messages and RTC queues separately; this is not a claim of Internet or total-memory acceptance. Freeze a single binary for Keychain-backed pairing administration and serving; executable identity changes are a separate upgrade/signing gate.
 
 ### Guest capture cleanup reconciliation
 

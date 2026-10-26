@@ -95,16 +95,9 @@ with tempfile.TemporaryDirectory(prefix='vm-control-') as tmp:
                     time.sleep(.25)
             else: raise TimeoutError('Guest service unavailable')
             record('actual guest info after console closed', info)
-            record('control acquired', tool(executor, 'vm_acquire_control', {'id':config['id']}, 79))
             execution = tool(executor, 'vm_exec', {'id':config['id'],'argv':['/bin/uname','-m'],'timeout_ms':5000}, 80)
             assert execution['result']['exit_code'] == 0 and 'aarch64' in execution['result']['stdout'], execution
             record('actual guest command via MCP', execution)
-            record('local human takeover', call('human_takeover', {'id':config['id']}))
-            revoked = send(executor, {'jsonrpc':'2.0','id':81,'method':'tools/call','params':{'name':'vm_exec','arguments':{'id':config['id'],'argv':['/bin/true']}}})
-            assert revoked['result']['isError'], revoked
-            record('stale lease denied after human takeover', revoked)
-            call('human_release', {'id':config['id']})
-            record('reacquired after human release', tool(executor, 'vm_acquire_control', {'id':config['id']}, 82))
             if args.jobs:
                 def job_start(argv, number):
                     response=tool(executor,'vm_exec_start',{'id':config['id'],'argv':argv,'timeout_ms':30000},number)
@@ -117,32 +110,18 @@ with tempfile.TemporaryDirectory(prefix='vm-control-') as tmp:
                     raise TimeoutError('guest job did not terminate')
                 job_id=job_start(['/bin/sleep','20'],100)
                 outsider=client(execute=True);initialize(outsider)
-                for operation in ['vm_exec_poll','vm_exec_cancel']:
-                    reply=send(outsider,{'jsonrpc':'2.0','id':101,'method':'tools/call','params':{'name':operation,'arguments':{'id':config['id'],'job_id':job_id}}})
-                    assert reply['result']['isError'],reply
-                    record('other MCP connection denied '+operation,reply)
+                reply=send(outsider,{'jsonrpc':'2.0','id':101,'method':'tools/call','params':{'name':'vm_exec_poll','arguments':{'id':config['id'],'job_id':'0'*32}}})
+                assert reply['result']['isError'] and 'job is unknown or expired on this VM' in json.dumps(reply),reply
+                record('unknown job refused',reply)
                 cancellation=tool(executor,'vm_exec_cancel',{'id':config['id'],'job_id':job_id},102)
                 assert cancellation['result']['cancel_requested'],cancellation
                 finished=job_finished(job_id,110);assert finished['result']['cancelled'] and not finished['result']['timed_out'],finished
                 record('actual async cancellation confirmed by terminal poll',finished)
-                job_id=job_start(['/bin/sleep','20'],220)
-                takeover=call('human_takeover',{'id':config['id']})
-                assert takeover['job_cancellation']['attempted']==1,takeover
-                assert takeover['job_cancellation']['unconfirmed_requests']==0,takeover
-                finished=job_finished(job_id,230);assert finished['result']['cancelled'],finished
-                record('human takeover cancelled actual guest job',{'takeover':takeover,'terminal':finished})
-                revoked=send(executor,{'jsonrpc':'2.0','id':340,'method':'tools/call','params':{'name':'vm_exec_start','arguments':{'id':config['id'],'argv':['/bin/true']}}})
-                assert revoked['result']['isError'],revoked
-                call('human_release',{'id':config['id']});tool(executor,'vm_acquire_control',{'id':config['id']},341)
-                original=tool(executor,'vm_exec_poll',{'id':config['id'],'job_id':job_id},342)
-                assert original['result']['state']=='finished';record('original epoch ownership survives new lease acquisition',True)
                 job_id=job_start(['/bin/printf','你好 ✓'],350);finished=job_finished(job_id,360)
                 assert finished['result']['stdout']=='你好 ✓' and finished['result']['exit_code']==0 and not finished['result']['cancelled'],finished
                 record('actual async Unicode command completion',finished)
-                tool(executor,'vm_release_control',{'id':config['id']},470)
                 for case in ['normal-eof','unterminated-frame','broken-stdout']:
                     closer=client(execute=True);initialize(closer)
-                    tool(closer,'vm_acquire_control',{'id':config['id']},500)
                     ready='/tmp/veynode-'+case+'-ready';late='/tmp/veynode-'+case+'-late'
                     started=tool(closer,'vm_exec_start',{'id':config['id'],'argv':['/bin/sh','-c',f'printf ready > {ready}; sleep 2; printf late > {late}'],'timeout_ms':10000},501)
                     for n in range(50):
@@ -158,11 +137,9 @@ with tempfile.TemporaryDirectory(prefix='vm-control-') as tmp:
                     if not closer.stdin.closed:closer.stdin.close()
                     assert exit_code==(0 if case=='normal-eof' else 1),exit_code
                     time.sleep(2.2)
-                    tool(outsider,'vm_acquire_control',{'id':config['id']},560)
                     absent=tool(outsider,'vm_exec',{'id':config['id'],'argv':['/bin/sh','-c',f'test ! -e {late}']},561)
                     assert absent['result']['exit_code']==0,absent
-                    record('MCP '+case+' cancels running job and releases lease',{'job_id':started['result']['job_id'],'late_marker_absent':True})
-                    tool(outsider,'vm_release_control',{'id':config['id']},562)
+                    record('MCP '+case+' cancels running job',{'job_id':started['result']['job_id'],'late_marker_absent':True})
 
 
         assert call('status', {'id':config['id']})['state'] == 'running'

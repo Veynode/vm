@@ -50,15 +50,16 @@ fn control_rejects_ambiguous_and_out_of_bound_values() {
         let s: SignedControl = serde_json::from_value(v).unwrap();
         assert!(s.request.canonical().is_err());
     }
-    for (field, value) in [("epoch", json!(0)), ("epoch", json!(MAX_SAFE_INTEGER + 1))] {
-        let mut v = original.clone();
-        v["request"]["action"][field] = value;
-        assert!(serde_json::from_value::<SignedControl>(v)
-            .unwrap()
-            .request
-            .canonical()
-            .is_err());
-    }
+    let mut v = original.clone();
+    v["request"]["action"]["epoch"] = json!(1);
+    assert!(serde_json::from_value::<SignedControl>(v).is_err());
+    let mut v = original.clone();
+    v["request"]["action"]["frame"]["source_generation"] = json!(MAX_SAFE_INTEGER + 1);
+    assert!(serde_json::from_value::<SignedControl>(v)
+        .unwrap()
+        .request
+        .canonical()
+        .is_err());
     let mut v = original.clone();
     v["request"]["action"]["frame"]["width"] = json!(8193);
     assert!(serde_json::from_value::<SignedControl>(v)

@@ -39,9 +39,9 @@ with tempfile.TemporaryDirectory(prefix='vm-files-') as directory:
   assert info['execution_identity']['uid']==1000,info
   record('actual separated Guest identities and explicit file root',info)
   for unauthorized in [observer,executor,life]:tool(unauthorized,'file_download_begin',denied=True,path='x')
-  tool(files,'exec',denied=True,argv=['/bin/true']);tool(files,'acquire_control',denied=True)
+  tool(files,'exec',denied=True,argv=['/bin/true'])
   tool(files,'file_upload_begin',denied=True,path='owner-injection',size=0,sha256=hashlib.sha256(b'').hexdigest(),owner='a'*64)
-  record('files permission independent of observe/lifecycle/execute; session owner cannot be supplied; no control lease required',True)
+  record('files permission independent of observe/lifecycle/execute; session owner cannot be supplied',True)
   body=b'\x00\xff'+('你好 ✓\n'.encode()*10000)+os.urandom(8192);name='roundtrip-'+uuid.uuid4().hex+'.bin';token=begin(files,name,body)
   tool(other,'file_upload_write',denied=True,token=token,offset=0,data=base64.b64encode(body[:10]).decode())
   tool(files,'file_download_begin',denied=True,path=name)
@@ -66,10 +66,9 @@ with tempfile.TemporaryDirectory(prefix='vm-files-') as directory:
   bad='bad-hash-'+uuid.uuid4().hex;token=tool(files,'file_upload_begin',path=bad,size=3,sha256='0'*64)['result']['token'];append(files,token,b'abc');tool(files,'file_upload_commit',denied=True,token=token);tool(files,'file_download_begin',denied=True,path=bad);record('wrong SHA256 cannot publish and staging removed',no_partial())
   token=begin(files,'disconnect-'+uuid.uuid4().hex,b'partial-body');tool(files,'file_upload_write',token=token,offset=0,data=base64.b64encode(b'partial').decode());files.close();record('MCP EOF cleans actual partial file and closes ownership',no_partial())
   tool(other,'file_upload_commit',denied=True,token=token)
-  tool(executor,'acquire_control')
   binary=tool(executor,'exec',argv=['sha256sum','/usr/local/bin/veynode-guest'])['result'];expected_binary=hashlib.sha256((args.config.parent/'veynode-guest').read_bytes()).hexdigest();assert binary['exit_code']==0 and binary['stdout'].split()[0]==expected_binary,binary;record('actual installed Guest binary matches fixture build artifact',expected_binary)
   denied=tool(executor,'exec',argv=['/bin/sh','-c','cat /home/veynode-files/transfers/"$1"; touch /home/veynode-files/transfers/execute-must-not-write','test',name])['result'];assert denied['exit_code']!=0 and 'Permission denied' in denied['stderr'],denied
-  tool(executor,'release_control');record('execution UID1000 cannot read or change dedicated files directory',denied)
+  record('execution UID1000 cannot read or change dedicated files directory',denied)
   if args.expiry:
    token=begin(other,'expiry-'+uuid.uuid4().hex,b'partial');tool(other,'file_upload_write',token=token,offset=0,data=base64.b64encode(b'p').decode());before=policy();assert before['staged_upload_files']==1,before
    deadline=time.monotonic()+62

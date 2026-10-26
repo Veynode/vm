@@ -8,10 +8,15 @@ mod args;
 mod container;
 mod daemon;
 mod desktop;
+mod desktop_stream;
 mod engine;
 mod gpt;
+mod machine;
 mod macos;
+mod macos_desktop;
+mod macos_grant;
 mod proxy;
+mod session;
 mod ui;
 
 use anyhow::{bail, Context, Result};
@@ -27,10 +32,12 @@ Usage: veynodevm [--json] COMMAND
 
 Containers:
   run [OPTIONS] IMAGE [COMMAND...]   Create and start a container
+      -i, --interactive  -t, --tty  (Ctrl-P Ctrl-Q detaches from -it)
       -d, --detach  --rm  --name NAME  -p, --publish [IP:]HOST:GUEST[/udp]
       -v, --volume /HOST:/PATH[:ro]  -e, --env KEY[=VALUE]  -w, --workdir DIR
       -u, --user USER  --entrypoint CMD  --cpus N  -m, --memory SIZE
       --disk-size GiB  --dns IP  --mtu N  --gpus all|virgl|venus  --desktop  --shared
+      --init systemd   (boot the image's /sbin/init as PID 1: a full distribution)
       (--gpus selects QEMU/HVF; otherwise Apple Virtualization)
       macOS images (e.g. ghcr.io/cirruslabs/macos-tahoe-vanilla) run as macOS VMs
       with Metal; COMMAND runs over SSH (-d: in the background, see logs; no
@@ -38,7 +45,12 @@ Containers:
       VEYNODEVM_MACOS_PASSWORD, default admin), --disk-size grows the disk
   ps [-a] [-q]                       List containers
   logs [-f] CONTAINER                Show container output
-  exec [-i] [-t] CONTAINER COMMAND...  Run a command (Linux: bounded, 30 s max)
+  exec [-i] [-t] [-e K=V] [-w DIR] [-u USER] CONTAINER [COMMAND...]
+                                     Run a command; without -i/-t it is bounded
+                                     (30 s, --timeout MS); -it with no COMMAND
+                                     opens a shell
+  attach CONTAINER                   Attach to a container started with -i/-t
+                                     (otherwise follow its output)
   cp SRC DST                         Copy files; one side is CONTAINER:PATH (macOS)
   start [-a] CONTAINER               Start a stopped container
   stop [-t SECONDS] CONTAINER...     Stop containers
@@ -55,6 +67,12 @@ Images:
 Shared engine (docker CLI compatible):
   engine start|stop|status|env      Shared Linux VM running dockerd
       start [--gpus venus|virgl] [--share DIR]...  (applied when the engine is created)
+
+Full Linux distributions (UEFI, installed from the distribution's ISO):
+  machine create NAME [--iso PATH] [--disk-size 40G] [-m 4g] [--cpus 4]
+                      [--gpus virgl|venus | --backend apple|qemu] [--monitor]
+  machine start|stop [-f]|eject|inspect|rm NAME     machine ls
+  (--gpus or --backend qemu selects QEMU/HVF; otherwise Apple Virtualization)
 
 Virtual machines:
   vm ls | vm create CONFIG.json | vm start|stop|rm|inspect ID
@@ -133,6 +151,7 @@ const RUN_SPEC: &[(&str, Option<char>, bool)] = &[
     ("shared", None, false),
     ("dns", None, true),
     ("mtu", None, true),
+    ("init", None, true),
     ("quiet", Some('q'), false),
 ];
 
@@ -189,7 +208,10 @@ fn run(rest: &[String], json_output: bool) -> Result<i32> {
             .map(str::parse)
             .transpose()
             .context("invalid --mtu")?,
+        init: p.value("init").map(str::to_owned),
         quiet: p.has("quiet") || json_output,
+        tty: p.has("tty"),
+        stdin: p.has("interactive"),
     };
     container::install_interrupt_handler();
     let c = container::create_and_start(&options)?;
@@ -202,9 +224,6 @@ fn run(rest: &[String], json_output: bool) -> Result<i32> {
             json_output,
         );
     }
-    if p.has("interactive") || p.has("tty") {
-        eprintln!("veynodevm: -i/-t are accepted but interactive stdin is not wired to micro-VMs yet; output is streamed");
-    }
     if options.detach {
         if json_output {
             print_json(&json!({"id":c.id,"name":c.name}))?;
@@ -214,6 +233,58 @@ fn run(rest: &[String], json_output: bool) -> Result<i32> {
         return Ok(0);
     }
     attach(&c)
+}
+
+/// Attach to the entrypoint: its terminal with `-t`, its stdin plus the
+/// console output with `-i`, otherwise just the output.
+fn attach(c: &container::Container) -> Result<i32> {
+    if !(c.tty || c.stdin) {
+        return follow(c);
+    }
+    let stream = session::connect(
+        c,
+        &session::Request {
+            op: "attach",
+            argv: vec![],
+            tty: c.tty,
+            stdin: true,
+            env: vec![],
+            workdir: None,
+            user: None,
+            size: session::terminal_size(),
+        },
+    )?;
+    if !c.tty {
+        // Output comes from the console log; the session only carries stdin.
+        let writer = session::Writer::new(&stream)?;
+        std::thread::spawn(move || {
+            let mut input = std::io::stdin().lock();
+            let mut buffer = [0u8; 8192];
+            loop {
+                match std::io::Read::read(&mut input, &mut buffer) {
+                    Ok(0) | Err(_) => {
+                        let _ = writer.frame(b'e', &[]);
+                        return;
+                    }
+                    Ok(n) => {
+                        if writer.frame(b'i', &buffer[..n]).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        let code = follow(c);
+        drop(stream);
+        return code;
+    }
+    match session::run(stream, true, true, true)? {
+        session::Ended::Detached => {
+            eprintln!("\r\nveynodevm: detached from {}", c.name);
+            Ok(0)
+        }
+        _ => finish(c, None),
+    }
 }
 
 /// macOS has no entrypoint: COMMAND (or a login shell) runs over SSH once the
@@ -228,9 +299,9 @@ fn run_macos(
 ) -> Result<i32> {
     if options.detach {
         if options.command.is_empty() {
-            if !c.volumes.is_empty() {
-                macos::ensure_ready(c, options.quiet)?;
-            }
+            // First-boot setup (volumes, the Accessibility grant) happens now
+            // rather than on the first exec.
+            macos::ensure_ready(c, options.quiet)?;
         } else {
             macos::start_command(c)?;
         }
@@ -250,10 +321,16 @@ fn run_macos(
     code
 }
 
-fn attach(c: &container::Container) -> Result<i32> {
+fn follow(c: &container::Container) -> Result<i32> {
     let mut stdout = std::io::stdout();
     let mut stderr = std::io::stderr();
     let code = container::stream_logs(c, true, &mut stdout, &mut stderr)?;
+    finish(c, code)
+}
+
+/// After the entrypoint's output ended: wait for the VM, report its status
+/// and honor `--rm`.
+fn finish(c: &container::Container, code: Option<i32>) -> Result<i32> {
     if container::INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
         eprintln!("veynodevm: stopping {}", c.name);
         container::stop(c, Duration::from_secs(5))?;
@@ -465,6 +542,14 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
             )?;
             Ok(0)
         }
+        "attach" => {
+            let c = container::find(rest.first().context("attach requires a CONTAINER")?)?;
+            if c.os == "darwin" {
+                return macos::logs(&c, true);
+            }
+            container::install_interrupt_handler();
+            attach(&c)
+        }
         "exec" => {
             let p = parse(
                 rest,
@@ -472,6 +557,9 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
                     ("interactive", Some('i'), false),
                     ("tty", Some('t'), false),
                     ("timeout", None, true),
+                    ("env", Some('e'), true),
+                    ("workdir", Some('w'), true),
+                    ("user", Some('u'), true),
                 ],
                 true,
             )?;
@@ -481,8 +569,49 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
                     .context("exec requires CONTAINER COMMAND")?,
             )?;
             let argv = &p.positional[1..];
-            if argv.is_empty() {
+            let (tty, interactive) = (p.has("tty"), p.has("interactive"));
+            if argv.is_empty() && !(tty && interactive) {
                 bail!("exec requires a COMMAND")
+            }
+            if c.os != "darwin" && (tty || interactive) && !json_output {
+                let mut env: Vec<String> = p
+                    .values("env")
+                    .iter()
+                    .filter_map(|e| {
+                        if e.contains('=') {
+                            Some(e.clone())
+                        } else {
+                            std::env::var(e).ok().map(|v| format!("{e}={v}"))
+                        }
+                    })
+                    .collect();
+                if tty && !env.iter().any(|e| e.starts_with("TERM=")) {
+                    env.push(format!(
+                        "TERM={}",
+                        std::env::var("TERM").unwrap_or_else(|_| "xterm".into())
+                    ));
+                }
+                let stream = session::connect(
+                    &c,
+                    &session::Request {
+                        op: "exec",
+                        argv: if argv.is_empty() {
+                            session::default_shell()
+                        } else {
+                            argv.to_vec()
+                        },
+                        tty,
+                        stdin: interactive,
+                        env,
+                        workdir: p.value("workdir").map(str::to_owned),
+                        user: p.value("user").map(str::to_owned),
+                        size: session::terminal_size(),
+                    },
+                )?;
+                return match session::run(stream, tty, interactive, false)? {
+                    session::Ended::Exit(code) => Ok(code),
+                    _ => bail!("the session to {} closed without an exit status", c.name),
+                };
             }
             if c.os == "darwin" {
                 if json_output {
@@ -532,15 +661,17 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
         }
         "stop" => {
             let (p, names) = names(rest, &[("time", Some('t'), true)])?;
-            let timeout = p
+            let timeout: Option<u64> = p
                 .value("time")
                 .map(str::parse)
                 .transpose()
-                .context("invalid -t")?
-                .unwrap_or(10);
+                .context("invalid -t")?;
             for name in names {
                 let c = container::find(&name)?;
-                container::stop(&c, Duration::from_secs(timeout))?;
+                let timeout = timeout
+                    .map(Duration::from_secs)
+                    .unwrap_or_else(|| container::default_stop_timeout(&c));
+                container::stop(&c, timeout)?;
                 println!("{}", c.name);
             }
             Ok(0)
@@ -632,11 +763,16 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
         "desktop" => match rest {
             [close, name] if close == "--close" => desktop::close(name),
             [name] => desktop::open(name),
+            [stream, name] if stream == "--stream" => desktop_stream::run(name, "hevc"),
+            [stream, codec, value, name] if stream == "--stream" && codec == "--codec" => {
+                desktop_stream::run(name, value)
+            }
             _ => bail!("usage: veynodevm desktop [--close] CONTAINER|VM"),
         },
         "engine" => engine::command(rest, json_output),
         "build" => engine::build(rest),
         "vm" => vm(rest),
+        "machine" => machine::command(rest, json_output),
         "daemon" => daemon::command(rest),
         "mcp" => {
             let mut flags = Vec::new();
@@ -658,6 +794,19 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
         }
         "ui" => ui::command(rest),
         "__proxy" => proxy::run(rest.first().context("missing id")?).map(|_| 0),
+        "__terminal" => match rest {
+            [name, rows, cols, argv @ ..] => {
+                session::relay(name, rows.parse()?, cols.parse()?, argv.to_vec())
+            }
+            _ => bail!("usage: veynodevm __terminal CONTAINER ROWS COLS [COMMAND...]"),
+        },
+        "__desktop" => match rest {
+            [vm, method, arguments] => {
+                print_json(&macos_desktop::run(vm, method, arguments)?)?;
+                Ok(0)
+            }
+            _ => bail!("usage: veynodevm __desktop VM METHOD ARGUMENTS"),
+        },
         other => bail!("unknown command: {other} (see veynodevm --help)"),
     }
 }

@@ -5,27 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"strconv"
 	"sync"
 	"time"
 	"unicode/utf8"
 )
 
 const serialHeartbeatTimeout = 2 * time.Second
-const serialScopeCleanupTimeout = 3 * time.Second
-const maxScopeEpoch = 9007199254740991
+const serialCleanupTimeout = 3 * time.Second
 
-type serialScope struct {
-	Owner string `json:"owner"`
-	Epoch uint64 `json:"epoch"`
-}
-
-func (scope *serialScope) key() (string, error) {
-	if scope == nil || !validSerialNonce(scope.Owner) || scope.Epoch == 0 || scope.Epoch > maxScopeEpoch {
-		return "", fmt.Errorf("invalid serial scope")
-	}
-	return scope.Owner + ":" + strconv.FormatUint(scope.Epoch, 10), nil
-}
 func exactKeys(m map[string]json.RawMessage, keys ...string) bool {
 	if len(m) != len(keys) {
 		return false
@@ -124,15 +111,13 @@ func validateSerialV2(e serialEnvelope, hello bool) error {
 	keys := []string{"id", "method"}
 	switch req.Method {
 	case "info", "heartbeat":
-	case "scope_revoke":
-		keys = append(keys, "scope")
 	case "exec_start":
-		keys = append(keys, "scope", "argv", "timeout_ms")
+		keys = append(keys, "argv", "timeout_ms")
 		if validateCommand(*req) != nil {
 			return fmt.Errorf("invalid start arguments")
 		}
 	case "exec_poll", "exec_cancel":
-		keys = append(keys, "scope", "job_id")
+		keys = append(keys, "job_id")
 		if !validJobID(req.JobID) || req.JobID != string(bytes.ToLower([]byte(req.JobID))) {
 			return fmt.Errorf("invalid job id")
 		}
@@ -142,24 +127,12 @@ func validateSerialV2(e serialEnvelope, hello bool) error {
 	if !exactKeys(fields, keys...) {
 		return fmt.Errorf("invalid method fields")
 	}
-	if req.Scope != nil {
-		if _, err := req.Scope.key(); err != nil {
-			return err
-		}
-		var scope map[string]json.RawMessage
-		if json.Unmarshal(fields["scope"], &scope) != nil || !exactKeys(scope, "owner", "epoch") {
-			return fmt.Errorf("invalid scope fields")
-		}
-	}
-	if len(keys) > 2 && req.Scope == nil {
-		return fmt.Errorf("scope required")
-	}
 	return nil
 }
 
 // The one lifetime never reconnects. Reader, writer and watchdog stay independent
-// of cmd.Start and revocation. A fatal path seals admission immediately; its final
-// return is delayed until scope descendants are confirmed gone or cleanup fails.
+// of cmd.Start. A fatal path seals admission immediately; its final return is
+// delayed until command descendants are confirmed gone or cleanup fails.
 // Guest time pauses with QEMU: host guardian termination remains mandatory.
 func serveSerialExec(s deadlineStream, manager *jobManager) (returned error) {
 	// OCI micro-VMs run commands as the image user inside the container root; the
@@ -187,7 +160,7 @@ func serveSerialExec(s deadlineStream, manager *jobManager) (returned error) {
 	}
 	defer func() {
 		trip(fmt.Errorf("serial incarnation ended"))
-		if !manager.stopAll(serialScopeCleanupTimeout) {
+		if !manager.stopAll(serialCleanupTimeout) {
 			returned = fmt.Errorf("serial execution cleanup unconfirmed")
 		}
 	}()
@@ -209,7 +182,7 @@ func serveSerialExec(s deadlineStream, manager *jobManager) (returned error) {
 		return err
 	}
 	replies := make(chan serialEnvelope, 8)
-	ordinary, revoke := make(chan struct{}, 1), make(chan struct{}, 1)
+	lane := make(chan struct{}, 1)
 	var heartbeatMu sync.Mutex
 	heartbeat := time.Now()
 	enqueue := func(seq uint64, reply response) bool {
@@ -296,17 +269,13 @@ func serveSerialExec(s deadlineStream, manager *jobManager) (returned error) {
 				}
 				continue
 			}
-			lane := ordinary
-			if req.Method == "scope_revoke" {
-				lane = revoke
-			}
 			select {
 			case lane <- struct{}{}:
 			default:
 				trip(fmt.Errorf("serial operation lane already occupied"))
 				return
 			}
-			go func(sequence uint64, req request, lane chan struct{}) {
+			go func(sequence uint64, req request) {
 				laneReleased := false
 				defer func() {
 					if !laneReleased {
@@ -325,25 +294,15 @@ func serveSerialExec(s deadlineStream, manager *jobManager) (returned error) {
 						value["transport"] = "virtio-serial-private-exec-v2"
 						value["transport_reconnect"] = false
 						value["transport_heartbeat_timeout_ms"] = 2000
-						value["transport_max_scopes"] = maxCommandScopes
 					}
 				}
-				if req.Scope != nil {
-					scope, _ := req.Scope.key()
-					switch req.Method {
-					case "exec_start":
-						reply = manager.startScoped(req, scope)
-					case "exec_poll":
-						reply = manager.pollScoped(req, scope)
-					case "exec_cancel":
-						reply = manager.cancelScoped(req, scope)
-					case "scope_revoke":
-						if manager.revokeScope(scope, serialScopeCleanupTimeout) {
-							reply = response{ID: req.ID, Result: map[string]any{"revoked": true, "pending_starts": 0, "cgroup_empty": true}}
-						} else {
-							reply = failure(req.ID, "containment_failed", "scope cleanup unconfirmed")
-						}
-					}
+				switch req.Method {
+				case "exec_start":
+					reply = manager.start(req)
+				case "exec_poll":
+					reply = manager.poll(req)
+				case "exec_cancel":
+					reply = manager.cancel(req)
 				}
 				// Release the completed operation before publishing its reply. A fast
 				// client may submit its next request as soon as the writer sends it.
@@ -353,7 +312,7 @@ func serveSerialExec(s deadlineStream, manager *jobManager) (returned error) {
 				if reply.Error != nil && reply.Error.Code == "containment_failed" {
 					trip(fmt.Errorf("serial command containment failed"))
 				}
-			}(seq, req, lane)
+			}(seq, req)
 		}
 		trip(fmt.Errorf("serial sequence exhausted"))
 	}()

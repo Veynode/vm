@@ -13,7 +13,7 @@ spec.loader.exec_module(probe)
 
 
 def receipt():
-    return {'result': {'closed': True, 'retired_owner': True, 'retired_owner_ttl_seconds': 120,
+    return {'result': {'closed': True,
                        'job_cancellation': {'attempted': 0, 'unconfirmed_requests': 0, 'outcomes': []},
                        'file_cancellation': {'attempted': 1, 'unconfirmed_requests': 0,
                                              'outcomes': [{'result': {'result': {'cancelled_transfers': 0}}}]}}}
@@ -80,7 +80,7 @@ class ProbeTests(unittest.TestCase):
             lambda r: r['result']['file_cancellation'].update(unconfirmed_requests=1),
             lambda r: r['result']['file_cancellation']['outcomes'][0]['result']['result'].update(cancelled_transfers=True),
             lambda r: r['result']['file_cancellation']['outcomes'][0].update(error='no receipt'),
-            lambda r: r['result'].update(input_release={'confirmed': True}),
+            lambda r: r['result'].update(retired_owner=True),
             lambda r: r['result']['job_cancellation'].update(attempted=1),
         ]
         for mutate in mutations:

@@ -58,6 +58,11 @@ static double nativeClock(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,
 static NSUInteger capturePacingDrops,capturePoolDrops,visibleSourceCopies,backgroundSourceCopies;
 #endif
 static gint64 capturedWall,capturedMono,lastCapture,firstPTS,lastEncode;
+// Trailing-edge capture/encode: an update that arrived inside the pacing
+// interval is captured and encoded at the next slot instead of waiting for
+// another draw or the 1 Hz idle refresh (typing would otherwise lag seconds).
+static BOOL sourceDirty,encodeDirty;
+static const gint64 encodeInterval=16667;
 static int generationFD=-1;
 static NSMutableData *input;
 static const NSUInteger maxAU=4*1024*1024;
@@ -126,20 +131,39 @@ static void compressed(void *context,void *source,OSStatus status,VTEncodeInfoFl
  if(offset!=total||!CMTIME_IS_NUMERIC(pts)||pts.value<0||au.length==0){fail(@"Invalid AU or timestamp");return;}
  if(writeRecord(au,(uint64_t)pts.value,key)){encoded++;if(key)keyframes++;}
 }}
-static BOOL createEncoder(CVPixelBufferRef pixel){
-    NSDictionary *spec=@{(__bridge NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder:@YES};
+// One required-hardware session attempt; NO leaves no session behind.
+static BOOL createEncoderWith(CVPixelBufferRef pixel,NSDictionary *spec,BOOL reportFailure){
     NSDictionary *attributes=@{(__bridge NSString *)kCVPixelBufferPixelFormatTypeKey:@(CVPixelBufferGetPixelFormatType(pixel)),(__bridge NSString *)kCVPixelBufferWidthKey:@(width),(__bridge NSString *)kCVPixelBufferHeightKey:@(height),(__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey:@{}};
     OSStatus result=VTCompressionSessionCreate(NULL,(int32_t)width,(int32_t)height,useHEVC?kCMVideoCodecType_HEVC:kCMVideoCodecType_H264,(__bridge CFDictionaryRef)spec,(__bridge CFDictionaryRef)attributes,NULL,compressed,NULL,&encoder);
-    if(result!=noErr){fail([NSString stringWithFormat:@"Required hardware %@ creation failed: %d",codecName,(int)result]);return NO;}
-    NSDictionary *properties=@{(__bridge NSString *)kVTCompressionPropertyKey_RealTime:@YES,(__bridge NSString *)kVTCompressionPropertyKey_AllowFrameReordering:@NO,(__bridge NSString *)kVTCompressionPropertyKey_AverageBitRate:@8000000,(__bridge NSString *)kVTCompressionPropertyKey_ExpectedFrameRate:@30,(__bridge NSString *)kVTCompressionPropertyKey_MaxKeyFrameInterval:@30,(__bridge NSString *)kVTCompressionPropertyKey_ProfileLevel:(__bridge NSString *)(useHEVC?kVTProfileLevel_HEVC_Main_AutoLevel:kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel)};
-    for(NSString *key in properties){result=VTSessionSetProperty(encoder,(__bridge CFStringRef)key,(__bridge CFTypeRef)properties[key]);if(result!=noErr){fail([NSString stringWithFormat:@"Encoder property rejected %@: %d",key,(int)result]);return NO;}}
-    if(VTCompressionSessionPrepareToEncodeFrames(encoder)!=noErr){fail(@"Encoder preparation failed");return NO;}
+    NSString *problem=nil;
+    if(result!=noErr){encoder=NULL;problem=[NSString stringWithFormat:@"Required hardware %@ creation failed: %d",codecName,(int)result];}
+    if(!problem){
+    // The H.264 hint stays at 30: at 60 the encoder picks a level above the
+    // Constrained Baseline 3.1 this helper guarantees. Frames still go at 60.
+    NSDictionary *properties=@{(__bridge NSString *)kVTCompressionPropertyKey_RealTime:@YES,(__bridge NSString *)kVTCompressionPropertyKey_AllowFrameReordering:@NO,(__bridge NSString *)kVTCompressionPropertyKey_AverageBitRate:@8000000,(__bridge NSString *)kVTCompressionPropertyKey_ExpectedFrameRate:useHEVC?@60:@30,(__bridge NSString *)kVTCompressionPropertyKey_MaxKeyFrameInterval:@120,(__bridge NSString *)kVTCompressionPropertyKey_ProfileLevel:(__bridge NSString *)(useHEVC?kVTProfileLevel_HEVC_Main_AutoLevel:kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel)};
+    for(NSString *key in properties){result=VTSessionSetProperty(encoder,(__bridge CFStringRef)key,(__bridge CFTypeRef)properties[key]);if(result!=noErr){problem=[NSString stringWithFormat:@"Encoder property rejected %@: %d",key,(int)result];break;}}
+    }
+    if(!problem){
+    // Best effort: not every encoder generation exposes these latency knobs.
+    VTSessionSetProperty(encoder,kVTCompressionPropertyKey_MaxFrameDelayCount,(__bridge CFTypeRef)@0);
+    VTSessionSetProperty(encoder,kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,kCFBooleanTrue);
+    if(VTCompressionSessionPrepareToEncodeFrames(encoder)!=noErr)problem=@"Encoder preparation failed";
+    }
+    if(!problem){
     CFTypeRef usingHardware=NULL;
     result=VTSessionCopyProperty(encoder,kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,NULL,&usingHardware);
     hardwareVerified=result==noErr&&usingHardware&&CFGetTypeID(usingHardware)==CFBooleanGetTypeID()&&CFBooleanGetValue(usingHardware);
     if(usingHardware)CFRelease(usingHardware);
-    if(!hardwareVerified){fail(@"Encoder did not confirm hardware acceleration; software fallback rejected");return NO;}
+    if(!hardwareVerified)problem=@"Encoder did not confirm hardware acceleration; software fallback rejected";
+    }
+    if(problem){
+     if(encoder){VTCompressionSessionInvalidate(encoder);CFRelease(encoder);encoder=NULL;}
+     if(reportFailure)fail(problem);return NO;
+    }
     rateReset();rateSubmitted=0;return YES;
+}
+static BOOL createEncoder(CVPixelBufferRef pixel){
+    return createEncoderWith(pixel,@{(__bridge NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder:@YES},YES);
 }
 static CVPixelBufferRef allocatePixel(NSUInteger w,NSUInteger h){
  NSDictionary *attributes=@{(__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey:@{},(__bridge NSString *)kCVPixelBufferMetalCompatibilityKey:@YES};CVPixelBufferRef pixel=NULL;
@@ -219,7 +243,7 @@ static void encodeLatest(gint64 now,BOOL idle){
  ,VNCopyEncoderResize
 #endif
  )){fail(@"Owned scaling failed");sessionFailure();return;}resizeCopies++;pixel=scaled;}
- if(!firstPTS)firstPTS=now;lastEncode=now;CMTime pts=CMTimeMake(now-firstPTS,1000000);
+ encodeDirty=NO;if(!firstPTS)firstPTS=now;lastEncode=now;CMTime pts=CMTimeMake(now-firstPTS,1000000);
  NSDictionary *options=forceKeyframe?@{(__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame:@YES}:nil;forceKeyframe=NO;
  CVPixelBufferRetain(pixel);OSStatus status=VTCompressionSessionEncodeFrame(encoder,pixel,pts,CMTimeMake(1,30),(__bridge CFDictionaryRef)options,NULL,NULL);
  if(status!=noErr)fail(@"Frame submission failed");else {rateSubmitted++;if(VTCompressionSessionCompleteFrames(encoder,pts)!=noErr)fail(@"Frame completion failed");}CVPixelBufferRelease(pixel);
@@ -258,33 +282,45 @@ static void scanout(SpiceDisplayChannel *channel,GParamSpec *spec,gpointer conte
  generationFD=dup(info->fd);if(generationFD<0){captureFail(@"scanout_fd_failed");return;}fcntl(generationFD,F_SETFD,FD_CLOEXEC);sourceWidth=info->width;sourceHeight=info->height;awaitingSource=NO;lastCapture=0;
  emit(0,@{@"event":@"source-generation",@"source_generation":@(generation),@"width":@(sourceWidth),@"height":@(sourceHeight)});
 }
+// Copy the live scanout into an owned buffer when pacing admits it; a refused
+// update stays dirty for the flush tick. Returns whether a new copy exists.
+static BOOL captureSource(gint64 now){
+ if(!surfaceLive()){awaitSource(@"generation_retired_during_draw");return NO;}
+#ifdef VEYNODE_NATIVE_DISPLAY
+ BOOL nativeVisible=VeynodeDisplayVisible();
+ // A browser stream gets the visible cadence even while the window is hidden.
+ if(!VNFramePacingAdmit(&capturePacing,now,nativeVisible||active)){capturePacingDrops++;sourceDirty=YES;return NO;}
+ CVPixelBufferRef next=VeynodeDisplayAcquire(sourceWidth,sourceHeight);
+ // Pool exhaustion drops this copy without blocking ACK; the flush retries.
+ if(!next){capturePoolDrops++;sourceDirty=YES;return NO;}
+ if(!copyPixels(surface,sourceWidth,sourceHeight,next,VNCopySource)){VeynodeDisplayRelease(next);captureFail(@"source_copy_failed");return NO;}
+ if(!surfaceLive()){VeynodeDisplayRelease(next);awaitSource(@"generation_retired_during_copy");return NO;}
+ clearCache();owned=next;sourceCopies++;sequence++;cachedGeneration=generation;capturedMono=g_get_monotonic_time();capturedWall=g_get_real_time();lastCapture=now;if(nativeVisible)visibleSourceCopies++;else backgroundSourceCopies++;VeynodeDisplayPublish(owned,generation,sequence,capturedMono);
+#else
+ if(lastCapture&&now-lastCapture<encodeInterval){sourceDirty=YES;return NO;}
+ cachedGeneration=0;if(!owned)owned=allocatePixel(sourceWidth,sourceHeight);
+ if(!owned||!copyPixels(surface,sourceWidth,sourceHeight,owned)){clearCache();captureFail(@"source_copy_failed");return NO;}
+ if(!surfaceLive()){awaitSource(@"generation_retired_during_copy");return NO;}
+ sourceCopies++;sequence++;cachedGeneration=generation;capturedMono=g_get_monotonic_time();capturedWall=g_get_real_time();lastCapture=now;
+#endif
+ sourceDirty=NO;encodeDirty=YES;return YES;
+}
+static void encodeIfDue(gint64 now){
+ if(!fatal&&active&&cacheValid()&&encodeDirty&&(!lastEncode||now-lastEncode>=encodeInterval))encodeLatest(now,NO);
+}
 static void draw(SpiceDisplayChannel *channel,guint32 x,guint32 y,guint32 w,guint32 h,gpointer context){@autoreleasepool{
  received++;gint64 now=g_get_monotonic_time();
- if(!surfaceLive()){awaitSource(@"generation_retired_during_draw");}
- else {
-#ifdef VEYNODE_NATIVE_DISPLAY
-  BOOL nativeVisible=VeynodeDisplayVisible();
-  if(!VNFramePacingAdmit(&capturePacing,now,nativeVisible)){capturePacingDrops++;}
-  else{
-  CVPixelBufferRef next=VeynodeDisplayAcquire(sourceWidth,sourceHeight);
-  if(next){
-   if(!copyPixels(surface,sourceWidth,sourceHeight,next,VNCopySource)){VeynodeDisplayRelease(next);captureFail(@"source_copy_failed");}
-   else if(!surfaceLive()){VeynodeDisplayRelease(next);awaitSource(@"generation_retired_during_copy");}
-   else{clearCache();owned=next;sourceCopies++;sequence++;cachedGeneration=generation;capturedMono=g_get_monotonic_time();capturedWall=g_get_real_time();lastCapture=now;if(nativeVisible)visibleSourceCopies++;else backgroundSourceCopies++;VeynodeDisplayPublish(owned,generation,sequence,capturedMono);}
-  }else capturePoolDrops++;
-  } // Pool exhaustion deliberately drops a source update without blocking ACK.
-#else
-  if(!lastCapture||now-lastCapture>=33333){
-  cachedGeneration=0;if(!owned)owned=allocatePixel(sourceWidth,sourceHeight);
-  if(!owned||!copyPixels(surface,sourceWidth,sourceHeight,owned)){clearCache();captureFail(@"source_copy_failed");}
-  else if(!surfaceLive()){awaitSource(@"generation_retired_during_copy");}
-  else{sourceCopies++;sequence++;cachedGeneration=generation;capturedMono=g_get_monotonic_time();capturedWall=g_get_real_time();lastCapture=now;}
-  }
-#endif
- }
+ captureSource(now);
  // Producer ACK is after the source copy, before encoding our owned buffer.
  spice_display_channel_gl_draw_done(channel);
- if(!fatal&&active&&cacheValid()&&(!lastEncode||now-lastEncode>=33333))encodeLatest(now,NO);
+ encodeIfDue(now);
+}}
+static gboolean flush(gpointer data){@autoreleasepool{
+ if(closing||fatal)return G_SOURCE_CONTINUE;
+ gint64 now=g_get_monotonic_time();
+ if(sourceDirty&&generationFD>=0&&surfaceLive())captureSource(now);
+ encodeIfDue(now);
+ return G_SOURCE_CONTINUE;
 }}
 static void channelEvent(SpiceChannel *channel,SpiceChannelEvent event,gpointer data){
  if(closing)return;
@@ -478,7 +514,7 @@ int main(int argc,char **argv){@autoreleasepool{
  outputWriter=[[VNRecordWriter alloc] initWithFD:STDOUT_FILENO];if(!outputWriter)return 1;
 #endif
  loop=g_main_loop_new(NULL,FALSE);SpiceSession *session=spice_session_new();g_object_set(session,"unix-path",argv[1],NULL);g_signal_connect(session,"channel-new",G_CALLBACK(newChannel),NULL);
- GIOChannel *channel=g_io_channel_unix_new(STDIN_FILENO);g_io_add_watch(channel,G_IO_IN|G_IO_HUP|G_IO_ERR,control,NULL);g_timeout_add(100,tick,NULL);
+ GIOChannel *channel=g_io_channel_unix_new(STDIN_FILENO);g_io_add_watch(channel,G_IO_IN|G_IO_HUP|G_IO_ERR,control,NULL);g_timeout_add(100,tick,NULL);g_timeout_add(4,flush,NULL);
 #ifdef VEYNODE_NATIVE_DISPLAY
  g_timeout_add(10,screenshotTick,NULL);
 #endif

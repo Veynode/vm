@@ -77,59 +77,24 @@ fn registry_protocol_and_permissions() {
         vm_control::call(&dir, "status", json!({"id":"registry-test"})).unwrap()["state"],
         "stopped"
     );
-    let owner = "a".repeat(64);
-    let acquired = vm_control::call(
-        &dir,
-        "acquire_control",
-        json!({"id":"registry-test","owner":owner}),
-    )
-    .unwrap();
-    let epoch = acquired["epoch"].as_u64().unwrap();
-    assert!(vm_control::call(
-        &dir,
-        "acquire_control",
-        json!({"id":"registry-test","owner":"b".repeat(64)})
-    )
-    .is_err());
-    vm_control::call(&dir, "human_takeover", json!({"id":"registry-test"})).unwrap();
-    let rejected = vm_control::call(
-        &dir,
-        "exec",
-        json!({"id":"registry-test","owner":owner,"epoch":epoch,"argv":["/bin/true"]}),
-    )
-    .unwrap_err();
-    assert!(rejected.to_string().contains("revoked"));
-    let rejected_start = vm_control::call(
-        &dir,
-        "exec_start",
-        json!({"id":"registry-test","owner":owner,"epoch":epoch,"argv":["/bin/true"]}),
-    )
-    .unwrap_err();
-    assert!(rejected_start.to_string().contains("revoked"));
+    // The VM is stopped, so commands fail before reaching a guest.
+    for operation in ["exec", "exec_start"] {
+        assert!(vm_control::call(
+            &dir,
+            operation,
+            json!({"id":"registry-test","argv":["/bin/true"]}),
+        )
+        .is_err());
+    }
     for operation in ["exec_poll", "exec_cancel"] {
         let rejected = vm_control::call(
             &dir,
             operation,
-            json!({"id":"registry-test","owner":owner,"epoch":epoch,"job_id":"a".repeat(32)}),
+            json!({"id":"registry-test","job_id":"a".repeat(32)}),
         )
         .unwrap_err();
-        assert!(rejected.to_string().contains("not owned"));
+        assert!(rejected.to_string().contains("unknown"));
     }
-
-    assert!(vm_control::call(
-        &dir,
-        "acquire_control",
-        json!({"id":"registry-test","owner":owner})
-    )
-    .is_err());
-    vm_control::call(&dir, "human_release", json!({"id":"registry-test"})).unwrap();
-    let next = vm_control::call(
-        &dir,
-        "acquire_control",
-        json!({"id":"registry-test","owner":owner}),
-    )
-    .unwrap();
-    assert!(next["epoch"].as_u64().unwrap() > epoch);
     let duplicate = Command::new(env!("CARGO_BIN_EXE_vm-control"))
         .env("VEYNODEVM_HOME", dir.parent().unwrap())
         .args(["daemon", "--state-dir"])

@@ -7,6 +7,7 @@ OUTPUT="$2"
 BASE="$ROOT/.local/runtime/utm"
 HEADERS="$BASE/CocoaSpice-127033fa3e59cd49678f49ed54f8adfc060afb56/Sources/CocoaSpice/ExternalHeaders"
 FRAMEWORKS="$BASE/UTM.app/Contents/Frameworks"
+[[ -d "$HEADERS" && -d "$FRAMEWORKS" ]] || { echo 'Run runtime/fetch-utm.sh and runtime/fetch-cocoaspice.sh first (or runtime/build-qemu-console.sh)' >&2; exit 1; }
 mkdir -p "$(dirname "$OUTPUT")"
 TEMP=$(mktemp -d "$(dirname "$OUTPUT")/.console-build.XXXXXXXX")
 trap 'rm -rf "$TEMP"' EXIT

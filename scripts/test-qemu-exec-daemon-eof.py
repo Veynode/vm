@@ -179,7 +179,6 @@ def main():
             and info.get('execution_identity', {}).get('rootless') is True
             and info.get('capabilities', {}).get('descendant_containment') is True, 'actual v2 containment precondition failed')
         record('actual guest info', info)
-        record('initial lease', tool(owner, 'acquire_control'))
         nonce = uuid.uuid4().hex
         marker = '/home/veynode/guardian-ready-' + nonce
         command = ['/bin/sh', '-eu', '-c', 'test "$(id -u)" = 1000; '

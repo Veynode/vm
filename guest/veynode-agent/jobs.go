@@ -16,16 +16,13 @@ const maxFinishedJobs = 32
 const finishedJobTTL = 5 * time.Minute
 
 type executionControl struct {
-	cancel       chan struct{}
-	once         sync.Once
-	scope        string
-	startPending bool
+	cancel chan struct{}
+	once   sync.Once
 }
 
 func (control *executionControl) requestCancel() { control.once.Do(func() { close(control.cancel) }) }
 
 type commandJob struct {
-	scope           string
 	control         *executionControl
 	cancelRequested bool
 	finished        bool
@@ -34,17 +31,10 @@ type commandJob struct {
 	result          map[string]any
 	err             *rpcError
 }
-type commandScopeState struct {
-	retired          bool
-	active, starting int
-}
-
-const maxCommandScopes = 1024
 
 var errStartContainment = errors.New("failed command start containment cleanup")
 
 type jobManager struct {
-	scopes          map[string]*commandScopeState
 	mu              sync.Mutex
 	active          int
 	jobs            map[string]*commandJob
@@ -59,7 +49,7 @@ type jobManager struct {
 }
 
 func newJobManager(now func() time.Time) *jobManager {
-	return &jobManager{scopes: make(map[string]*commandScopeState), jobs: make(map[string]*commandJob), now: now, identity: currentExecutionIdentity(), controls: make(map[*executionControl]struct{}), boundary: legacyBoundary, containmentMode: "legacy-process-group-not-contained"}
+	return &jobManager{jobs: make(map[string]*commandJob), now: now, identity: currentExecutionIdentity(), controls: make(map[*executionControl]struct{}), boundary: legacyBoundary, containmentMode: "legacy-process-group-not-contained"}
 }
 func validateCommand(req request) *rpcError {
 	if len(req.Argv) == 0 || len(req.Argv) > 128 || req.Argv[0] == "" || req.TimeoutMS < 1 || req.TimeoutMS > 30000 {
@@ -108,96 +98,25 @@ func (manager *jobManager) pruneLocked(now time.Time) {
 	}
 }
 func (manager *jobManager) reserve() *executionControl {
-	control, _ := manager.reserveScoped("")
-	return control
-}
-func (manager *jobManager) reserveScoped(scope string) (*executionControl, *rpcError) {
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 	manager.pruneLocked(manager.now())
 	if manager.stopping || manager.active >= maxActiveCommands {
-		return nil, &rpcError{"busy", "command limit reached or service is stopping"}
+		return nil
 	}
-	var state *commandScopeState
-	if scope != "" {
-		state = manager.scopes[scope]
-		if state == nil {
-			if len(manager.scopes) >= maxCommandScopes {
-				return nil, &rpcError{"busy", "service scope lifetime capacity reached"}
-			}
-			state = &commandScopeState{}
-			manager.scopes[scope] = state
-		}
-		if state.retired {
-			return nil, &rpcError{"scope_retired", "command scope is permanently retired"}
-		}
-		state.active++
-		state.starting++
-	}
-	control := &executionControl{cancel: make(chan struct{}), scope: scope, startPending: scope != ""}
+	control := &executionControl{cancel: make(chan struct{})}
 	manager.active++
 	manager.controls[control] = struct{}{}
-	return control, nil
-}
-func (manager *jobManager) startedLocked(control *executionControl) {
-	if control.startPending {
-		manager.scopes[control.scope].starting--
-		control.startPending = false
-	}
+	return control
 }
 func (manager *jobManager) releaseLocked(control *executionControl) {
-	manager.startedLocked(control)
 	manager.active--
 	delete(manager.controls, control)
-	if control.scope != "" {
-		manager.scopes[control.scope].active--
-	}
 }
 func (manager *jobManager) release(control *executionControl) {
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 	manager.releaseLocked(control)
-}
-
-// Retirement precedes cancellation. Active includes pending starts until their
-// real start outcome and descendant cleanup finish; lost start replies cannot
-// hide a job from this scope-level barrier. Failed cleanup remains sticky.
-func (manager *jobManager) revokeScope(scope string, timeout time.Duration) bool {
-	manager.mu.Lock()
-	state := manager.scopes[scope]
-	if state == nil {
-		if len(manager.scopes) >= maxCommandScopes {
-			manager.noteCleanupFailureLocked(&rpcError{"containment_failed", "scope retirement capacity exhausted"})
-			manager.mu.Unlock()
-			return false
-		}
-		state = &commandScopeState{}
-		manager.scopes[scope] = state
-	}
-	state.retired = true
-	for control := range manager.controls {
-		if control.scope == scope {
-			control.requestCancel()
-		}
-	}
-	manager.mu.Unlock()
-	deadline := time.Now().Add(timeout)
-	for {
-		manager.mu.Lock()
-		done := state.active == 0 && state.starting == 0
-		failed := manager.cleanupFailed
-		manager.mu.Unlock()
-		if done {
-			return !failed
-		}
-		if time.Now().After(deadline) {
-			manager.mu.Lock()
-			manager.noteCleanupFailureLocked(&rpcError{"containment_failed", "scope cleanup deadline"})
-			manager.mu.Unlock()
-			return false
-		}
-		time.Sleep(time.Millisecond)
-	}
 }
 func (manager *jobManager) stopAll(timeout time.Duration) bool {
 	manager.mu.Lock()
@@ -262,14 +181,13 @@ func (manager *jobManager) execute(req request) response {
 	}
 	return response{ID: req.ID, Result: result}
 }
-func (manager *jobManager) start(req request) response { return manager.startScoped(req, "") }
-func (manager *jobManager) startScoped(req request, scope string) response {
+func (manager *jobManager) start(req request) response {
 	if err := validateCommand(req); err != nil {
 		return response{ID: req.ID, Error: err}
 	}
-	control, denied := manager.reserveScoped(scope)
-	if denied != nil {
-		return response{ID: req.ID, Error: denied}
+	control := manager.reserve()
+	if control == nil {
+		return failure(req.ID, "busy", "command limit reached or service is stopping")
 	}
 	var random [16]byte
 	if _, err := rand.Read(random[:]); err != nil {
@@ -290,9 +208,8 @@ func (manager *jobManager) startScoped(req request, scope string) response {
 		}
 		return failure(req.ID, "exec_failed", err.Error())
 	}
-	job := &commandJob{control: control, scope: scope}
+	job := &commandJob{control: control}
 	manager.mu.Lock()
-	manager.startedLocked(control)
 	manager.jobs[id] = job
 	manager.mu.Unlock()
 	go func() {
@@ -311,8 +228,7 @@ func (manager *jobManager) startScoped(req request, scope string) response {
 	}()
 	return response{ID: req.ID, Result: map[string]any{"job_id": id, "state": "running"}}
 }
-func (manager *jobManager) poll(req request) response { return manager.pollScoped(req, "") }
-func (manager *jobManager) pollScoped(req request, scope string) response {
+func (manager *jobManager) poll(req request) response {
 	if !validJobID(req.JobID) {
 		return failure(req.ID, "invalid_request", "job_id must be 32 hexadecimal characters")
 	}
@@ -320,7 +236,7 @@ func (manager *jobManager) pollScoped(req request, scope string) response {
 	defer manager.mu.Unlock()
 	manager.pruneLocked(manager.now())
 	job, ok := manager.jobs[req.JobID]
-	if !ok || job.scope != scope {
+	if !ok {
 		return failure(req.ID, "not_found", "job is unknown or its finished result expired")
 	}
 	result := map[string]any{"job_id": req.JobID, "state": "running"}
@@ -334,8 +250,7 @@ func (manager *jobManager) pollScoped(req request, scope string) response {
 	}
 	return response{ID: req.ID, Result: result}
 }
-func (manager *jobManager) cancel(req request) response { return manager.cancelScoped(req, "") }
-func (manager *jobManager) cancelScoped(req request, scope string) response {
+func (manager *jobManager) cancel(req request) response {
 	if !validJobID(req.JobID) {
 		return failure(req.ID, "invalid_request", "job_id must be 32 hexadecimal characters")
 	}
@@ -343,7 +258,7 @@ func (manager *jobManager) cancelScoped(req request, scope string) response {
 	defer manager.mu.Unlock()
 	manager.pruneLocked(manager.now())
 	job, ok := manager.jobs[req.JobID]
-	if !ok || job.scope != scope {
+	if !ok {
 		return failure(req.ID, "not_found", "job is unknown or its finished result expired")
 	}
 	if job.finished {

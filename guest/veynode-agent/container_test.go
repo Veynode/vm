@@ -3,9 +3,11 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -86,5 +88,97 @@ func TestContainerConfigDNS(t *testing.T) {
 	}
 	if _, err := parseContainerConfig([]byte(containerConfigMagic + fmt.Sprintf(base, `["not-an-ip"]`))); err == nil {
 		t.Fatal("invalid DNS server accepted")
+	}
+}
+
+func TestContainerConfigInit(t *testing.T) {
+	base := `{"version":1,"id":"x","argv":[%q],"transport":"vsock"%s}`
+	if config, err := parseContainerConfig([]byte(containerConfigMagic + fmt.Sprintf(base, "/sbin/init", `,"init":"systemd"`))); err != nil || config.Init != "systemd" {
+		t.Fatalf("%+v %v", config, err)
+	}
+	if config, err := parseContainerConfig([]byte(containerConfigMagic + fmt.Sprintf(base, "sh", ""))); err != nil || config.Init != "" {
+		t.Fatalf("default init: %+v %v", config, err)
+	}
+	for _, bad := range []string{fmt.Sprintf(base, "/sbin/init", `,"init":"openrc"`), fmt.Sprintf(base, "init", `,"init":"systemd"`)} {
+		if _, err := parseContainerConfig([]byte(containerConfigMagic + bad)); err == nil {
+			t.Fatalf("accepted %s", bad)
+		}
+	}
+}
+
+func TestStatInRootFollowsLinksInsideRoot(t *testing.T) {
+	root := t.TempDir()
+	os.MkdirAll(filepath.Join(root, "usr/lib/systemd"), 0o755)
+	os.MkdirAll(filepath.Join(root, "usr/sbin"), 0o755)
+	os.WriteFile(filepath.Join(root, "usr/lib/systemd/systemd"), []byte("#!/bin/sh\n"), 0o755)
+	os.Symlink("usr/sbin", filepath.Join(root, "sbin"))
+	os.Symlink("usr/lib", filepath.Join(root, "lib"))
+	// Absolute links resolve inside the root, not on the host.
+	os.Symlink("/lib/systemd/systemd", filepath.Join(root, "usr/sbin/init"))
+	info, err := statInRoot(root, "/sbin/init")
+	if err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
+		t.Fatalf("%v %v", info, err)
+	}
+	os.Symlink("../../../../../../../../bin/sh", filepath.Join(root, "usr/sbin/escape"))
+	if _, err := statInRoot(root, "/sbin/escape"); err == nil {
+		t.Fatal("followed a link out of the root")
+	}
+	os.Symlink("loop", filepath.Join(root, "loop"))
+	if _, err := statInRoot(root, "/loop"); err == nil {
+		t.Fatal("symlink loop resolved")
+	}
+}
+
+func TestPrepareSystemdRuntime(t *testing.T) {
+	root := t.TempDir()
+	for _, dir := range []string{"run", "etc", "sbin"} {
+		os.MkdirAll(filepath.Join(root, dir), 0o755)
+	}
+	agent := filepath.Join(t.TempDir(), "agent")
+	os.WriteFile(agent, []byte("agent-binary"), 0o755)
+	config := containerConfig{Argv: []string{"/sbin/init"}, Transport: "virtio-serial-exec", Workdir: "/srv"}
+	if err := prepareSystemdRuntime(root, agent, config, []string{"PATH=/bin"}); err == nil {
+		t.Fatal("accepted an image without init")
+	}
+	os.WriteFile(filepath.Join(root, "sbin/init"), []byte("#!/bin/sh\n"), 0o755)
+	if err := prepareSystemdRuntime(root, agent, config, []string{"PATH=/bin"}); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(filepath.Join(root, "run/veynodevm/agent")); string(data) != "agent-binary" {
+		t.Fatalf("agent copy: %q", data)
+	}
+	unit, _ := os.ReadFile(filepath.Join(root, "run/systemd/system/veynodevm-agent.service"))
+	if !strings.Contains(string(unit), "ExecStart=/run/veynodevm/agent --virtio-serial-exec --allow-execute --container-root / --container-env /run/veynodevm/env.json\n") || strings.Contains(string(unit), "--allow-shutdown") {
+		t.Fatalf("unit:\n%s", unit)
+	}
+	for _, link := range []string{"sysinit.target.wants/veynodevm-agent.service", "poweroff.target.wants/veynodevm-exit.service", "halt.target.wants/veynodevm-exit.service"} {
+		if target, err := os.Readlink(filepath.Join(root, "run/systemd/system", link)); err != nil || !strings.HasPrefix(target, "../veynodevm-") {
+			t.Fatalf("%s: %s %v", link, target, err)
+		}
+	}
+	if blacklist, _ := os.ReadFile(filepath.Join(root, "run/modprobe.d/veynodevm.conf")); !strings.Contains(string(blacklist), "blacklist virtio_balloon\n") {
+		t.Fatalf("modprobe.d: %q", blacklist)
+	}
+	if target, _ := os.Readlink(filepath.Join(root, "run/systemd/system/systemd-firstboot.service")); target != "/dev/null" {
+		t.Fatalf("firstboot not masked: %q", target)
+	}
+	var env containerEnvFile
+	raw, _ := os.ReadFile(filepath.Join(root, "run/veynodevm/env.json"))
+	if json.Unmarshal(raw, &env) != nil || env.Workdir != "/srv" || env.Env[0] != "PATH=/bin" {
+		t.Fatalf("env: %s", raw)
+	}
+	id, _ := os.ReadFile(filepath.Join(root, "etc/machine-id"))
+	if len(strings.TrimSpace(string(id))) != 32 {
+		t.Fatalf("machine-id %q", id)
+	}
+	// A second boot keeps the identity.
+	if err := prepareSystemdRuntime(root, agent, config, nil); err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := os.ReadFile(filepath.Join(root, "etc/machine-id")); string(again) != string(id) {
+		t.Fatal("machine-id changed")
+	}
+	if !strings.Contains(systemdAgentUnit("vsock"), "--allow-shutdown") {
+		t.Fatal("vsock unit cannot shut down")
 	}
 }

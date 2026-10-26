@@ -88,6 +88,20 @@ fn point(x: u64, y: u64, w: u64, h: u64) -> Result<Vec<Value>> {
         json!({"type":"abs","data":{"axis":"y","value":physical(y,h)?}}),
     ])
 }
+/// Longest key hold. The macOS Guest service retires an operation idle for one second.
+pub const MAX_HOLD_MS: u64 = 900;
+/// Milliseconds between a plan's first and second step: a key's press and release, which
+/// games sample per frame, so a 20 ms tap can be missed while a held key steers or accelerates.
+pub fn first_gap_ms(method: &str, args: &Value) -> Result<u64> {
+    match args.get("hold_ms") {
+        None => Ok(20),
+        Some(value) if method == "input_key" => match value.as_u64() {
+            Some(ms) if ms <= MAX_HOLD_MS => Ok(ms.max(20)),
+            _ => bail!("hold_ms must be an integer from 0 to {MAX_HOLD_MS}"),
+        },
+        Some(_) => bail!("hold_ms applies only to input_key"),
+    }
+}
 pub fn plan(method: &str, args: &Value) -> Result<Vec<Vec<Value>>> {
     let w = args["width"].as_u64().context("width required")?;
     let h = args["height"].as_u64().context("height required")?;
@@ -98,6 +112,7 @@ pub fn plan(method: &str, args: &Value) -> Result<Vec<Vec<Value>>> {
     {
         bail!("screenshot frame_id and source_generation required")
     }
+    first_gap_ms(method, args)?;
     let mut steps = Vec::new();
     if method == "input_key" {
         let keys = args["keys"].as_array().context("keys must be an array")?;
@@ -315,5 +330,20 @@ mod tests {
         assert!(plan("input_key", &a).is_err());
         a["ticks"] = json!(21);
         assert!(plan("input_scroll", &a).is_err());
+    }
+    #[test]
+    fn key_hold_is_bounded_and_key_only() {
+        let mut a = json!({"frame_id":"00000000-0000-0000-0000-000000000000","width":1280,"height":800,"source_generation":4,"x":0,"y":0,"keys":["up"]});
+        assert_eq!(first_gap_ms("input_key", &a).unwrap(), 20);
+        a["hold_ms"] = json!(0);
+        assert_eq!(first_gap_ms("input_key", &a).unwrap(), 20);
+        a["hold_ms"] = json!(MAX_HOLD_MS);
+        assert_eq!(first_gap_ms("input_key", &a).unwrap(), MAX_HOLD_MS);
+        assert_eq!(plan("input_key", &a).unwrap().len(), 2);
+        assert!(plan("input_click", &a).is_err());
+        for bad in [json!(MAX_HOLD_MS + 1), json!(-1), json!(1.5), json!("500")] {
+            a["hold_ms"] = bad;
+            assert!(plan("input_key", &a).is_err());
+        }
     }
 }

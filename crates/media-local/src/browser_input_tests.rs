@@ -170,22 +170,15 @@ impl Fixture {
                     let req: Value = serde_json::from_str(&line).unwrap();
                     seen.lock().unwrap().push(req.clone());
                     let mut response = json!({"result":match req["method"].as_str().unwrap(){
-    "capabilities"=>json!({"control_session_fencing":{"retired_owner_ttl_seconds":120,"request_dispatch_deadline_seconds":30}}),
     "status"=>json!({"config":{"id":"linux-input-test","backend":"qemu-hvf"},"state":"running","capabilities":{"input":true},"runtime":{"console_socket":path},"pid":123}),
-    "acquire_control"=>json!({"epoch":7,"expires_in_seconds":60}),
-    "release_control"=>json!({"released":true}),
     "screenshot"=>json!({"frame_id":"01234567-89ab-4def-8123-456789abcdef","source_generation":4,"width":1280,"height":800,"mime_type":"image/png","byte_length":1,"data_base64":"AA=="}),
     "input_click"=>json!({"dispatched":true,"guest_delivery_confirmed":false}),
-    "session_end"=>json!({"closed":true,"retired_owner":true,"retired_owner_ttl_seconds":120,"released_vm_ids":[]}),
     _=>panic!("unexpected fixture method")}});
                     let current = mode.load(Ordering::SeqCst);
                     if current == 1 && req["method"] == "input_click" {
-                        response = json!({"error":"lease revoked by human takeover"});
+                        response = json!({"error":"input rejected by the guest"});
                     }
-                    if current == 2 && req["method"] == "session_end" {
-                        response = json!({"result":{"closed":true}});
-                    }
-                    if current == 3 && req["method"] == "acquire_control" {
+                    if current == 3 && req["method"] == "screenshot" {
                         tokio::time::sleep(Duration::from_secs(2)).await;
                     }
                     let _ = reader
@@ -227,10 +220,6 @@ impl Fixture {
         }
     }
     async fn anchor(&self) -> FrameAnchor {
-        self.session
-            .handle(self.signed(1, ControlAction::Acquire))
-            .await
-            .unwrap();
         let shot = self
             .session
             .handle(self.signed(2, ControlAction::ObserveFrame))
@@ -238,9 +227,8 @@ impl Fixture {
             .unwrap();
         frame_from_screenshot(&shot["result"]).unwrap()
     }
-    fn click(frame: FrameAnchor, epoch: u64) -> ControlAction {
+    fn click(frame: FrameAnchor) -> ControlAction {
         ControlAction::Click {
-            epoch,
             frame,
             x: 10,
             y: 20,
@@ -249,10 +237,10 @@ impl Fixture {
     }
 }
 #[tokio::test]
-async fn signed_control_routes_current_lease_and_rejects_replay_tamper() {
+async fn signed_control_routes_input_and_rejects_replay_tamper() {
     let f = Fixture::new().await;
     let frame = f.anchor().await;
-    let request = f.signed(3, Fixture::click(frame, 7));
+    let request = f.signed(3, Fixture::click(frame));
     let ok = f.session.handle(request.clone()).await.unwrap();
     assert_eq!(ok["result"]["dispatched"], true);
     assert!(f
@@ -273,35 +261,29 @@ async fn signed_control_routes_current_lease_and_rejects_replay_tamper() {
         .find(|v| v["method"] == "input_click")
         .unwrap()
         .clone();
-    assert_eq!(call["arguments"]["owner"], f.session.owner);
-    assert_eq!(call["arguments"]["epoch"], 7);
-    f.session.end().await.unwrap();
+    assert!(call["arguments"].get("owner").is_none());
+    f.session.end();
     assert!(f
         .session
-        .handle(f.signed(5, ControlAction::Acquire))
+        .handle(f.signed(5, ControlAction::ObserveFrame))
         .await
         .is_err());
 }
 #[tokio::test]
-async fn frame_epoch_mismatch_expiry_and_takeover_fail_closed() {
+async fn frame_mismatch_expiry_and_rejection_fail_closed() {
     let f = Fixture::new().await;
     let frame = f.anchor().await;
-    assert!(f
-        .session
-        .handle(f.signed(3, Fixture::click(frame.clone(), 8)))
-        .await
-        .is_err());
     let mut altered = frame.clone();
     altered.width = 1279;
     assert!(f
         .session
-        .handle(f.signed(4, Fixture::click(altered, 7)))
+        .handle(f.signed(4, Fixture::click(altered)))
         .await
         .is_err());
     f.session.state.lock().await.frames[0].received = Instant::now() - Duration::from_secs(6);
     assert!(f
         .session
-        .handle(f.signed(5, Fixture::click(frame.clone(), 7)))
+        .handle(f.signed(5, Fixture::click(frame.clone())))
         .await
         .unwrap_err()
         .to_string()
@@ -310,11 +292,11 @@ async fn frame_epoch_mismatch_expiry_and_takeover_fail_closed() {
     f.reply_mode.store(1, Ordering::SeqCst);
     assert!(f
         .session
-        .handle(f.signed(6, Fixture::click(frame, 7)))
+        .handle(f.signed(6, Fixture::click(frame)))
         .await
         .unwrap_err()
         .to_string()
-        .contains("takeover"));
+        .contains("rejected"));
     assert_eq!(
         f.calls
             .lock()
@@ -324,21 +306,21 @@ async fn frame_epoch_mismatch_expiry_and_takeover_fail_closed() {
             .count(),
         1
     );
-    f.session.end().await.unwrap();
+    f.session.end();
 }
 #[tokio::test]
-async fn close_requires_retirement_ack_and_interrupts_inflight_acquire() {
+async fn end_interrupts_inflight_rpc_and_rejects_later_actions() {
     let f = Fixture::new().await;
     f.reply_mode.store(3, Ordering::SeqCst);
     let session = f.session.clone();
-    let request = f.signed(1, ControlAction::Acquire);
+    let request = f.signed(1, ControlAction::ObserveFrame);
     let running = tokio::spawn(async move { session.handle(request).await });
     loop {
         if f.calls
             .lock()
             .unwrap()
             .iter()
-            .any(|v| v["method"] == "acquire_control")
+            .any(|v| v["method"] == "screenshot")
         {
             break;
         }
@@ -346,25 +328,18 @@ async fn close_requires_retirement_ack_and_interrupts_inflight_acquire() {
     }
     assert!(f
         .session
-        .handle(f.signed(2, ControlAction::Acquire))
+        .handle(f.signed(2, ControlAction::ObserveFrame))
         .await
         .unwrap_err()
         .to_string()
         .contains("busy"));
-    f.reply_mode.store(2, Ordering::SeqCst);
+    f.session.end();
+    assert!(running.await.unwrap().is_err());
     assert!(f
         .session
-        .end()
+        .handle(f.signed(3, ControlAction::ObserveFrame))
         .await
-        .unwrap_err()
-        .to_string()
-        .contains("acknowledgement"));
-    assert!(running.await.unwrap().is_err());
-    f.reply_mode.store(0, Ordering::SeqCst);
-    assert_eq!(
-        f.session.end().await.unwrap()["lease_release_confirmed"],
-        true
-    );
+        .is_err());
 }
 #[tokio::test]
 async fn revoked_registry_and_replaced_console_reject_before_input() {
@@ -377,7 +352,7 @@ async fn revoked_registry_and_replaced_console_reject_before_input() {
     store.save(&registry).unwrap();
     assert!(f
         .session
-        .handle(f.signed(3, Fixture::click(frame, 7)))
+        .handle(f.signed(3, Fixture::click(frame)))
         .await
         .is_err());
     assert!(!f
@@ -386,7 +361,7 @@ async fn revoked_registry_and_replaced_console_reject_before_input() {
         .unwrap()
         .iter()
         .any(|v| v["method"] == "input_click"));
-    f.session.end().await.unwrap();
+    f.session.end();
     let other = Fixture::new().await;
     let frame = other.anchor().await;
     std::fs::remove_file(&other.session.console.path).unwrap();
@@ -398,10 +373,10 @@ async fn revoked_registry_and_replaced_console_reject_before_input() {
     .unwrap();
     assert!(other
         .session
-        .handle(other.signed(3, Fixture::click(frame, 7)))
+        .handle(other.signed(3, Fixture::click(frame)))
         .await
         .unwrap_err()
         .to_string()
         .contains("incarnation"));
-    other.session.end().await.unwrap();
+    other.session.end();
 }

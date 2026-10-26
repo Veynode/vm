@@ -2,9 +2,9 @@
 //!
 //! AppKit is only used for desktop control. Apple Virtualization containers
 //! show `VZVirtualMachineView` (2D virtio-gpu, USB keyboard and pointer); QEMU
-//! GPU containers show the SPICE console helper, whose explicit Take Control
-//! / Return to Agent hand input between the person and MCP agents. Closing
-//! the window leaves the VM running.
+//! GPU containers show the SPICE console helper, which sends input while its
+//! window has focus and releases held keys when it loses focus. Closing the
+//! window leaves the VM running.
 use crate::{container, daemon_call};
 use anyhow::{bail, Result};
 use serde_json::json;

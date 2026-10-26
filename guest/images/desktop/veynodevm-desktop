@@ -4,8 +4,14 @@
 # renderers on stdout (container logs).
 set -u
 mkdir -p /run/udev /tmp/.X11-unix "$XDG_RUNTIME_DIR"
+# The container is starting, so no X server runs; a lock left by an unclean
+# stop (it lives in the writable layer) would make Xorg refuse to start.
+rm -f /tmp/.X0-lock /tmp/.X11-unix/X0
 chmod 1777 /tmp/.X11-unix
 chmod 0700 "$XDG_RUNTIME_DIR"
+# The container root is a chroot of the agent's PID 1 root; systemd's udevadm
+# ignores trigger and settle there, leaving input devices unknown to Xorg.
+export SYSTEMD_IGNORE_CHROOT=1
 # eudev (Alpine) installs udevd on PATH; systemd distributions keep it private.
 for udevd in udevd /lib/systemd/systemd-udevd /usr/lib/systemd/systemd-udevd; do
     command -v "$udevd" >/dev/null 2>&1 && break

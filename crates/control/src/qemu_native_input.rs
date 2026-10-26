@@ -1,9 +1,12 @@
 //! Worker-side native input fence; the daemon cannot substitute a screenshot anchor.
+//! `epoch` here is the native session's activation number: it binds frame
+//! acquisition receipts to one focus period of the window, nothing more.
 use super::*;
 use vm_control::native_input::{DisplayedFrame, Event, RejectionDiagnostic, RejectionStage};
 #[derive(Default)]
 pub(super) struct NativeInput {
     owner: Option<String>,
+    operation: Option<String>,
     epoch: u64,
     sequence: u64,
     display: String,
@@ -11,7 +14,7 @@ pub(super) struct NativeInput {
 }
 impl NativeInput {
     pub fn active(&self, input: &InputState) -> bool {
-        self.owner.is_some() && input.active_epoch == Some(self.epoch)
+        self.owner.is_some() && self.operation.is_some() && input.operation == self.operation
     }
     pub fn handle(
         &mut self,
@@ -49,6 +52,17 @@ impl NativeInput {
             .as_str()
             .filter(|s| vm_control::native_input::hex(s, 64))
             .context("invalid native owner")?;
+        if method == "native_end" {
+            // Releases what this window session still holds; it may begin again.
+            if self.owner.as_deref() == Some(owner) {
+                if self.active(input) {
+                    input.cleanup(qmp)?;
+                }
+                self.owner = None;
+                self.operation = None;
+            }
+            return Ok(json!({"ready":false,"released":true}));
+        }
         let epoch = args["epoch"]
             .as_u64()
             .filter(|n| *n > 0)
@@ -57,9 +71,6 @@ impl NativeInput {
             .as_u64()
             .filter(|n| *n > 0)
             .context("invalid native sequence")?;
-        if epoch <= input.revoked_through {
-            bail!("native epoch revoked")
-        }
         if method == "native_begin" {
             if input.operation.is_some() {
                 bail!("input cleanup required")
@@ -86,9 +97,9 @@ impl NativeInput {
             self.epoch = epoch;
             self.sequence = sequence;
             self.display = display.into();
-            input.operation =
-                Some(vm_control::bridge::State::new()?.worker_instance[..32].to_owned());
-            input.active_epoch = Some(epoch);
+            let operation = vm_control::bridge::State::new()?.worker_instance[..32].to_owned();
+            self.operation = Some(operation.clone());
+            input.operation = Some(operation);
             input.until = Some(Instant::now() + Duration::from_secs(2));
             let mut reply = json!({"ready":true,"epoch":epoch});
             if acquisition {
@@ -100,7 +111,7 @@ impl NativeInput {
         if self.owner.as_deref() != Some(owner)
             || self.epoch != epoch
             || sequence <= self.sequence
-            || input.active_epoch != Some(epoch)
+            || !self.active(input)
             || input.until.is_none_or(|until| Instant::now() >= until)
         {
             bail!("native authority lost")
@@ -280,12 +291,13 @@ mod tests {
             reply_prefix: Vec::new(),
         };
         let mut input = InputState {
-            active_epoch: Some(3),
+            operation: Some("o".repeat(32)),
             until: Some(Instant::now() + Duration::from_secs(2)),
             ..Default::default()
         };
         let mut native = NativeInput {
             owner: Some("a".repeat(64)),
+            operation: Some("o".repeat(32)),
             epoch: 3,
             sequence: 0,
             display: "d".repeat(32),
@@ -327,7 +339,7 @@ mod tests {
         }
     }
     #[test]
-    fn real_unix_display_proof_and_qmp_epoch_release() {
+    fn real_unix_display_proof_and_qmp_release_on_end() {
         for diagnostic_id in [None, Some(1), Some(9_007_199_254_740_991u64)] {
             replay_display_proof(diagnostic_id);
         }
@@ -490,7 +502,9 @@ mod tests {
         );
         assert_eq!(input.held.len(), 1);
         assert_eq!(
-            input.revoke(&json!({"through_epoch":3}), &mut qmp).unwrap()["released"],
+            native
+                .handle("native_end", &args, &mut input, &path, &mut qmp)
+                .unwrap()["released"],
             true
         );
         args["sequence"] = json!(8);
@@ -498,7 +512,7 @@ mod tests {
             .handle("native_event", &args, &mut input, &path, &mut qmp)
             .unwrap_err();
         let diagnostic = error.downcast_ref::<RejectionDiagnostic>().unwrap();
-        assert_eq!(diagnostic.stage, RejectionStage::Admission);
+        assert_eq!(diagnostic.stage, RejectionStage::Authority);
         assert!(
             RejectionDiagnostic::from_wire(&serde_json::to_value(diagnostic).unwrap()).is_some()
         );
@@ -632,7 +646,7 @@ mod acquisition_tests {
                 assert_eq!(native.acquisition, requested);
             } else {
                 assert!(reply.is_err());
-                assert!(input.active_epoch.is_none());
+                assert!(input.operation.is_none());
                 assert!(native.owner.is_none());
             }
             assert_eq!(
@@ -755,12 +769,13 @@ mod acquisition_tests {
             reply_prefix: Vec::new(),
         };
         let mut input = InputState {
-            active_epoch: Some(3),
+            operation: Some("o".repeat(32)),
             until: Some(Instant::now() + Duration::from_secs(2)),
             ..Default::default()
         };
         let mut native = NativeInput {
             owner: Some("b".repeat(64)),
+            operation: Some("o".repeat(32)),
             epoch: 3,
             sequence: 0,
             display: "d".repeat(32),

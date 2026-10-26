@@ -54,15 +54,6 @@ impl SessionFiles {
             let proof = proofs.get(session_id).context("proof unavailable")?;
             (proof.transcript.digest()?, proof.device_public_key.clone())
         };
-        let caps = source
-            .file_rpc("capabilities", json!({}), Duration::from_secs(3))
-            .await?;
-        ensure!(
-            caps["result"]["control_session_fencing"]["retired_owner_ttl_seconds"] == 120
-                && caps["result"]["control_session_fencing"]["request_dispatch_deadline_seconds"]
-                    == 30,
-            "controller retirement unsupported"
-        );
         auth.reload()?;
         auth.gate.authorize_active(session_id, "files")?;
         let (cancel, _) = watch::channel(false);
@@ -384,10 +375,7 @@ fn pick(value: &Value, fields: &[&str]) -> Result<Value> {
     Ok(Value::Object(out))
 }
 fn validate_cleanup(v: &Value) -> Result<()> {
-    ensure!(
-        v["closed"] == true && v["retired_owner"] == true && v["retired_owner_ttl_seconds"] == 120,
-        "owner retirement unconfirmed"
-    );
+    ensure!(v["closed"] == true, "owner cleanup unconfirmed");
     ensure!(
         v["job_cancellation"]["attempted"] == 0
             && v["job_cancellation"]["unconfirmed_requests"] == 0
@@ -409,10 +397,6 @@ fn validate_cleanup(v: &Value) -> Result<()> {
                     .as_u64()
                     .is_some()),
         "Guest file cleanup unconfirmed"
-    );
-    ensure!(
-        v.get("input_release").is_none(),
-        "unexpected file-owner input"
     );
     Ok(())
 }

@@ -12,8 +12,7 @@
 - (NSDictionary *)acquisitionContext;
 - (BOOL)enqueueEvent:(NSDictionary *)event frame:(NSDictionary *)frame acquisition:(NSDictionary *)acquisition receipt:(NSString *)receipt context:(NSDictionary *)context;
 - (void)start;
-- (void)takeControl;
-- (void)returnAgent;
+- (void)begin;
 - (void)suspend;
 // Fixed diagnostic labels only; never event contents or arbitrary peer messages.
 - (void)suspendWithReason:(NSString *)reason;

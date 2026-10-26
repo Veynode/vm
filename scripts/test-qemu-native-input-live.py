@@ -2,8 +2,8 @@
 """Attach-only actual native-input acceptance. Manual CUA phases; no UI synthesis.
 
 Requires an already-running disposable QEMU VM with linux-control-input-oracle.c.
-Never starts/stops a VM or daemon, never issues human_takeover/human_release, and
-never sends native-control events. Only baseline/final clicks use real MCP.
+Never starts/stops a VM or daemon and never sends native-control events.
+Only baseline/final clicks use real MCP.
 """
 import argparse
 import hashlib
@@ -164,15 +164,15 @@ class MCP:
         return reply
 
     def tool(self, name, arguments, denied=False):
-        require(name in ('acquire_control', 'release_control', 'input_click', 'screenshot'), 'fixture_tool_not_allowlisted')
+        require(name in ('input_click', 'screenshot'), 'fixture_tool_not_allowlisted')
         reply = self.rpc('tools/call', {'name': 'vm_' + name, 'arguments': arguments})
         failed = 'error' in reply or reply.get('result', {}).get('isError') is True
         require(failed == denied, 'unexpected_mcp_tool_outcome:' + name)
         if denied:
             message = json.dumps(reply, sort_keys=True)
-            require('control lease expired, revoked or belongs to another client' in message,
-                    'mcp_denial_was_not_authority_fence')
-            return {'rejected': True, 'reason': 'control lease expired, revoked or belongs to another client',
+            require('input busy: another operation is active' in message,
+                    'mcp_denial_was_not_native_input_exclusion')
+            return {'rejected': True, 'reason': 'input busy: another operation is active',
                     'response_sha256': hashlib.sha256(message.encode()).hexdigest()}
         content = reply['result']['content']
         if name == 'screenshot':
@@ -298,7 +298,7 @@ def main():
     def status():
         value = call('window_status')
         require(value.get('native_window_protocol') == 2 and value.get('native_input_protocol') == 1, 'native_input_protocol_missing')
-        for key in ('native_input_ready', 'native_human_hold', 'native_release_confirmed', 'window_open'):
+        for key in ('native_input_ready', 'native_release_confirmed', 'window_open'):
             require(type(value.get(key)) is bool, 'native_status_type:' + key)
         require(value.get('native_input_state') != 'cleanup_unconfirmed', 'native_cleanup_unconfirmed')
         return value
@@ -343,22 +343,18 @@ def main():
         serial = Serial(args.serial_log.absolute())
         report['serial'] = serial.summary()
         old = client()
-        old.tool('acquire_control', {'id': args.vm})
-        lease_at = time.monotonic()
         mark = serial.offset()
         dispatch = click(old)
         require(dispatch.get('dispatched') is True and dispatch.get('guest_delivery_confirmed') is False, 'mcp_dispatch_contract')
         wait(lambda: button_pair(serial.since(mark), 200, 200), 8)
         record('baseline_mcp_click_guest_xorg_and_evdev', serial.since(mark))
-        phase('wait-native-take', 'Within 45 seconds click native Take Control. Then keep pointer/keys out of Guest until next phase.')
+        phase('wait-native-focus', 'Within 45 seconds click the native window title bar so it gains keyboard focus. Then keep pointer/keys out of Guest until next phase.')
         acquired = wait(lambda: (v if (v := status())['native_input_ready'] else None), min(45, args.phase_timeout), .2)
-        require(time.monotonic()-lease_at < 55, 'old_lease_expired_before_takeover_proof')
-        require(acquired['native_human_hold'] is True, 'takeover_without_human_hold')
-        record('native_take_confirmed', compact(acquired))
-        phase('checking-old-mcp-denied', 'Do not interact with Guest; script checks denial and independent event silence.')
-        record('previous_mcp_denied_without_guest_events', deny_without_events(old))
+        record('native_begin_confirmed', compact(acquired))
+        phase('checking-mcp-busy', 'Keep native window focused; do not interact with Guest. Script checks denial and independent event silence.')
+        record('mcp_input_busy_during_native_session_without_guest_events', deny_without_events(old))
         mark = serial.offset()
-        phase('wait-native-click-return', 'Click INSIDE Guest oracle [100,100..500,400] in native image, then press Return. Do not click Return to Agent yet.')
+        phase('wait-native-click-return', 'Click INSIDE Guest oracle [100,100..500,400] in native image, then press Return.')
         wait(lambda: button_pair(serial.since(mark)) and return_pair(serial.since(mark)), args.phase_timeout)
         record('native_click_and_return_actual_guest_xorg_evdev', serial.since(mark))
         if not args.skip_drag:
@@ -373,28 +369,22 @@ def main():
             record('window_closed_after_observed_held_button', {'before_close_events': before_close, 'window_ack': compact(closed), 'window_ack_is_release_proof': False})
             wait(lambda: button_pair(serial.since(mark)), 12)
             released = wait(lambda: (v if (v := status())['native_release_confirmed'] and not v['native_input_ready'] else None), 15, .1)
-            require(released['native_human_hold'] is True, 'window_close_unexpectedly_returned_authority')
             report['held_drag_tested'] = True
             record('window_close_release_guest_up_and_separate_native_ack', {'events': serial.since(mark), 'status': compact(released), 'elapsed_since_close_request_s': time.monotonic()-close_started,
                 'causal_limit': 'Guest up and ACK observed after close request; physical CUA drag release timing is external, not independently measured'})
         else:
             record('held_drag_not_tested', 'Explicit --skip-drag; no full acceptance pass claimed')
-        phase('checking-human-hold', 'Do not interact; old MCP must still be rejected without Guest events.')
-        record('human_hold_previous_mcp_still_denied', deny_without_events(old))
+            closed = call('close_window')
+            require(closed.get('window_open') is False and closed.get('native_input_ready') is False, 'window_close_did_not_locally_fence')
+            released = wait(lambda: (v if (v := status())['native_release_confirmed'] and not v['native_input_ready'] else None), 15, .1)
+            record('window_closed_native_session_ended', compact(released))
+        phase('checking-mcp-restored', 'Do not touch the Guest; script checks MCP input after the native session ended.')
+        mark = serial.offset()
+        click(old, 230, 230)
+        wait(lambda: button_pair(serial.since(mark), 230, 230), 8)
+        record('mcp_guest_click_restored_after_native_session_ended', serial.since(mark))
         shown = call('show_window')
         require(shown.get('window_open') is True, 'window_reopen_failed')
-        phase('wait-return-agent', 'Click native Return to Agent explicitly. Do not touch Guest image during final MCP check.')
-        returned = wait(lambda: (v if not (v := status())['native_human_hold'] and v['native_release_confirmed'] and not v['native_input_ready'] else None), args.phase_timeout, .2)
-        record('explicit_return_to_agent_confirmed', compact(returned))
-        fresh = client()
-        fresh.tool('acquire_control', {'id': args.vm})
-        mark = serial.offset()
-        click(fresh, 230, 230)
-        wait(lambda: button_pair(serial.since(mark), 230, 230), 8)
-        record('fresh_mcp_lease_and_guest_click_restored', serial.since(mark))
-        release = fresh.tool('release_control', {'id': args.vm})
-        require(release.get('input_release') == {'confirmed': True, 'vm_count': 1, 'guest_delivery_confirmed': False}, 'final_mcp_release_unconfirmed')
-        record('fresh_mcp_release_dispatch_confirmed', release)
         running()
         report['tested_subset_passed'] = True
         report['passed'] = not args.skip_drag

@@ -58,6 +58,14 @@ type containerConfig struct {
 	Desktop          bool              `json:"desktop,omitempty"`
 	DNS              []string          `json:"dns,omitempty"`
 	MTU              int               `json:"mtu,omitempty"`
+	// Interactive sessions (session_linux.go): the token the host presents,
+	// and whether the entrypoint gets a pty (-t) or an open stdin (-i).
+	SessionToken string `json:"session_token,omitempty"`
+	TTY          bool   `json:"tty,omitempty"`
+	Stdin        bool   `json:"stdin,omitempty"`
+	// Init "systemd" ("full system" mode) prepares the root as usual, then
+	// makes argv (the image's /sbin/init) PID 1 inside it; see systemd_linux.go.
+	Init string `json:"init,omitempty"`
 }
 
 type containerEnvFile struct {
@@ -88,6 +96,12 @@ func parseContainerConfig(raw []byte) (containerConfig, error) {
 	}
 	if config.Transport != "vsock" && config.Transport != "virtio-serial-exec" {
 		return config, errors.New("unsupported guest transport")
+	}
+	if config.Init != "" && config.Init != "systemd" {
+		return config, fmt.Errorf("unsupported init %q", config.Init)
+	}
+	if config.Init == "systemd" && !filepath.IsAbs(config.Argv[0]) {
+		return config, errors.New("init path must be absolute")
 	}
 	for _, path := range append([]string{config.Workdir}, config.AnonymousVolumes...) {
 		if path != "" && !filepath.IsAbs(path) {
@@ -333,7 +347,7 @@ func prepareRoot(config containerConfig) error {
 	}
 	if config.Desktop {
 		// Apple Virtualization attaches USB keyboard and pointer; QEMU uses virtio input.
-		modprobe("xhci-pci", "usbhid", "hid-generic", "evdev", "virtio-input")
+		modprobe("xhci-pci", "usbhid", "hid-generic", "evdev", "virtio-input", "uinput")
 	}
 	if config.Engine {
 		modprobe("bridge", "br_netfilter", "veth", "nf_tables", "nft_chain_nat", "nft_compat", "ip_tables", "iptable_nat", "iptable_filter", "xt_MASQUERADE", "xt_conntrack", "xt_addrtype", "nf_nat", "nf_conntrack", "ipt_REJECT", "xt_nat")
@@ -497,6 +511,10 @@ func containerInit() int {
 			marker("gpu", "unavailable")
 		}
 	}
+	if config.Init == "systemd" {
+		// Returns only on failure; on success the image's init is PID 1.
+		return fail(handOffToSystemd(config))
+	}
 	uid, gid, home, err := lookupUser(containerRootDir, config.User)
 	if err != nil {
 		return fail(err)
@@ -510,6 +528,11 @@ func containerInit() int {
 		agentArgs = append([]string{"--virtio-serial-exec"}, agentArgs...)
 	} else {
 		agentArgs = append(agentArgs, "--allow-shutdown")
+		if config.Desktop {
+			// Apple Virtualization has no host capture for Linux; the browser
+			// desktop reads the scanout through the agent.
+			agentArgs = append(agentArgs, "--desktop-stream")
+		}
 	}
 	agentLog, _ := os.OpenFile(containerRunDir+"/agent.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	agent := exec.Command("/veynode/agent", agentArgs...)
@@ -533,16 +556,63 @@ func containerInit() int {
 		entry.SysProcAttr.Credential = &syscall.Credential{Uid: uid, Gid: gid}
 	}
 	entry.Stdin, entry.Stdout, entry.Stderr = nil, os.Stdout, os.Stderr
+	// With -t the entrypoint gets a pty, with -i an open stdin pipe; the
+	// session server holds the other end for `attach`.
+	var handover, childEnd *os.File
+	mode := ""
+	if config.TTY {
+		if handover, childEnd, err = openPTY(containerRootDir); err != nil {
+			return fail(fmt.Errorf("pty: %w", err))
+		}
+		entry.Stdin, entry.Stdout, entry.Stderr = childEnd, childEnd, childEnd
+		entry.SysProcAttr.Setctty = true
+		mode = "tty"
+	} else if config.Stdin {
+		if childEnd, handover, err = os.Pipe(); err != nil {
+			return fail(err)
+		}
+		entry.Stdin = childEnd
+		mode = "stdin"
+	}
 	signals := make(chan os.Signal, 4)
 	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT, syscall.SIGUSR1, syscall.SIGUSR2)
 	if err = entry.Start(); err != nil {
 		return fail(err)
 	}
+	if childEnd != nil {
+		childEnd.Close()
+	}
+	startSessionServer(config, agentLog, handover, mode)
 	marker("started", strconv.Itoa(entry.Process.Pid))
 	code := reapUntil(entry.Process.Pid, agent, signals)
 	marker("exit", strconv.Itoa(code))
 	powerOff(code)
 	return code
+}
+
+// startSessionServer runs the interactive session service (session_linux.go)
+// as its own process, so PID 1's reaper never takes its children's status.
+func startSessionServer(config containerConfig, log *os.File, handover *os.File, mode string) {
+	if config.SessionToken == "" {
+		if handover != nil {
+			handover.Close()
+		}
+		return
+	}
+	server := exec.Command("/veynode/agent", "session-server", containerRootDir, containerRunDir+"/env.json")
+	server.Env = []string{"VEYNODEVM_SESSION_TOKEN=" + config.SessionToken}
+	if handover != nil {
+		server.Env = append(server.Env, "VEYNODEVM_MAIN_STDIO="+mode)
+		server.ExtraFiles = []*os.File{handover}
+	}
+	// The entrypoint's terminal output goes to the console from there.
+	server.Stdout, server.Stderr = os.Stdout, log
+	if err := server.Start(); err != nil {
+		marker("warning", "session server: "+err.Error())
+	}
+	if handover != nil {
+		handover.Close()
+	}
 }
 
 // reapUntil is the PID 1 loop: it reaps every orphan and returns the main

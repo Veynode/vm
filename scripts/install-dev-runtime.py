@@ -6,8 +6,16 @@ Writes <VEYNODEVM_HOME or ~/Library/Application Support/VeynodeVM>/runtime.json:
   boot      .local/boot/{Image,initramfs.gz,modloop}  (guest/kernel/build.py)
   qemu      UTM-derived QEMU/HVF GPU runtime, only with --qemu and when present
             (runtime/fetch-utm.sh, runtime/build-utm-loader.sh; the SPICE reconnect
-            build's loader is preferred when present)
+            build's loader is preferred when present); the console broker
+            target/debug/vm-console with the native window helper
+            .local/bin/VeynodeQEMUConsole.app (runtime/build-qemu-console.sh)
   web       web/server.mjs when web/dist is built (cd web && npm ci && npm run build)
+  vz_desktop_stream  .local/bin/vz-desktop-stream, the host encoder for Apple
+            Virtualization Linux browser desktops (native/tools/build-vz-desktop-stream.sh)
+  vision    .local/bin/vm-vision, host text recognition for MCP vm_screen_text
+            (native/tools/build-vm-vision.sh)
+  macos_desktop  .local/bin/vm-macos-desktop, the desktop and accessibility helper
+            macOS containers run over SSH (native/tools/build-vm-macos-desktop.sh)
 
 Only paths that exist are written; the daemon reads this file when started
 without flags. Existing keys not managed here (memory_budget_mib) are kept.
@@ -43,7 +51,10 @@ def qemu_paths():
         'spice_library': ROOT / '.local/spice-reconnect-build/runtime/libspice-server-fixed.dylib',
         'screenshot_helper': ROOT / '.local/bin/spice-screenshot',
         'console_broker': ROOT / 'target/debug/vm-console',
-        'console_helper': ROOT / '.local/bin/spice-console',
+        # The windowed app build first; the headless helper has no native window.
+        'console_helper': next((p for p in (ROOT / '.local/bin/VeynodeQEMUConsole.app/Contents/MacOS/spice-console',
+                                            ROOT / '.local/bin/spice-console') if p.exists()),
+                               ROOT / '.local/bin/VeynodeQEMUConsole.app/Contents/MacOS/spice-console'),
         'venus_runtime': ROOT / '.local/runtime/venus/registration.json',
     }
     missing = [str(p) for p in paths.values() if not p.exists()]
@@ -78,6 +89,15 @@ def main():
     web = ROOT / 'web/server.mjs'
     if (ROOT / 'web/dist/server/server.js').exists():
         runtime['web'] = str(web.resolve())
+    encoder = ROOT / '.local/bin/vz-desktop-stream'
+    if encoder.exists():
+        runtime['vz_desktop_stream'] = str(encoder.resolve())
+    vision = ROOT / '.local/bin/vm-vision'
+    if vision.exists():
+        runtime['vision'] = str(vision.resolve())
+    macos_desktop = ROOT / '.local/bin/vm-macos-desktop'
+    if macos_desktop.exists():
+        runtime['macos_desktop'] = str(macos_desktop.resolve())
     if args.dns:
         runtime['dns'] = args.dns
     if args.memory_budget_mib:

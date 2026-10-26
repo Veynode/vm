@@ -17,7 +17,7 @@ fn actual_https_subprocess_signals_and_cleanup_outcomes() {
     );
     let evidence: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(evidence["passed"], true);
-    assert_eq!(evidence["checks"].as_array().unwrap().len(), 15);
+    assert_eq!(evidence["checks"].as_array().unwrap().len(), 14);
     println!("{}", String::from_utf8_lossy(&output.stdout));
 }
 

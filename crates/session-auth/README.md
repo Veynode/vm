@@ -29,7 +29,7 @@ The one encoding exception is identity derivation: SHA-256 of ASCII `Veynode/ide
 
 `replace_grants` checks host signatures and version monotonicity and returns affected pending/active session IDs. **The embedding service must stop those transports.** In-memory highest-seen versions prevent reinstalling revoked grants; durable registry tombstones preserve version progression across CLI operations. Same-account modification or rollback of the entire host state is inside the trusted-host boundary, not protection offered by these signatures. No automatic key replacement or identity recovery occurs.
 
-The library does not turn an observe grant into input/execute/files authority. Transport-level media authorization requires observe; input additionally requires the existing current VM control lease and epoch. Session expiration after confirmation is the embedding transport's responsibility; the 60-second challenge expiry is not a promise to terminate active video after 60 seconds.
+The library does not turn an observe grant into input/execute/files authority. Transport-level media authorization requires observe; input additionally requires the input scope and a fresh screenshot anchor. Session expiration after confirmation is the embedding transport's responsibility; the 60-second challenge expiry is not a promise to terminate active video after 60 seconds.
 
 ## Local administration
 
@@ -70,11 +70,12 @@ cargo test -p vm-session-auth --test keychain --target-dir .local/stage-target -
 ## Signed physical console control
 
 `control.rs` defines a separate `Veynode/control/v1\0` transcript and
-`tests/control-golden.json` provides seven cross-language fixtures. A signed request
+`tests/control-golden.json` provides five cross-language fixtures. A signed request
 contains the verified media session ID and answer-transcript SHA-256, a strictly
-increasing sequence, an expiry at most five seconds ahead, and one typed action.
+increasing sequence, an expiry at most five seconds ahead, and one typed action:
+`file`, `observe_frame`, `click`, `drag`, `scroll` or `key`.
 The canonical format uses UTF-8 length-prefixed strings and big-endian integers;
-physical actions additionally bind the exact lease epoch and screenshot UUID,
+physical actions additionally bind the screenshot UUID,
 source generation and Guest pixel dimensions. No command strings, file paths,
 remote-selected VM IDs, Unicode injection or arbitrary QMP payloads are accepted.
 `vm-pair verify` accepts `kind:control` for cryptographic interoperability only.
@@ -82,24 +83,19 @@ remote-selected VM IDs, Unicode injection or arbitrary QMP payloads are accepted
 The host adapter (`crates/media-local/src/browser_input.rs`) requires a confirmed,
 currently granted session, a private owner-held controller socket, a matching
 QEMU console socket and worker incarnation. Observe and input remain separate
-scopes. The browser must explicitly acquire control; the adapter never reclaims a
-lease automatically. It allows one request in flight and no queue. An explicit
+scopes; input needs the input scope plus a fresh screenshot. It allows one
+request in flight and no queue. An explicit
 PNG screenshot is the input anchor, retained at most five seconds after receipt;
 RTP decoder stats and resized video pixels are not presented as that binding.
-The daemon rechecks its own screenshot age, geometry, source generation and lease
+The daemon rechecks its own screenshot age, geometry and source generation
 before every physical step. Capture validation and QMP dispatch occur in different
 processes, so a small generation-change race remains; QMP acknowledgement does not
 prove Guest application acceptance.
 
-Session end cancels the pending Unix RPC, awaits daemon owner retirement and lease
-release, and reports failure if this acknowledgement is absent. A dropped Rust
-adapter attempts cleanup, while process/runtime loss retains the existing bounded
-60-second lease. Each new session uses a fresh random owner. The controller keeps
-retired-owner tombstones for 120 seconds, rejects requests more than 30 seconds
-since accept, and rejects a disconnected client's acquire. At 4096 unexpired
-retirements it rejects all new acquisitions for the full fence interval instead of
-evicting a still-live tombstone. Cleanup is not an application-level rollback or
-confirmation that every Guest has processed key/button release.
+Session end, revocation or disconnect cancels the pending Unix RPC; the daemon
+releases held keys and buttons at the end of every input operation. Cleanup is
+not an application-level rollback or confirmation that every Guest has processed
+key/button release.
 
 This integration is confined to the existing loopback diagnostic server. Signed
 HTTP input is authenticated but **not encrypted**. Internet deployment, authenticated

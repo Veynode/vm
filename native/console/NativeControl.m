@@ -59,7 +59,7 @@ static NSDictionary *exchange(int fd,NSDictionary *request){
     uint64_t _suspensionCount;
     NSDictionary *_move;
     BOOL _acquisitionNegotiated;
-    BOOL _started,_attached,_ready,_humanHold,_releaseConfirmed,_fatal,_suspendPending,_takeInFlight;
+    BOOL _started,_attached,_ready,_releaseConfirmed,_fatal,_suspendPending,_beginInFlight;
     uint64_t _epoch,_generation,_sequence;
 }
 - (instancetype)initWithSocket:(NSString *)socket vm:(NSString *)vm worker:(NSString *)worker display:(NSString *)display{
@@ -69,10 +69,11 @@ static NSDictionary *exchange(int fd,NSDictionary *request){
 }
 - (NSDictionary *)acquisitionContext{[_condition lock];NSDictionary *c=(_ready&&!_fatal&&_acquisitionNegotiated)?@{@"epoch":@(_epoch),@"generation":@(_generation)}:nil;[_condition unlock];return c;}
 - (void)start{[_condition lock];if(!_started&&!_fatal){_started=YES;[NSThread detachNewThreadSelector:@selector(run) toTarget:self withObject:nil];}[_condition unlock];}
-- (NSDictionary *)status{[_condition lock];NSDictionary *s=@{@"native_frame_acquisition_protocol":@1,@"native_frame_acquisition_negotiated":_acquisitionNegotiated?@YES:@NO,@"native_frame_acquisition_enabled":(_ready&&!_fatal&&_acquisitionNegotiated)?@YES:@NO,@"native_input_supported":@YES,@"native_input_available":(_attached&&!_fatal?@YES:@NO),@"native_input_protocol":@1,@"input_enabled":(_ready&&!_fatal?@YES:@NO),@"display_only":(!_ready||_fatal?@YES:@NO),@"native_input_state":_state,@"native_input_ready":(_ready&&!_fatal?@YES:@NO),@"native_human_hold":(_humanHold?@YES:@NO),@"native_release_confirmed":(_releaseConfirmed?@YES:@NO),@"native_input_epoch":_epoch?@(_epoch):[NSNull null],@"native_input_queued_transitions":@(_queue.count),@"native_input_pending_move":(_move!=nil?@YES:@NO),@"native_input_transition_limit":@32,@"native_input_suspension_count":@(_suspensionCount),@"native_input_suspensions":[_suspensions copy]};[_condition unlock];return s;}
-- (void)takeControl{[_condition lock];if(_attached&&!_fatal&&!_ready&&[@[@"view_only",@"suspended_human_hold"] containsObject:_state]){_suspensionRecorded=NO;_generation++;[self.frameAcquisition deactivate];[_queue removeAllObjects];_move=nil;_state=@"taking_control";[_queue addObject:@{@"method":@"take_control",@"local_generation":@(_generation)}];[_condition signal];}[_condition unlock];}
-- (void)returnAgent{[_condition lock];if(_attached&&!_fatal&&_epoch&&_humanHold&&[@[@"human_control",@"suspended_human_hold"] containsObject:_state]){_generation++;[self.frameAcquisition deactivate];_ready=NO;_move=nil;[_queue removeAllObjects];_state=@"returning_agent";[_queue addObject:@{@"method":@"return_agent",@"epoch":@(_epoch),@"local_generation":@(_generation)}];[_condition signal];}[_condition unlock];}
-- (void)suspendLocked{_generation++;[self.frameAcquisition deactivate];_ready=NO;_move=nil;[_queue removeAllObjects];if(_epoch){_suspendPending=YES;_releaseConfirmed=NO;_state=@"suspending";}else if([_state isEqual:@"taking_control"]){_state=_takeInFlight?@"suspended":@"view_only";}[_condition signal];}
+- (NSDictionary *)status{[_condition lock];NSDictionary *s=@{@"native_frame_acquisition_protocol":@1,@"native_frame_acquisition_negotiated":_acquisitionNegotiated?@YES:@NO,@"native_frame_acquisition_enabled":(_ready&&!_fatal&&_acquisitionNegotiated)?@YES:@NO,@"native_input_supported":@YES,@"native_input_available":(_attached&&!_fatal?@YES:@NO),@"native_input_protocol":@1,@"input_enabled":(_ready&&!_fatal?@YES:@NO),@"display_only":(!_ready||_fatal?@YES:@NO),@"native_input_state":_state,@"native_input_ready":(_ready&&!_fatal?@YES:@NO),@"native_release_confirmed":(_releaseConfirmed?@YES:@NO),@"native_input_epoch":_epoch?@(_epoch):[NSNull null],@"native_input_queued_transitions":@(_queue.count),@"native_input_pending_move":(_move!=nil?@YES:@NO),@"native_input_transition_limit":@32,@"native_input_suspension_count":@(_suspensionCount),@"native_input_suspensions":[_suspensions copy]};[_condition unlock];return s;}
+// Begin starts a new activation; the daemon answers with its epoch, which only
+// numbers activations so stale frames and events from an earlier one are refused.
+- (void)begin{[_condition lock];if(_attached&&!_fatal&&!_ready&&[@[@"view_only",@"suspended"] containsObject:_state]){_suspensionRecorded=NO;_generation++;[self.frameAcquisition deactivate];[_queue removeAllObjects];_move=nil;_state=@"beginning";[_queue addObject:@{@"method":@"begin",@"local_generation":@(_generation)}];[_condition signal];}[_condition unlock];}
+- (void)suspendLocked{_generation++;[self.frameAcquisition deactivate];_ready=NO;_move=nil;[_queue removeAllObjects];if(_epoch&&!_releaseConfirmed){_suspendPending=YES;_state=@"suspending";}else if([_state isEqual:@"beginning"]){_state=_beginInFlight?@"suspending":@"view_only";}[_condition signal];}
 - (void)recordSuspensionLocked:(NSString *)reason queueAge:(double)age remote:(NSDictionary *)remote{
     if(_suspensionRecorded)return;
     _suspensionRecorded=YES;
@@ -86,7 +87,7 @@ static NSDictionary *exchange(int fd,NSDictionary *request){
     [_suspensions addObject:[record copy]];
 }
 - (void)suspend{[self suspendWithReason:@"explicit"];}
-- (void)suspendWithReason:(NSString *)reason{[_condition lock];if(!_fatal&&(_ready||[_state isEqual:@"taking_control"])){
+- (void)suspendWithReason:(NSString *)reason{[_condition lock];if(!_fatal&&(_ready||[_state isEqual:@"beginning"])){
     [self recordSuspensionLocked:reason queueAge:-1 remote:nil];[self suspendLocked];}[_condition unlock];}
 - (BOOL)enqueueEvent:(NSDictionary *)event frame:(NSDictionary *)frame{return [self enqueueEvent:event frame:frame acquisition:nil];}
 - (BOOL)enqueueEvent:(NSDictionary *)event frame:(NSDictionary *)frame acquisition:(NSDictionary *)acquisition{return [self enqueueEvent:event frame:frame acquisition:acquisition receipt:nil context:nil];}
@@ -120,7 +121,7 @@ static NSDictionary *exchange(int fd,NSDictionary *request){
         else if(_queue.count){entry=_queue[0];[_queue removeObjectAtIndex:0];}
         else if(_move){entry=_move;_move=nil;}
         else{NSMutableDictionary *h=[@{@"method":@"heartbeat",@"local_generation":@(_generation)} mutableCopy];if(_ready)h[@"epoch"]=@(_epoch);entry=h;}
-        NSString *method=entry[@"method"];if([method isEqual:@"take_control"])_takeInFlight=YES;uint64_t generation=[entry[@"local_generation"] unsignedLongLongValue];
+        NSString *method=entry[@"method"];if([method isEqual:@"begin"])_beginInFlight=YES;uint64_t generation=[entry[@"local_generation"] unsignedLongLongValue];
         double queueAge=[method isEqual:@"event"]?mono()-[entry[@"queued_at"] doubleValue]:-1;
         if([method isEqual:@"event"]&&(!_ready||generation!=_generation||queueAge>0.200)){
             [self recordSuspensionLocked:(!_ready?@"not_ready":generation!=_generation?@"generation_changed":@"queue_expired") queueAge:queueAge remote:nil];
@@ -137,8 +138,8 @@ static NSDictionary *exchange(int fd,NSDictionary *request){
             [self recordSuspensionLocked:[@"remote_" stringByAppendingString:code] queueAge:queueAge remote:error[@"diagnostic"]];
             [self suspendLocked];[_condition unlock];continue;}[self failLocked];[_condition unlock];break;}
         if(![r isKindOfClass:NSDictionary.class]||!boolean(r[@"ready"])){[self failLocked];[_condition unlock];break;}
-        if([method isEqual:@"take_control"]){_takeInFlight=NO;if(![r[@"ready"] boolValue]||!integer(r[@"epoch"])||(_acquisitionNegotiated?!protocolOne(r[@"frame_acquisition_protocol"]):r[@"frame_acquisition_protocol"]!=nil)){[self failLocked];}else{_epoch=[r[@"epoch"] unsignedLongLongValue];_humanHold=YES;_releaseConfirmed=NO;if(generation==_generation){_ready=YES;_state=@"human_control";if(_acquisitionNegotiated)[self.frameAcquisition activateEpoch:_epoch generation:_generation];}else{_suspendPending=YES;_state=@"suspending";}}}
-        else if([method isEqual:@"suspend"]||[method isEqual:@"return_agent"]){if([r[@"ready"] boolValue]||!boolean(r[@"released"])||![r[@"released"] boolValue]){[self failLocked];}else{_ready=NO;_releaseConfirmed=YES;if([method isEqual:@"suspend"]){if(!integer(r[@"epoch"]))[self failLocked];else _epoch=[r[@"epoch"] unsignedLongLongValue];}_state=_humanHold?@"suspended_human_hold":@"view_only";if([method isEqual:@"return_agent"]){_humanHold=NO;_epoch=0;_suspendPending=NO;_state=@"view_only";}}}
+        if([method isEqual:@"begin"]){_beginInFlight=NO;if(![r[@"ready"] boolValue]||!integer(r[@"epoch"])||[r[@"epoch"] unsignedLongLongValue]<=_epoch||(_acquisitionNegotiated?!protocolOne(r[@"frame_acquisition_protocol"]):r[@"frame_acquisition_protocol"]!=nil)){[self failLocked];}else{_epoch=[r[@"epoch"] unsignedLongLongValue];_releaseConfirmed=NO;if(generation==_generation){_ready=YES;_state=@"active";if(_acquisitionNegotiated)[self.frameAcquisition activateEpoch:_epoch generation:_generation];}else{_suspendPending=YES;_state=@"suspending";}}}
+        else if([method isEqual:@"suspend"]){if([r[@"ready"] boolValue]||!boolean(r[@"released"])||![r[@"released"] boolValue]||!integer(r[@"epoch"])||[r[@"epoch"] unsignedLongLongValue]!=_epoch){[self failLocked];}else{_ready=NO;_releaseConfirmed=YES;_state=@"suspended";}}
         else if([method isEqual:@"event"]){if(![r[@"ready"] boolValue]||!boolean(r[@"dispatched"])||![r[@"dispatched"] boolValue]||!boolean(r[@"guest_delivery_confirmed"])||[r[@"guest_delivery_confirmed"] boolValue]){[self failLocked];}}
         else if([method isEqual:@"heartbeat"]){BOOL active=request[@"epoch"]!=nil;if([r[@"ready"] boolValue]!=active||(active&&(!integer(r[@"epoch"])||[r[@"epoch"] unsignedLongLongValue]!=[request[@"epoch"] unsignedLongLongValue])))[self failLocked];}
         if(_fatal)_state=@"cleanup_unconfirmed";BOOL done=_fatal;[_condition unlock];if(done)break;

@@ -114,7 +114,7 @@ async function main(argv) {
       const listed = await entry.client.listTools({}, { timeout: 15000 });
       const names = listed.tools.map(value => value.name);
       check(['vm_guest_info', 'vm_file_upload_begin', 'vm_file_upload_write', 'vm_file_upload_commit', 'vm_file_download_begin', 'vm_file_download_read', 'vm_file_cancel'].every(name => names.includes(name)), 'required_tools_missing');
-      check(!names.some(name => /^(vm_exec|vm_input|vm_acquire_control|vm_start|vm_shutdown|vm_force_stop|vm_create)/.test(name)), 'unexpected_non_files_permission');
+      check(!names.some(name => /^(vm_exec|vm_input|vm_start|vm_shutdown|vm_force_stop|vm_create)/.test(name)), 'unexpected_non_files_permission');
     }
     record('official SDK initialized and negotiated file-only tool permissions');
     stage = 'guest-identity';

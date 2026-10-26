@@ -78,7 +78,6 @@ with tempfile.TemporaryDirectory(prefix='vm-installed-jobs-') as directory:
         record('installed service actual identity/capabilities', info)
         life.tool('vm_exec_start', {'id': config['id'], 'argv': ['/bin/true']}, denied=True)
         record('lifecycle-only client denied command job', True)
-        tool(owner, 'vm_acquire_control')
         probe = execute(owner, ['/bin/sh', '-c', 'uname -r; cat /proc/self/cgroup; cat /proc/filesystems; grep cgroup /proc/mounts || true; ls -ld /sys/fs/cgroup; cat /etc/init.d/veynode-agent'])
         record('actual installed kernel, mount, membership and service configuration', probe)
         if args.expect_contained:
@@ -91,7 +90,7 @@ with tempfile.TemporaryDirectory(prefix='vm-installed-jobs-') as directory:
             record('unprivileged nested service explicitly refuses unsupported containment', unavailable)
 
 
-        for reason in (['cancel', 'takeover', 'timeout', 'completed', 'disconnect'] if args.expect_contained else ['cancel']):
+        for reason in (['cancel', 'timeout', 'completed', 'disconnect'] if args.expect_contained else ['cancel']):
             marker = '/home/veynode/cgroup-' + reason + '-marker'
             ready = '/home/veynode/cgroup-' + reason + '-ready'
             execute(owner, ['/bin/rm', '-f', marker, ready])
@@ -108,18 +107,12 @@ with tempfile.TemporaryDirectory(prefix='vm-installed-jobs-') as directory:
                 raise AssertionError('detached child never announced readiness')
             if reason == 'cancel':
                 assert tool(owner, 'vm_exec_cancel', job_id=job)['result']['cancel_requested']
-            elif reason == 'takeover':
-                local('human_takeover', {'id': config['id']})
             if reason == 'disconnect':
                 owner.close()
-                tool(other, 'vm_acquire_control')
                 owner, other = other, owner
-                result = {'transport': 'MCP stdio EOF; old owner cannot poll after disconnect'}
+                result = {'transport': 'MCP stdio EOF; session end cancels its job'}
             else:
                 result = finish(owner, job)
-            if reason == 'takeover':
-                local('human_release', {'id': config['id']})
-                tool(owner, 'vm_acquire_control')
             time.sleep(1.4)
             survived = execute(owner, ['/bin/sh', '-c', 'test -e "$1"', 'marker', marker])['exit_code'] == 0
             assert survived != args.expect_contained, (reason, result, survived)
@@ -127,7 +120,6 @@ with tempfile.TemporaryDirectory(prefix='vm-installed-jobs-') as directory:
         after = tool(owner, 'vm_guest_info')['result']
         assert after['file_policy']['uid'] == 1001 and 'error' not in after['file_policy'], after
         record('service and separate UID1001 files worker remain responsive after job cleanup', after)
-        tool(owner, 'vm_release_control')
         assert tool(life, 'vm_shutdown', mode='guest')['result']['requested']
         for _ in range(150):
             if local('status', {'id': config['id']})['state'] == 'stopped':

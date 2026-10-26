@@ -51,7 +51,7 @@ assert headless['native_window'] is False
 assert view['displayed_frame_protocol']==1
 assert view['owned_slot_limit']==3 and view['display_gpu_inflight_limit']==1
 assert view['capture_limit_fps']==60 and view['native_window_capture_limit_fps']==60
-assert view['background_capture_limit_fps']==30 and view['encoder_limit_fps']==30
+assert view['background_capture_limit_fps']==30 and view['encoder_limit_fps']==60
 assert view['idle_encode_interval_ms']==1000 and view['display_refresh_preference_hz']==60
 assert view['physical_presentation_measurement']=='unavailable'
 assert view['presented_time_sample_limit']==120

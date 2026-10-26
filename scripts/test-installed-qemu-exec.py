@@ -3,7 +3,7 @@
 
 Attach an existing controller. Register one NEW fixture VM on an explicitly
 supplied disposable clone. Never boot the immutable base or start a controller.
-This baseline is not the lost-ACK/worker-pause/service-crash acceptance gate.
+This baseline is not the worker-pause/service-crash acceptance gate.
 """
 import argparse
 import base64
@@ -82,7 +82,7 @@ def main():
     evidence = {'passed': False, 'started_at_unix': time.time(), 'checks': [],
         'scope': 'real installed Linux accelerated desktop and explicit rootless serial v2 MCP jobs',
         'limits': ['single VM baseline; not performance or Parallels comparison',
-                   'lost ACK, worker/Guest SIGSTOP, daemon death and whole-VM pause are separate gates']}
+                   'worker/Guest SIGSTOP, daemon death and whole-VM pause are separate gates']}
     clients, started = [], False
     vm = None
 
@@ -181,7 +181,6 @@ def main():
         denied = life.tool('exec_start', {'id': vm, 'argv': ['/bin/true']}, denied=True)
         require('Tool unknown or permission not granted' in json.dumps(denied), 'wrong execute-scope denial')
         record('client without execute scope denied', denied)
-        tool(owner, 'acquire_control')
         identity = execute(owner, ['/bin/sh', '-eu', '-c',
             'id; printf "HOME=%s\\nPWD=%s\\n" "$HOME" "$PWD"; cat /proc/self/cgroup; '
             'test "$(id -u)" = 1000; test "$(id -G)" = 1000; '
@@ -205,8 +204,12 @@ def main():
         require('unsupported' in json.dumps(files).lower(), 'files denial was not an unsupported capability')
         record('files remain explicitly unsupported', files)
 
+        denied = other.tool('exec_poll', {'id': vm, 'job_id': uuid.uuid4().hex}, denied=True)
+        require('job is unknown or expired on this VM' in json.dumps(denied), 'unknown job not refused')
+        record('unknown job refused', denied)
+
         token = uuid.uuid4().hex
-        for reason in ('cancel', 'timeout', 'completed', 'takeover', 'disconnect'):
+        for reason in ('cancel', 'timeout', 'completed', 'disconnect'):
             marker = f'/home/veynode/v2-{token}-{reason}-marker'
             ready = f'/home/veynode/v2-{token}-{reason}-ready'
             # The detached grandchild changes its session and outlives its parent.
@@ -226,27 +229,10 @@ def main():
                         break
                     time.sleep(.025)
                 require(ready_seen, 'detached process did not announce readiness before cancellation')
-            for method in ('exec_poll', 'exec_cancel'):
-                denied = other.tool(method, {'id': vm, 'job_id': job}, denied=True)
-                require('job is unknown, expired or not owned by this client and lease epoch' in json.dumps(denied),
-                        'wrong cross-owner job denial')
             if reason == 'cancel':
-                denied = life.tool('shutdown', {'id': vm}, denied=True)
-                require('shutdown refused: execution scope cleanup unconfirmed' in json.dumps(denied),
-                        'normal shutdown bypassed original execution scope cleanup')
-                require(tool(owner, 'exec_poll', job_id=job)['result']['state'] == 'running',
-                        'rejected shutdown disrupted the authorized command')
-                record('shutdown with active execution scope explicitly refused', denied)
                 require(tool(owner, 'exec_cancel', job_id=job)['result']['cancel_requested'] is True, 'cancel request failed')
-            elif reason == 'takeover':
-                record('human takeover completes original-scope cleanup', local('human_takeover', {'id': vm}))
-                owner.tool('exec_start', {'id': vm, 'argv': ['/bin/true']}, denied=True)
-                other.tool('acquire_control', {'id': vm}, denied=True)
-                local('human_release', {'id': vm})
-                tool(owner, 'acquire_control')
             elif reason == 'disconnect':
                 owner.close()
-                tool(other, 'acquire_control')
                 clients.remove(owner)
                 owner = other
                 other = MCP(args.binary, args.state)
@@ -260,7 +246,7 @@ def main():
                     require(execute(owner, ['/bin/sh', '-c', 'test -e "$1"', 'ready', ready])['exit_code'] == 0,
                             'completed parent did not launch detached descendant')
             else:
-                result = {'cleanup': 'original scope retired before new lease acquired'}
+                result = {'cleanup': 'MCP session end cancelled the job'}
             time.sleep(max(0, begin + 4.5 - time.monotonic()))
             absent = execute(owner, ['/bin/sh', '-c', 'test ! -e "$1"', 'marker', marker])
             require(absent['exit_code'] == 0, 'detached descendant escaped and wrote marker')
@@ -279,7 +265,6 @@ def main():
         require(decode['streams'] == [{'codec_name': 'png', 'width': config['width'], 'height': config['height']}],
                 'desktop capture regression')
         record('accelerated desktop screenshot after command tests', {'decode': decode, 'sha256': digest(path)})
-        tool(owner, 'release_control')
         for client in clients:
             client.close()
         clients.clear()
@@ -289,14 +274,14 @@ def main():
                 'expected real ACPI power-button shutdown')
         require(shutdown.get('execution_quiescing') is True and shutdown.get('shutdown_timeout_seconds') == 60,
                 'shutdown lacks bounded execution quiescing')
-        record('bounded normal shutdown after all scopes retired', shutdown)
+        record('bounded normal shutdown after all MCP sessions ended', shutdown)
         clients.append(MCP(args.binary, args.state))
-        denied = clients[-1].tool('acquire_control', {'id': vm}, denied=True)
-        require('VM execution is quiescing for shutdown; new authority denied' in json.dumps(denied),
-                'shutdown accepted new execution authority')
+        denied = clients[-1].tool('exec_start', {'id': vm, 'argv': ['/bin/true']}, denied=True)
+        require('VM execution is quiescing for shutdown' in json.dumps(denied),
+                'shutdown accepted new execution')
         clients[-1].close()
         clients.clear()
-        record('quiescing shutdown rejects a fresh MCP control owner', denied)
+        record('quiescing shutdown rejects new execution from a fresh MCP session', denied)
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
             status = local('status', {'id': vm})

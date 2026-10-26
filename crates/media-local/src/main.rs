@@ -1028,21 +1028,13 @@ async fn end_session_input(app: &App, id: &str) -> bool {
         .filter(|s| s.id == id)
         .map(|s| (s.input.clone(), s.files.clone()))
         .unwrap_or((None, None));
-    let (input_clean, files_clean) = tokio::join!(
-        async {
-            match input {
-                Some(input) => input.end().await.is_ok(),
-                None => true,
-            }
-        },
-        async {
-            match files {
-                Some(files) => files.end().await.is_ok(),
-                None => true,
-            }
-        }
-    );
-    input_clean && files_clean
+    if let Some(input) = input {
+        input.end();
+    }
+    match files {
+        Some(files) => files.end().await.is_ok(),
+        None => true,
+    }
 }
 fn cleanup_attested_exit(code: Option<i32>, failure_exit: Option<i32>) -> bool {
     code == Some(0) || (code.is_some() && code == failure_exit)

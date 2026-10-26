@@ -25,7 +25,7 @@ async function page(scopes, name, action) {
   const grant = { host_id: host.id, device_id: device.id, device_public_key: device.publicKey, vm_id: 'control-fixture', scopes, version: 1 };
   const signedGrant = { grant, signature: await host.sign(await grantBytes(grant)) };
   const saved = new Map(); const replace = (key, value) => { saved.set(key, Object.getOwnPropertyDescriptor(globalThis, key)); Object.defineProperty(globalThis, key, { value, writable: true, configurable: true }); };
-  let clock = 100, transcript, sequence = 0, epoch = 0, frameCounter = 0, pendingInput, releaseInput, leaseDeadline;
+  let clock = 100, transcript, sequence = 0, frameCounter = 0, pendingInput, releaseInput;
   let delayFile = false, releaseFile, uploadDeclaration, delayClose = false, releaseClose; const fileBytes = new Uint8Array([1, 2, 3]);
   let confirmed = false, denyNextInput = false, delayNextInput = false, offerCount = 0, failOffer = false, denyChallenge = false;
   const iceEnabled = name.startsWith('ice-');
@@ -68,8 +68,7 @@ async function page(scopes, name, action) {
         else if (a.kind === 'upload_commit') { if(delayFile) { delayFile=false;await new Promise(r=>releaseFile=r); } result={ok:true,value:{published:true,size:uploadDeclaration.size,sha256:uploadDeclaration.sha256}}; }
         else if (a.kind === 'cancel') result={ok:true,value:{cancelled:true}};
         else throw new Error('Unexpected file fixture op');
-      } else if (op.kind === 'acquire') result = { epoch: ++epoch, expires_in_seconds: 60 };
-      else if (op.kind === 'release') result = { released: true };
+      }
       else if (op.kind === 'observe_frame') result = { frame_id: `00000000-0000-0000-0000-${String(++frameCounter).padStart(12, '0')}`, source_generation: 4, width: 1000, height: 500, coordinate_space: 'guest-physical-pixels', mime_type: 'image/png', byte_length: image.length, data_base64: image.toString('base64') };
       else { if (denyNextInput) { denyNextInput = false; return { sequence: body.request.sequence, error: 'control rejected' }; } if (delayNextInput) { delayNextInput = false; pendingInput?.(); await new Promise(resolve => { releaseInput = resolve; }); } result = { dispatched: true, steps: 1, guest_delivery_confirmed: false }; }
       if (op.kind === 'observe_frame' && name.startsWith('jpeg-')) {
@@ -83,7 +82,6 @@ async function page(scopes, name, action) {
   const oldOpen = AuthenticatedReceiver.open;
   let connectTask;
   try {
-    if (name.startsWith('files-')) { const timer = globalThis.setTimeout; replace('setTimeout', (callback, ms, ...args) => { if (ms === 60000) { leaseDeadline = callback; return timer(() => {}, 60000); } return timer(callback, ms, ...args); }); }
     if (name.startsWith('automatic-')) { const timer = globalThis.setTimeout; replace('setTimeout', (callback, ms, ...args) => { if (ms === 120000) { diagnosticDeadline = callback; return timer(() => {}, 120000); } return timer(callback, ms, ...args); }); }
     if (name === 'source-deadline') { const timer = globalThis.setTimeout; replace('setTimeout', (callback, ms, ...args) => timer(callback, ms === 12000 ? 120 : ms, ...args)); }
     replace('document', { querySelector: element, createElement: () => new Element() }); replace('window', new EventTarget()); replace('Image', Image);
@@ -115,10 +113,9 @@ async function page(scopes, name, action) {
     await element('#accept-grant').click(); await poll(() => element('#pairing-status').textContent.includes('Ready'));
     connectTask = element('#connect').click(); if (name === 'ice-malformed') await connectTask; else await poll(() => confirmed && !(name === 'files-only' ? element('#upload-file-button') : element('#refresh-control-frame')).disabled);
     const refresh = async () => { await element('#refresh-control-frame').click(); await poll(() => element('#control-status').textContent.startsWith('Screenshot ready')); };
-    const acquire = async () => { await element('#acquire-control').click(); await poll(() => element('#control-status').textContent.startsWith('Control acquired')); };
     const reconnect = async (fail = false) => { if (connectTask) await connectTask; confirmed = false; failOffer = fail === true; denyChallenge = fail === 'challenge'; connectTask = element('#connect').click(); if (fail) { await connectTask; return; } await poll(() => confirmed && !(name === 'files-only' ? element('#upload-file-button') : element('#refresh-control-frame')).disabled); };
     const startMedia = async () => { const peer = peers.at(-1); peer.connectionState = 'connected'; peer.onconnectionstatechange(); peer.mediaReady = true; peer.ontrack({ track: { stop() {} } }); const video = element('#received'); video.videoWidth = 1000; video.videoHeight = 500; for (let i = 0; i < 5; i++) video.videoCallback(); await poll(() => element('#status').textContent.startsWith('Receiving native')); };
-    await action({ delayClose: () => { delayClose = true; }, releaseClose: () => releaseClose?.(), fileBytes, expireLease: () => leaseDeadline(), delayFile: () => {delayFile=true;}, releaseFile: () => releaseFile?.(), startMedia, expire: () => { assert.equal(typeof diagnosticDeadline, 'function'); diagnosticDeadline(); }, imageSources, reconnect, element, poll, refresh, acquire, controls, calls, peers, receiver, advance: ms => { clock += ms; }, deny: () => { denyNextInput = true; }, delay: () => { delayNextInput = true; return new Promise(resolve => { pendingInput = resolve; }); }, release: () => releaseInput?.(), rejectPlay: () => latePlayReject?.(new Error('late old playback')) });
+    await action({ delayClose: () => { delayClose = true; }, releaseClose: () => releaseClose?.(), fileBytes, delayFile: () => {delayFile=true;}, releaseFile: () => releaseFile?.(), startMedia, expire: () => { assert.equal(typeof diagnosticDeadline, 'function'); diagnosticDeadline(); }, imageSources, reconnect, element, poll, refresh, controls, calls, peers, receiver, advance: ms => { clock += ms; }, deny: () => { denyNextInput = true; }, delay: () => { delayNextInput = true; return new Promise(resolve => { pendingInput = resolve; }); }, release: () => releaseInput?.(), rejectPlay: () => latePlayReject?.(new Error('late old playback')) });
   } finally {
     releaseInput?.(); releaseFile?.(); releaseClose?.(); await element('#disconnect').click(); if (connectTask) await connectTask;
     assert.equal(calls.includes('/auth/control'), false);
@@ -127,15 +124,15 @@ async function page(scopes, name, action) {
   }
 }
 
-test('observe-only page refuses acquire/key/pointer even with a fresh screenshot', async () => page(['observe'], 'observe', async f => {
+test('observe-only page refuses key/pointer even with a fresh screenshot', async () => page(['observe'], 'observe', async f => {
   await f.refresh(); const count = f.controls.length;
-  await f.element('#acquire-control').click(); await f.element('#send-physical-key').click(); await f.element('#control-frame').click({ clientX: 300, clientY: 175 });
-  assert.equal(f.controls.length, count); assert.equal(f.element('#acquire-control').disabled, true); assert.equal(f.element('#send-physical-key').disabled, true);
+  await f.element('#send-physical-key').click(); await f.element('#control-frame').click({ clientX: 300, clientY: 175 });
+  assert.equal(f.controls.length, count); assert.equal(f.element('#send-physical-key').disabled, true);
 }));
 
-test('input uses displayed screenshot CSS mapping, explicit lease, fresh frame and physical-key allowlist', async () => page(['input', 'observe'], 'input', async f => {
-  await f.refresh(); const before = f.controls.length; await f.element('#control-frame').click({ clientX: 300, clientY: 175 }); assert.equal(f.controls.length, before);
-  await f.acquire(); await f.refresh();
+test('input uses displayed screenshot CSS mapping, fresh frame and physical-key allowlist', async () => page(['input', 'observe'], 'input', async f => {
+  const before = f.controls.length; await f.element('#control-frame').click({ clientX: 300, clientY: 175 }); assert.equal(f.controls.length, before, 'no screenshot, no input');
+  await f.refresh();
   await f.element('#control-frame').click({ clientX: 550, clientY: 300 }); assert.equal(f.controls.at(-1).kind, 'observe_frame', 'Outside right/bottom boundary is rejected');
   await f.element('#control-frame').click({ clientX: 300, clientY: 175 }); await f.poll(() => f.controls.at(-1).kind === 'click' && !f.element('#refresh-control-frame').disabled);
   assert.deepEqual({ x: f.controls.at(-1).x, y: f.controls.at(-1).y }, { x: 500, y: 250 }); assert.equal(f.controls.at(-1).frame.width, 1000);
@@ -151,21 +148,20 @@ test('input uses displayed screenshot CSS mapping, explicit lease, fresh frame a
   assert.equal(f.element('#result').textContent.includes('data_base64'), false); assert.equal(f.element('#result').textContent.includes(image.toString('base64')), false);
 }));
 
-test('semantic denial fences the session without reacquiring; explicit reconnect requires fresh confirmation', async () => page(['input', 'observe'], 'takeover', async f => {
-  await f.acquire(); await f.refresh(); f.deny(); await f.element('#control-frame').click({ clientX: 300, clientY: 175 });
+test('semantic denial fences the session; explicit reconnect requires fresh confirmation', async () => page(['input', 'observe'], 'denied', async f => {
+  await f.refresh(); f.deny(); await f.element('#control-frame').click({ clientX: 300, clientY: 175 });
   await f.poll(() => f.calls.includes('/auth/close') && !f.element('#connect').disabled);
-  const count = f.controls.length; await f.element('#control-frame').click({ clientX: 300, clientY: 175 }); await f.element('#acquire-control').click();
-  assert.equal(f.controls.length, count); assert.equal(f.controls.filter(x => x.kind === 'acquire').length, 1);
-  assert.equal(f.element('#acquire-control').disabled, true); assert.equal(f.peers[0].channel.readyState, 'closed');
+  const count = f.controls.length; await f.element('#control-frame').click({ clientX: 300, clientY: 175 }); await f.element('#refresh-control-frame').click();
+  assert.equal(f.controls.length, count); assert.equal(f.element('#refresh-control-frame').disabled, true); assert.equal(f.peers[0].channel.readyState, 'closed');
   await f.reconnect(); assert.equal(f.calls.filter(x => x === '/auth/confirm').length, 2);
-  await f.acquire(); assert.equal(f.controls.filter(x => x.kind === 'acquire').length, 2);
+  await f.refresh(); assert.equal(f.controls.at(-1).kind, 'observe_frame');
 }));
 
 test('disconnect fences pending control before signed cleanup and never retries the input', async () => page(['input', 'observe'], 'pending', async f => {
-  await f.acquire(); await f.refresh(); const reached = f.delay(); await f.element('#control-frame').click({ clientX: 300, clientY: 175 }); await reached;
+  await f.refresh(); const reached = f.delay(); await f.element('#control-frame').click({ clientX: 300, clientY: 175 }); await reached;
   const count = f.controls.length, closing = f.element('#disconnect').click();
   await f.poll(() => f.peers[0].channel.readyState === 'closed');
-  assert.equal(f.element('#acquire-control').disabled, true); await f.element('#send-physical-key').click(); assert.equal(f.controls.length, count);
+  assert.equal(f.element('#refresh-control-frame').disabled, true); await f.element('#send-physical-key').click(); assert.equal(f.controls.length, count);
   f.release(); await closing; assert.equal(f.calls.filter(x => x === '/auth/close').length, 1);
   assert.equal(f.controls.filter(x => x.kind === 'click').length, 1);
 }));
@@ -253,7 +249,7 @@ test('failed ICE retains only historical sanitized selected path without making 
 }));
 
 test('JPEG is verified before display and retains physical screenshot coordinate mapping', async () => page(['input', 'observe'], 'jpeg-valid', async f => {
-  await f.acquire(); await f.refresh();
+  await f.refresh();
   assert.ok(f.imageSources.at(-1).startsWith('data:image/jpeg;base64,'));
   await f.element('#control-frame').click({ clientX: 300, clientY: 175 });
   await f.poll(() => f.controls.at(-1).kind === 'click');
@@ -261,7 +257,7 @@ test('JPEG is verified before display and retains physical screenshot coordinate
   assert.equal(f.element('#result').textContent.includes(jpeg.toString('base64')), false);
 }));
 for (const failure of ['hash', 'dimensions', 'decode', 'anchor', 'generation']) test(`JPEG ${failure} failure never enables screenshot input`, async () => page(['input', 'observe'], `jpeg-${failure}`, async f => {
-  await f.acquire(); await f.element('#refresh-control-frame').click();
+  await f.element('#refresh-control-frame').click();
   await f.poll(() => f.element('#control-status').textContent.startsWith('Screenshot unavailable') || f.element('#connect').disabled === false);
   const count = f.controls.length;
   await f.element('#control-frame').click({ clientX: 300, clientY: 175 });
@@ -322,20 +318,12 @@ test('post-acceptance transport failure also releases page ownership after clean
 }));
 
 // Synthetic DOM/crypto fixtures exercise the actual page event path, not Guest acceptance.
-test('files-only page uploads without an input adapter or lease', async()=>page(['files','observe'],'files-only',async f=>{
+test('files-only page uploads without an input adapter', async()=>page(['files','observe'],'files-only',async f=>{
   f.element('#upload-file').files=[Object.assign(new Blob([f.fileBytes]),{name:'fixture.bin'})];
   await f.element('#upload-file-button').click();await f.poll(()=>f.element('#file-status').textContent.startsWith('Upload published'));
-  assert.equal(f.controls.some(a=>a.kind==='acquire'),false);assert.equal(f.controls.filter(a=>a.kind==='file').length,3);
+  assert.equal(f.controls.every(a=>a.kind==='file'),true);assert.equal(f.controls.filter(a=>a.kind==='file').length,3);
   assert.equal(f.element('#result').textContent.includes('token'),false);
 }));
-test('input lease expiry does not discard acknowledged file upload in the same session',async()=>page(['files','input','observe'],'files-lease',async f=>{
-  await f.acquire();f.delayFile();f.element('#upload-file').files=[Object.assign(new Blob([f.fileBytes]),{name:'fixture.bin'})];
-  await f.element('#upload-file-button').click();await f.poll(()=>f.controls.at(-1)?.operation?.kind==='upload_commit');
-  f.expireLease();f.releaseFile();await f.poll(()=>f.element('#file-status').textContent.startsWith('Upload published'));
-  assert.match(f.element('#control-status').textContent,/lease expired/);
-}));
-
-
 test('manual file-session close shows pending then acknowledged cleanup; late upload completion cannot overwrite a new session', async () => page(['files', 'observe'], 'files-manual-close', async f => {
   await f.startMedia(); f.delayFile();
   f.element('#upload-file').files = [Object.assign(new Blob([f.fileBytes]), { name: 'fixture.bin' })];

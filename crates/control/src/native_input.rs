@@ -256,7 +256,8 @@ pub struct Attach {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Message {
-    TakeControl {
+    /// The window gained keyboard focus; its input may reach the guest.
+    Begin {
         sequence: u64,
     },
     Heartbeat {
@@ -273,11 +274,8 @@ pub enum Message {
         #[serde(default, deserialize_with = "deserialize_acquisition_receipt")]
         acquisition_receipt: Option<String>,
     },
+    /// The window lost focus; release everything it holds.
     Suspend {
-        sequence: u64,
-        epoch: u64,
-    },
-    ReturnAgent {
         sequence: u64,
         epoch: u64,
     },
@@ -288,11 +286,10 @@ pub enum Message {
 impl Message {
     pub fn sequence(&self) -> u64 {
         match self {
-            Self::TakeControl { sequence }
+            Self::Begin { sequence }
             | Self::Heartbeat { sequence, .. }
             | Self::Event { sequence, .. }
             | Self::Suspend { sequence, .. }
-            | Self::ReturnAgent { sequence, .. }
             | Self::Detach { sequence } => *sequence,
         }
     }

@@ -19,8 +19,43 @@ def load(name,path):
     s=importlib.util.spec_from_file_location(name,ROOT/'scripts'/path);m=importlib.util.module_from_spec(s);s.loader.exec_module(m);return m
 base=load('crash_baseline','test-installed-qemu-exec.py')
 process=load('crash_process','test-qemu-exec-guardian.py')
-oracle=load('crash_oracle','test-installed-qemu-exec-lost-ack.py')
 require=base.require
+
+# A rootless detached grandchild in its own session keeps writing ticks.
+CHILD = r'''test "$(id -u)" = 1000 || exit 61
+read start _ < /proc/uptime
+printf '%s\n' "$start" > "$1.ready"
+cat /proc/self/cgroup > "$1.cgroup"
+read pid comm state ppid pgrp sid rest < /proc/self/stat
+printf '%s %s %s\n' "$pid" "$pgrp" "$sid" > "$1.proc"
+(sleep 20; printf escaped > "$1.marker") </dev/null >/dev/null 2>&1 &
+i=0
+while test "$i" -lt 125; do printf x >> "$1.ticks"; sleep .2; i=$((i+1)); done
+wait'''
+OUTER = ('read pid comm state ppid pgrp sid rest < /proc/self/stat; printf "%s\\n" "$sid" > "$1.outer-sid"; '
+         'setsid /bin/sh -c \'("$@") </dev/null >/dev/null 2>&1 & exit 0\' detached /bin/sh -c "$2" child "$1" & sleep 28 & wait')
+READ = r'''test -s "$1.ready" && test -s "$1.ticks" || exit 62
+cat "$1.ready"
+read now _ < /proc/uptime
+printf '%s\n' "$now"
+wc -c < "$1.ticks"
+if test -e "$1.marker"; then printf 'present\n'; else printf 'absent\n'; fi
+cat "$1.cgroup"
+cat "$1.proc"
+cat "$1.outer-sid"'''
+
+
+def parse_observation(stdout):
+    fields = stdout.splitlines()
+    require(len(fields) == 7 and fields[3] == 'absent'
+            and re.fullmatch(r'0::/veynode-exec/job-[^\s/]+', fields[4]), 'invalid actual descendant oracle')
+    start, now, ticks = float(fields[0]), float(fields[1]), int(fields[2])
+    pid, pgrp, sid = map(int, fields[5].split())
+    require(pid > 1 and sid > 1 and pid != sid and pgrp == sid and sid != int(fields[6]),
+            'actual double-fork/session separation not established')
+    require(ticks >= 2 and 0 <= now-start < 27, 'oracle must precede command completion/timeout')
+    return {'guest_elapsed_seconds': now-start, 'tick_bytes': ticks, 'marker_absent': True,
+            'session_detached_grandchild': True}
 
 
 def events(log):
@@ -100,14 +135,13 @@ def main():
         record('original worker guardian QEMU identities',pins)
         info,_=base.wait_guest_info(owner,vm,lambda:call('status',{'id':vm}),status['pid'])
         require(info['transport']=='virtio-serial-private-exec-v2' and info['execution_containment']=='cgroup-v2-clone3-kill','actual v2 containment required')
-        tool(owner,'acquire_control')
         path='/home/veynode/crash-'+nonce[:16]
-        job=tool(owner,'exec_start',argv=['/bin/sh','-c',oracle.OUTER,'guest-crash',path,oracle.CHILD],timeout_ms=30000)['result']['job_id']
+        job=tool(owner,'exec_start',argv=['/bin/sh','-c',OUTER,'guest-crash',path,CHILD],timeout_ms=30000)['result']['job_id']
         require(re.fullmatch('[0-9a-f]{32}',job),'actual start ACK missing')
         time.sleep(.5)
         observations=[]
         for _ in range(2):
-            observations.append(oracle.parse_observation(execute(owner,['/bin/sh','-eu','-c',oracle.READ,'observe',path])));time.sleep(.3)
+            observations.append(parse_observation(execute(owner,['/bin/sh','-eu','-c',READ,'observe',path])));time.sleep(.3)
         require(observations[1]['tick_bytes']>observations[0]['tick_bytes'],'real detached descendant not writing')
         record('real command acknowledged and detached child actively writing',{'job_id_sha256':hashlib.sha256(job.encode()).hexdigest(),'observations':observations})
         # No elevated command: UID1000 may only overwrite the root-precreated

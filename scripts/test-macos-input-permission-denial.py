@@ -33,8 +33,6 @@ def main():
         assert guest["input_policy"]["enabled"] is True
         assert guest["input_policy"]["permission"] == "required", "Permission already granted; refusing denial fixture"
         assert guest["input_policy"]["available"] is False
-        report["lease"] = client.tool("vm_acquire_control", {"id": args.id})
-        assert not report["lease"]["isError"], report["lease"]
         reply = client.tool("vm_screenshot", {"id": args.id})
         assert not reply["isError"], reply
         frame = json.loads(reply["content"][1]["text"])

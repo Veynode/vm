@@ -12,7 +12,7 @@ VM and their pinned incarnations. This initial browser path uses macOS Guest
 binding; it does not advertise QEMU, Linux or Windows browser files support.
 Existing observe-only grants and default scopes do not change. A local admin
 must explicitly approve the device for sorted scopes `files,observe`; requesting
-files is also explicit in the browser. No input lease, command permission or
+files is also explicit in the browser. No input, command permission or
 macOS input capability is granted by this option.
 
 Each file request is a signed `ControlRequest` bound to the exact confirmed
@@ -31,7 +31,7 @@ The adapter assigns a fresh owner distinct from desktop input, checks current
 grant and pinned VM/worker/bridge before dispatch and again before returning a
 result, and has one operation in flight with no queue. Source checks and Guest
 file execution are different RPCs; they are not an atomic VM-incarnation
-transaction. A detected change fails closed and retires the owner. The request
+transaction. A detected change fails closed and ends the owner's session. The request
 has a 10s overall deadline, including source checks. A valid Guest business
 error becomes only `{ok:false,error:{code}}` from a fixed allowlist, without
 paths or raw diagnostics. Invalid replies, transport, source, signature and
@@ -39,17 +39,16 @@ replay errors fence the channel. Info excludes the Guest root path.
 
 Close immediately fences authority and cancels the waiting operation. Its
 independent cleanup task survives cancellation of a close waiter, sends real
-controller `session_end`, validates owner retirement and every Guest file
+controller `session_end`, validates its `closed` reply and every Guest file
 cancellation result, and retains its first outcome, including failure. The
-files owner cannot have jobs or held input; those appearing in its receipt
-invalidate proof. Cleanup waits at most 10s for the daemon's 8s file cleanup
+files owner cannot have jobs; jobs appearing in its receipt invalidate proof. Cleanup waits at most 10s for the daemon's 8s file cleanup
 budget. HTTP close, channel retirement and service shutdown wait at most 12s;
 missing or failed cleanup never becomes success on a repeated close. Native
 capture recovery cannot override failed file cleanup. A cancelled upload is
 not rollback of a publication already completed by the Guest.
 
 Validation on 2026-10-09: 7 private Unix protocol/real-P256 adapter tests passed
-(owner-scoped dispatch, no input lease, sanitized errors, replay, registry
+(owner-scoped dispatch, no input authority, sanitized errors, replay, registry
 revocation, changed worker, close/in-flight cancellation and sticky cleanup).
 One opt-in/scope route test and 2 canonical/boundary tests passed. Regression:
 media binary 105 passed, 8 explicit external-fixture tests ignored; media
