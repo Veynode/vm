@@ -67,7 +67,7 @@ the broker must retain its bounded timeout and treat missing ACK as uncertain.
 No window request changes an encoding epoch or native input state.
 
 The content view does not accept or forward keys, mouse buttons, wheel,
-clipboard or accessibility operations. The title says “View Only”. Native
+clipboard or accessibility operations. The title and a line above the picture say “View Only” only when there is no native input path; input that simply follows focus is not announced. Native
 window chrome, move, resize and minimize still work. A future input path must
 be authorized through the controller; this target does not bypass it.
 

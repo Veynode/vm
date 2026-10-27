@@ -45,5 +45,5 @@ macOS containers use Tart-compatible OCI images (config, LZ4 disk chunks, NVRAM)
 - Actual guest GPU evidence: `vulkaninfo` reports the Venus device in micro-VM and shared modes; GL/GLES pixel checks through virgl.
 - Desktop: native window and browser WebRTC with input; window closure does not end the VM or remote session.
 - Concurrent stability, crash, disk-full, sleep and upgrade recovery.
-- **Redistribution review of the QEMU/virglrenderer/ANGLE/MoltenVK/SPICE runtime** (`scripts/package-reviewed-runtime.py`, `licenses/`). This is currently blocked; development fetches the runtime locally through `runtime/`.
+- **Redistribution review of the QEMU/virglrenderer/ANGLE/MoltenVK/SPICE runtime** (`scripts/package-reviewed-runtime.py`, `licenses/`). This is currently blocked; development fetches the runtime locally through `runtime/`. The release builds it from source and ships it with its corresponding source ([decision 0026](decisions/0026-gpu-runtime-source-build.md)).
 - Security and packaging review.

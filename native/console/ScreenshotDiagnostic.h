@@ -1,6 +1,6 @@
 // Fixed, non-sensitive screenshot failure metadata; no pixels, paths or dynamic errors.
 #import <Foundation/Foundation.h>
-#define VEYNODE_SCREENSHOT_MAX_BYTES (2u * 1024u * 1024u)
+#define VEYNODE_SCREENSHOT_MAX_BYTES (8u * 1024u * 1024u)
 static inline NSDictionary *VNScreenshotFailure(NSString *stage, NSNumber *encodedBytes) {
     return @{ @"version": @1, @"stage": stage,
               @"encoded_bytes": encodedBytes ?: [NSNull null],

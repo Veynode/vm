@@ -1,0 +1,71 @@
+[
+  {
+    "file": "web/src/vendor/veynode-ui/components/ui/button.tsx",
+    "registry": "https://ui.shadcn.com/r/styles/base-nova",
+    "retrievedOn": "2026-10-17",
+    "adaptation": "Soft pill. Variants default, outline, ghost, secondary, destructive and link. Sizes include the round icon squares. leadingIcon and trailingIcon, AnimatedIcon through leadingAnimate and trailingAnimate, a pending spinner that keeps the label laid out, and a 44px touch hit area."
+  },
+  {
+    "file": "web/src/vendor/veynode-ui/components/ui/icon-button.tsx",
+    "registry": "https://ui.shadcn.com/r/styles/base-nova",
+    "retrievedOn": "2026-10-17",
+    "adaptation": "Not a separate shadcn component: Button at its icon sizes, round, with the quieter toolbar ink. ghost and outline, press scale .94, aria-label required, animate draws an AnimatedIcon."
+  },
+  {
+    "file": "web/src/vendor/veynode-ui/components/ui/input.tsx",
+    "registry": "https://ui.shadcn.com/r/styles/base-nova",
+    "retrievedOn": "2026-10-17",
+    "adaptation": "Soft field shell: field fill, md radius, field ring on focus, failed edge when aria-invalid. Sizes medium and small. Leading and trailing icon and addon slots. An empty date or time field hides WebKit's grey today through data-empty-picker."
+  },
+  {
+    "file": "web/src/vendor/veynode-ui/components/ui/textarea.tsx",
+    "registry": "https://ui.shadcn.com/r/styles/base-nova",
+    "retrievedOn": "2026-10-17",
+    "adaptation": "Multiline sibling of Input in the same field shell. rows sets the resting height, autoResize grows up to maxRows, resize exposes the native grab handle."
+  },
+  {
+    "file": "web/src/vendor/veynode-ui/components/ui/checkbox.tsx",
+    "registry": "https://ui.shadcn.com/r/styles/base-nova",
+    "retrievedOn": "2026-10-17",
+    "adaptation": "18px box (16px at sm), line-strong edge, ink fill and an on-action mark when checked or indeterminate. children make the box and its words one label."
+  },
+  {
+    "file": "web/src/vendor/veynode-ui/components/ui/switch.tsx",
+    "registry": "https://ui.shadcn.com/r/styles/base-nova",
+    "retrievedOn": "2026-10-17",
+    "adaptation": "Ink track when on, line-strong when off. The thumb stretches while held and lands on the pop curve. Sizes compact, sm, md and lg; shape pill or rectangle. Always inside a label. checked and onCheckedChange."
+  },
+  {
+    "file": "web/src/vendor/veynode-ui/components/ui/badge.tsx",
+    "registry": "https://ui.shadcn.com/r/styles/base-nova",
+    "retrievedOn": "2026-10-17",
+    "adaptation": "20px pill for a kind, a count or a note, never a state (states use StateTag). default is ink-2, strong is ink, both on ink at 6%."
+  },
+  {
+    "file": "web/src/vendor/veynode-ui/components/ui/label.tsx",
+    "registry": "https://ui.shadcn.com/r/styles/base-nova",
+    "retrievedOn": "2026-10-17",
+    "adaptation": "Field label, 13px semibold. required draws the asterisk. tooltip draws a static info mark; an explanation a person can open is InfoTip beside the label."
+  },
+  {
+    "file": "web/src/vendor/veynode-ui/components/ui/alert.tsx",
+    "registry": "https://ui.shadcn.com/r/styles/base-nova/alert.json",
+    "upstreamPath": "alert.tsx",
+    "retrievedOn": "2026-10-17",
+    "adaptation": "Soft state variants (neutral/done/failed/waiting/working), auto state icon with icon={false}, grid columns that appear only with an icon or action, AlertAction as a centred slot, role alert for failed and status otherwise (atomic); BoardUI notification inline card replaced."
+  },
+  {
+    "file": "web/src/vendor/veynode-ui/components/ui/tooltip.tsx",
+    "registry": "https://ui.shadcn.com/r/styles/base-nova",
+    "upstreamPath": "tooltip.json",
+    "retrievedOn": "2026-10-17",
+    "adaptation": "Soft look. 400ms trigger delay, a press that does not close, a non-hoverable card, per-side caret, size variants, container and positionerClassName props, role=tooltip and aria-describedby while open, exported TOOLTIP_* constants."
+  },
+  {
+    "file": "web/src/vendor/veynode-ui/components/ui/select.tsx",
+    "registry": "https://ui.shadcn.com/r/styles/base-nova",
+    "upstreamPath": "select.json",
+    "retrievedOn": "2026-10-17",
+    "adaptation": "Soft field-shell trigger and menu-style popup (140ms in, 100ms out via data-starting/ending-style, z-menu); size sm|md; SelectItem meta prop and reserved check slot; SelectBadge; popup portalled into the enclosing dialog or popover; scroll arrows omitted; AnimatedIcon chevron; non-modal by default."
+  }
+]

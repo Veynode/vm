@@ -26,17 +26,23 @@ const systemdEnvPath = "/run/veynodevm/env.json"
 
 // systemdAgentArgs are the guest service flags for the transport; commands run
 // as root in "/" because the service itself lives inside the container root.
-func systemdAgentArgs(transport string) []string {
+// A desktop container on Apple Virtualization also serves its scanout to the
+// browser, as the non-systemd path does.
+func systemdAgentArgs(transport string, desktop bool) []string {
 	args := []string{"--allow-execute", "--container-root", "/", "--container-env", systemdEnvPath}
 	if transport == "virtio-serial-exec" {
 		return append([]string{"--virtio-serial-exec"}, args...)
 	}
 	// On Apple Virtualization `veynodevm stop` asks the service to shut down;
 	// /sbin/poweroff in a systemd image is `systemctl poweroff`.
-	return append(args, "--allow-shutdown")
+	args = append(args, "--allow-shutdown")
+	if desktop {
+		args = append(args, "--desktop-stream")
+	}
+	return args
 }
 
-func systemdAgentUnit(transport string) string {
+func systemdAgentUnit(transport string, desktop bool) string {
 	return `[Unit]
 Description=VeynodeVM guest service (exec, stop)
 DefaultDependencies=no
@@ -44,7 +50,7 @@ Conflicts=shutdown.target
 Before=shutdown.target
 
 [Service]
-ExecStart=` + systemdAgentPath + " " + strings.Join(systemdAgentArgs(transport), " ") + `
+ExecStart=` + systemdAgentPath + " " + strings.Join(systemdAgentArgs(transport, desktop), " ") + `
 Restart=always
 RestartSec=1
 `
@@ -216,7 +222,7 @@ func prepareSystemdRuntime(root, agentSource string, config containerConfig, env
 	}
 	units := "/run/systemd/system/"
 	for _, unit := range []struct{ name, body, wantedBy string }{
-		{"veynodevm-agent.service", systemdAgentUnit(config.Transport), "sysinit.target"},
+		{"veynodevm-agent.service", systemdAgentUnit(config.Transport, config.Desktop), "sysinit.target"},
 		{"veynodevm-exit.service", systemdExitUnit, "poweroff.target"},
 		{"veynodevm-exit.service", "", "halt.target"},
 	} {

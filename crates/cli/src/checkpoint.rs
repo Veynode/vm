@@ -346,7 +346,9 @@ pub fn rollback(c: &Container, name: &str, start: Option<bool>, memory: bool) ->
     if start.unwrap_or(was_running) {
         let boot = Instant::now();
         let mut path = "cold";
-        if memory && machine_state.is_file() {
+        // A machine state is the Apple Virtualization backend's; after
+        // `update --gpus` moved the container to QEMU it boots the disk.
+        if memory && machine_state.is_file() && c.backend == "apple-virtualization" {
             match resume_warm(c, &checkpoint) {
                 Ok(timing) => {
                     path = "warm";

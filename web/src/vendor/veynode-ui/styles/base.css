@@ -1,0 +1,642 @@
+@import "tailwindcss";
+/* Geist and JetBrains Mono ship with the app (npm, OFL), so type is the same
+   offline, in the desktop app and on a machine's settings page. Only the
+   latin and latin-ext faces download, and only when a page uses them; Chinese
+   falls back to the system's own face. */
+@import "@fontsource-variable/geist";
+@import "@fontsource-variable/jetbrains-mono";
+@import "./boardui-theme.css";
+@import "./boardui-typography.css";
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Veynode Soft foundations plus application animation tokens. Layout recipes stay in the applications. */
+@theme {
+  --font-sans:
+    "Geist Variable", Geist, "PingFang SC", "HarmonyOS Sans SC",
+    "Microsoft YaHei", system-ui, sans-serif;
+  --font-mono:
+    "JetBrains Mono Variable", "JetBrains Mono", "SF Mono", Menlo, ui-monospace,
+    monospace;
+  /* Named workspace breakpoints (DESIGN.md layout): max-narrow / max-compact / max-wide. */
+  --breakpoint-narrow: 37.5rem;
+  --breakpoint-compact: 59.375rem;
+  --breakpoint-wide: 71.875rem;
+}
+
+@layer base {
+  html {
+    @apply bg-canvas font-sans text-ink antialiased;
+    font-variant-numeric: tabular-nums;
+  }
+  body {
+    @apply m-0 text-body-regular;
+  }
+  button {
+    @apply inline-flex cursor-pointer items-center justify-center gap-[7px] border-0 bg-transparent text-inherit;
+  }
+  [role="menuitem"] {
+    @apply justify-start text-left;
+  }
+  button:disabled {
+    @apply cursor-not-allowed;
+  }
+  /* Focus: 2px ink, 2px clear of the control, on every ground. Text
+     controls draw the field ring on their shell instead. */
+  button:focus-visible,
+  a:focus-visible {
+    @apply outline-2 outline-offset-2 outline-focus;
+  }
+  ::selection {
+    background-color: color-mix(in srgb, var(--color-ink) 16%, transparent);
+  }
+  a {
+    @apply text-inherit no-underline;
+  }
+  h1 {
+    @apply text-title-1-semibold;
+  }
+  h2 {
+    @apply text-title-3-semibold;
+  }
+  p {
+    @apply leading-[1.8];
+  }
+  small {
+    @apply text-caption-1-regular;
+  }
+  /* BoardUI owns form-control surfaces and focus states. Native file inputs
+     remain browser controls; app fields compose InputBase/TextareaBase. */
+  label {
+    @apply text-body-medium text-ink;
+  }
+  fieldset {
+    @apply rounded-md border border-line p-3;
+  }
+  legend {
+    @apply text-body-2-regular text-ink-2;
+  }
+  [hidden] {
+    @apply hidden;
+  }
+}
+
+/* Tailwind v4's `outline-none` (and `outline-hidden`) also sets
+   `--tw-outline-style: none`, and every width utility (`outline-2`, the
+   button rule above, `focus-visible:outline-2`) draws in that style, so a
+   control that hides its resting outline lost its focus ring too. Keyboard
+   focus puts the style back; the ring itself still comes only from a width
+   utility, and pointer focus never matches. Unlayered, so it outranks the
+   utilities layer. */
+:focus-visible,
+[data-focus-visible] {
+  --tw-outline-style: solid;
+}
+
+/* ---------- Feedback motion (ds Motion 「复制、保存成功」「数字变化」) ----------
+   Copied / saved: when a button's icon changes (Copy → Check and back), the
+   new icon pops in over 160ms on the pop curve and a check draws itself on
+   (40ms later). Only a change animates, never a mount (`useIconSwap`).
+      Reduced motion: no movement or scale, a 120ms fade at most. */
+@keyframes icon-swap-in {
+  from {
+    opacity: 0;
+    transform: scale(0.5);
+  }
+}
+@keyframes icon-check-draw {
+  from {
+    stroke-dashoffset: 24;
+  }
+}
+@keyframes feedback-fade-in {
+  from {
+    opacity: 0;
+  }
+}
+@layer components {
+  .icon-swap-in {
+    animation: icon-swap-in var(--motion-base) cubic-bezier(0.3, 1.4, 0.5, 1)
+      both;
+  }
+  .icon-swap-in.lucide-check > * {
+    stroke-dasharray: 24;
+    animation: icon-check-draw var(--motion-base) cubic-bezier(0.2, 0, 0, 1)
+      40ms both;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .icon-swap-in {
+      animation: feedback-fade-in 120ms ease-out both;
+    }
+    .icon-swap-in.lucide-check > * {
+      animation: none;
+    }
+  }
+}
+
+/* ---------- Icons (ds 「图标」) ----------
+   One icon style: `@veynode/ui/icons` (lucide and Veynode's own drawings
+   on its grid), a 1.5 stroke, round caps and joins, whatever
+   stroke a call site passes (a presentation attribute loses to this rule).
+   A drawing that is not an icon (progress rings, the logo, avatars) does
+   not carry the `lucide` class and keeps its own stroke. */
+@layer base {
+  svg.lucide {
+    stroke-width: 1.5;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+}
+
+/* ---------- Icon motion (ds 「图标动效」, AnimatedIcon) ----------
+   An icon moves when its own action happens or its state changes, never by
+   itself; only `working` loops. Parts are <g> groups inside the lucide
+   drawing (packages/ui/src/boardui/icons/animated-icon.tsx) and move by
+   transform, opacity or stroke-dash only, in the icon's 24-unit box.
+   Triggers: hover = the enclosing button, link, menu item or
+   `.icon-motion-host` is hovered or keyboard-focused (or `.im-hover`), and
+   these rules are keyed to lucide's own classes, so a plain lucide icon in a
+   control plays them too; `.im-play` = one shot per action; `.im-on` = a
+   state (`.im-live` once something changed, so a remount shows the state
+   without motion); `.im-working` = the loop.
+   Timings: every one-shot ends within 200ms, delays included. A whole
+   turn, a tooth or a lift 200ms; nudges, swaps, morphs and drawings 160ms
+   (anything that starts late is shortened to still end by 200ms); leaving
+   120ms exit.
+   Reduced motion: nothing moves or scales; a state is simply shown (a
+   chevron is turned, a × is crossed), swaps and slashes fade in 120ms, hover
+   poses and loops are off. */
+@layer components {
+  .icon-motion {
+    overflow: visible;
+  }
+  .icon-motion g {
+    transform-box: view-box;
+    transform-origin: 12px 12px;
+  }
+  /* State: the look each state ends in. */
+  .icon-motion .im-dr {
+    stroke-dasharray: 1 1.2;
+    stroke-dashoffset: 1;
+    opacity: 0;
+  }
+  .icon-motion.im-on .im-dr {
+    stroke-dashoffset: 0;
+    opacity: 1;
+  }
+  .icon-motion .im-sw.im-b,
+  .icon-motion.im-on .im-sw.im-a {
+    opacity: 0;
+    transform: scale(0.5);
+  }
+  .icon-motion.im-on .im-sw.im-b {
+    opacity: 1;
+    transform: none;
+  }
+  .icon-motion.im-theme .im-sw.im-b {
+    transform: rotate(-90deg) scale(0.5);
+  }
+  .icon-motion.im-theme.im-on .im-sw.im-a {
+    transform: rotate(90deg) scale(0.5);
+  }
+  .icon-motion.im-theme.im-on .im-sw.im-b {
+    transform: none;
+  }
+  .icon-motion.im-folder .im-sw.im-a {
+    opacity: 1;
+    transform: none;
+  }
+  .icon-motion.im-folder .im-sw.im-b {
+    opacity: 0;
+    transform: translateY(1.5px);
+  }
+  .icon-motion.im-flip.im-on .im-p {
+    transform: rotate(180deg);
+  }
+  .icon-motion.im-flip.im-r90.im-on .im-p {
+    transform: rotate(90deg);
+  }
+  .icon-motion.im-plus.im-on .im-p {
+    transform: rotate(45deg);
+  }
+  .icon-motion.im-menu.im-on .im-l1 {
+    transform: rotate(45deg) translateY(7px);
+  }
+  .icon-motion.im-menu.im-on .im-l2 {
+    opacity: 0;
+    transform: scaleX(0.2);
+  }
+  .icon-motion.im-menu.im-on .im-l3 {
+    transform: rotate(-45deg) translateY(-7px);
+  }
+  .icon-motion.im-unlock .im-k {
+    transform-origin: 7px 11px;
+  }
+  .icon-motion.im-unlock.im-on .im-k {
+    transform: rotate(-18deg);
+  }
+  .icon-motion.im-mute :is(.im-w1, .im-w2) {
+    transform-origin: 11px 12px;
+  }
+  .icon-motion.im-mute.im-on :is(.im-w1, .im-w2),
+  .icon-motion.im-mute.im-low .im-w2 {
+    opacity: 0;
+    transform: scale(0.6);
+  }
+  .icon-motion.im-panel .im-fill {
+    opacity: 0;
+    transform: scaleX(0.5);
+    transform-origin: 21px 12px;
+  }
+  .icon-motion.im-panel.im-on .im-bar {
+    transform: translateX(-3px);
+  }
+  .icon-motion.im-panel.im-on .im-fill {
+    opacity: 1;
+    transform: none;
+  }
+  .icon-motion.im-ring :is(.im-p, .im-c) {
+    transform-origin: 12px 2.5px;
+  }
+  .icon-motion.im-twinkle .im-s1 {
+    transform-origin: 20px 4px;
+  }
+  .icon-motion.im-twinkle .im-s2 {
+    transform-origin: 4px 20px;
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .icon-motion g {
+      transition:
+        transform var(--motion-exit) var(--ease-exit),
+        opacity var(--motion-exit) var(--ease-exit);
+    }
+    .icon-motion .im-dr {
+      transition:
+        stroke-dashoffset var(--motion-exit) var(--ease-exit),
+        opacity 0s linear var(--motion-exit);
+    }
+    .icon-motion.im-on .im-dr {
+      transition:
+        stroke-dashoffset var(--motion-base) var(--ease-standard),
+        opacity 0s;
+    }
+    /* Swaps (复制 → 勾, 播放 ↔ 暂停, 主题, 文件夹): the old drawing shrinks
+       to .5 and fades as the new one pops in, 160ms; the check draws on
+       40ms later. */
+    .icon-motion .im-sw {
+      transition:
+        opacity var(--motion-fast) var(--ease-standard),
+        transform var(--motion-base) var(--ease-pop);
+    }
+    .icon-motion.im-folder .im-sw {
+      transition:
+        opacity var(--motion-fast) var(--ease-standard),
+        transform var(--motion-base) var(--ease-standard);
+    }
+    .icon-motion.im-copied.im-live.im-on .im-sw.im-b path {
+      stroke-dasharray: 24;
+      animation: icon-check-draw var(--motion-base) var(--ease-standard) 40ms
+        both;
+    }
+    /* Morphs: 展开 turns the chevron 180° (a disclosure's › 90°), 菜单 → ×
+       crosses the outer lines and folds the middle one, 加号 → × turns 45°;
+       the pane's edge slides and the pane fills. */
+    .icon-motion:is(.im-flip, .im-plus) .im-p,
+    .icon-motion.im-menu g,
+    .icon-motion.im-panel :is(.im-bar, .im-fill) {
+      transition:
+        transform var(--motion-base) var(--ease-standard),
+        opacity var(--motion-fast) var(--ease-standard);
+    }
+    /* 显示 / 隐藏: the eye blinks whichever way it goes, as the slash draws
+       across and cuts its gap. */
+    .icon-motion.im-blink.im-live.im-on .im-e {
+      animation: icon-motion-blink var(--motion-base) var(--ease-standard);
+    }
+    .icon-motion.im-blink.im-live:not(.im-on) .im-e {
+      animation: icon-motion-blink-back var(--motion-base) var(--ease-standard);
+    }
+    /* 锁: the shackle swings open on its left leg with the pop; locking is
+       the 120ms exit. */
+    .icon-motion.im-unlock.im-on .im-k {
+      transition: transform var(--motion-base) var(--ease-pop);
+    }
+    /* 静音: the waves fold into the speaker, the outer one first (120ms exit,
+       40ms apart), and the × draws from 40ms (160ms); unmuting brings the
+       inner wave back first with the pop. */
+    .icon-motion.im-mute :is(.im-w1, .im-w2) {
+      transition:
+        transform var(--motion-base) var(--ease-pop),
+        opacity var(--motion-base) var(--ease-standard);
+    }
+    .icon-motion.im-mute .im-w2 {
+      transition-delay: 40ms;
+    }
+    .icon-motion.im-mute:is(.im-on, .im-low) .im-w2,
+    .icon-motion.im-mute.im-on .im-w1 {
+      transition-duration: var(--motion-exit);
+      transition-timing-function: var(--ease-exit);
+    }
+    .icon-motion.im-mute.im-on .im-w1 {
+      transition-delay: 40ms;
+    }
+    .icon-motion.im-mute.im-on .im-w2 {
+      transition-delay: 0s;
+    }
+    .icon-motion.im-mute.im-on .im-dr {
+      transition-delay: 40ms;
+    }
+    /* Hover: 设置 turns one tooth (60°, 200ms); 删除 tips its lid on the
+       left hinge; 搜索 tilts; 外链 nudges up and right; 回复 swings up on its
+       tail (160ms). Back in the 120ms exit. */
+    :is(.lucide-settings, .lucide-search, .lucide-reply) > *,
+    .lucide-trash-2 > :nth-child(n + 4),
+    .lucide-external-link > :nth-child(-n + 2) {
+      transform-box: view-box;
+      transition: transform var(--motion-exit) var(--ease-exit);
+    }
+    .lucide-settings > * {
+      transform-origin: 12px 12px;
+    }
+    .lucide-search > * {
+      transform-origin: 11px 11px;
+    }
+    .lucide-reply > * {
+      transform-origin: 20px 18px;
+    }
+    .lucide-trash-2 > * {
+      transform-origin: 3px 6px;
+    }
+    :is(button, a, [role="button"], [role="menuitem"], .icon-motion-host):is(
+        :hover,
+        :focus-visible
+      )
+      .lucide-settings
+      > *,
+    .im-hover.lucide-settings > * {
+      transform: rotate(60deg);
+      transition: transform var(--motion-slow) var(--ease-standard);
+    }
+    :is(button, a, [role="button"], [role="menuitem"], .icon-motion-host):is(
+        :hover,
+        :focus-visible
+      )
+      .lucide-trash-2
+      > :nth-child(n + 4),
+    .im-hover.lucide-trash-2 > :nth-child(n + 4) {
+      transform: translateY(-1px) rotate(-12deg);
+      transition: transform var(--motion-base) var(--ease-standard);
+    }
+    :is(button, a, [role="button"], [role="menuitem"], .icon-motion-host):is(
+        :hover,
+        :focus-visible
+      )
+      .lucide-search
+      > *,
+    .im-hover.lucide-search > * {
+      transform: rotate(-14deg);
+      transition: transform var(--motion-base) var(--ease-standard);
+    }
+    :is(button, a, [role="button"], [role="menuitem"], .icon-motion-host):is(
+        :hover,
+        :focus-visible
+      )
+      .lucide-external-link
+      > :nth-child(-n + 2),
+    .im-hover.lucide-external-link > :nth-child(-n + 2) {
+      transform: translate(1.5px, -1.5px);
+      transition: transform var(--motion-base) var(--ease-standard);
+    }
+    :is(button, a, [role="button"], [role="menuitem"], .icon-motion-host):is(
+        :hover,
+        :focus-visible
+      )
+      .lucide-reply:not(.icon-still)
+      > *,
+    .im-hover.lucide-reply > * {
+      transform: rotate(-10deg);
+      transition: transform var(--motion-base) var(--ease-standard);
+    }
+    :is(button, a, [role="button"], [role="menuitem"], .icon-motion-host):is(
+        :hover,
+        :focus-visible
+      )
+      .icon-motion.im-folder
+      .im-sw.im-a,
+    .icon-motion.im-folder:is(.im-hover, .im-on) .im-sw.im-a {
+      opacity: 0;
+    }
+    :is(button, a, [role="button"], [role="menuitem"], .icon-motion-host):is(
+        :hover,
+        :focus-visible
+      )
+      .icon-motion.im-folder
+      .im-sw.im-b,
+    .icon-motion.im-folder:is(.im-hover, .im-on) .im-sw.im-b {
+      opacity: 1;
+      transform: none;
+    }
+    /* Once per action (a new `play`), each within 200ms: 发送 and 上传 lift
+       3px and 下载 drops 3px, then land with the pop (200ms); 刷新 turns once
+       (200ms); 置顶 drops in 5px with the pop (200ms); 铃铛 swings ±14° → ±3°
+       on its top (160ms, the clapper 40ms behind); 电源 draws its stem
+       (100ms) and ring (160ms, from 40ms); 语言: 文 and A roll up and back in
+       (160ms, A 40ms later). */
+    .icon-motion.im-send.im-play .im-p,
+    .icon-motion.im-lift.im-play .im-ar {
+      animation: icon-motion-lift var(--motion-slow) both;
+    }
+    .icon-motion.im-drop.im-play .im-ar {
+      animation: icon-motion-drop var(--motion-slow) both;
+    }
+    .icon-motion.im-refresh.im-play .im-p {
+      animation: icon-motion-turn var(--motion-slow) var(--ease-standard) both;
+    }
+    .icon-motion.im-pin.im-play .im-p {
+      animation: icon-motion-pin var(--motion-slow) var(--ease-pop) both;
+    }
+    .icon-motion.im-ring.im-play .im-p {
+      animation: icon-motion-ring 160ms var(--ease-standard) both;
+    }
+    .icon-motion.im-ring.im-play .im-c {
+      animation: icon-motion-ring 160ms var(--ease-standard) 40ms both;
+    }
+    .icon-motion.im-power.im-play path {
+      stroke-dasharray: 1 1.2;
+    }
+    .icon-motion.im-power.im-play .im-st path {
+      animation: icon-motion-draw var(--motion-fast) var(--ease-standard) both;
+    }
+    .icon-motion.im-power.im-play .im-rg path {
+      animation: icon-motion-draw var(--motion-base) var(--ease-standard) 40ms
+        both;
+    }
+    .icon-motion.im-lang.im-play .im-l {
+      animation: icon-motion-roll var(--motion-base) both;
+    }
+    .icon-motion.im-lang.im-play .im-r {
+      animation: icon-motion-roll var(--motion-base) 40ms both;
+    }
+    /* Working, the only loops: 刷新中 / 加载 turns once a second, linear,
+       and finishes its turn when stopped; 帮我写's sparkle breathes to .86
+       while the small stars trade places (2.4s) and settles in 160ms. */
+    .icon-motion.im-refresh.im-working .im-p {
+      animation: icon-motion-spin 1s linear infinite;
+    }
+    .icon-motion.im-twinkle.im-working .im-st {
+      animation: icon-motion-breathe 2.4s ease-in-out infinite;
+    }
+    .icon-motion.im-twinkle.im-working .im-s1 {
+      animation: icon-motion-star 2.4s ease-in-out infinite;
+    }
+    .icon-motion.im-twinkle.im-working .im-s2 {
+      animation: icon-motion-star 2.4s ease-in-out -1.2s infinite;
+    }
+    .icon-motion.im-twinkle.im-settle g {
+      animation: icon-motion-settle var(--motion-base) var(--ease-standard);
+    }
+    /* rotate-ccw turns the way its arrow points. */
+    .icon-motion.im-refresh.im-ccw:is(.im-play, .im-working) .im-p {
+      animation-direction: reverse;
+    }
+  }
+  /* Reduced motion: states are shown in place; a swap, a slash and the
+     parts that come and go only fade (120ms). */
+  @media (prefers-reduced-motion: reduce) {
+    .icon-motion .im-sw,
+    .icon-motion.im-mute :is(.im-w1, .im-w2),
+    .icon-motion.im-panel .im-fill,
+    .icon-motion.im-menu .im-l2 {
+      transform: none !important;
+      transition: opacity var(--motion-fast) ease-out;
+    }
+    .icon-motion .im-dr {
+      stroke-dashoffset: 0;
+      transition: opacity var(--motion-fast) ease-out;
+    }
+  }
+}
+@keyframes icon-motion-blink {
+  50% {
+    transform: scaleY(0.1);
+  }
+}
+@keyframes icon-motion-blink-back {
+  50% {
+    transform: scaleY(0.1);
+  }
+}
+@keyframes icon-motion-lift {
+  0% {
+    transform: none;
+    animation-timing-function: cubic-bezier(0.2, 0, 0, 1);
+  }
+  37.5% {
+    transform: translateY(-3px);
+    animation-timing-function: cubic-bezier(0.3, 1.4, 0.5, 1);
+  }
+  100% {
+    transform: none;
+  }
+}
+@keyframes icon-motion-drop {
+  0% {
+    transform: none;
+    animation-timing-function: cubic-bezier(0.2, 0, 0, 1);
+  }
+  37.5% {
+    transform: translateY(3px);
+    animation-timing-function: cubic-bezier(0.3, 1.4, 0.5, 1);
+  }
+  100% {
+    transform: none;
+  }
+}
+@keyframes icon-motion-turn {
+  from {
+    transform: none;
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes icon-motion-pin {
+  from {
+    opacity: 0;
+    transform: translateY(-5px);
+  }
+  40% {
+    opacity: 1;
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes icon-motion-ring {
+  0%,
+  100% {
+    transform: none;
+  }
+  15% {
+    transform: rotate(14deg);
+  }
+  35% {
+    transform: rotate(-11deg);
+  }
+  55% {
+    transform: rotate(7deg);
+  }
+  75% {
+    transform: rotate(-3deg);
+  }
+}
+@keyframes icon-motion-draw {
+  from {
+    stroke-dashoffset: 1;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+@keyframes icon-motion-roll {
+  0% {
+    transform: none;
+    animation-timing-function: cubic-bezier(0.4, 0, 1, 1);
+  }
+  40% {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  41% {
+    opacity: 0;
+    transform: translateY(4px);
+    animation-timing-function: cubic-bezier(0.2, 0, 0, 1);
+  }
+  100% {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes icon-motion-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes icon-motion-breathe {
+  50% {
+    transform: scale(0.86);
+  }
+}
+@keyframes icon-motion-star {
+  50% {
+    opacity: 0.2;
+    transform: scale(0.6);
+  }
+}
+@keyframes icon-motion-settle {
+  from {
+    opacity: 0.6;
+    transform: scale(0.92);
+  }
+}

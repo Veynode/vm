@@ -66,4 +66,27 @@ static void explicitInvalidationAndBrokenPipe(void){
 static void invalidAdmission(void){
  int fds[2];CHECK(pipe(fds)==0,"pipe");CHECK(![[VNRecordWriter alloc]initWithFD:fds[1]],"blocking FD rejected");close(fds[0]);close(fds[1]);openPipe(fds);VNRecordWriter *w=[[VNRecordWriter alloc]initWithFD:fds[1]];CHECK(![w enqueueKind:1 epoch:1 body:[NSData data]]&&w.failed,"empty rejected");CHECK(w.pending==0,"invalid reserves nothing");close(fds[0]);close(fds[1]);puts("PASS invalid admission");
 }
-int main(void){@autoreleasepool{signal(SIGPIPE,SIG_IGN);mixedFramingAndFIFO();concurrentProducers();mutableBodyIsCopied();partialTimeoutIsPermanent();countBudgetIncludesInFlight();byteBudgetIncludesHeadersAndInFlight();explicitInvalidationAndBrokenPipe();invalidAdmission();puts("PASS all eight real-pipe writer groups; no GPU workload");}return 0;}
+static void largeJSONRecord(void){
+ // A full-resolution screenshot reply (kind 1) up to 12 MiB: one at a time, beside the normal budget.
+ int fds[2];openPipe(fds);VNRecordWriter *w=[[VNRecordWriter alloc]initWithFD:fds[1]];
+ NSUInteger size=11*1024*1024;NSData *large=body(size,0x5a);
+ __block NSMutableData *got=[NSMutableData data];dispatch_semaphore_t done=dispatch_semaphore_create(0);int rfd=fds[0];
+ dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT,0),^{
+  uint8_t chunk[65536];double deadline=now()+5;
+  while(got.length<size+13&&now()<deadline){struct pollfd p={.fd=rfd,.events=POLLIN};if(poll(&p,1,20)<=0)continue;ssize_t n=read(rfd,chunk,sizeof(chunk));if(n>0)[got appendBytes:chunk length:(NSUInteger)n];}
+  dispatch_semaphore_signal(done);});
+ VNWriteReceipt *r=[w enqueueKind:1 epoch:42 body:large];CHECK(r,"11 MiB JSON record admitted");
+ CHECK([w drainFor:3],"large record written within its deadline");dispatch_semaphore_wait(done,DISPATCH_TIME_FOREVER);
+ confirmReceipt(r,YES);CHECK(got.length==size+13,"complete framed record");
+ const uint8_t *q=got.bytes;uint32_t length;memcpy(&length,q,4);CHECK(CFSwapInt32BigToHost(length)==size&&q[4]==1,"kind 1 and exact length");
+ CHECK(q[13]==0x5a&&q[got.length-1]==0x5a,"body intact");close(fds[0]);close(fds[1]);
+ // Other records keep the 4 MiB bound, and JSON stops at 12 MiB.
+ openPipe(fds);w=[[VNRecordWriter alloc]initWithFD:fds[1]];CHECK(![w enqueueKind:2 epoch:1 body:body(4*1024*1024+1,1)]&&w.failed,"kind 2 above 4 MiB refused");close(fds[0]);close(fds[1]);
+ openPipe(fds);w=[[VNRecordWriter alloc]initWithFD:fds[1]];CHECK(![w enqueueKind:1 epoch:1 body:body(12*1024*1024+1,1)]&&w.failed,"JSON above 12 MiB refused");close(fds[0]);close(fds[1]);
+ // A second large record while one is queued fails closed; a normal record beside one is admitted.
+ openPipe(fds);fillPipe(fds[1]);w=[[VNRecordWriter alloc]initWithFD:fds[1]];
+ VNWriteReceipt *a=[w enqueueKind:1 epoch:1 body:body(5*1024*1024,1)];CHECK(a,"first large admitted");VNWriteReceipt *b=[w enqueueKind:2 epoch:2 body:body(4*1024*1024,2)];CHECK(b,"normal record beside a large one");
+ CHECK(![w enqueueKind:1 epoch:3 body:body(5*1024*1024,3)]&&w.failed,"second large record fails closed");CHECK(![w drainFor:2]&&w.pending==0,"all retired");close(fds[0]);close(fds[1]);
+ puts("PASS large JSON record admitted one at a time, other bounds unchanged");
+}
+int main(void){@autoreleasepool{signal(SIGPIPE,SIG_IGN);mixedFramingAndFIFO();concurrentProducers();mutableBodyIsCopied();partialTimeoutIsPermanent();countBudgetIncludesInFlight();byteBudgetIncludesHeadersAndInFlight();explicitInvalidationAndBrokenPipe();invalidAdmission();largeJSONRecord();puts("PASS all eight real-pipe writer groups; no GPU workload");}return 0;}

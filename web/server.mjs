@@ -1,6 +1,6 @@
 // Loopback-only Node host for the built TanStack Start app (dist/).
-// Started by `veynodevm ui`, which passes VEYNODEVM_UI_PORT, VEYNODEVM_UI_TOKEN
-// and VEYNODEVM_CLI. Never binds anything but 127.0.0.1.
+// Started by `veynodevm ui`, which passes VEYNODEVM_UI_PORT and VEYNODEVM_CLI.
+// Never binds anything but 127.0.0.1.
 import { createReadStream, statSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { dirname, extname, join, normalize } from 'node:path'
@@ -12,11 +12,6 @@ import { upgradeTerminal } from './terminal.mjs'
 
 const root = dirname(fileURLToPath(import.meta.url))
 const port = Number(process.env.VEYNODEVM_UI_PORT || 3417)
-const token = process.env.VEYNODEVM_UI_TOKEN
-if (!token || token.length < 32) {
-  console.error('VEYNODEVM_UI_TOKEN (>= 32 chars) is required; start the UI with `veynodevm ui`.')
-  process.exit(2)
-}
 const { default: app } = await import(join(root, 'dist/server/server.js'))
 const assets = join(root, 'dist/client')
 // Inside the Bun executable (build-bun.mjs) assets are embedded files, not dist/client.
@@ -51,15 +46,10 @@ function staticFile(pathname) {
 
 const server = createServer(async (req, res) => {
   try {
-    const decision = admit({ host: req.headers.host, url: req.url, cookie: req.headers.cookie }, { port, token })
+    const decision = admit({ host: req.headers.host }, { port })
     if (decision.kind === 'reject') {
       res.writeHead(decision.status, { 'content-type': 'text/plain; charset=utf-8', ...SECURITY })
       res.end(decision.message + '\n')
-      return
-    }
-    if (decision.kind === 'redirect') {
-      res.writeHead(303, { location: decision.location, 'set-cookie': decision.cookie, ...SECURITY })
-      res.end()
       return
     }
     const url = new URL(req.url, `http://${req.headers.host}`)
@@ -116,9 +106,9 @@ const server = createServer(async (req, res) => {
 
 const origins = new Set([`http://127.0.0.1:${port}`, `http://localhost:${port}`])
 server.on('upgrade', (req, socket) => {
-  const decision = admit({ host: req.headers.host, url: req.url, cookie: req.headers.cookie }, { port, token })
+  const decision = admit({ host: req.headers.host }, { port })
   if (decision.kind !== 'allow') {
-    socket.end('HTTP/1.1 401 Unauthorized\r\nconnection: close\r\ncontent-length: 0\r\n\r\n')
+    socket.end('HTTP/1.1 421 Misdirected Request\r\nconnection: close\r\ncontent-length: 0\r\n\r\n')
     return
   }
   const options = { cli: process.env.VEYNODEVM_CLI || 'veynodevm', origins }

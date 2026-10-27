@@ -3,7 +3,7 @@
 A Docker-like runtime for Apple Silicon Macs with a **GPU inside the container**, an optional **guest desktop**, and **MCP** for AI agents.
 Docker on macOS gives containers no GPU. VeynodeVM runs each workload on QEMU/HVF with virtio-gpu, which provides OpenGL/GLES through virgl and Vulkan 1.2 through Venus → MoltenVK → Metal.
 
-**Status: engineering preview, not a release.** The Docker-like layer works end to end on Apple Virtualization: OCI pull, micro-VM `run`/`exec`/`logs`/`stop`/`rm` with interactive `-it` sessions and `attach`, `-p`/`-v`, the shared docker engine (`docker` CLI, compose, `build`), the web UI, MCP container tools, the 2D guest desktop window and the low-latency [browser desktop](docs/browser-desktop.md) (QEMU and Apple Virtualization). On QEMU/HVF with the locally fetched UTM runtime, `--gpus virgl` (OpenGL 2.1 / GLES 3.0) and `--gpus venus` (Vulkan 1.3, `Virtio-GPU Venus (Apple M3 Pro)`, pixel-checked offscreen rendering) are verified, including Vulkan on an XFCE desktop (`veynodevm/ubuntu-desktop`); direct-KMS clients that import GBM buffers into Venus do not work on macOS hosts. macOS containers run Tart-compatible OCI images (`ghcr.io/cirruslabs/macos-*`) on Apple Virtualization with the paravirtualized Metal GPU: `exec`/`cp` go over SSH, and MCP screenshots and input go through the guest's built-in Screen Sharing, so the guest needs no Screen Recording or Accessibility grants; on the first boot `run` itself grants SSH sessions Accessibility and System Events automation through that screen, so `exec` can script the desktop. Linux desktop containers on Apple Virtualization get MCP screenshots and input from the guest agent, and every desktop backend has `vm_screen_wait` (wait for the screen to change or settle) and `vm_screen_text` (host Vision OCR with clickable boxes); Linux desktop containers and macOS containers also report their windows, focus, keyboard layout and installed apps and can activate, move, resize, close windows and launch apps without screenshots, and expose their accessibility tree (AT-SPI on Linux, the Accessibility API on macOS: find controls by role and name, click or fill them by reference). A game-like Metal frame (4.7M triangles, 2048 draws, 4x MSAA) renders in the macOS guest at 99% of the host's rate and holds 60 fps on its 60 Hz display. See [known issues](docs/known-issues.md), the [product spec](docs/product-spec.md) and [architecture](docs/architecture.md).
+**Status: engineering preview, not a release.** The Docker-like layer works end to end on Apple Virtualization: OCI pull, micro-VM `run`/`exec`/`logs`/`stop`/`rm` with interactive `-it` sessions and `attach`, `-p`/`-v`, the shared docker engine (`docker` CLI, compose, `build`), the web UI, MCP container tools, the 2D guest desktop window and the low-latency [browser desktop](docs/browser-desktop.md) (QEMU, Apple Virtualization Linux and macOS containers). On QEMU/HVF with the locally fetched UTM runtime, `--gpus virgl` (OpenGL 2.1 / GLES 3.0) and `--gpus venus` (Vulkan 1.3, `Virtio-GPU Venus (Apple M3 Pro)`, pixel-checked offscreen rendering) are verified, including Vulkan on an XFCE desktop (`veynodevm/ubuntu-desktop`), where OpenGL runs through Zink on Venus (OpenGL 3.1 / GLES 3.1, pixel-checked) and SuperTuxKart renders with both its GLES (Zink) and Vulkan renderers at about 115 FPS, and offscreen Vulkan rendering runs at the host's rate (presenting to X11 costs about 0.6 ms a frame); direct-KMS clients that import GBM buffers into Venus do not work on macOS hosts. macOS containers run Tart-compatible OCI images (`ghcr.io/cirruslabs/macos-*`) on Apple Virtualization with the paravirtualized Metal GPU: `exec`/`cp` go over SSH, and MCP screenshots and input go through the guest's built-in Screen Sharing, so the guest needs no Screen Recording or Accessibility grants; on the first boot `run` itself grants SSH sessions Accessibility and System Events automation through that screen, so `exec` can script the desktop. Linux desktop containers on Apple Virtualization get MCP screenshots and input from the guest agent, and every desktop backend has `vm_screen_wait` (wait for the screen to change or settle) and `vm_screen_text` (host Vision OCR with clickable boxes); Linux desktop containers and macOS containers also report their windows, focus, keyboard layout and installed apps and can activate, move, resize, close windows and launch apps without screenshots, and expose their accessibility tree (AT-SPI on Linux, the Accessibility API on macOS: find controls by role and name, click or fill them by reference). A game-like Metal frame (4.7M triangles, 2048 draws, 4x MSAA) renders in the macOS guest at 99% of the host's rate and holds 60 fps on its 60 Hz display. See [known issues](docs/known-issues.md), the [product spec](docs/product-spec.md) and [architecture](docs/architecture.md).
 
 ## Quick start
 
@@ -28,6 +28,8 @@ veynodevm run -d --desktop --gpus venus --name vkdesk veynodevm/ubuntu-desktop  
 veynodevm desktop desk                         # native AppKit window
 veynodevm ui                                   # web UI; container page → Open desktop in browser
 veynodevm run --rm --gpus venus veynodevm/ubuntu-gpu   # vulkaninfo: Virtio-GPU Venus (Apple M…)
+veynodevm update --gpus virgl --restart desk   # add, change or drop (none) a GPU later; keeps the disk
+veynodevm update --cpus 4 -m 4g --disk-size 32 -p 8080:80 --restart desk   # hardware later, one restart; disks only grow
 
 veynodevm pull ghcr.io/cirruslabs/macos-tahoe-vanilla   # macOS guest (~22 GB download, ~26 GB on disk)
 veynodevm run -d --name mac --disk-size 100 -v $PWD:/Users/Shared/src ghcr.io/cirruslabs/macos-tahoe-vanilla
@@ -37,6 +39,8 @@ veynodevm run -it --rm ghcr.io/cirruslabs/macos-tahoe-vanilla   # throwaway macO
 # Full system: systemd as PID 1, GDM logs in to GNOME (Ubuntu 24.04)
 veynodevm build -t veynodevm/ubuntu-gnome guest/images/ubuntu-gnome
 veynodevm run -d --init systemd --desktop --name gnome veynodevm/ubuntu-gnome   # add --gpus virgl for QEMU/virgl
+veynodevm run -d --desktop --desktop-size 1920x1080 --gpus virgl --name big veynodevm/ubuntu-gnome   # QEMU desktop size, default 1280x800
+veynodevm update --desktop-size 1280x800 --restart big   # resize later; --desktop on|off adds or removes the display
 veynodevm desktop gnome; veynodevm exec gnome systemctl status gdm
 veynodevm stop gnome                           # systemctl poweroff inside the guest
 
@@ -47,7 +51,7 @@ veynodevm rollback web before-upgrade          # restore it with processes runni
 veynodevm fork -n 3 --checkpoint before-upgrade web   # 3 containers, fresh id/hostname/MAC/ports
 veynodevm fork rm web                          # remove every fork of web
 
-veynodevm ui --open                            # TanStack Start web UI on 127.0.0.1
+veynodevm ui                                   # TanStack Start web UI on 127.0.0.1, opens the browser
 veynodevm mcp --lifecycle                      # stdio MCP server
 veynodevm mcp --input --tools core,screen,input  # list only some tool groups
 ```
@@ -65,6 +69,9 @@ veynodevm machine start ubuntu      # boots the ISO (the disk once installed)
 veynodevm machine stop ubuntu       # ACPI power button; -f kills
 veynodevm machine eject ubuntu      # detach the installer ISO after installing
 veynodevm machine ls; veynodevm machine inspect ubuntu; veynodevm machine rm ubuntu
+veynodevm machine rename ubuntu ubuntu-dev  # stopped only; moves its directory and VM id
+veynodevm machine update ubuntu --cpus 8 -m 8g --disk-size 64G  # stopped only; disks only grow
+veynodevm machine icon ubuntu-dev globe:pink  # the UI's sticker, as `veynodevm icon` for containers
 veynodevm desktop ubuntu            # native window (Apple Virtualization machines)
 ```
 
@@ -84,7 +91,7 @@ Verified: Ubuntu Desktop 24.04.5 arm64 and Fedora Workstation 44 aarch64 install
 
 ## Windows 11 ARM64 (UEFI machine)
 
-Windows runs as a QEMU/HVF machine installed from your own Windows 11 ARM64 ISO (Apple Virtualization has no Windows support). `--os windows` puts the ISO and seed images on USB CD-ROMs (Setup reads them before any driver loads), the disk on virtio-blk (`--disk-bus nvme` for the inbox NVMe driver instead), and adds virtio-net, virtio-serial, balloon, RNG, virtio keyboard/tablet and pvpanic; their drivers come from the virtio-win ISO. The display is UTM's `virtio-ramfb` (Basic Display, no GPU acceleration); `--gpus neptune` is an experimental Triton profile with hardware D3D11 through DXMT on Metal, pixel-checked and benchmarked, which needs UTM's guest tools 0.1.273 in the guest. Guest reboots restart QEMU, because edk2 hangs after an in-process reset. `install-distro.py windows` also sets up Windows' OpenSSH Server with a generated key, forwarded to `127.0.0.1:2222` (`machine create --publish HOST:GUEST`), and records that login (`veynodevm machine ssh-key`) so the MCP tools `vm_exec`, file transfer, `vm_desktop_state`, window actions, app launch and the UI Automation accessibility tree work over it, without installing anything in the guest. There is no TPM, no Secure Boot key enrolment and no guest agent, so Setup's Windows 11 checks are bypassed by the answer file.
+Windows runs as a QEMU/HVF machine installed from your own Windows 11 ARM64 ISO (Apple Virtualization has no Windows support). `--os windows` puts the ISO and seed images on USB CD-ROMs (Setup reads them before any driver loads), the disk on virtio-blk (`--disk-bus nvme` for the inbox NVMe driver instead), and adds virtio-net, virtio-serial, balloon, RNG, virtio keyboard/tablet and pvpanic; their drivers come from the virtio-win ISO. The display is UTM's `virtio-ramfb` (Basic Display, no GPU acceleration); `--gpus neptune` is an experimental Triton profile with hardware D3D11 through DXMT on Metal, pixel-checked and benchmarked, which needs UTM's guest tools 0.1.273 in the guest. With Neptune the guest defaults to 1280x1024; `veynodevm machine display NAME 1920x1080` sets the mode (the driver lists up to 2048x1152; it persists across boots) through that SSH login. Guest reboots restart QEMU, because edk2 hangs after an in-process reset. `install-distro.py windows` also sets up Windows' OpenSSH Server with a generated key, forwarded to `127.0.0.1:2222` (`machine create --publish HOST:GUEST`), and records that login (`veynodevm machine ssh-key`) so the MCP tools `vm_exec`, file transfer, `vm_desktop_state`, window actions, app launch and the UI Automation accessibility tree work over it, without installing anything in the guest. There is no TPM, no Secure Boot key enrolment and no guest agent, so Setup's Windows 11 checks are bypassed by the answer file.
 
 ```sh
 scripts/install-distro.py windows --name win11 --iso ~/Downloads/Windows11_Client_arm64_en-us.iso \
@@ -102,8 +109,8 @@ The script writes an `Autounattend.xml` seed (Windows 11 Pro with the generic, n
 | OCI registry client, blob store, layer flattening, squashfs roots | `crates/oci` | implemented |
 | Pinned kernel, initramfs, agent as container init | `guest/kernel`, `guest/veynode-agent` | implemented |
 | Shared engine VM (dockerd, docker context, dynamic port publishing, `--share`) | `crates/cli/src/engine.rs` | implemented; Venus GPU via CDI verified |
-| Web management UI | `web/` (TanStack Start) | implemented, including the WebCodecs browser desktop and an xterm.js terminal |
-| Official desktop and GPU images | `guest/images` | alpine-desktop verified on VZ and virgl; ubuntu-gpu verified on virgl and Venus; ubuntu-desktop verified with Venus vkcube on XFCE |
+| Web management UI | `web/` (TanStack Start; shadcn/ui on Base UI in Veynode Soft, vendored from core: [SOURCE.md](web/src/vendor/veynode-ui/SOURCE.md)) | implemented, including the WebCodecs browser desktop and an xterm.js terminal |
+| Official desktop and GPU images | `guest/images` | alpine-desktop verified on VZ and virgl; ubuntu-gpu verified on virgl and Venus; ubuntu-desktop verified with Venus vkcube, Zink OpenGL and SuperTuxKart on XFCE |
 | Control daemon, MCP (stdio + HTTPS), jobs, files | `crates/control` | implemented |
 | QEMU/HVF worker with virgl / Venus GPU profiles | `crates/control/src/bin/vm-qemu.rs`, `qemu_graphics.rs` | implemented (Venus experimental) |
 | Apple Virtualization worker | `native/worker` | implemented (2D display, no GPU) |

@@ -567,6 +567,27 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
         }
     }
     func windowWillClose(_ notification: Notification) { window = nil; emit(["event":"window_closed","vm_id":config.id]) }
+    /// The browser desktop of a macOS Guest: Screen Sharing speaks the Linux agent's
+    /// stream protocol over a socketpair whose far end the bridge treats as the Guest.
+    func macosStreamEndpoint(_ completion: @escaping (Result<GuestStreamEndpoint, Error>) -> Void) {
+        DispatchQueue.main.async {
+            guard self.vm.state == .running, let sharing = self.screenSharing else {
+                completion(.failure(NativeError(message:"macOS Guest is not running or has no Screen Sharing login"))); return
+            }
+            var pair: [Int32] = [-1, -1]
+            guard socketpair(AF_UNIX, SOCK_STREAM, 0, &pair) == 0 else {
+                completion(.failure(NativeError(message:"Cannot create the desktop stream pair"))); return
+            }
+            // A full-screen update is 8 MB: keep the pair's buffers well above the 8 KB default.
+            var buffer: Int32 = 1 << 20
+            for descriptor in pair {
+                setsockopt(descriptor, SOL_SOCKET, SO_SNDBUF, &buffer, socklen_t(MemoryLayout<Int32>.size))
+                setsockopt(descriptor, SOL_SOCKET, SO_RCVBUF, &buffer, socklen_t(MemoryLayout<Int32>.size))
+            }
+            MacDesktopStream.start(fd:pair[1], connect:{ try sharing.connect() })
+            completion(.success(GuestStreamEndpoint(fd:pair[0])))
+        }
+    }
     func stopGuestStreamBridge(_ completion: @escaping () -> Void) {
         guestStreamBinding = nil
         guard let bridge = guestStreamBridge else { completion(); return }
@@ -782,12 +803,13 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
             func nonce(_ v:String?)->Bool {guard let v else{return false};return v.utf8.count==64 && v.utf8.allSatisfy{(48...57).contains($0)||(97...102).contains($0)}}
             let hasBinding=object["worker_instance"] != nil || object["bridge_instance"] != nil
             guard !hasBinding || (nonce(workerNonce) && nonce(bridgeNonce)) else {error("invalid_request","Paired lowercase256-bit binding nonces required");return}
-            guard !installing, vm.state == .running, vm.socketDevices.first is VZVirtioSocketDevice else {
-                error("invalid_state","VM must be running with a virtio socket"); return
+            guard !installing, vm.state == .running, config.guest == "macos" ? screenSharing != nil : vm.socketDevices.first is VZVirtioSocketDevice else {
+                error("invalid_state","VM must be running with a virtio socket (Linux) or a Screen Sharing login (macOS)"); return
             }
             guard guestStreamBridge == nil else { error("busy","Guest stream bridge already exists or is stopping"); return }
             do {
                 let bridge = try GuestStreamBridge(path:path, connector:{ [weak self] completion in
+                    if self?.config.guest == "macos" { self?.macosStreamEndpoint(completion); return }
                     DispatchQueue.main.async {
                         guard let self, self.vm.state == .running,
                               let socket = self.vm.socketDevices.first as? VZVirtioSocketDevice else {

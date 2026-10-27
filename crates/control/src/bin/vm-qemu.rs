@@ -2039,7 +2039,11 @@ fn run() -> Result<bool> {
                     if events.as_array().is_none_or(|e| e.is_empty() || e.len() > 4 * vm_control::desktop_input::MAX_EVENTS) {
                         Err(anyhow::anyhow!("invalid desktop input batch"))
                     } else {
-                        qmp.arguments("input-send-event", json!({"events":events})).map(|_| json!({"sent":true}))
+                        // One sync per command: keep a click's down and up from collapsing.
+                        vm_control::desktop_input::sync_groups(events.as_array().unwrap())
+                            .into_iter()
+                            .try_for_each(|group| qmp.arguments("input-send-event", json!({"events":group})).map(|_| ()))
+                            .map(|_| json!({"sent":true}))
                     }
                 }
             }

@@ -1,11 +1,11 @@
 #import "ScreenshotDiagnostic.h"
 #include <assert.h>
 int main(void) { @autoreleasepool {
-    assert(VNScreenshotEncodingFailure(YES,2*1024*1024,YES)==nil);
-    NSDictionary *large=VNScreenshotEncodingFailure(YES,2*1024*1024+1,YES);
+    assert(VNScreenshotEncodingFailure(YES,8*1024*1024,YES)==nil);
+    NSDictionary *large=VNScreenshotEncodingFailure(YES,8*1024*1024+1,YES);
     assert([large[@"stage"] isEqual:@"encoded_size_limit"]);
-    assert([large[@"encoded_bytes"] unsignedIntegerValue]==2*1024*1024+1);
-    assert([large[@"maximum_encoded_bytes"] unsignedIntegerValue]==2*1024*1024);
+    assert([large[@"encoded_bytes"] unsignedIntegerValue]==8*1024*1024+1);
+    assert([large[@"maximum_encoded_bytes"] unsignedIntegerValue]==8*1024*1024);
     assert([VNScreenshotEncodingFailure(NO,33,YES)[@"stage"] isEqual:@"png_finalize_failed"]);
     assert([VNScreenshotEncodingFailure(YES,33,NO)[@"stage"] isEqual:@"cache_invalid_after_encode"]);
     NSDictionary *early=VNScreenshotFailure(@"cache_invalid_before_copy",nil);

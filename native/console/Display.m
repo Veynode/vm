@@ -134,15 +134,15 @@ static NSString *displayMetalFailure(NSString *phase,NSError *error){
     NSAssert([NSThread isMainThread],@"AppKit thread");
     if(self.window){[self.window makeKeyAndOrderFront:nil];return nil;}
     NSString *failure=[self prepareMetal];if(failure)return failure;
-    self.view=[[VNReadOnlyView alloc] initWithFrame:NSMakeRect(0,0,960,600) device:self.device];self.view.delegate=self;
+    self.view=[[VNReadOnlyView alloc] initWithFrame:NSMakeRect(0,0,960,640) device:self.device];self.view.delegate=self;
     self.view.colorPixelFormat=MTLPixelFormatBGRA8Unorm;self.view.clearColor=MTLClearColorMake(0.03,0.03,0.03,1);self.view.framebufferOnly=YES;self.view.preferredFramesPerSecond=60;self.view.enableSetNeedsDisplay=NO;self.view.paused=NO;
     __weak VNDisplay *weak=self;self.view.inputEvent=^(NSEvent *event){[weak inputEvent:event];};
     NSView *container=[[NSView alloc] initWithFrame:NSMakeRect(0,0,960,640)];
     self.view.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;[container addSubview:self.view];
-    self.inputLabel=[NSTextField labelWithString:@"View Only"];self.inputLabel.frame=NSMakeRect(10,610,935,20);self.inputLabel.autoresizingMask=NSViewWidthSizable|NSViewMinYMargin;self.inputLabel.accessibilityLabel=@"Native input state";[container addSubview:self.inputLabel];
+    self.inputLabel=[NSTextField labelWithString:@""];self.inputLabel.hidden=YES;self.inputLabel.frame=NSMakeRect(10,610,935,20);self.inputLabel.autoresizingMask=NSViewWidthSizable|NSViewMinYMargin;self.inputLabel.accessibilityLabel=@"Native input state";[container addSubview:self.inputLabel];
     self.window=[[NSWindow alloc] initWithContentRect:container.frame styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskResizable|NSWindowStyleMaskMiniaturizable backing:NSBackingStoreBuffered defer:NO];
     self.layoutObserved=NO;self.windowEpoch++;self.lastGeneration=UINT64_MAX;self.lastSequence=UINT64_MAX;self.lastDrawableSize=CGSizeZero;
-    self.window.title=@"Veynode VM Console — View Only";self.window.releasedWhenClosed=NO;self.window.delegate=self;self.window.contentView=container;self.window.acceptsMouseMovedEvents=YES;
+    self.window.title=@"Veynode VM Console";self.window.releasedWhenClosed=NO;self.window.delegate=self;self.window.contentView=container;self.window.acceptsMouseMovedEvents=YES;
     self.inputTimer=[NSTimer timerWithTimeInterval:0.05 repeats:YES block:^(NSTimer *timer){[weak updateInput];}];[[NSRunLoop mainRunLoop] addTimer:self.inputTimer forMode:NSRunLoopCommonModes];
     [publicationLock lock];enabled=YES;[publicationLock unlock];
     [self.window center];[self.window makeKeyAndOrderFront:nil];[NSApp activateIgnoringOtherApps:YES];[self updateVisibility];return nil;
@@ -182,6 +182,14 @@ static NSString *displayMetalFailure(NSString *phase,NSError *error){
 - (void)suspendInputWithReason:(NSString *)reason{[nativeControl suspendWithReason:reason];[self.heldKeys removeAllObjects];[self.heldButtons removeAllObjects];self.inputWasReady=NO;}
 - (void)windowDidResignKey:(NSNotification *)notification{[self suspendInputWithReason:@"window_focus_lost"];}
 - (void)applicationDidResignActive:(NSNotification *)notification{[self suspendInputWithReason:@"application_focus_lost"];}
+// Unsaid states are the input lifecycle itself: waiting for focus, connecting,
+// active, releasing and suspended after focus moved away.
+static NSString *VNInputNotice(NSDictionary *s){
+    if(![s[@"native_input_available"] boolValue])return @"View Only";
+    NSString *state=s[@"native_input_state"]?:@"view_only";
+    if([@[@"view_only",@"connecting",@"beginning",@"active",@"suspending",@"suspended"] containsObject:state])return nil;
+    return [state isEqual:@"cleanup_unconfirmed"]?@"Input Disabled — releasing held keys was not confirmed":@"Input Disabled";
+}
 // Input follows focus: a focused, visible console window begins an activation
 // and losing focus suspends it, releasing anything held in the guest.
 - (void)beginIfFocused:(NSDictionary *)s{
@@ -201,11 +209,14 @@ static NSString *displayMetalFailure(NSString *phase,NSError *error){
     if(ready&&!VNInputMayDispatch(NSApp.active,self.window.keyWindow,self.view&&self.window.firstResponder==self.view)){[self suspendInputWithReason:@"dispatch_focus_lost"];s=nativeInputStatus();ready=NO;}
     if(!ready){[self.heldKeys removeAllObjects];[self.heldButtons removeAllObjects];}
     self.inputWasReady=ready;
-    NSString *state=s[@"native_input_state"]?:@"view_only";
-    NSDictionary *labels=@{@"view_only":@"View Only — focus the window to type",@"connecting":@"Connecting — View Only",@"beginning":@"Connecting Input",@"active":@"Input Active",@"suspending":@"Releasing Inputs",@"suspended":@"Input Suspended — focus the window to resume",@"cleanup_unconfirmed":@"Cleanup Unconfirmed — Input Disabled"};
-    NSString *label=labels[state]?:@"Input Disabled";
-    self.inputLabel.stringValue=label;
-    self.window.title=[@"Veynode VM Console — " stringByAppendingString:label];
+    // Input following focus is the normal case and goes unsaid, as in any
+    // window; a line above the picture appears only when typing cannot work.
+    NSString *notice=VNInputNotice(s);
+    if(self.inputLabel.hidden!=(notice==nil)||(notice&&![notice isEqual:self.inputLabel.stringValue])){
+        self.inputLabel.stringValue=notice?:@"";self.inputLabel.hidden=notice==nil;
+        NSRect frame=self.view.superview.bounds;if(notice)frame.size.height-=40;self.view.frame=frame;
+        self.window.title=notice?[@"Veynode VM Console — " stringByAppendingString:notice]:@"Veynode VM Console";
+    }
 }
 - (void)inputEvent:(NSEvent *)e{
     if(!VNInputMayDispatch(NSApp.active,self.window.keyWindow,self.view&&self.window.firstResponder==self.view)){[self suspendInputWithReason:@"dispatch_focus_lost"];return;}

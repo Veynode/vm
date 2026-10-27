@@ -224,7 +224,10 @@ func TestPrepareSystemdRuntime(t *testing.T) {
 	if again, _ := os.ReadFile(filepath.Join(root, "etc/machine-id")); string(again) != string(id) {
 		t.Fatal("machine-id changed")
 	}
-	if !strings.Contains(systemdAgentUnit("vsock"), "--allow-shutdown") {
+	if strings.Contains(systemdAgentUnit("vsock", false), "--desktop-stream") || !strings.Contains(systemdAgentUnit("vsock", true), "--desktop-stream") || strings.Contains(systemdAgentUnit("virtio-serial-exec", true), "--desktop-stream") {
+		t.Fatal("--desktop-stream belongs to desktop containers on the vsock transport only")
+	}
+	if !strings.Contains(systemdAgentUnit("vsock", false), "--allow-shutdown") {
 		t.Fatal("vsock unit cannot shut down")
 	}
 }

@@ -1,6 +1,6 @@
 //! Per-user control daemon management. `daemon start` registers a launchd
 //! user agent so the daemon (and the VMs it owns) outlive the terminal.
-use crate::{daemon_call, sibling};
+use crate::{daemon_call, print_json, sibling};
 use anyhow::{bail, Context, Result};
 use serde_json::json;
 use std::{
@@ -71,7 +71,7 @@ fn wait(up: bool) -> Result<()> {
     )
 }
 
-pub fn command(rest: &[String]) -> Result<i32> {
+pub fn command(rest: &[String], json_output: bool) -> Result<i32> {
     let uid = unsafe { libc::getuid() };
     match rest.first().map(String::as_str).unwrap_or("status") {
         "run" => {
@@ -126,6 +126,19 @@ pub fn command(rest: &[String]) -> Result<i32> {
             Ok(0)
         }
         "status" => match daemon_call("capabilities", json!({})) {
+            Ok(c) if json_output => {
+                print_json(&json!({
+                    "running": true,
+                    "state_dir": home::state_dir()?,
+                    "log": home::root()?.join("daemon.log"),
+                    "label": LABEL,
+                    "memory_budget_mib": c["resource_admission"]["vm_memory_budget_mib"],
+                    "assigned_memory_mib": c["resource_admission"]["active_assigned_memory_mib"],
+                    "qemu_registered": c["backends"]["qemu-hvf"]["registered"],
+                    "host_cpus": host_cpus(),
+                }))?;
+                Ok(0)
+            }
             Ok(c) => {
                 println!("running  state={}", home::state_dir()?.display());
                 println!(
@@ -136,6 +149,12 @@ pub fn command(rest: &[String]) -> Result<i32> {
                 );
                 Ok(0)
             }
+            Err(_) if json_output => {
+                print_json(
+                    &json!({"running": false, "label": LABEL, "log": home::root()?.join("daemon.log"), "host_cpus": host_cpus()}),
+                )?;
+                Ok(1)
+            }
             Err(_) => {
                 println!("not running (veynodevm daemon start)");
                 Ok(1)
@@ -143,6 +162,11 @@ pub fn command(rest: &[String]) -> Result<i32> {
         },
         other => bail!("unknown daemon command: {other}"),
     }
+}
+
+/// The cores a VM can be given at most, as the UI shows them.
+fn host_cpus() -> usize {
+    std::thread::available_parallelism().map_or(1, usize::from)
 }
 
 #[cfg(test)]

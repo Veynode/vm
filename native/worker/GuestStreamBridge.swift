@@ -126,7 +126,7 @@ final class GuestStreamBridge {
     private var completions: [() -> Void] = []
     private let writeTimeout: UInt64
     private let connectTimeout: UInt64
-    private static let capacity = 64 * 1024
+    private static let capacity = 256 * 1024
 
     init(path: String, writeTimeoutMilliseconds: UInt64 = 500,
          connectTimeoutMilliseconds: UInt64 = 5000,

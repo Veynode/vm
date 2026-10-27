@@ -357,31 +357,41 @@ pub fn relay(name: &str, rows: u16, cols: u16, argv: Vec<String>) -> Result<i32>
         Ok(())
     };
     let result = (|| -> Result<i32> {
-        let c = container::find(name)?;
-        let session: Box<dyn Session> = if c.os == "darwin" {
-            let mut ssh = crate::macos::shell_command(&c, &argv)?;
-            // ssh sends its own TERM with the pty request.
-            ssh.env("TERM", "xterm-256color");
-            Box::new(LocalPty::spawn(ssh, rows, cols)?)
-        } else {
-            let stream = connect(
-                &c,
-                &Request {
-                    op: "exec",
-                    argv: if argv.is_empty() {
-                        default_shell()
-                    } else {
-                        argv
+        let session: Box<dyn Session> = match container::find(name) {
+            Ok(c) if c.os == "darwin" => {
+                let mut ssh = crate::macos::shell_command(&c, &argv)?;
+                // ssh sends its own TERM with the pty request.
+                ssh.env("TERM", "xterm-256color");
+                Box::new(LocalPty::spawn(ssh, rows, cols)?)
+            }
+            Ok(c) => {
+                let stream = connect(
+                    &c,
+                    &Request {
+                        op: "exec",
+                        argv: if argv.is_empty() {
+                            default_shell()
+                        } else {
+                            argv
+                        },
+                        tty: true,
+                        stdin: true,
+                        env: vec!["TERM=xterm-256color".into()],
+                        workdir: None,
+                        user: None,
+                        size: Some((rows, cols)),
                     },
-                    tty: true,
-                    stdin: true,
-                    env: vec!["TERM=xterm-256color".into()],
-                    workdir: None,
-                    user: None,
-                    size: Some((rows, cols)),
-                },
-            )?;
-            Box::new(Remote(stream))
+                )?;
+                Box::new(Remote(stream))
+            }
+            // A VM (machine) has no guest agent: its terminal is an SSH login.
+            Err(e) => {
+                let Some(mut ssh) = crate::machine::terminal(name, &argv)? else {
+                    return Err(e);
+                };
+                ssh.env("TERM", "xterm-256color");
+                Box::new(LocalPty::spawn(ssh, rows, cols)?)
+            }
         };
         record(&out, 1, br#"{"event":"ready"}"#)?;
         let input = session.input()?;

@@ -1,0 +1,139 @@
+/* ---------------------------------------------------------------------------
+ * Veynode Soft typography
+ *
+ * BoardUI's recipe structure (see packages/ui/BOARDUI-NOTICE.md), set to the
+ * Veynode Soft scale in Inter (JetBrains Mono for code). Each recipe
+ * registers a Tailwind v4 text utility — `text-{family}-{weight}` applies
+ * font-size, line-height, letter-spacing and font-weight in one go.
+ *
+ *   Soft style   recipe family   size / line   use
+ *   title-1      title-1         26 / 34       empty states and welcome, one per screen
+ *   title-2      title-2         20 / 28       dialog and Settings page titles
+ *   title-3      title-3         17 / 24       pane headers, card titles, the conversation name
+ *   chat         chat            15 / 24       message text and the composer
+ *   body         body            14 / 20       default UI text; `-semibold` is body-strong
+ *   small        body-2          13 / 18       compact rows, list previews, secondary values
+ *   caption      caption-1       12 / 16       timestamps, tags, counts, tooltips
+ *   code         code            13 / 20       with `font-mono`: code, paths, commands
+ *   badge        badge           11 / 16       semibold only: counts and state words in a 20px pill
+ *
+ * Weights: regular 400, medium 500, semibold 600 (title-1 650). Numbers are
+ * tabular everywhere (base.css). Keep packages/ui/src/boardui/utils/cx.ts in
+ * step: tailwind-merge must know every family here.
+ * --------------------------------------------------------------------------- */
+
+@theme {
+  /* ===== Title 1 — 26 / 34 ================================================== */
+  --text-title-1-regular: 1.625rem;
+  --text-title-1-regular--line-height: 2.125rem;
+  --text-title-1-regular--letter-spacing: -0.01em;
+  --text-title-1-regular--font-weight: 400;
+  --text-title-1-medium: 1.625rem;
+  --text-title-1-medium--line-height: 2.125rem;
+  --text-title-1-medium--letter-spacing: -0.01em;
+  --text-title-1-medium--font-weight: 500;
+  --text-title-1-semibold: 1.625rem;
+  --text-title-1-semibold--line-height: 2.125rem;
+  --text-title-1-semibold--letter-spacing: -0.01em;
+  --text-title-1-semibold--font-weight: 650;
+
+  /* ===== Title 2 — 20 / 28 ================================================== */
+  --text-title-2-regular: 1.25rem;
+  --text-title-2-regular--line-height: 1.75rem;
+  --text-title-2-regular--letter-spacing: -0.012em;
+  --text-title-2-regular--font-weight: 400;
+  --text-title-2-medium: 1.25rem;
+  --text-title-2-medium--line-height: 1.75rem;
+  --text-title-2-medium--letter-spacing: -0.012em;
+  --text-title-2-medium--font-weight: 500;
+  --text-title-2-semibold: 1.25rem;
+  --text-title-2-semibold--line-height: 1.75rem;
+  --text-title-2-semibold--letter-spacing: -0.012em;
+  --text-title-2-semibold--font-weight: 600;
+
+  /* ===== Title 3 — 17 / 24 ================================================== */
+  --text-title-3-regular: 1.0625rem;
+  --text-title-3-regular--line-height: 1.5rem;
+  --text-title-3-regular--letter-spacing: -0.012em;
+  --text-title-3-regular--font-weight: 400;
+  --text-title-3-medium: 1.0625rem;
+  --text-title-3-medium--line-height: 1.5rem;
+  --text-title-3-medium--letter-spacing: -0.012em;
+  --text-title-3-medium--font-weight: 500;
+  --text-title-3-semibold: 1.0625rem;
+  --text-title-3-semibold--line-height: 1.5rem;
+  --text-title-3-semibold--letter-spacing: -0.012em;
+  --text-title-3-semibold--font-weight: 600;
+
+  /* ===== Chat — 15 / 24 ===================================================== */
+  --text-chat-regular: 0.9375rem;
+  --text-chat-regular--line-height: 1.5rem;
+  --text-chat-regular--letter-spacing: 0;
+  --text-chat-regular--font-weight: 400;
+  --text-chat-medium: 0.9375rem;
+  --text-chat-medium--line-height: 1.5rem;
+  --text-chat-medium--letter-spacing: 0;
+  --text-chat-medium--font-weight: 500;
+  --text-chat-semibold: 0.9375rem;
+  --text-chat-semibold--line-height: 1.5rem;
+  --text-chat-semibold--letter-spacing: 0;
+  --text-chat-semibold--font-weight: 600;
+
+  /* ===== Body — 14 / 20 ===================================================== */
+  --text-body-regular: 0.875rem;
+  --text-body-regular--line-height: 1.25rem;
+  --text-body-regular--letter-spacing: 0;
+  --text-body-regular--font-weight: 400;
+  --text-body-medium: 0.875rem;
+  --text-body-medium--line-height: 1.25rem;
+  --text-body-medium--letter-spacing: 0;
+  --text-body-medium--font-weight: 500;
+  --text-body-semibold: 0.875rem;
+  --text-body-semibold--line-height: 1.25rem;
+  --text-body-semibold--letter-spacing: 0;
+  --text-body-semibold--font-weight: 600;
+
+  /* ===== Small (body-2) — 13 / 18 =========================================== */
+  --text-body-2-regular: 0.8125rem;
+  --text-body-2-regular--line-height: 1.125rem;
+  --text-body-2-regular--letter-spacing: 0;
+  --text-body-2-regular--font-weight: 400;
+  --text-body-2-medium: 0.8125rem;
+  --text-body-2-medium--line-height: 1.125rem;
+  --text-body-2-medium--letter-spacing: 0;
+  --text-body-2-medium--font-weight: 500;
+  --text-body-2-semibold: 0.8125rem;
+  --text-body-2-semibold--line-height: 1.125rem;
+  --text-body-2-semibold--letter-spacing: 0;
+  --text-body-2-semibold--font-weight: 600;
+
+  /* ===== Caption (caption-1) — 12 / 16 ====================================== */
+  --text-caption-1-regular: 0.75rem;
+  --text-caption-1-regular--line-height: 1rem;
+  --text-caption-1-regular--letter-spacing: 0;
+  --text-caption-1-regular--font-weight: 400;
+  --text-caption-1-medium: 0.75rem;
+  --text-caption-1-medium--line-height: 1rem;
+  --text-caption-1-medium--letter-spacing: 0;
+  --text-caption-1-medium--font-weight: 500;
+  --text-caption-1-semibold: 0.75rem;
+  --text-caption-1-semibold--line-height: 1rem;
+  --text-caption-1-semibold--letter-spacing: 0;
+  --text-caption-1-semibold--font-weight: 600;
+
+  /* ===== Badge — 11 / 16, semibold only =================================== */
+  --text-badge-semibold: 0.6875rem;
+  --text-badge-semibold--line-height: 1rem;
+  --text-badge-semibold--letter-spacing: 0;
+  --text-badge-semibold--font-weight: 600;
+
+  /* ===== Code — 13 / 20, with font-mono ===================================== */
+  --text-code-regular: 0.8125rem;
+  --text-code-regular--line-height: 1.25rem;
+  --text-code-regular--letter-spacing: 0;
+  --text-code-regular--font-weight: 400;
+  --text-code-medium: 0.8125rem;
+  --text-code-medium--line-height: 1.25rem;
+  --text-code-medium--letter-spacing: 0;
+  --text-code-medium--font-weight: 500;
+}

@@ -43,8 +43,16 @@ for _ in $(seq 100); do
     sleep 0.1
 done
 export DISPLAY=:0
+vulkan=$(vulkaninfo --summary 2>/dev/null | grep -E "deviceName|driverName")
+echo "$vulkan" | sed '/^$/d; s/^ */desktop: vulkan /'
+# On Venus, OpenGL runs on Vulkan through Zink (GL 3.1, GLES 3.1) instead of
+# virgl (GL 2.1, GLES 3.0); the image's Vulkan layer works around MoltenVK.
+# Set MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu to get virgl back.
+if [ -z "${MESA_LOADER_DRIVER_OVERRIDE:-}" ] && echo "$vulkan" | grep -q "driverName *= *venus" \
+    && [ -e /usr/share/vulkan/implicit_layer.d/veynodevm_zink_layer.json ]; then
+    export MESA_LOADER_DRIVER_OVERRIDE=zink
+fi
 glxinfo -B 2>/dev/null | grep -E "OpenGL (renderer|version) string" | sed 's/^/desktop: /'
-vulkaninfo --summary 2>/dev/null | grep -E "deviceName|driverName" | sed 's/^ */desktop: vulkan /'
 echo "desktop: XFCE session starting on :0${user:+ as $user}"
 if [ -n "$user" ]; then
     exec runuser -u "$user" -- env HOME="$home" USER="$user" LOGNAME="$user" dbus-run-session startxfce4

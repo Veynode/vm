@@ -90,6 +90,14 @@ pub struct Container {
     /// Set on containers made by `fork` (see `checkpoint`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_of: Option<crate::checkpoint::ForkOrigin>,
+    /// The icon the web UI draws for it, `KIND[:COLOR]` (see `parse_icon`);
+    /// `None` draws the kind of container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// The guest display size of a desktop container, when not the 1280x800
+    /// default (`run --desktop-size`, `update --desktop-size`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_size: Option<(u32, u32)>,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -110,6 +118,8 @@ pub struct RunOptions {
     pub disk_gib: Option<u64>,
     pub gpus: Option<String>,
     pub desktop: bool,
+    /// `--desktop-size WxH`: the guest display (default 1280x800).
+    pub desktop_size: Option<(u32, u32)>,
     pub engine: bool,
     pub dns: Vec<String>,
     pub mtu: Option<u16>,
@@ -243,6 +253,36 @@ pub fn save(container: &Container) -> Result<()> {
     fs::write(&tmp, serde_json::to_vec_pretty(container)?)?;
     fs::rename(tmp, dir.join("container.json"))?;
     Ok(())
+}
+
+/// The devices a container's icon can show and the colours it can take: the
+/// computer icons of Veynode's design system (`@veynode/shared/avatar`).
+pub const ICON_KINDS: [&str; 10] = [
+    "monitor", "laptop", "vm", "box", "server", "terminal", "cpu", "globe", "folder", "code",
+];
+pub const ICON_COLORS: [&str; 8] = [
+    "blue", "teal", "green", "yellow", "orange", "pink", "purple", "black",
+];
+
+/// Checks an icon, `KIND` (the kind's own colour) or `KIND:COLOR`.
+pub fn parse_icon(icon: &str) -> Result<String> {
+    let (kind, color) = match icon.split_once(':') {
+        Some((kind, color)) => (kind, Some(color)),
+        None => (icon, None),
+    };
+    if !ICON_KINDS.contains(&kind) {
+        bail!(
+            "unknown icon {kind:?}; use one of {}",
+            ICON_KINDS.join(", ")
+        )
+    }
+    if let Some(color) = color.filter(|c| !ICON_COLORS.contains(c)) {
+        bail!(
+            "unknown icon colour {color:?}; use one of {}",
+            ICON_COLORS.join(", ")
+        )
+    }
+    Ok(icon.to_owned())
 }
 
 /// Write the read-only configuration disk (vdc) the guest agent reads at boot.
@@ -398,21 +438,38 @@ fn ensure_image(store: &Store, name: &str, quiet: bool) -> Result<ImageRecord> {
     })
 }
 
+/// A name a container can take: `[A-Za-z0-9_.-]{1,64}`, used by no other.
+pub fn check_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+    {
+        bail!("container name must be [A-Za-z0-9_.-]{{1,64}}")
+    }
+    if list()?.iter().any(|c| c.name == name) {
+        bail!("container name already in use: {name}")
+    }
+    Ok(())
+}
+
+/// Renames a container's record, as `docker rename` does: the guest keeps the
+/// hostname it booted with, and forks keep the source name they recorded.
+pub fn rename(container: &mut Container, name: &str) -> Result<()> {
+    if container.name == name {
+        return Ok(());
+    }
+    check_name(name)?;
+    container.name = name.to_owned();
+    save(container)
+}
+
 /// Validated `--name`, or one derived from the image reference.
 pub fn container_name(options: &RunOptions, image: &ImageRecord, id: &str) -> Result<String> {
     Ok(match &options.name {
         Some(n) => {
-            if n.is_empty()
-                || n.len() > 64
-                || !n
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
-            {
-                bail!("container name must be [A-Za-z0-9_.-]{{1,64}}")
-            }
-            if list()?.iter().any(|c| &c.name == n) {
-                bail!("container name already in use: {n}")
-            }
+            check_name(n)?;
             n.clone()
         }
         None => {
@@ -462,6 +519,27 @@ pub fn parse_volumes(options: &RunOptions) -> Result<Vec<VolumeSpec>> {
         v.host = v.host.canonicalize()?;
     }
     Ok(volumes)
+}
+
+/// The QEMU graphics profile for a `--gpus` value.
+pub fn gpu_profile(gpus: &str) -> Result<&'static str> {
+    Ok(match gpus {
+        "all" | "virgl" | "gl" => "virgl",
+        "venus" | "vulkan" => "venus-moltenvk-experimental",
+        other => bail!("--gpus accepts all|virgl|venus, got {other}"),
+    })
+}
+
+/// Memory when `-m` is not given. A full desktop distribution (GNOME, KDE)
+/// needs more than a single app.
+pub fn default_memory_mib(qemu: bool, engine: bool, desktop: bool, systemd: bool) -> u64 {
+    if systemd && desktop {
+        4096
+    } else if qemu || engine || desktop || systemd {
+        2048
+    } else {
+        512
+    }
 }
 
 /// Create and start a container. Returns the record; the caller attaches.
@@ -537,12 +615,7 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
         .filter(|v| !targets.contains(v.as_str()))
         .cloned()
         .collect();
-    let gpu_profile = match options.gpus.as_deref() {
-        None => None,
-        Some("all" | "virgl" | "gl") => Some("virgl"),
-        Some("venus" | "vulkan") => Some("venus-moltenvk-experimental"),
-        Some(other) => bail!("--gpus accepts all|virgl|venus, got {other}"),
-    };
+    let gpu_profile = options.gpus.as_deref().map(gpu_profile).transpose()?;
     let dns: Vec<String> = if options.dns.is_empty() {
         runtime.dns.iter().map(ToString::to_string).collect()
     } else {
@@ -604,17 +677,12 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
         }
         let config_disk = dir.join("config.img");
         write_config_disk(&config_disk, &guest_config)?;
-        // A full desktop distribution (GNOME, KDE) needs more than a single app.
-        let memory_mib =
-            options
-                .memory_mib
-                .unwrap_or(if systemd_init.is_some() && options.desktop {
-                    4096
-                } else if qemu || options.engine || options.desktop || systemd_init.is_some() {
-                    2048
-                } else {
-                    512
-                });
+        let memory_mib = options.memory_mib.unwrap_or(default_memory_mib(
+            qemu,
+            options.engine,
+            options.desktop,
+            systemd_init.is_some(),
+        ));
         let cpus = options.cpus.unwrap_or(2);
         let vm_id = format!("c-{id}");
         let mut vm = json!({
@@ -636,8 +704,9 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
             "shares": volumes.iter().enumerate().map(|(i, v)| json!({"tag":format!("v{i}"),"path":v.host,"read_only":v.read_only})).collect::<Vec<_>>(),
         });
         if options.desktop {
-            vm["width"] = json!(1280);
-            vm["height"] = json!(800);
+            let (width, height) = options.desktop_size.unwrap_or((1280, 800));
+            vm["width"] = json!(width);
+            vm["height"] = json!(height);
         }
         let mac_address = if qemu {
             None
@@ -689,6 +758,8 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
             tty: options.tty,
             stdin: options.stdin,
             fork_of: None,
+            icon: None,
+            desktop_size: options.desktop.then_some(options.desktop_size).flatten(),
         };
         save(&container)?;
         daemon_call("create", vm)?;
@@ -705,6 +776,426 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
         let _ = fs::remove_dir_all(&dir);
     }
     result
+}
+
+/// A container's configuration on the backend a new `--gpus` selects.
+pub struct BackendSwitch {
+    pub record: Container,
+    pub guest_config: Value,
+    pub vm: Value,
+}
+
+/// Rebuild a stopped Linux container's records for the GPU `profile` (`None`:
+/// Apple Virtualization, else QEMU/HVF). `session_port` is the QEMU session
+/// forward and `mac_address` the Apple MAC; the writable layer, image disks,
+/// shares, published ports and session token stay as they are.
+pub fn switch_backend(
+    c: &Container,
+    vm: &Value,
+    guest_config: &Value,
+    dir: &Path,
+    profile: Option<&str>,
+    session_port: Option<u16>,
+    mac_address: Option<String>,
+) -> Result<BackendSwitch> {
+    let was_qemu = c.backend == "qemu-hvf";
+    let qemu = profile.is_some();
+    if !vm.is_object() {
+        bail!("daemon returned no configuration for {}", c.vm_id)
+    }
+    if !qemu && c.ports.iter().any(|p| p.protocol != "tcp") {
+        bail!("{} publishes UDP, which needs the QEMU backend; remove it and run it again without --gpus", c.name)
+    }
+    let mut record = c.clone();
+    record.backend = if qemu {
+        "qemu-hvf"
+    } else {
+        "apple-virtualization"
+    }
+    .to_owned();
+    record.gpus = profile.map(str::to_owned);
+    record.session_port = if qemu { session_port } else { None };
+    record.mac_address = if qemu { None } else { mac_address };
+    // Only a default follows the backend; a size given with -m stays.
+    let systemd = c.init.is_some();
+    if c.memory_mib == default_memory_mib(was_qemu, c.engine, c.desktop, systemd) {
+        record.memory_mib = default_memory_mib(qemu, c.engine, c.desktop, systemd);
+    }
+
+    let mut guest = guest_config.clone();
+    guest["transport"] = json!(if qemu { "virtio-serial-exec" } else { "vsock" });
+    guest["gpu"] = json!(qemu);
+    for volume in guest["volumes"].as_array_mut().into_iter().flatten() {
+        volume["fs"] = json!(if qemu { "9p" } else { "virtiofs" });
+    }
+
+    let mut vm = vm.clone();
+    vm["backend"] = json!(record.backend);
+    vm["memory_mib"] = json!(record.memory_mib);
+    let (from, to) = if qemu {
+        ("console=hvc0", "console=ttyAMA0")
+    } else {
+        ("console=ttyAMA0", "console=hvc0")
+    };
+    let command_line = vm["command_line"]
+        .as_str()
+        .unwrap_or_default()
+        .replace(from, to);
+    vm["command_line"] = json!(command_line);
+    let fields = vm.as_object_mut().unwrap();
+    for key in [
+        "ports",
+        "qemu_guest_exec",
+        "qemu_graphics_profile",
+        "mac_address",
+        "machine_identifier_file",
+    ] {
+        fields.remove(key);
+    }
+    if qemu {
+        vm["ports"] = json!(record.ports);
+        if let Some(port) = record.session_port {
+            crate::session::add_forward(&mut vm, port);
+        }
+        vm["qemu_guest_exec"] = json!(true);
+        vm["qemu_graphics_profile"] = json!(profile);
+    } else {
+        vm["mac_address"] = json!(record.mac_address);
+        vm["machine_identifier_file"] = json!(dir.join(MACHINE_IDENTIFIER_FILE));
+    }
+    Ok(BackendSwitch {
+        record,
+        guest_config: guest,
+        vm,
+    })
+}
+
+/// What `update` changes; `None` (or `false`) keeps it. `gpus` is a `--gpus`
+/// value or `none`; `ports` replaces the published ports (empty: none);
+/// `dns` empty and `mtu` 0 go back to the defaults `run` uses.
+#[derive(Default, Debug, Clone)]
+pub struct Changes {
+    pub cpus: Option<u32>,
+    pub memory_mib: Option<u64>,
+    pub disk_gib: Option<u64>,
+    pub gpus: Option<String>,
+    pub desktop: Option<bool>,
+    pub desktop_size: Option<(u32, u32)>,
+    pub ports: Option<Vec<String>>,
+    pub dns: Option<Vec<String>>,
+    pub mtu: Option<u16>,
+    pub new_mac: bool,
+}
+
+/// The disk holding a container's writable layer (a macOS container's whole
+/// system), and its size and allocated bytes.
+pub fn disk(container: &Container) -> Result<(PathBuf, u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let name = if container.os == "darwin" {
+        "disk.img"
+    } else {
+        "rw.raw"
+    };
+    let path = container_dir(&container.id)?.join(name);
+    let meta = fs::metadata(&path).with_context(|| format!("read {}", path.display()))?;
+    Ok((path, meta.len(), meta.blocks() * 512))
+}
+
+/// Check the parts of `changes` that need no daemon: limits, grow-only disk,
+/// what macOS and engine containers allow. Returns the GPU profile change
+/// (`Some(None)`: to Apple Virtualization) and the parsed ports.
+#[allow(clippy::type_complexity)]
+fn check_changes(
+    c: &Container,
+    changes: &Changes,
+    disk_bytes: u64,
+) -> Result<(Option<Option<&'static str>>, Option<Vec<PortSpec>>)> {
+    if c.engine {
+        bail!(
+            "{} runs the shared engine; recreate it with veynodevm engine start",
+            c.name
+        )
+    }
+    if let Some(cpus) = changes.cpus {
+        if !(1..=128).contains(&cpus) {
+            bail!("--cpus must be 1..128")
+        }
+    }
+    if let Some(memory) = changes.memory_mib {
+        if !(256..=1 << 20).contains(&memory) {
+            bail!("--memory must be 256m..1024g")
+        }
+    }
+    if c.os == "darwin" {
+        if changes.disk_gib.is_some()
+            || changes.gpus.is_some()
+            || changes.desktop.is_some()
+            || changes.desktop_size.is_some()
+            || changes.ports.is_some()
+            || changes.dns.is_some()
+            || changes.mtu.is_some()
+            || changes.new_mac
+        {
+            bail!("a macOS container changes only --cpus and --memory; its GPU, desktop, disk and network stay as created")
+        }
+        if changes.cpus.is_some_and(|n| n < 2) || changes.memory_mib.is_some_and(|m| m < 4096) {
+            bail!("a macOS container needs at least 2 CPUs and 4096 MiB of memory")
+        }
+    }
+    if let Some(gib) = changes.disk_gib {
+        if gib << 30 < disk_bytes {
+            bail!(
+                "the disk can only grow: {} is {} GiB",
+                c.name,
+                disk_bytes.div_ceil(1 << 30)
+            )
+        }
+        if gib > 4096 {
+            bail!("--disk-size must be at most 4096 GiB")
+        }
+    }
+    let profile = match changes.gpus.as_deref() {
+        None => None,
+        Some("none") => Some(None),
+        Some(other) => Some(Some(gpu_profile(other).map_err(|_| {
+            anyhow::anyhow!("--gpus accepts none|all|virgl|venus, got {other}")
+        })?)),
+    }
+    .filter(|p| *p != c.gpus.as_deref());
+    let qemu = match profile {
+        Some(p) => p.is_some(),
+        None => c.backend == "qemu-hvf",
+    };
+    let ports = changes
+        .ports
+        .as_ref()
+        .map(|specs| {
+            let ports = specs
+                .iter()
+                .map(|p| parse_port(p))
+                .collect::<Result<Vec<_>>>()?;
+            if !qemu && ports.iter().any(|p| p.protocol != "tcp") {
+                bail!("UDP publishing needs the QEMU backend; Apple Virtualization containers publish TCP only")
+            }
+            let mut seen = BTreeSet::new();
+            for p in &ports {
+                if !seen.insert((p.host_address, p.host_port, p.protocol.clone())) {
+                    bail!("duplicate published port {}", p.host_port)
+                }
+            }
+            Ok(ports)
+        })
+        .transpose()?;
+    let want = changes.desktop.unwrap_or(c.desktop);
+    if changes.desktop_size.is_some() && (!want || !qemu) {
+        bail!("--desktop-size needs a desktop on the QEMU backend (--gpus virgl|venus)")
+    }
+    if changes
+        .mtu
+        .is_some_and(|m| m != 0 && !(576..=9000).contains(&m))
+    {
+        bail!("--mtu must be 576..9000")
+    }
+    if changes.dns.as_ref().is_some_and(|d| d.len() > 3) {
+        bail!("at most 3 DNS servers")
+    }
+    Ok((profile, ports))
+}
+
+/// `update`: change a container's hardware (CPUs, memory, disk, GPU, desktop,
+/// network) in one re-registration of its VM. A running container is refused
+/// unless `restart`, which stops it first and starts it again afterwards; the
+/// writable layer, image, volumes and session token stay. A disk only grows,
+/// and its file system grows at the next start.
+pub fn update(c: &Container, changes: &Changes, restart: bool) -> Result<Container> {
+    let (disk_path, disk_bytes, _) = disk(c)?;
+    let (profile, ports) = check_changes(c, changes, disk_bytes)?;
+    if profile.is_some_and(|p| p.is_some()) && home::Runtime::load()?.qemu.is_none() {
+        bail!("--gpus needs the QEMU/HVF GPU runtime: run runtime/fetch-utm.sh and scripts/install-dev-runtime.py --qemu")
+    }
+    let runtime = home::Runtime::load()?;
+    let dns = changes
+        .dns
+        .as_ref()
+        .map(|dns| -> Result<Vec<String>> {
+            if dns.is_empty() {
+                return Ok(runtime.dns.iter().map(ToString::to_string).collect());
+            }
+            dns.iter()
+                .map(|d| {
+                    d.parse::<std::net::IpAddr>()
+                        .map(|ip| ip.to_string())
+                        .with_context(|| format!("invalid --dns {d}"))
+                })
+                .collect()
+        })
+        .transpose()?;
+    let mtu = changes
+        .mtu
+        .map(|m| if m == 0 { runtime.mtu } else { Some(m) });
+    let disk_gib = changes.disk_gib.filter(|gib| gib << 30 != disk_bytes);
+    let want_desktop = changes.desktop.unwrap_or(c.desktop);
+    let want_size = if want_desktop {
+        changes.desktop_size.or(c.desktop_size)
+    } else {
+        None
+    };
+    let changed = profile.is_some()
+        || changes.cpus.is_some_and(|n| n != c.cpus)
+        || changes.memory_mib.is_some_and(|m| m != c.memory_mib)
+        || disk_gib.is_some()
+        || want_desktop != c.desktop
+        || want_size != c.desktop_size
+        || ports.as_ref().is_some_and(|p| *p != c.ports)
+        || dns.is_some()
+        || mtu.is_some()
+        || changes.new_mac;
+    if !changed {
+        return Ok(c.clone());
+    }
+    // Ports the container holds itself are freed by stopping it.
+    for p in ports.iter().flatten().filter(|p| !c.ports.contains(p)) {
+        port_free(p)?;
+    }
+    let running = active(&vm_state(c));
+    if running && !restart {
+        bail!(
+            "container {} is running; stop it first or use --restart",
+            c.name
+        )
+    }
+    if running {
+        stop(c, default_stop_timeout(c))?;
+    }
+    crate::proxy::stop_existing(c)?;
+    let dir = container_dir(&c.id)?;
+    let old_vm = daemon_call("status", json!({"id":c.vm_id}))?["config"].clone();
+    if !old_vm.is_object() {
+        bail!("daemon returned no configuration for {}", c.vm_id)
+    }
+    let config_disk = dir.join("config.img");
+    let old_guest = if c.os == "darwin" {
+        Value::Null
+    } else {
+        read_config_disk(&config_disk)?
+    };
+
+    let mut base = c.clone();
+    if let Some(ports) = &ports {
+        base.ports = ports.clone();
+    }
+    let (mut record, mut guest, mut vm) = match profile {
+        Some(profile) => {
+            let session_port = match (profile, c.session_port) {
+                (Some(_), Some(port)) => Some(port),
+                (Some(_), None) => Some(crate::session::free_port()?),
+                (None, _) => None,
+            };
+            let mac = c
+                .mac_address
+                .clone()
+                .unwrap_or_else(crate::macos::random_mac);
+            let s = switch_backend(
+                &base,
+                &old_vm,
+                &old_guest,
+                &dir,
+                profile,
+                session_port,
+                Some(mac),
+            )?;
+            (s.record, s.guest_config, s.vm)
+        }
+        None => {
+            let mut vm = old_vm.clone();
+            if ports.is_some() && base.backend == "qemu-hvf" {
+                vm["ports"] = json!(base.ports);
+                if let Some(port) = base.session_port {
+                    crate::session::add_forward(&mut vm, port);
+                }
+            }
+            (base, old_guest.clone(), vm)
+        }
+    };
+    if want_desktop != record.desktop || want_size != record.desktop_size {
+        let qemu = record.backend == "qemu-hvf";
+        let systemd = record.init.is_some();
+        // Only a default follows the desktop; a size given with -m stays.
+        if record.memory_mib == default_memory_mib(qemu, record.engine, record.desktop, systemd) {
+            record.memory_mib = default_memory_mib(qemu, record.engine, want_desktop, systemd);
+        }
+        record.desktop = want_desktop;
+        record.desktop_size = want_size;
+        guest["desktop"] = json!(want_desktop);
+        let fields = vm.as_object_mut().unwrap();
+        fields.remove("width");
+        fields.remove("height");
+        if want_desktop {
+            let (width, height) = want_size.unwrap_or((1280, 800));
+            vm["width"] = json!(width);
+            vm["height"] = json!(height);
+        }
+    }
+    if let Some(cpus) = changes.cpus {
+        record.cpus = cpus;
+    }
+    if let Some(memory) = changes.memory_mib {
+        record.memory_mib = memory;
+    }
+    vm["cpus"] = json!(record.cpus);
+    vm["memory_mib"] = json!(record.memory_mib);
+    if let Some(dns) = dns {
+        guest["dns"] = json!(dns);
+    }
+    if let Some(mtu) = mtu {
+        guest["mtu"] = json!(mtu);
+    }
+    if changes.new_mac {
+        let mac = crate::macos::random_mac();
+        vm["mac_address"] = json!(mac);
+        record.mac_address = Some(mac);
+    }
+
+    let guest_changed = guest != old_guest;
+    if guest_changed {
+        replace_config_disk(&config_disk, &guest)?;
+    }
+    daemon_call("delete", json!({"id":c.vm_id,"confirm":c.vm_id}))?;
+    if let Err(e) = daemon_call("create", vm) {
+        let restored = (|| {
+            if guest_changed {
+                replace_config_disk(&config_disk, &old_guest)?;
+            }
+            daemon_call("create", old_vm)
+        })();
+        return Err(match restored {
+            Ok(_) => e.context("registering the new VM configuration failed; kept the old one"),
+            Err(r) => e.context(format!(
+                "registering the new VM configuration failed, and restoring the old one too: {r:#}"
+            )),
+        });
+    }
+    // Sparse: the new space costs nothing until the guest writes it.
+    if let Some(gib) = disk_gib {
+        OpenOptions::new()
+            .write(true)
+            .open(&disk_path)?
+            .set_len(gib << 30)?;
+    }
+    save(&record)?;
+    if running {
+        start(&record)?;
+    }
+    Ok(record)
+}
+
+/// Swap the (read-only) configuration disk for one holding `guest_config`.
+fn replace_config_disk(path: &Path, guest_config: &Value) -> Result<()> {
+    let staged = path.with_extension("img.new");
+    let _ = fs::remove_file(&staged);
+    write_config_disk(&staged, guest_config)?;
+    fs::rename(&staged, path)?;
+    Ok(())
 }
 
 pub static INTERRUPTED: AtomicBool = AtomicBool::new(false);
@@ -967,7 +1458,14 @@ pub fn inspect(container: &Container) -> Result<Value> {
     }
     let (state, status) = status_text(container);
     let vm = daemon_call("status", json!({"id":container.vm_id})).unwrap_or(Value::Null);
+    let disk = disk(container).ok();
+    // What the guest configures its network with (`update --dns --mtu`).
+    let guest = read_config_disk(&container_dir(&container.id)?.join("config.img")).ok();
     Ok(json!({
+        "dns": guest.as_ref().map(|g| g["dns"].clone()),
+        "mtu": guest.as_ref().map(|g| g["mtu"].clone()),
+        "disk_bytes": disk.as_ref().map(|d| d.1),
+        "disk_used_bytes": disk.as_ref().map(|d| d.2),
         "container": container,
         "state": state,
         "status": status,
@@ -1023,6 +1521,14 @@ pub fn wait_for_ip(container: &Container, timeout: Duration) -> Result<String> {
 mod tests {
     use super::*;
     #[test]
+    fn icons() {
+        assert_eq!(parse_icon("box").unwrap(), "box");
+        assert_eq!(parse_icon("monitor:blue").unwrap(), "monitor:blue");
+        for bad in ["", "boat", "box:", "box:red", "box:blue:x", ":blue"] {
+            assert!(parse_icon(bad).is_err(), "{bad}");
+        }
+    }
+    #[test]
     fn ports() {
         assert_eq!(parse_port("8080:80").unwrap().host_port, 8080);
         assert_eq!(parse_port("80").unwrap().guest_port, 80);
@@ -1069,6 +1575,102 @@ mod tests {
         options.entrypoint = Some(vec!["/init".into()]);
         assert!(systemd_argv(&options).is_err());
     }
+    fn record(backend: &str, gpus: Option<&str>, memory_mib: u64) -> Container {
+        let qemu = backend == "qemu-hvf";
+        serde_json::from_value(json!({"id":"a","name":"n","image":"i","config_digest":"d","argv":["sh"],"env":[],"workdir":"","user":"","ports":[{"host_address":"127.0.0.1","host_port":8080,"guest_port":80,"protocol":"tcp"}],"volumes":[{"host":"/h/data","target":"/data","read_only":false}],"backend":backend,"gpus":gpus,"desktop":false,"engine":false,"auto_remove":false,"cpus":2,"memory_mib":memory_mib,"created_at":0,"vm_id":"c-a","mac_address":if qemu {None} else {Some("02:00:00:00:00:01")},"session_port":if qemu {Some(41000)} else {None},"icon":"box:blue"})).unwrap()
+    }
+    fn guest(qemu: bool) -> Value {
+        json!({"version":1,"id":"a","argv":["sh"],"session_token":"t","transport":if qemu {"virtio-serial-exec"} else {"vsock"},"gpu":qemu,
+            "volumes":[{"tag":"v0","target":"/data","read_only":false,"fs":if qemu {"9p"} else {"virtiofs"}}]})
+    }
+    fn vm(qemu: bool) -> Value {
+        let mut vm = json!({"backend":if qemu {"qemu-hvf"} else {"apple-virtualization"},"id":"c-a","guest":"linux","cpus":2,
+            "memory_mib":if qemu {2048} else {512},"kernel":"/k","initrd":"/i",
+            "command_line":format!("console={} rdinit=/veynode/init quiet loglevel=1 panic=-1", if qemu {"ttyAMA0"} else {"hvc0"}),
+            "disk":"/h/c/a/rw.raw","extra_disks":[{"path":"/r","read_only":true},{"path":"/h/c/a/config.img","read_only":true},{"path":"/m","read_only":true}],
+            "serial_log":"/h/c/a/console.log","shares":[{"tag":"v0","path":"/h/data","read_only":false}]});
+        if qemu {
+            vm["ports"] = json!([{"host_address":"127.0.0.1","host_port":8080,"guest_port":80,"protocol":"tcp"}]);
+            crate::session::add_forward(&mut vm, 41000);
+            vm["qemu_guest_exec"] = json!(true);
+            vm["qemu_graphics_profile"] = json!("virgl");
+        } else {
+            vm["mac_address"] = json!("02:00:00:00:00:01");
+            vm["machine_identifier_file"] = json!("/h/c/a/machine-identifier");
+        }
+        vm
+    }
+    #[test]
+    fn gpu_switch_to_qemu() {
+        let c = record("apple-virtualization", None, 512);
+        let dir = Path::new("/h/c/a");
+        let s = switch_backend(
+            &c,
+            &vm(false),
+            &guest(false),
+            dir,
+            Some("virgl"),
+            Some(41000),
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.record.backend, "qemu-hvf");
+        assert_eq!(s.record.gpus.as_deref(), Some("virgl"));
+        assert_eq!(s.record.session_port, Some(41000));
+        assert_eq!(s.record.mac_address, None);
+        assert_eq!(s.record.memory_mib, 2048);
+        assert_eq!(
+            (s.record.name.as_str(), s.record.icon.as_deref()),
+            ("n", Some("box:blue"))
+        );
+        // Built the way `run --gpus virgl` builds it.
+        assert_eq!(s.guest_config, guest(true));
+        assert_eq!(s.vm, vm(true));
+    }
+    #[test]
+    fn gpu_switch_to_apple() {
+        let c = record("qemu-hvf", Some("virgl"), 2048);
+        let dir = Path::new("/h/c/a");
+        let mac = Some("02:00:00:00:00:01".to_owned());
+        let s = switch_backend(&c, &vm(true), &guest(true), dir, None, None, mac).unwrap();
+        assert_eq!(s.record.backend, "apple-virtualization");
+        assert_eq!((s.record.gpus, s.record.session_port), (None, None));
+        assert_eq!(s.record.memory_mib, 512);
+        assert_eq!(s.guest_config, guest(false));
+        let mut expected = vm(false);
+        expected["machine_identifier_file"] = json!(dir.join(MACHINE_IDENTIFIER_FILE));
+        assert_eq!(s.vm, expected);
+    }
+    #[test]
+    fn gpu_switch_keeps_an_explicit_memory_size_and_profile_changes() {
+        let c = record("qemu-hvf", Some("virgl"), 8192);
+        let s = switch_backend(
+            &c,
+            &vm(true),
+            &guest(true),
+            Path::new("/h/c/a"),
+            Some("venus-moltenvk-experimental"),
+            Some(41000),
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.record.memory_mib, 8192);
+        assert_eq!(s.vm["memory_mib"], 8192);
+        assert_eq!(s.vm["qemu_graphics_profile"], "venus-moltenvk-experimental");
+        assert_eq!(s.vm["ports"], vm(true)["ports"]);
+        let mut udp = record("qemu-hvf", Some("virgl"), 2048);
+        udp.ports[0].protocol = "udp".into();
+        assert!(switch_backend(
+            &udp,
+            &vm(true),
+            &guest(true),
+            Path::new("/h/c/a"),
+            None,
+            None,
+            None
+        )
+        .is_err());
+    }
     #[test]
     fn records_without_init_still_load() {
         let record = json!({"id":"a","name":"n","image":"i","config_digest":"d","argv":["sh"],"env":[],"workdir":"","user":"","ports":[],"volumes":[],"backend":"apple-virtualization","gpus":null,"desktop":false,"engine":false,"auto_remove":false,"cpus":2,"memory_mib":512,"created_at":0,"vm_id":"c-a"});
@@ -1079,5 +1681,160 @@ mod tests {
             .unwrap()
             .get("init")
             .is_none());
+    }
+    #[test]
+    fn hardware_changes_are_checked_before_the_daemon() {
+        let apple = record("apple-virtualization", None, 512);
+        let qemu = record("qemu-hvf", Some("virgl"), 2048);
+        let gib = 1u64 << 30;
+        let check = |c: &Container, changes: Changes| check_changes(c, &changes, 16 * gib);
+        // The disk only grows.
+        assert!(check(
+            &apple,
+            Changes {
+                disk_gib: Some(8),
+                ..Default::default()
+            }
+        )
+        .is_err());
+        assert!(check(
+            &apple,
+            Changes {
+                disk_gib: Some(32),
+                ..Default::default()
+            }
+        )
+        .is_ok());
+        assert!(check(
+            &apple,
+            Changes {
+                cpus: Some(0),
+                ..Default::default()
+            }
+        )
+        .is_err());
+        assert!(check(
+            &apple,
+            Changes {
+                memory_mib: Some(128),
+                ..Default::default()
+            }
+        )
+        .is_err());
+        assert!(check(
+            &apple,
+            Changes {
+                mtu: Some(100),
+                ..Default::default()
+            }
+        )
+        .is_err());
+        assert!(check(
+            &apple,
+            Changes {
+                mtu: Some(0),
+                ..Default::default()
+            }
+        )
+        .is_ok());
+        let dns = |n: usize| Some(vec!["1.1.1.1".to_owned(); n]);
+        assert!(check(
+            &apple,
+            Changes {
+                dns: dns(4),
+                ..Default::default()
+            }
+        )
+        .is_err());
+        // UDP needs QEMU, whichever backend the change ends on.
+        let udp = Some(vec!["5353:53/udp".to_owned()]);
+        assert!(check(
+            &apple,
+            Changes {
+                ports: udp.clone(),
+                ..Default::default()
+            }
+        )
+        .is_err());
+        assert!(check(
+            &qemu,
+            Changes {
+                ports: udp.clone(),
+                ..Default::default()
+            }
+        )
+        .is_ok());
+        let to_apple = Changes {
+            gpus: Some("none".into()),
+            ports: udp,
+            ..Default::default()
+        };
+        assert!(check(&qemu, to_apple).is_err());
+        let dup = Some(vec!["8080:80".to_owned(), "8080:81".to_owned()]);
+        assert!(check(
+            &apple,
+            Changes {
+                ports: dup,
+                ..Default::default()
+            }
+        )
+        .is_err());
+        // The GPU it already has is no change.
+        let (profile, _) = check(
+            &qemu,
+            Changes {
+                gpus: Some("virgl".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(profile, None);
+        let (profile, _) = check(
+            &qemu,
+            Changes {
+                gpus: Some("none".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(profile, Some(None));
+        assert!(check(
+            &apple,
+            Changes {
+                desktop_size: Some((1920, 1080)),
+                desktop: Some(true),
+                ..Default::default()
+            }
+        )
+        .is_err());
+        let mut mac = apple.clone();
+        mac.os = "darwin".into();
+        assert!(check(
+            &mac,
+            Changes {
+                cpus: Some(4),
+                memory_mib: Some(8192),
+                ..Default::default()
+            }
+        )
+        .is_ok());
+        assert!(check(
+            &mac,
+            Changes {
+                new_mac: true,
+                ..Default::default()
+            }
+        )
+        .is_err());
+        let mut engine = qemu.clone();
+        engine.engine = true;
+        assert!(check(
+            &engine,
+            Changes {
+                cpus: Some(4),
+                ..Default::default()
+            }
+        )
+        .is_err());
     }
 }

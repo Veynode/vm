@@ -710,6 +710,8 @@ pub fn create_and_start(
             mac_address: Some(mac),
             session_port: None,
             fork_of: None,
+            icon: None,
+            desktop_size: None,
             init: None,
             tty: false,
             stdin: false,

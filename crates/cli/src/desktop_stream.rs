@@ -8,6 +8,8 @@
 //!   console broker (VideoToolbox on the console surface).
 //! - Apple Virtualization Linux: `vz-desktop-stream` against the worker's
 //!   vsock 5001 bridge to the guest agent's DRM scanout capture.
+//! - Apple Virtualization macOS: the same encoder and bridge, fed by the
+//!   worker's Screen Sharing (RFB) session instead of a guest agent.
 //!
 //! stdout records: `u32 big-endian length, u8 kind, payload`; kind 1 is a JSON
 //! event, kind 2 is `u64 pts_us, u8 keyframe, Annex B`. With `--tracks`
@@ -17,17 +19,17 @@
 //! stdin: JSON lines, `{"events":[...]}` (see `vm_control::desktop_input`),
 //! `{"keyframe":true}`, or `{"encoder":"LINE"}`, one encoder command from
 //! docs/browser-desktop.md (`[@T ]keyframe|bitrate|crop|scale`, `track add|remove T`;
-//! QEMU takes `crop`, `scale` and `keyframe` only). EOF stops the stream and
+//! QEMU takes `bitrate` over its rate channel, 250000..40000000, and no tracks). EOF stops the stream and
 //! releases held keys/buttons.
 use crate::{container, daemon_call, random_hex, sibling};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::{
     io::{BufRead, BufReader, Read, Write},
-    os::unix::fs::DirBuilderExt,
+    os::{fd::AsRawFd, unix::fs::DirBuilderExt, unix::net::UnixStream},
     path::PathBuf,
     process::{Child, ChildStdin, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{mpsc, Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -58,14 +60,113 @@ enum Backend {
 struct Session {
     vm: String,
     backend: Backend,
+    /// Whether the guest paints its cursor into the picture, so the browser must not draw its own.
+    guest_cursor: bool,
     child: Child,
+    /// The QEMU encoder's private rate channel (`vm-console-stream --rate-control-fd`).
+    rate: Option<UnixStream>,
+}
+
+/// The controller end of the encoder's rate channel: one request at a time, each acknowledged
+/// within the encoder's 3 s deadline (`vm_media_local::rate_control`).
+struct RateControl {
+    socket: BufReader<UnixStream>,
+    instance: Option<String>,
+    epoch: u64,
+    sequence: u64,
+    id: u64,
+}
+
+impl RateControl {
+    fn new(socket: UnixStream) -> Result<Self> {
+        socket.set_read_timeout(Some(Duration::from_secs(3)))?;
+        socket.set_write_timeout(Some(Duration::from_secs(1)))?;
+        Ok(Self {
+            socket: BufReader::new(socket),
+            instance: None,
+            epoch: 0,
+            sequence: 0,
+            id: 0,
+        })
+    }
+
+    fn call(&mut self, mut request: Value) -> Result<Value> {
+        self.id += 1;
+        request["version"] = json!(1);
+        request["request_id"] = json!(format!("r{}", self.id));
+        let mut line = serde_json::to_vec(&request)?;
+        line.push(b'\n');
+        self.socket.get_mut().write_all(&line)?;
+        let mut reply = String::new();
+        if self.socket.read_line(&mut reply)? == 0 {
+            bail!("encoder rate channel closed")
+        }
+        Ok(serde_json::from_str(&reply)?)
+    }
+
+    fn status(&mut self) -> Result<()> {
+        let reply = self.call(json!({"method":"rate_status"}))?;
+        let result = reply
+            .get("result")
+            .with_context(|| format!("rate_status refused: {reply}"))?;
+        self.instance = result["encoder_instance"].as_str().map(str::to_owned);
+        self.epoch = result["epoch"].as_u64().unwrap_or(0);
+        self.sequence = result["sequence"].as_u64().unwrap_or(0);
+        if self.instance.is_none() || self.epoch == 0 {
+            bail!("rate_status without an encoder instance")
+        }
+        Ok(())
+    }
+
+    /// Set the encoder's target and wait for its read-back; one status refresh and retry when
+    /// the encoder was replaced (a new epoch or instance).
+    fn set(&mut self, bps: u64) -> Result<()> {
+        for attempt in 0..2 {
+            if self.instance.is_none() || attempt > 0 {
+                self.status()?;
+            }
+            let reply = self.call(json!({
+                "method":"set_bitrate",
+                "encoder_instance":self.instance,
+                "epoch":self.epoch,
+                "sequence":self.sequence + 1,
+                "target_bps":bps,
+            }))?;
+            if let Some(result) = reply.get("result") {
+                if result["target_bps"] != bps || result["readback_bps"] != bps {
+                    bail!("encoder read back {result}, not {bps}")
+                }
+                self.sequence = result["sequence"].as_u64().unwrap_or(self.sequence + 1);
+                return Ok(());
+            }
+            if attempt == 1 {
+                bail!("set_bitrate refused: {reply}")
+            }
+        }
+        unreachable!()
+    }
+}
+
+/// Apply the newest `bitrate` command; a refusal is reported once as an encoder event.
+fn rate_worker(mut control: RateControl, commands: mpsc::Receiver<u64>, out: Out) {
+    while let Ok(mut target) = commands.recv() {
+        while let Ok(newer) = commands.try_recv() {
+            target = newer;
+        }
+        if let Err(error) = control.set(target) {
+            let _ = event(
+                &out,
+                json!({"event":"encoder","detail":{"event":"rate","command":format!("bitrate {target}"),"error":format!("{error:#}")}}),
+            );
+        }
+    }
 }
 
 impl Session {
     fn start(name: &str, codec: &str, tracks: bool) -> Result<Self> {
         let vm = match container::find(name) {
             Ok(c) => c.vm_id,
-            Err(_) => name.to_owned(),
+            Err(_) => crate::machine::resolve(name),
         };
         let status = daemon_call("status", json!({"id":vm}))?;
         if !matches!(status["state"].as_str(), Some("running")) {
@@ -74,6 +175,7 @@ impl Session {
         let backend = status["config"]["backend"].as_str().unwrap_or_default();
         let guest = status["config"]["guest"].as_str().unwrap_or_default();
         let mut command;
+        let mut rate = None;
         let session_backend = match (backend, guest) {
             ("qemu-hvf", _) => {
                 let console = status["runtime"]["console_socket"]
@@ -81,9 +183,16 @@ impl Session {
                     .context("this QEMU VM has no persistent console; register the console broker and restart it")?;
                 command = Command::new(sibling("vm-console-stream")?);
                 command.args([console, "--codec", codec]);
+                let (controller, encoder_end) = UnixStream::pair()?;
+                // std opens descriptors close-on-exec; the encoder's end must survive the exec.
+                if unsafe { libc::fcntl(encoder_end.as_raw_fd(), libc::F_SETFD, 0) } != 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                command.args(["--rate-control-fd", &encoder_end.as_raw_fd().to_string()]);
+                rate = Some((controller, encoder_end));
                 Backend::Qemu
             }
-            ("apple-virtualization", "linux") => {
+            ("apple-virtualization", "linux" | "macos") => {
                 let encoder = home::Runtime::load()?
                     .vz_desktop_stream
                     .context("vz_desktop_stream is not registered in runtime.json (scripts/install-dev-runtime.py)")?;
@@ -126,7 +235,7 @@ impl Session {
                 Backend::Apple { bridge_dir }
             }
             _ => bail!(
-                "browser desktop supports Linux containers on QEMU/HVF or Apple Virtualization"
+                "browser desktop supports Linux containers on QEMU/HVF or Apple Virtualization, and macOS containers"
             ),
         };
         let spawned = command
@@ -139,7 +248,11 @@ impl Session {
             Ok(child) => Ok(Self {
                 vm,
                 backend: session_backend,
+                // Windows paints a software cursor into the display surface, which the
+                // encoder captures; Linux and macOS guests use a hardware cursor plane.
+                guest_cursor: backend == "qemu-hvf" && guest == "windows",
                 child,
+                rate: rate.map(|(controller, _encoder_end)| controller),
             }),
             Err(error) => {
                 close_bridge(&vm, &session_backend);
@@ -276,7 +389,7 @@ pub fn encoder_line(line: &str, qemu: bool) -> Option<&str> {
         "keyframe" => rest.is_empty(),
         "crop" => numbers(4),
         "scale" => numbers(2),
-        "bitrate" => !qemu && numbers(1),
+        "bitrate" => numbers(1),
         "track" if !qemu && !line.starts_with('@') => {
             rest.len() == 2
                 && matches!(rest[0], "add" | "remove")
@@ -305,13 +418,24 @@ pub fn run(name: &str, codec: &str, tracks: bool) -> Result<i32> {
     let qemu = matches!(session.backend, Backend::Qemu);
     event(
         &out,
-        json!({"event":"ready","vm":session.vm,"backend":if qemu {"qemu-hvf"} else {"apple-virtualization"},"codec":codec}),
+        json!({"event":"ready","vm":session.vm,"backend":if qemu {"qemu-hvf"} else {"apple-virtualization"},"codec":codec,"cursor":if session.guest_cursor {"guest"} else {"local"}}),
     )?;
     let video = session.child.stdout.take().unwrap();
     let diagnostics = session.child.stderr.take().unwrap();
     let input = Arc::new(Mutex::new(session.child.stdin.take().unwrap()));
     let video_out = out.clone();
     let multi_track = tracks && !qemu;
+    // QEMU takes `bitrate` over the encoder's private rate channel, not its stdin.
+    let rate_tx = match session.rate.take() {
+        Some(socket) => {
+            let (tx, rx) = mpsc::channel();
+            let control = RateControl::new(socket)?;
+            let rate_out = out.clone();
+            thread::spawn(move || rate_worker(control, rx, rate_out));
+            Some(tx)
+        }
+        None => None,
+    };
     let video_thread = thread::spawn(move || pump_video(video, video_out, multi_track));
     let diag_out = out.clone();
     thread::spawn(move || pump_diagnostics(diagnostics, diag_out));
@@ -334,6 +458,17 @@ pub fn run(name: &str, codec: &str, tracks: bool) -> Result<i32> {
             }
             if let Some(line) = message["encoder"].as_str() {
                 match encoder_line(line, qemu) {
+                    Some(line) if rate_tx.is_some() && line.starts_with("bitrate ") => {
+                        let target = line["bitrate ".len()..].parse::<u64>().unwrap_or(0);
+                        if (250_000..=40_000_000).contains(&target) {
+                            let _ = rate_tx.as_ref().unwrap().send(target);
+                        } else {
+                            let _ = event(
+                                &input_out,
+                                json!({"event":"encoder","detail":{"event":"rate","command":line,"error":"outside 250000..40000000"}}),
+                            );
+                        }
+                    }
                     Some(line) => {
                         let _ = control
                             .lock()
@@ -395,6 +530,69 @@ pub fn run(name: &str, codec: &str, tracks: bool) -> Result<i32> {
 mod tests {
     use super::*;
 
+    /// An encoder end that acknowledges like the console helper: a status receipt, then each
+    /// `set_bitrate` echoed with its sequence, refusing the first as stale when `stale` is set.
+    fn fake_encoder(socket: UnixStream, stale: bool) -> thread::JoinHandle<Vec<Value>> {
+        thread::spawn(move || {
+            let mut seen = Vec::new();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut writer = socket;
+            let mut refused = !stale;
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                let request: Value = serde_json::from_str(&line).unwrap();
+                line.clear();
+                let reply = if request["method"] == "rate_status" {
+                    json!({"version":1,"request_id":request["request_id"],"result":{"encoder_instance":"0123456789abcdef0123456789abcdef","epoch":7,"sequence":4,"target_bps":8000000,"readback_bps":8000000,"submitted_frames":1,"hardware_verified":true}})
+                } else if !refused {
+                    refused = true;
+                    json!({"version":1,"request_id":request["request_id"],"error":{"code":"stale_encoder"}})
+                } else {
+                    json!({"version":1,"request_id":request["request_id"],"result":{"encoder_instance":request["encoder_instance"],"epoch":request["epoch"],"sequence":request["sequence"],"target_bps":request["target_bps"],"readback_bps":request["target_bps"],"submitted_frames":2,"hardware_verified":true}})
+                };
+                seen.push(request);
+                writeln!(writer, "{reply}").unwrap();
+            }
+            seen
+        })
+    }
+
+    #[test]
+    fn rate_control_reads_status_then_sets_with_the_next_sequence() {
+        let (controller, encoder) = UnixStream::pair().unwrap();
+        let peer = fake_encoder(encoder, false);
+        let mut control = RateControl::new(controller).unwrap();
+        control.set(12_000_000).unwrap();
+        control.set(16_000_000).unwrap();
+        drop(control);
+        let seen = peer.join().unwrap();
+        let methods: Vec<_> = seen.iter().map(|r| r["method"].as_str().unwrap()).collect();
+        assert_eq!(methods, ["rate_status", "set_bitrate", "set_bitrate"]);
+        assert_eq!(seen[1]["sequence"], 5);
+        assert_eq!(seen[2]["sequence"], 6);
+        assert_eq!(seen[2]["target_bps"], 16_000_000);
+        assert_eq!(seen[1]["epoch"], 7);
+    }
+
+    #[test]
+    fn rate_control_refreshes_status_once_after_a_stale_refusal() {
+        let (controller, encoder) = UnixStream::pair().unwrap();
+        let peer = fake_encoder(encoder, true);
+        let mut control = RateControl::new(controller).unwrap();
+        control.set(24_000_000).unwrap();
+        drop(control);
+        let methods: Vec<_> = peer
+            .join()
+            .unwrap()
+            .iter()
+            .map(|r| r["method"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            methods,
+            ["rate_status", "set_bitrate", "rate_status", "set_bitrate"]
+        );
+    }
+
     #[test]
     fn encoder_lines_follow_each_encoders_grammar() {
         for ok in [
@@ -426,7 +624,11 @@ mod tests {
             encoder_line("crop 0 0 960 540", true),
             Some("crop 0 0 960 540")
         );
-        for qemu_bad in ["bitrate 1000000", "@1 keyframe", "track add 1"] {
+        assert_eq!(
+            encoder_line("bitrate 1000000", true),
+            Some("bitrate 1000000")
+        );
+        for qemu_bad in ["@1 keyframe", "track add 1"] {
             assert_eq!(encoder_line(qemu_bad, true), None, "{qemu_bad}");
         }
     }

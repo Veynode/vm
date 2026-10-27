@@ -42,6 +42,10 @@
   jobs started with `&` that ignore it keep running in the container.
 - Detach from `attach` with Ctrl-P Ctrl-Q; only the last 64 KiB of a `-t`
   container's output is replayed on attach.
+- The web UI (`veynodevm ui`) has no sign-in. It binds only 127.0.0.1 and
+  checks the Host header (its WebSockets also the Origin), but another site
+  open in the browser, or any process on this Mac, can send its HTTP requests
+  and so start, stop, remove or exec in containers.
 - Named volumes are not implemented; use host bind mounts (`-v /host:/path`).
   Image `VOLUME`s become anonymous directories on the container's disk.
 - Apple Virtualization publishing (`-p`) is TCP only; UDP needs QEMU.
@@ -209,6 +213,11 @@
 - `machine eject` re-registers the VM without `cdrom`/seed images (daemon VM
   configs are immutable). Eject after installing: booting an installed disk
   with the ISO still attached was not tested.
+- `machine rename` works on a stopped machine only: the name is the daemon
+  VM id and the directory name, so it moves `<home>/machines/NAME` and
+  re-registers the VM under the new id with its paths moved. Checked against
+  a disposable daemon with a registered, never-booted machine; not yet on a
+  machine with an installed system, snapshots or a Windows SSH login.
 - `efi_vars` files are backend specific: a QEMU store is a 64 MiB pflash
   image, a VZ store is created by Virtualization.framework. Moving a disk
   between backends needs a fresh `efi_vars` (fallback boot path).
@@ -273,6 +282,15 @@
   on Basic Display unless the Neptune profile below is used; viogpudo is
   never installed. `--disk-bus nvme` keeps the inbox NVMe driver as an
   alternative (the first install used it).
+- **Windows `vm_screenshot` over 2 MiB (fixed in the native console).** A
+  photographic Windows desktop (Neptune 1280x1024) encodes to 2.6 MB of PNG,
+  which the native console refused at its old 2 MiB bound while the documented
+  contract (decision 0024) was 8 MiB PNG / 12 MiB JSON. `VEYNODE_SCREENSHOT_MAX_BYTES`
+  and `spice-screenshot` are now 8 MiB, and `VNRecordWriter` admits one JSON
+  record up to 12 MiB at a time beside its 8 MiB queue (kinds other than JSON
+  stay at 4 MiB). Live: 2.62 MB PNG, 3.5 MB reply, 0.44 s. Needs the rebuilt
+  `VeynodeQEMUConsole.app`; an older staged app still returns
+  `screenshot_exceeds_2MiB_limit`.
 - **Warm guest reboots hang edk2; reboots are cold.** In both installs, the
   reboot from WinPE into the installed system (a guest reset inside the same
   QEMU process) left vCPU0 spinning in firmware at the same PC
@@ -312,6 +330,12 @@
     host=0x00000001 guest=0x00000002`). Use **0.1.273**
     (`.local/iso/utm-guest-tools-0.1.273.iso`, SHA-256 `7d2c0343…c2f04601`
     from GitHub's asset digest, viogpu3d DriverVer 08/30/2026).
+  - **Licence.** The owner states Neptune is MIT, and the driver repositories
+    (`virtio-win/kvm-guest-drivers-windows`, UTM's fork) carry a BSD 3-Clause
+    `LICENSE` (checked 2026-10-27; not legal advice). Not done: shipping the
+    guest tools as a default install. The prebuilt drivers may be unsigned,
+    so a bundled install still needs a signing plan; until then the tools
+    ISO stays a user-supplied file.
   - viogpu3d is the only display adapter: dxdiag in the desktop session
     names "Red Hat VirtIO GPU 3D controller", chip "QEMU VIRTIO GPU",
     `neptune_umd.dll`, driver 100.6.101.58000, WDDM 2.2, DDI 11.1, feature
@@ -372,8 +396,8 @@
     /uninstall`) hung the guest; restore a pre-driver clone instead. Plain
     `virtio-ramfb` is the same PCI device (1AF4:1050), so viogpu3d also binds
     to it when the Neptune profile is off.
-  Not established: D3D12, real games, frames on the console (the swapchain
-  paces at 60 Hz, but nobody looked at the window), long runs, and the
+  Frames on the console: the browser stream gets 60 fps bursts
+  (16.5 ms median, see [browser-desktop](browser-desktop.md)). Not established: D3D12, real games, long runs, and the
   redistribution rights of the guest tools and DXMT. See
   [decision 0001](decisions/0001-windows-gpu.md).
 - Not established: TPM (UTM's swtpm framework exists in the runtime but isn't
@@ -485,6 +509,88 @@ Virtualization (llvmpipe) and on QEMU with `--gpus virgl` (GLX renderer
     renders correctly in an XFCE session (`veynodevm/ubuntu-desktop`);
     `MESA_VK_WSI_DEBUG=sw` (CPU copy, ~350 FPS) also works, including on
     Xvfb, which has no DRI3.
+  - **OpenGL through Zink on Venus** (`ubuntu-desktop` selects it for the
+    XFCE session when the Vulkan driver is `venus`; elsewhere set
+    `MESA_LOADER_DRIVER_OVERRIDE=zink`): renderer `zink Vulkan 1.3(Virtio-GPU
+    Venus (Apple M3 Pro) (MOLTENVK))`, OpenGL 3.1 core/compatibility, GLSL
+    1.40, OpenGL ES 3.1 (Mesa 25.2.8). Live evidence, 2026-10-26:
+    `scripts/linux-gl-triangle.c` (core context, instanced quads through a
+    uniform block, FBO and window readback) passes with 0 mismatches at ~970
+    FPS, and at 3.3 with `MESA_GL_VERSION_OVERRIDE=3.3
+    MESA_GLSL_VERSION_OVERRIDE=330`; glxgears ~800–950 FPS (virgl ~1250);
+    glmark2 2023.01 runs every default scene at 800x600 (score 331–405 on a
+    heavily loaded host, load average ~22); SuperTuxKart 1.4 (Ubuntu's arm64
+    build is GLES) renders its full pipeline (dynamic lights, karts, terrain;
+    screenshot-checked) at 106–112 FPS average in `--profile-time` races,
+    1024x768 window, 4 karts. FPS figures vary several-fold with host load.
+    - The version stops at 3.1 because MoltenVK 1.4.2 lacks
+      `VK_EXT_depth_clip_enable` (GL 3.2 `ARB_depth_clamp`); 3.3 also needs
+      `ARB_vertex_type_2_10_10_10_rev`, which Zink withholds because Metal has
+      no USCALED/SSCALED 2_10_10_10 vertex formats; 4.0 needs `shaderFloat64`,
+      which Metal does not have. The override works for programs that use
+      neither depth clamping nor scaled 2_10_10_10 vertices.
+    - Plain Zink cannot draw on MoltenVK 1.4.2. With `robustBufferAccess`
+      MoltenVK's bounds checks on Zink's arrayed uniform buffers do not
+      compile; Venus hides `VK_EXT_provoking_vertex` (MoltenVK has it), so
+      Zink wraps draws in generated geometry shaders that MoltenVK's emulation
+      does not compile; debug names such as `sampler` (Gallium's blit
+      shaders) reach the MSL as identifiers; and depth images with
+      `HOST_TRANSFER` usage cannot be created, so every depth texture fails
+      with `GL_OUT_OF_MEMORY` (Zink drops that usage only when built for
+      macOS). The image's implicit Vulkan layer
+      (`guest/images/zink/veynodevm_zink_layer.c`) hides `robustBufferAccess`,
+      `geometryShader` and `VK_EXT_host_image_copy` from Zink and strips
+      SPIR-V debug names; applications other than Zink see the device
+      unchanged. Side effects: no geometry shaders in GL, and flat-shaded
+      varyings take the first vertex instead of GL's last. An image built
+      from `guest/images/ubuntu-desktop/Dockerfile` reports the Zink renderer
+      in its `desktop:` log lines, and the oracle passes in it; `veynodevm
+      exec` sessions need `-e MESA_LOADER_DRIVER_OVERRIDE=zink`.
+    - Why Venus does not pass `VK_EXT_provoking_vertex` through is not
+      established: the host render server allows it and Mesa's Venus driver
+      supports it.
+  - **A burst of host shader compiles kills a QEMU container that has guest
+    exec.** QEMU's main thread runs virgl, whose ANGLE (Metal) shader compiles
+    are synchronous: SuperTuxKart's first race (cold Metal cache), and any
+    virgl GL game, makes it compile 130–160 ms shaders back to back for over a
+    second. The guest stalls behind it, misses the 1 s serial-exec heartbeat
+    budget ([decision 0015](decisions/0015-qemu-serial-execution-v2.md)),
+    and the worker fail-stops QEMU (`serial execution incarnation fenced;
+    QEMU will be terminated`). Seen with virgl and also with Venus/Zink on a
+    fresh container (Xorg's glamor runs on virgl); warm runs survive, and
+    eight guest CPU spinners for 25 s do not trigger it. Live evidence,
+    2026-10-26: the worker's stdout event, and host logs of QEMU's compiles
+    right before each fence. The fence is hard to see: the daemon starts the
+    worker with stderr discarded, does not log the event, and `ps` can still
+    show the container `Up`. What to change (the heartbeat budget, or virgl
+    off the big QEMU lock) is open.
+  - **A real Vulkan game:** SuperTuxKart 1.4 `--render-driver=vulkan` on
+    Venus renders correctly (screenshot-checked) at 115 FPS average in a
+    36 s `--profile-time` race, 4 karts, 1024x768 window, frame cap raised.
+  - **Performance against the host** (live, 2026-10-26, M3 Pro, host load
+    average ~6 from other sessions; run-to-run noise ~±5%).
+    `scripts/vk-offscreen-bench.c` runs the same scene natively on MoltenVK
+    and in the guest on Venus. Offscreen, the guest matches the host: 1080p
+    16-layer fill 396 vs 397 FPS pipelined (100%), 335 vs 340 waiting each
+    frame (99%), 385 vs 385 with a per-frame CPU readback of the frame
+    (100%). One-triangle frames, sync per frame, run at 1922 vs 1876 FPS
+    (102%), but three frames in flight reach 6525 vs 12046 (54%): submission
+    overhead. Presenting to X11 is the cost. At 1280x720, X11 drops the light
+    scene from 6338 to 1322 FPS (~0.6 ms per frame) and the heavy scene from
+    880 to 480. Swapchain image count, present mode and Venus feedback
+    options don't change it; FIFO isn't vsynced (1051 FPS);
+    `MESA_VK_WSI_DEBUG=sw` is slower (231 / 273). During it the guest is ~84%
+    idle and QEMU's main thread ~22% busy: a serial
+    glamor → virtio-gpu → virgl → fence round trip, not a copy. SuperTuxKart
+    holds 111–118 FPS on Vulkan and Zink alike, whether at 640x480 or
+    1024x768, with 2 or 4 vCPUs (2 or 4 GiB), with a 256 MiB or 1 GiB
+    `hostmem`, with any present mode or Venus ring/batching option, and with
+    Mesa 25.2.8 or 26.0.8 (Ubuntu 26.04). It uses ~30% of a guest CPU, so the
+    limit is per-frame latency in this path. No change won, so the defaults
+    stay: 2 vCPUs, `hostmem=256M`, Zink on Venus, Ubuntu 24.04's Mesa. Mesa
+    26.0.8 still needs the Zink layer (Zink aborts without it) and still stops
+    at GL 3.1. Its X11 present is mixed: heavy +19%, light −43%. The host STK
+    baseline was not measured, since that needs an app installed on the host.
   - **Venus cannot import buffers allocated by another guest driver.**
     Applications that allocate with GBM and import into Vulkan (for example
     `vkmark --winsys kms`, or any direct-KMS client built that way) abort with
@@ -522,6 +628,44 @@ Virtualization (llvmpipe) and on QEMU with `--gpus virgl` (GLX renderer
 - QEMU containers (other than `--init systemd`) stop with a hard stop: container-init does not handle the
   virt power button and the serial agent has no shutdown permission, so the
   entrypoint gets no SIGTERM.
+- `veynodevm update --gpus none|virgl|venus` (and the web UI's GPU entry)
+  moves an existing Linux container between Apple Virtualization and QEMU/HVF.
+  It keeps the writable layer, image, ports, volumes, env and session token
+  and rewrites the configuration disk and the daemon's VM configuration; the
+  container must be stopped, or `--restart` stops and starts it. UDP ports
+  block the move to Apple Virtualization; macOS containers and the shared
+  engine can't switch. The memory follows the backend's default (512 MiB vs
+  2 GiB) only when it still had the old default, so a QEMU container given
+  `-m 2g` explicitly also drops to 512 MiB on Apple Virtualization. Warm checkpoints restore only
+  on Apple Virtualization with the MAC they were taken with: after a switch
+  to QEMU and back (new MAC) a rollback cold-boots their disk. Live-checked
+  with `alpine:3.20` (Apple Virtualization → `--gpus virgl --restart` →
+  `none`): `exec` works after each switch, a file in the writable layer and a
+  `-v` mount survive both, and the virgl guest has `/dev/dri/renderD128` with
+  `[drm] features: +virgl`; not yet checked with a desktop, `--init systemd`
+  or warm checkpoints.
+- `veynodevm update` (and the web UI's Hardware dialog) changes CPUs,
+  memory, disk, GPU, desktop, published ports, DNS, MTU and MAC in one
+  re-registration of the container's VM. The disk only grows: `rw.raw` is
+  made longer (sparse) and container-init runs `resize2fs` at the next start,
+  which needs boot assets rebuilt with `guest/kernel/build.py` (it adds
+  `e2fsprogs-extra`); older ones keep the old file system size. Memory is
+  checked against the VM budget at start, not when it is changed. macOS
+  containers change only CPUs and memory; the shared engine none. Network is
+  one NAT adapter only (no bridged mode or second adapter); Apple
+  Virtualization containers publish TCP only. A new MAC or GPU means warm
+  checkpoints cold-boot their disk. Checked with unit tests and the web
+  fixture only; not yet live (the disk growth included).
+- `machine update` and the Hardware dialog change a VM only while it is
+  stopped: a grown disk still needs its partition and file system extended
+  inside the guest (`growpart`, GNOME Disks, Windows Disk Management).
+- A VM's web terminal is an SSH login, as `vm_exec` reaches Windows: it
+  needs the key `machine ssh-key` stored and a forward to guest port 22
+  (`--publish 2222:22`), and the guest's own SSH server. Installed
+  distributions have no guest agent, so a VM without them has no terminal.
+  Checked live on a Windows 11 clone (PowerShell input, resize, exit) through
+  the production web server; `npm run dev` does not serve the terminal
+  WebSocket, so use `web/server.mjs` (`veynodevm ui`) to try it.
 - `--desktop` without `--gpus` runs on Apple Virtualization with a fixed
   1280x800 2D scanout and llvmpipe rendering; no dynamic resolution.
 - `veynodevm desktop` opens the Apple Virtualization window, or for `--gpus`
@@ -535,6 +679,16 @@ Virtualization (llvmpipe) and on QEMU with `--gpus virgl` (GLX renderer
   [remote-desktop.md](remote-desktop.md)) and does not
   show the guest cursor (the browser draws its own). Desktop containers created
   before the Apple path existed need a restart to boot the agent that serves
-  it. Firefox needs the H.264 option (no HEVC in WebCodecs).
+  it. Firefox needs the H.264 option (no HEVC in WebCodecs). macOS
+  containers stream from the Guest's Screen Sharing the same way, one viewer
+  at a time; Option has no Screen Sharing keysym, and guest resolution changes
+  are not verified. Sending Option through the VM's own keyboard did not work
+  either (tried on a macOS 26 guest): from an unshown `VZVirtualMachineView`
+  the worker posted Option as a `flagsChanged` event, then as a key-down of
+  key code 58 with the option flag, and routed the letter after it through
+  the same view. The guest received the letter (TextEdit and Terminal showed
+  a plain `a`, not `å`) but never the modifier; the unshown window is not the
+  key window, and making it one would put a window on the user's screen. The
+  experiment is not in the tree.
 - Alpine 3.22 packages no Venus ICD; Vulkan GPU workloads need an image with
   Mesa's virtio driver (`veynodevm/ubuntu-gpu`).

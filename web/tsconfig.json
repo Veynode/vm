@@ -11,6 +11,13 @@
     "skipLibCheck": true,
     "isolatedModules": true,
     "verbatimModuleSyntax": false,
-    "types": ["node", "vite/client"]
+    "types": ["node", "vite/client"],
+    "paths": {
+      "@ui/*": ["./src/vendor/veynode-ui/*"],
+      "@veynode/ui/icons": ["./src/vendor/veynode-ui/icons/index.tsx"],
+      "@veynode/ui/boardui/swipe-back": ["./src/vendor/veynode-ui/boardui/overlays/swipe-back.tsx"],
+      "@console/*": ["./src/vendor/veynode-console/*"],
+      "@veynode/shared/avatar": ["./src/vendor/veynode-console/shared/avatar.ts"]
+    }
   }
 }

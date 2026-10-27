@@ -12,6 +12,8 @@ export interface DesktopStats {
   state: 'connecting' | 'streaming' | 'closed' | 'error'
   backend?: string
   codec?: string
+  /** 'guest' when the picture already has the guest's cursor, so the page's own is hidden. */
+  cursor?: 'guest' | 'local'
   width: number
   height: number
   fps: number
@@ -152,7 +154,10 @@ export class DesktopClient {
   }
 
   private onEvent(event: any) {
-    if (event.event === 'ready') this.emit({ state: 'connecting', backend: event.backend, codec: event.codec })
+    if (event.event === 'ready') {
+      this.canvas.style.cursor = event.cursor === 'guest' ? 'none' : ''
+      this.emit({ state: 'connecting', backend: event.backend, codec: event.codec, cursor: event.cursor })
+    }
     else if (event.event === 'error') this.emit({ state: 'error', message: event.message })
     else if (event.event === 'input_error') this.emit({ inputError: event.message })
   }

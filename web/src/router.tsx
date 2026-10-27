@@ -6,6 +6,6 @@ export function getRouter() {
     routeTree,
     scrollRestoration: true,
     defaultPreload: 'intent',
-    defaultNotFoundComponent: () => <p className="muted">Not found.</p>,
+    defaultNotFoundComponent: () => <p className="py-4 text-ink-2">Not found.</p>,
   })
 }

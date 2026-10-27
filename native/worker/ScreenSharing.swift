@@ -285,6 +285,58 @@ final class RFBClient {
         }
         return (width, height, framebuffer)
     }
+    /// Whether the server has something to read within `milliseconds`.
+    func readable(milliseconds: Int32) -> Bool {
+        var descriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+        return poll(&descriptor, 1, milliseconds) > 0
+    }
+    func requestUpdate(incremental: Bool) throws {
+        try write([3, incremental ? 1 : 0, 0, 0, 0, 0] + RFBClient.be16(width) + RFBClient.be16(height))
+    }
+    /// One server message, for the browser desktop. A raw rectangle reaches `rows`
+    /// in bands of at most `band` rows (BGRA, packed); a desktop-size change calls
+    /// `resized` after the new size is in `width`/`height`. True when the message
+    /// was a framebuffer update, which ends a frame.
+    ///
+    /// `early` runs once per update, as soon as its first pixel rectangle's header is
+    /// read: the next incremental request goes out while this update's pixels are
+    /// still being read and forwarded, so the server prepares the next frame in
+    /// parallel instead of after the whole transfer.
+    func stream(band: Int, early: () throws -> Void, rows: (Int, Int, Int, Int, [UInt8]) throws -> Void, resized: () throws -> Void) throws -> Bool {
+        switch try read(1)[0] {
+        case 0:
+            let header = try read(3)
+            var requested = false
+            for _ in 0..<u16(header, 1) {
+                let r = try read(12)
+                let (x, y, w, h) = (u16(r, 0), u16(r, 2), u16(r, 4), u16(r, 6))
+                let encoding = Int32(bitPattern: u32(r, 8))
+                if encoding == -223 {
+                    width = w; height = h
+                    try resized()
+                    continue
+                }
+                guard encoding == 0, x + w <= width, y + h <= height else { throw ScreenSharingError(code: "screen_sharing_protocol", message: "unexpected encoding \(encoding)") }
+                if !requested { requested = true; try early() }
+                var done = 0
+                while done < h {
+                    let count = min(band, h - done)
+                    try rows(x, y + done, w, count, try read(w * count * 4))
+                    done += count
+                }
+            }
+            return true
+        case 1:
+            let header = try read(5)
+            _ = try read(u16(header, 3) * 6)
+        case 2: break
+        case 3:
+            let header = try read(7)
+            _ = try read(Int(min(u32(header, 3), 1 << 20)))
+        default: throw ScreenSharingError(code: "screen_sharing_protocol", message: "unexpected server message")
+        }
+        return false
+    }
     func pointer(x: Int, y: Int, mask: UInt8) throws { try write([5, mask] + RFBClient.be16(x) + RFBClient.be16(y)) }
     func key(_ keysym: UInt32, down: Bool) throws {
         try write([4, down ? 1 : 0, 0, 0, UInt8(keysym >> 24), UInt8(truncatingIfNeeded: keysym >> 16), UInt8(truncatingIfNeeded: keysym >> 8), UInt8(truncatingIfNeeded: keysym)])
@@ -330,13 +382,17 @@ final class ScreenSharingGuest {
 
     func session() throws -> RFBClient {
         if let client { return client }
+        let connected = try connect()
+        client = connected
+        return connected
+    }
+    /// A new Screen Sharing connection with the Guest login; the browser desktop keeps its own.
+    func connect() throws -> RFBClient {
         guard let address = dhcpLeaseAddress(mac: mac) else { throw ScreenSharingError(code: "guest_unavailable", message: "Guest has no DHCP lease yet") }
         guard let text = try? String(contentsOfFile: loginFile, encoding: .utf8) else { throw ScreenSharingError(code: "screen_sharing_auth", message: "Guest login file unreadable") }
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
         guard lines.count >= 2 else { throw ScreenSharingError(code: "screen_sharing_auth", message: "Guest login file must contain user and password lines") }
-        let connected = try RFBClient(host: address, user: String(lines[0]), password: String(lines[1]))
-        client = connected
-        return connected
+        return try RFBClient(host: address, user: String(lines[0]), password: String(lines[1]))
     }
     /// One reconnect on a dropped session; authentication errors are final.
     func withSession<T>(_ body: (RFBClient) throws -> T) throws -> T {
@@ -522,5 +578,228 @@ final class ScreenSharingGuest {
             throw error
         }
         return ["dispatched": true, "source_generation": frame.generation, "guest_delivery_confirmed": false, "coordinate_space": "captured-display-pixels"]
+    }
+}
+
+
+/// Linux evdev key codes (what the browser desktop sends) → X keysyms. Apple's
+/// Screen Sharing server takes Alt_L/Alt_R as Command (a chord with Alt_L clears
+/// Terminal with Command+K); Meta_L/Meta_R and Super do nothing, and no keysym
+/// reached Option, so the browser's Meta (Command) keys send Alt and its Alt keys Meta.
+let screenSharingEvdev: [Int: UInt32] = {
+    var map: [Int: UInt32] = [1: 0xff1b, 12: 0x2d, 13: 0x3d, 14: 0xff08, 15: 0xff09, 26: 0x5b, 27: 0x5d, 28: 0xff0d, 29: 0xffe3,
+        39: 0x3b, 40: 0x27, 41: 0x60, 42: 0xffe1, 43: 0x5c, 51: 0x2c, 52: 0x2e, 53: 0x2f, 54: 0xffe2, 55: 0xffaa, 56: 0xffe7,
+        57: 0x20, 58: 0xffe5, 69: 0xff7f, 70: 0xff14, 74: 0xffad, 78: 0xffab, 83: 0xffae, 96: 0xff8d, 97: 0xffe4, 98: 0xffaf,
+        100: 0xffe8, 102: 0xff50, 103: 0xff52, 104: 0xff55, 105: 0xff51, 106: 0xff53, 107: 0xff57, 108: 0xff54, 109: 0xff56,
+        110: 0xff63, 111: 0xffff, 125: 0xffe9, 126: 0xffea, 127: 0xff67]
+    for (i, c) in "1234567890".unicodeScalars.enumerated() { map[2 + i] = c.value }
+    for (i, c) in "qwertyuiop".unicodeScalars.enumerated() { map[16 + i] = c.value }
+    for (i, c) in "asdfghjkl".unicodeScalars.enumerated() { map[30 + i] = c.value }
+    for (i, c) in "zxcvbnm".unicodeScalars.enumerated() { map[44 + i] = c.value }
+    for i in 0..<10 { map[59 + i] = 0xffbe + UInt32(i) }
+    map[87] = 0xffc8; map[88] = 0xffc9
+    for (i, code) in [71, 72, 73].enumerated() { map[code] = 0xffb7 + UInt32(i) }
+    for (i, code) in [75, 76, 77].enumerated() { map[code] = 0xffb4 + UInt32(i) }
+    for (i, code) in [79, 80, 81].enumerated() { map[code] = 0xffb1 + UInt32(i) }
+    map[82] = 0xffb0
+    return map
+}()
+
+/// Browser desktop for a macOS Guest: the Guest's Screen Sharing server, read
+/// with incremental raw updates, is turned into the record protocol the Linux
+/// guest agent speaks on vsock 5001 (see guest/veynode-agent/desktop_linux.go),
+/// so the same bridge and `vz-desktop-stream` encoder serve both. The worker
+/// end of a socketpair stands in for the vsock connection.
+///   host -> here: JSON lines {"method":"start"} then {"input":[...]}
+///   here -> host: u32 BE length, u8 kind, body (1 event, 2 rectangle, 3 frame end)
+final class MacDesktopStream {
+    private let fd: Int32
+    private let connect: () throws -> RFBClient
+    private let output = NSLock()
+    private let rfbWrites = NSLock()
+    private let state = NSLock()
+    private var ended = false
+    private var client: RFBClient?
+    private var location = (x: 0, y: 0)
+    private var mask: UInt8 = 0
+    private var held = Set<UInt32>()
+    private let epoch = DispatchTime.now().uptimeNanoseconds
+    // Every 5 s a stats event: frames, megabytes and the time spent writing to the bridge.
+    private var writeNanoseconds: UInt64 = 0
+    private var sentBytes: UInt64 = 0
+
+    private init(fd: Int32, connect: @escaping () throws -> RFBClient) { self.fd = fd; self.connect = connect }
+
+    /// Takes ownership of `fd` and serves it on its own threads.
+    static func start(fd: Int32, connect: @escaping () throws -> RFBClient) {
+        var noSignal: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size))
+        let stream = MacDesktopStream(fd: fd, connect: connect)
+        Thread.detachNewThread { stream.run() }
+    }
+
+    private var finished: Bool { state.lock(); defer { state.unlock() }; return ended }
+    private func finish() { state.lock(); ended = true; state.unlock() }
+
+    private func writeAll(_ bytes: UnsafeRawBufferPointer) throws {
+        var offset = 0
+        while offset < bytes.count {
+            let n = Darwin.write(fd, bytes.baseAddress! + offset, bytes.count - offset)
+            if n < 0 && errno == EINTR { continue }
+            guard n > 0 else { throw ScreenSharingError(code: "stream_closed", message: "desktop stream closed") }
+            offset += n
+        }
+    }
+    private func record(_ kind: UInt8, _ head: [UInt8], _ body: [UInt8] = []) throws {
+        let length = UInt32(1 + head.count + body.count)
+        let prefix: [UInt8] = [UInt8(length >> 24), UInt8(truncatingIfNeeded: length >> 16), UInt8(truncatingIfNeeded: length >> 8), UInt8(truncatingIfNeeded: length), kind] + head
+        output.lock(); defer { output.unlock() }
+        let began = DispatchTime.now().uptimeNanoseconds
+        defer { writeNanoseconds += DispatchTime.now().uptimeNanoseconds - began }
+        try prefix.withUnsafeBytes { try writeAll($0) }
+        if !body.isEmpty { try body.withUnsafeBytes { try writeAll($0) } }
+        sentBytes += UInt64(prefix.count + body.count)
+    }
+    private func event(_ fields: [String: Any]) throws {
+        try record(1, [UInt8](try JSONSerialization.data(withJSONObject: fields)))
+    }
+    private func mode(_ client: RFBClient) throws {
+        try event(["event": "mode", "width": client.width, "height": client.height, "format": "bgrx"])
+    }
+
+    /// One JSON line of at most 4 KiB from the host, or nil on EOF, timeout or overflow.
+    private func line(timeoutMilliseconds: Int32?, pending: inout [UInt8]) -> [UInt8]? {
+        while true {
+            if let newline = pending.firstIndex(of: 10) {
+                let found = Array(pending[..<newline]); pending.removeSubrange(...newline); return found
+            }
+            guard pending.count < 4096 else { return nil }
+            if let timeoutMilliseconds {
+                var descriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+                guard poll(&descriptor, 1, timeoutMilliseconds) > 0 else { return nil }
+            }
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            let n = Darwin.read(fd, &buffer, buffer.count)
+            if n < 0 && errno == EINTR { continue }
+            guard n > 0 else { return nil }
+            pending += buffer[..<n]
+        }
+    }
+
+    private func run() {
+        let inputDone = DispatchSemaphore(value: 0)
+        var inputStarted = false
+        defer {
+            finish()
+            releaseInput()
+            shutdown(fd, SHUT_RDWR)
+            if inputStarted { _ = inputDone.wait(timeout: .now() + 1) }
+            Darwin.close(fd)
+        }
+        var pending: [UInt8] = []
+        guard let start = line(timeoutMilliseconds: 5000, pending: &pending),
+              (try? JSONSerialization.jsonObject(with: Data(start)) as? [String: Any])?["method"] as? String == "start" else {
+            try? event(["event": "error", "message": "expected start"]); return
+        }
+        let rfb: RFBClient
+        do { rfb = try connect() } catch {
+            try? event(["event": "error", "message": (error as? ScreenSharingError)?.message ?? error.localizedDescription]); return
+        }
+        client = rfb
+        inputStarted = true
+        let leftover = pending
+        Thread.detachNewThread { self.readInput(initial: leftover); inputDone.signal() }
+        do {
+            try mode(rfb)
+            try locked { try rfb.requestUpdate(incremental: false) }
+            var frames = 0, reported = DispatchTime.now().uptimeNanoseconds
+            while !finished {
+                let now = DispatchTime.now().uptimeNanoseconds
+                if now - reported >= 5_000_000_000 {
+                    try event(["event": "stats", "frames": frames, "mb": Double(sentBytes) / 1e6, "write_ms": Double(writeNanoseconds) / 1e6,
+                               "seconds": Double(now - reported) / 1e9])
+                    frames = 0; sentBytes = 0; writeNanoseconds = 0; reported = now
+                }
+                guard rfb.readable(milliseconds: 200) else { continue }
+                var resized = false
+                var requestedEarly = false
+                let frame = try rfb.stream(band: 64, early: {
+                    requestedEarly = true
+                    try locked { try rfb.requestUpdate(incremental: true) }
+                }, rows: { x, y, w, h, data in
+                    try record(2, RFBClient.be16(x) + RFBClient.be16(y) + RFBClient.be16(w) + RFBClient.be16(h), data)
+                }, resized: { resized = true; try mode(rfb) })
+                guard frame || resized else { continue }
+                frames += 1
+                let stamp = (DispatchTime.now().uptimeNanoseconds - epoch) / 1000
+                try record(3, (0..<8).map { UInt8(truncatingIfNeeded: stamp >> UInt64(56 - 8 * $0)) })
+                if resized || !requestedEarly { try locked { try rfb.requestUpdate(incremental: !resized) } }
+            }
+        } catch {
+            if !finished { try? event(["event": "error", "message": (error as? ScreenSharingError)?.message ?? error.localizedDescription]) }
+        }
+    }
+
+    private func locked<T>(_ body: () throws -> T) rethrows -> T { rfbWrites.lock(); defer { rfbWrites.unlock() }; return try body() }
+
+    private func readInput(initial: [UInt8]) {
+        var pending = initial
+        while !finished, let bytes = line(timeoutMilliseconds: nil, pending: &pending) {
+            guard let message = (try? JSONSerialization.jsonObject(with: Data(bytes))) as? [String: Any], let events = message["input"] as? [[String: Any]] else { continue }
+            do { try locked { try apply(events) } } catch {
+                try? event(["event": "input_error", "message": (error as? ScreenSharingError)?.message ?? error.localizedDescription])
+            }
+        }
+        finish()
+    }
+
+    /// {"t":"abs","x","y"} 0..32767, {"t":"key","code":evdev,"down"} (BTN_LEFT..BTN_MIDDLE are the
+    /// buttons) and {"t":"wheel","dx","dy"}; same shapes as the Linux agent's.
+    private func apply(_ events: [[String: Any]]) throws {
+        guard let client else { return }
+        for event in events {
+            switch event["t"] as? String {
+            case "abs":
+                guard let x = event["x"] as? Int, let y = event["y"] as? Int, (0..<32768).contains(x), (0..<32768).contains(y) else {
+                    throw ScreenSharingError(code: "invalid_request", message: "abs outside 0..32767")
+                }
+                location = (x * client.width / 32768, y * client.height / 32768)
+                try client.pointer(x: location.x, y: location.y, mask: mask)
+            case "key":
+                guard let code = event["code"] as? Int, let down = event["down"] as? Bool else { throw ScreenSharingError(code: "invalid_request", message: "invalid key event") }
+                if let bit = [0x110: UInt8(1), 0x111: 4, 0x112: 2][code] {
+                    mask = down ? mask | bit : mask & ~bit
+                    try client.pointer(x: location.x, y: location.y, mask: mask)
+                } else if let symbol = screenSharingEvdev[code] {
+                    if down { held.insert(symbol) } else { held.remove(symbol) }
+                    try client.key(symbol, down: down)
+                } else {
+                    throw ScreenSharingError(code: "unsupported_key", message: "key code \(code) has no macOS mapping")
+                }
+            case "wheel":
+                guard let dx = event["dx"] as? Int, let dy = event["dy"] as? Int, abs(dx) <= 10, abs(dy) <= 10 else {
+                    throw ScreenSharingError(code: "invalid_request", message: "wheel outside bound")
+                }
+                // Browser dy > 0 scrolls down; the RFB wheel buttons are 4/5 (8, 16) up and down, 6/7 (32, 64) left and right.
+                for (count, negative, positive) in [(dy, UInt8(8), UInt8(16)), (dx, UInt8(32), UInt8(64))] where count != 0 {
+                    for _ in 0..<abs(count) {
+                        try client.pointer(x: location.x, y: location.y, mask: mask | (count < 0 ? negative : positive))
+                        try client.pointer(x: location.x, y: location.y, mask: mask)
+                    }
+                }
+            default:
+                throw ScreenSharingError(code: "invalid_request", message: "unknown input type")
+            }
+        }
+    }
+
+    /// A closed viewer must not leave keys or buttons down in the Guest.
+    private func releaseInput() {
+        locked {
+            guard let client else { return }
+            for symbol in held { try? client.key(symbol, down: false) }
+            if mask != 0 { try? client.pointer(x: location.x, y: location.y, mask: 0) }
+            held.removeAll(); mask = 0
+        }
     }
 }

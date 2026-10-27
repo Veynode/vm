@@ -1,0 +1,48 @@
+/* A computer's icon while a Bot works on it (ds 电脑图标): the one loop,
+ * slow and faint like the Bot's working glow. What is lit breathes (2.4s), the
+ * lights and a terminal's cursor blink.
+ * Reduced motion: nothing moves; what is lit keeps a faint, still glow and
+ * the halo around the device (drawn by the icon's filter) stays. */
+.glow {
+  opacity: 0;
+  animation: computer-icon-glow 2.4s ease-in-out infinite;
+}
+.led {
+  animation: computer-icon-blink 1.2s steps(1) infinite;
+}
+.cursor {
+  animation: computer-icon-blink 1s steps(1) infinite;
+}
+:global(html[data-page-idle]) .glow,
+:global(html[data-page-idle]) .led,
+:global(html[data-page-idle]) .cursor {
+  animation-play-state: paused;
+}
+@keyframes computer-icon-glow {
+  0%,
+  100% {
+    opacity: 0;
+  }
+  50% {
+    opacity: 0.26;
+  }
+}
+@keyframes computer-icon-blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .glow,
+  .led,
+  .cursor {
+    animation: none;
+  }
+  .glow {
+    opacity: 0.16;
+  }
+}

@@ -88,7 +88,21 @@ impl Ssh {
     }
 
     fn command(&self, remote: &str) -> Command {
+        let mut command = self.base(false);
+        command.arg(remote);
+        command
+    }
+
+    /// An interactive login shell on a pseudo-terminal (the web UI terminal).
+    pub fn terminal(&self) -> Command {
+        self.base(true)
+    }
+
+    fn base(&self, tty: bool) -> Command {
         let mut command = Command::new("/usr/bin/ssh");
+        if tty {
+            command.arg("-tt");
+        }
         command
             .arg("-i")
             .arg(&self.key)
@@ -110,8 +124,7 @@ impl Ssh {
                 "-o",
                 "ServerAliveInterval=15",
             ])
-            .arg(format!("{}@{}", self.user, self.address))
-            .arg(remote);
+            .arg(format!("{}@{}", self.user, self.address));
         command
     }
 

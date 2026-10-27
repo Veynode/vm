@@ -35,6 +35,9 @@ and [Linux graphics limits](../docs/decisions/0002-linux-graphics.md) retain the
 D3DMetal/DXMT/guest-driver distinctions. No commercial SDK inquiry, purchase,
 license acceptance or outside message was made. Signing an executable, verifying
 Apple's signature, or passing a VM test does not establish redistribution rights.
+The release runtime is to be built from source and shipped with its corresponding
+source; [decision 0026](../docs/decisions/0026-gpu-runtime-source-build.md) lists the components, licences and
+our patches.
 
 ## Packaging boundary
 

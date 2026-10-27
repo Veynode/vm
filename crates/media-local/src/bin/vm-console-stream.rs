@@ -40,6 +40,10 @@ fn request(socket: &mut UnixStream, id: &str, method: &str, codec: Option<&str>)
     let mut value = json!({"request_id":id,"method":method});
     if let Some(codec) = codec {
         value["codec"] = json!(codec);
+        // A WebCodecs viewer decodes whatever level the SPS declares: 1080p instead of 720p.
+        if method == "start" && codec == "h264" {
+            value["level"] = json!(40);
+        }
     }
     serde_json::to_writer(&mut *socket, &value)?;
     socket.write_all(b"\n")?;

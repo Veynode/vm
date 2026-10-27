@@ -39,8 +39,9 @@ static const size_t maxRecord = 1 + 8 + maxSide * tile * 4;
 // Same bounds as crates/media-local/src/rate_control.rs MIN_BPS/MAX_BPS.
 static const uint64_t minBitrate = 250000, maxBitrate = 40000000, defaultBitrate = 8000000;
 typedef struct {
-    BOOL used, forceKeyframe;
-    VTCompressionSessionRef encoder;
+    BOOL used, forceKeyframe, stillActive, stillFailed;
+    // The speed-first session while a still screen is carried by the full-quality one (enterStill).
+    VTCompressionSessionRef encoder, parked;
     VTPixelTransferSessionRef transfer;
     CVPixelBufferPoolRef cropPool, pool;
     uint64_t bitrate;
@@ -52,6 +53,7 @@ typedef struct {
 static Track tracks[maxTracks];
 static CVPixelBufferPoolRef sourcePool;
 static BOOL useHEVC, multiTrack, dirty, failed, stopping, settled = YES;
+static int64_t lastStill;
 static size_t sourceWidth, sourceHeight;
 static uint8_t *canvas;
 static int64_t epoch, lastChange;
@@ -127,6 +129,8 @@ static void compressed(void *context, void *source, OSStatus status, VTEncodeInf
 }
 
 static void destroyTrack(Track *t) {
+    if (t->parked) { VTCompressionSessionCompleteFrames(t->parked, kCMTimeInvalid); VTCompressionSessionInvalidate(t->parked); CFRelease(t->parked); t->parked = NULL; }
+    t->stillActive = t->stillFailed = NO;
     if (t->encoder) { VTCompressionSessionCompleteFrames(t->encoder, kCMTimeInvalid); VTCompressionSessionInvalidate(t->encoder); CFRelease(t->encoder); t->encoder = NULL; }
     if (t->transfer) { VTPixelTransferSessionInvalidate(t->transfer); CFRelease(t->transfer); t->transfer = NULL; }
     if (t->pool) { CVPixelBufferPoolRelease(t->pool); t->pool = NULL; }
@@ -159,37 +163,54 @@ static void viewEvent(size_t i) {
                  @"src_w": @(sourceWidth), @"src_h": @(sourceHeight), @"out_w": @(t->outW), @"out_h": @(t->outH), @"bitrate": @(t->bitrate)});
 }
 
-// Nil on success. A new session's first frame is a keyframe.
-static NSString *buildTrack(size_t i) {
-    Track *t = &tracks[i];
-    destroyTrack(t); resolveView(t);
+// Nil on success. The speed-first session, or with still the full-quality one: Quality only counts when
+// set before the session is prepared, and it lifts a photographic keyframe from SSIM 0.94 to 0.99
+// (1920x1080: 300 KB to 1.1 MB), so it is only for a screen that stopped changing.
+static void discard(VTCompressionSessionRef session) { VTCompressionSessionInvalidate(session); CFRelease(session); }
+static NSString *newSession(size_t i, Track *t, BOOL still, VTCompressionSessionRef *out) {
     NSDictionary *spec = @{(__bridge NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES};
     NSDictionary *attributes = @{(__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
                                  (__bridge NSString *)kCVPixelBufferWidthKey: @(t->outW), (__bridge NSString *)kCVPixelBufferHeightKey: @(t->outH),
                                  (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{}};
+    VTCompressionSessionRef session = NULL;
     OSStatus r = VTCompressionSessionCreate(NULL, (int32_t)t->outW, (int32_t)t->outH, useHEVC ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264,
-                                            (__bridge CFDictionaryRef)spec, (__bridge CFDictionaryRef)attributes, NULL, compressed, (void *)(uintptr_t)i, &t->encoder);
-    if (r != noErr) { t->encoder = NULL; return [NSString stringWithFormat:@"hardware %@ encoder unavailable at %zux%zu: %d", useHEVC ? @"HEVC" : @"H.264", t->outW, t->outH, (int)r]; }
+                                            (__bridge CFDictionaryRef)spec, (__bridge CFDictionaryRef)attributes, NULL, compressed, (void *)(uintptr_t)i, &session);
+    if (r != noErr) return [NSString stringWithFormat:@"hardware %@ encoder unavailable at %zux%zu: %d", useHEVC ? @"HEVC" : @"H.264", t->outW, t->outH, (int)r];
     // Same latency settings as the QEMU console helper (native/tools/spice-console.m).
     NSDictionary *properties = @{(__bridge NSString *)kVTCompressionPropertyKey_RealTime: @YES,
                                  (__bridge NSString *)kVTCompressionPropertyKey_AllowFrameReordering: @NO,
                                  (__bridge NSString *)kVTCompressionPropertyKey_AverageBitRate: @(t->bitrate),
                                  (__bridge NSString *)kVTCompressionPropertyKey_ExpectedFrameRate: @60,
+                                 // Written into the stream: untagged, decoders assume BT.601 and shift the colours.
+                                 (__bridge NSString *)kVTCompressionPropertyKey_ColorPrimaries: (__bridge NSString *)kCVImageBufferColorPrimaries_ITU_R_709_2,
+                                 (__bridge NSString *)kVTCompressionPropertyKey_TransferFunction: (__bridge NSString *)kCVImageBufferTransferFunction_ITU_R_709_2,
+                                 (__bridge NSString *)kVTCompressionPropertyKey_YCbCrMatrix: (__bridge NSString *)kCVImageBufferYCbCrMatrix_ITU_R_709_2,
                                  (__bridge NSString *)kVTCompressionPropertyKey_MaxKeyFrameInterval: @120,
                                  (__bridge NSString *)kVTCompressionPropertyKey_ProfileLevel: (__bridge NSString *)(useHEVC ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel)};
     for (NSString *key in properties) {
-        if ((r = VTSessionSetProperty(t->encoder, (__bridge CFStringRef)key, (__bridge CFTypeRef)properties[key])) != noErr) {
-            destroyTrack(t); return [NSString stringWithFormat:@"encoder property rejected %@: %d", key, (int)r];
+        if ((r = VTSessionSetProperty(session, (__bridge CFStringRef)key, (__bridge CFTypeRef)properties[key])) != noErr) {
+            discard(session); return [NSString stringWithFormat:@"encoder property rejected %@: %d", key, (int)r];
         }
     }
-    VTSessionSetProperty(t->encoder, kVTCompressionPropertyKey_MaxFrameDelayCount, (__bridge CFTypeRef)@0);
-    VTSessionSetProperty(t->encoder, kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue);
-    if (VTCompressionSessionPrepareToEncodeFrames(t->encoder) != noErr) { destroyTrack(t); return @"encoder preparation failed"; }
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_MaxFrameDelayCount, (__bridge CFTypeRef)@0);
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, still ? kCFBooleanFalse : kCFBooleanTrue);
+    if (still) VTSessionSetProperty(session, kVTCompressionPropertyKey_Quality, (__bridge CFTypeRef)@0.9);
+    if (VTCompressionSessionPrepareToEncodeFrames(session) != noErr) { discard(session); return @"encoder preparation failed"; }
     CFTypeRef hardware = NULL;
-    BOOL verified = VTSessionCopyProperty(t->encoder, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, NULL, &hardware) == noErr
+    BOOL verified = VTSessionCopyProperty(session, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, NULL, &hardware) == noErr
                     && hardware && CFGetTypeID(hardware) == CFBooleanGetTypeID() && CFBooleanGetValue(hardware);
     if (hardware) CFRelease(hardware);
-    if (!verified) { destroyTrack(t); return @"encoder did not confirm hardware acceleration"; }
+    if (!verified) { discard(session); return @"encoder did not confirm hardware acceleration"; }
+    *out = session;
+    return nil;
+}
+
+// Nil on success. A new session's first frame is a keyframe.
+static NSString *buildTrack(size_t i) {
+    Track *t = &tracks[i];
+    destroyTrack(t); resolveView(t);
+    NSString *problem = newSession(i, t, NO, &t->encoder);
+    if (problem) { t->encoder = NULL; return problem; }
     if (!(t->pool = createPool(t->outW, t->outH))) { destroyTrack(t); return @"pixel buffer pool failed"; }
     if (!fullView(t) && !(t->cropPool = createPool(t->w, t->h))) { destroyTrack(t); return @"pixel buffer pool failed"; }
     if (t->outW != t->w || t->outH != t->h) {
@@ -248,6 +269,29 @@ static void encode(size_t only) {
     if (only == maxTracks) dirty = NO;
 }
 
+// Back to the speed-first session; its next frame is a keyframe (the two reference chains differ).
+static void leaveStill(Track *t) {
+    if (!t->stillActive) return;
+    VTCompressionSessionRef still = t->encoder; t->encoder = t->parked; t->parked = still;
+    t->stillActive = NO; t->forceKeyframe = YES;
+}
+
+// A screen that stopped changing: one keyframe at full quality, from the second session. Not above about
+// 4.2 Mpx (a photographic keyframe would near the 4 MiB access unit bound) and a failed creation leaves the
+// speed-first session alone; NO then means the caller refines with the speed-first session instead.
+static BOOL enterStill(size_t i) {
+    Track *t = &tracks[i];
+    // The bitrate control is the network's say: a viewer it has backed off for would stall on a 1 MB keyframe.
+    if (t->stillActive || t->stillFailed || !t->encoder || t->outW * t->outH > 4200000 || t->bitrate < defaultBitrate) return NO;
+    VTCompressionSessionRef still = NULL;
+    if (!t->parked) {
+        NSString *problem = newSession(i, t, YES, &still);
+        if (problem) { t->stillFailed = YES; return NO; }
+    } else { still = t->parked; t->parked = NULL; }
+    t->parked = t->encoder; t->encoder = still; t->stillActive = YES; t->forceKeyframe = YES;
+    return YES;
+}
+
 // Rebuild after a crop or scale change; a refused size puts the old view back.
 static void rebuild(size_t i, Track previous, NSString *command) {
     if (!canvas) return;
@@ -265,10 +309,12 @@ static void setBitrate(size_t i, uint64_t requested) {
     Track *t = &tracks[i];
     t->bitrate = MIN(MAX(requested, minBitrate), maxBitrate);
     NSMutableDictionary *event = [@{@"event": @"rate", @"track": @(i), @"bitrate": @(t->bitrate), @"requested": @(requested)} mutableCopy];
-    if (t->encoder) {
-        OSStatus r = VTSessionSetProperty(t->encoder, kVTCompressionPropertyKey_AverageBitRate, (__bridge CFTypeRef)@(t->bitrate));
+    // The full-quality session is outside rate control: the rate goes to the speed-first one, parked or not.
+    VTCompressionSessionRef speedFirst = t->stillActive ? t->parked : t->encoder;
+    if (speedFirst) {
+        OSStatus r = VTSessionSetProperty(speedFirst, kVTCompressionPropertyKey_AverageBitRate, (__bridge CFTypeRef)@(t->bitrate));
         CFTypeRef raw = NULL;
-        if (r == noErr) r = VTSessionCopyProperty(t->encoder, kVTCompressionPropertyKey_AverageBitRate, NULL, &raw);
+        if (r == noErr) r = VTSessionCopyProperty(speedFirst, kVTCompressionPropertyKey_AverageBitRate, NULL, &raw);
         id readback = CFBridgingRelease(raw);
         if (r != noErr) event[@"error"] = [NSString stringWithFormat:@"bitrate property rejected: %d", (int)r];
         else event[@"readback"] = readback ?: [NSNull null];
@@ -403,7 +449,10 @@ static BOOL handleRecord(const uint8_t *body, size_t length) {
         return YES;
     }
     if (kind == 3) {
-        if (dirty) { encode(maxTracks); settled = NO; }
+        if (dirty) {
+            for (size_t i = 0; i < maxTracks; i++) leaveStill(&tracks[i]);
+            encode(maxTracks); settled = NO;
+        }
         return YES;
     }
     fail(@"unknown guest record");
@@ -431,12 +480,21 @@ int main(int argc, char **argv) {
         NSMutableData *incoming = [NSMutableData new], *commands = [NSMutableData new];
         uint8_t buffer[256 * 1024];
         while (!failed && !stopping) {
-            // A still screen gets one more encode after it settles: the
-            // first encode of a change is speed-first and can be soft.
+            // A still screen gets one more encode after it settles: the first encode of a change is
+            // speed-first and can be soft, so a full-quality keyframe (at most every 3 s), else a refinement.
             int timeout = -1;
             if (!settled && canvas) {
                 int64_t wait = 300000 - (nowUs() - lastChange);
-                if (wait <= 0) { encode(maxTracks); settled = YES; continue; }
+                if (wait <= 0) {
+                    int64_t now = nowUs();
+                    BOOL allowed = now - lastStill >= 3000000;
+                    for (size_t i = 0; i < maxTracks; i++) {
+                        if (!tracks[i].used || !tracks[i].encoder) continue;
+                        if (allowed && enterStill(i)) lastStill = now;
+                        encode(i);
+                    }
+                    settled = YES; continue;
+                }
                 timeout = (int)(wait / 1000) + 1;
             }
             struct pollfd fds[2] = {{.fd = guest, .events = POLLIN}, {.fd = STDIN_FILENO, .events = POLLIN}};

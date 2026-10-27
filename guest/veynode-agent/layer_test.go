@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
@@ -54,5 +55,27 @@ func TestAdoptWritableLayer(t *testing.T) {
 	// No id (older host) changes nothing.
 	if forked, err := adoptWritableLayer(disk, upper, ""); err != nil || forked {
 		t.Fatalf("empty id: forked=%v err=%v", forked, err)
+	}
+}
+
+func TestExt4Bytes(t *testing.T) {
+	super := make([]byte, 1024)
+	if ext4Bytes(super) != 0 {
+		t.Fatal("no magic is not ext4")
+	}
+	binary.LittleEndian.PutUint16(super[0x38:], 0xef53)
+	binary.LittleEndian.PutUint32(super[0x4:], 4<<20) // 4 Mi blocks
+	binary.LittleEndian.PutUint32(super[0x18:], 2)    // 4 KiB blocks
+	if got := ext4Bytes(super); got != 16<<30 {
+		t.Fatalf("got %d, want 16 GiB", got)
+	}
+	// The high half counts only with the 64bit feature.
+	binary.LittleEndian.PutUint32(super[0x150:], 1)
+	if got := ext4Bytes(super); got != 16<<30 {
+		t.Fatalf("got %d without 64bit", got)
+	}
+	binary.LittleEndian.PutUint32(super[0x60:], 0x80)
+	if got := ext4Bytes(super); got != (1<<32+4<<20)<<12 {
+		t.Fatalf("got %d with 64bit", got)
 	}
 }

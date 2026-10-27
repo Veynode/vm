@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"errors"
 	"io/fs"
 	"os"
@@ -47,4 +48,18 @@ func adoptWritableLayer(disk, upper, id string) (bool, error) {
 		}
 	}
 	return forked, os.WriteFile(owner, []byte(id+"\n"), 0o644)
+}
+
+// ext4Bytes is the size of the ext4 file system whose superblock (the 1 KiB
+// at byte 1024 of the device) is `super`, or 0 when it is not ext4.
+func ext4Bytes(super []byte) int64 {
+	if len(super) < 0x158 || binary.LittleEndian.Uint16(super[0x38:]) != 0xef53 {
+		return 0
+	}
+	blocks := uint64(binary.LittleEndian.Uint32(super[0x4:]))
+	// INCOMPAT_64BIT: the high half of the block count is valid.
+	if binary.LittleEndian.Uint32(super[0x60:])&0x80 != 0 {
+		blocks |= uint64(binary.LittleEndian.Uint32(super[0x150:])) << 32
+	}
+	return int64(blocks << (10 + binary.LittleEndian.Uint32(super[0x18:])))
 }

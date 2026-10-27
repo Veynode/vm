@@ -209,6 +209,26 @@ pub fn qmp(events: &[Event]) -> Result<Vec<Value>> {
     Ok(out)
 }
 
+/// QMP applies one input sync per `input-send-event`, so a button or key that goes
+/// down and up inside one command reaches a USB or virtio pointer as its final
+/// state only: a click sent as one batch never happened (Windows Start menu,
+/// 0 of 6 in one command, 6 of 6 when the up came in its own command). Each button
+/// or key change therefore ends a group, and groups are sent as separate commands.
+pub fn sync_groups(events: &[Value]) -> Vec<Vec<Value>> {
+    let mut groups = Vec::new();
+    let mut group = Vec::new();
+    for event in events {
+        group.push(event.clone());
+        if matches!(event["type"].as_str(), Some("btn" | "key")) {
+            groups.push(std::mem::take(&mut group));
+        }
+    }
+    if !group.is_empty() {
+        groups.push(group);
+    }
+    groups
+}
+
 /// Guest uinput events: absolute axes scaled to 0..32767 and evdev codes.
 pub fn evdev(events: &[Event]) -> Result<Vec<Value>> {
     let mut out = Vec::new();
@@ -345,6 +365,36 @@ impl Held {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn every_button_or_key_change_gets_its_own_sync() {
+        let events = qmp(&parse(&json!([
+            {"t":"move","x":640,"y":400,"w":1280,"h":800},
+            {"t":"button","button":"left","down":true},
+            {"t":"button","button":"left","down":false},
+            {"t":"key","code":"KeyA","down":true},
+            {"t":"key","code":"KeyA","down":false},
+            {"t":"move","x":1,"y":2,"w":1280,"h":800}
+        ]))
+        .unwrap())
+        .unwrap();
+        let groups = sync_groups(&events);
+        let shapes: Vec<Vec<&str>> = groups
+            .iter()
+            .map(|g| g.iter().map(|e| e["type"].as_str().unwrap()).collect())
+            .collect();
+        assert_eq!(
+            shapes,
+            vec![
+                vec!["abs", "abs", "btn"],
+                vec!["btn"],
+                vec!["key"],
+                vec!["key"],
+                vec!["abs", "abs"]
+            ]
+        );
+        assert_eq!(groups.concat(), events);
+        assert!(sync_groups(&[]).is_empty());
+    }
     #[test]
     fn batches_translate_to_qmp_and_evdev() {
         let events = parse(&json!([

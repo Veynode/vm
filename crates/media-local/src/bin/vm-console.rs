@@ -382,9 +382,13 @@ impl Native {
             }
         }
     }
-    fn start(&self, client: u64, output: Output, codec: &str) -> Result<Value> {
+    fn start(&self, client: u64, output: Output, codec: &str, level: Option<u64>) -> Result<Value> {
         if !matches!(codec, "h264" | "hevc") {
             bail!("unsupported codec")
+        }
+        // H.264 level 4.0 (1920x1080) is for WebCodecs desktop viewers; the WebRTC console stays at 3.1.
+        if level.is_some_and(|level| codec != "h264" || !matches!(level, 31 | 40)) {
+            bail!("unsupported level")
         }
         let epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed);
         if epoch > 9_007_199_254_740_991 {
@@ -404,7 +408,11 @@ impl Native {
                 early: Vec::new(),
             });
         }
-        match self.call(json!({"method":"start","epoch":epoch,"codec":codec})) {
+        let mut command = json!({"method":"start","epoch":epoch,"codec":codec});
+        if let Some(level) = level {
+            command["level"] = json!(level);
+        }
+        match self.call(command) {
             Ok(mut value) => {
                 value["epoch"] = json!(epoch);
                 Ok(value)
@@ -540,6 +548,7 @@ struct Request {
     request_id: String,
     method: String,
     codec: Option<String>,
+    level: Option<u64>,
     frame: Option<vm_control::native_input::DisplayedFrame>,
     #[serde(
         default,
@@ -840,6 +849,7 @@ fn connection(stream: UnixStream, native: Arc<Native>, client: u64) -> Result<()
                     client,
                     output.clone(),
                     request.codec.as_deref().context("missing codec")?,
+                    request.level,
                 ),
                 "stop" => native.close(client),
                 "keyframe" => native.keyframe(client),

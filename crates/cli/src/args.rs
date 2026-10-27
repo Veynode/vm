@@ -121,9 +121,32 @@ pub fn memory_mib(value: &str) -> Result<u64> {
     Ok(n * factor)
 }
 
+/// `1920x1080` → (1920, 1080): even sides, 640x400 to 3840x2160.
+pub fn desktop_size(value: &str) -> Result<(u32, u32)> {
+    let bad = || {
+        anyhow::anyhow!(
+            "invalid --desktop-size {value}: expected WIDTHxHEIGHT, even, 640x400 to 3840x2160"
+        )
+    };
+    let (w, h) = value.split_once(['x', 'X']).ok_or_else(bad)?;
+    let (w, h): (u32, u32) = (w.parse().map_err(|_| bad())?, h.parse().map_err(|_| bad())?);
+    if w % 2 != 0 || h % 2 != 0 || !(640..=3840).contains(&w) || !(400..=2160).contains(&h) {
+        return Err(bad());
+    }
+    Ok((w, h))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn desktop_size_is_bounded_and_even() {
+        assert_eq!(desktop_size("1920x1080").unwrap(), (1920, 1080));
+        assert_eq!(desktop_size("1280X800").unwrap(), (1280, 800));
+        for bad in ["1920", "1921x1080", "100x100", "5000x2000", "ax1", "1920x"] {
+            assert!(desktop_size(bad).is_err(), "{bad}");
+        }
+    }
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
     }

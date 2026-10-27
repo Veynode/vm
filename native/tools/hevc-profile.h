@@ -24,7 +24,7 @@ static bool veynode_hevc_main_level4(const uint8_t *nal,size_t length,VeynodeHEV
  if(count<13||(prefix[0]&0x0e)!=0||(prefix[0]&1)==0)return false;
  out->profile_space=prefix[1]>>6;out->tier=(prefix[1]>>5)&1;
  out->profile_id=prefix[1]&31;out->level=prefix[12];
- bool level=out->level==30||out->level==60||out->level==63||out->level==90||out->level==93||out->level==120;
+ bool level=out->level==30||out->level==60||out->level==63||out->level==90||out->level==93||out->level==120||out->level==123;
  return out->profile_space==0&&out->profile_id==1&&out->tier==0&&level;
 }
 #endif

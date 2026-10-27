@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -165,6 +166,31 @@ func waitForDevice(path string) error {
 		time.Sleep(20 * time.Millisecond)
 	}
 	return fmt.Errorf("device %s did not appear", path)
+}
+
+// growWritableLayer grows the mounted file system on `device` to the whole
+// device once the host made the disk larger (`veynodevm update --disk-size`).
+// A failure is reported and the layer is used at its old size.
+func growWritableLayer(device, mountpoint string) {
+	f, err := os.Open(device)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	super := make([]byte, 1024)
+	if _, err := f.ReadAt(super, 1024); err != nil {
+		return
+	}
+	used := ext4Bytes(super)
+	size, err := f.Seek(0, io.SeekEnd)
+	// Less than a 4 KiB block over: nothing to grow into.
+	if err != nil || used == 0 || size-used < 4096 {
+		return
+	}
+	marker("status", "growing writable layer")
+	if out, err := exec.Command("/usr/sbin/resize2fs", device).CombinedOutput(); err != nil {
+		marker("error", fmt.Sprintf("resize2fs %s (%s): %v %s", device, mountpoint, err, strings.TrimSpace(string(out))))
+	}
 }
 
 func hasExt4(device string) bool {
@@ -448,6 +474,7 @@ func prepareRoot(config containerConfig) error {
 	if err := mountAt(writableDevice, "/run/disk", "ext4", 0, ""); err != nil {
 		return err
 	}
+	growWritableLayer(writableDevice, "/run/disk")
 	for _, dir := range []string{"/run/disk/upper", "/run/disk/work", "/run/disk/volumes"} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err

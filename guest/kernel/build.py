@@ -4,7 +4,7 @@
 Output (default .local/boot):
   Image          raw ARM64 kernel (Alpine linux-virt, from scripts/prepare-linux.py)
   initramfs.gz   Alpine initramfs-virt + overlay: guest agent as container init,
-                 mke2fs from pinned e2fsprogs packages
+                 mke2fs and resize2fs from pinned e2fsprogs packages
   modloop        the matching full kernel module squashfs, attached read-only
   manifest.json  SHA256 of every output and input
 
@@ -18,11 +18,12 @@ CACHE = ROOT / '.local/media/apk-3.24'
 REPO = 'https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/'
 PACKAGES = {
     'e2fsprogs-1.47.4-r0.apk': '52fd401e79ce6b0ff7648733ba4de3135083cd0132543534e72106e7ea767a00',
+    'e2fsprogs-extra-1.47.4-r0.apk': '70b0a01bf62349263a8f400809c7512e991b7db13dbebbf9b3a1cb3b3d21efcc',
     'e2fsprogs-libs-1.47.4-r0.apk': '52124971ae397d599aadd79263fcd68fc9e271922ccf8185b124f35fe24c60c8',
     'libcom_err-1.47.4-r0.apk': 'a75b5955ff57046e33fc2842cfe466dc77d8e68305d5c86c6646b38a069490a2',
 }
-# Only what container-init needs to format the writable layer.
-WANTED = {'sbin/mke2fs', 'etc/mke2fs.conf', 'usr/lib/libe2p.so.2', 'usr/lib/libe2p.so.2.3',
+# Only what container-init needs to format and grow the writable layer.
+WANTED = {'sbin/mke2fs', 'usr/sbin/resize2fs', 'etc/mke2fs.conf', 'usr/lib/libe2p.so.2', 'usr/lib/libe2p.so.2.3',
           'usr/lib/libext2fs.so.2', 'usr/lib/libext2fs.so.2.4', 'usr/lib/libcom_err.so.2', 'usr/lib/libcom_err.so.2.1'}
 INIT = b'#!/bin/sh\nexec /veynode/agent container-init\n'
 

@@ -46,6 +46,12 @@ static uint64_t epoch,lastEpoch,generation,sequence,cachedGeneration,rateSubmitt
 // geometry of the view. carriedBitrate keeps the rate across a rebuild for either.
 static NSUInteger cropX,cropY,cropWidth,cropHeight,scaleWidth,scaleHeight;
 static NSNumber *carriedBitrate;
+// A still screen gets one full-quality keyframe from a second session, which then carries the
+// idle refreshes until the screen changes (enterStill). The speed-first session is parked meanwhile.
+static VTCompressionSessionRef parkedEncoder;
+static BOOL stillActive,stillFailed,creatingStill;
+static int h264Level=31; // 40 only when the start request asked for it (WebCodecs desktop viewers)
+static gint64 lastChange,lastStill;
 static NSUInteger scanoutLogCount,channelLogCount;
 #ifdef VEYNODE_NATIVE_DISPLAY
 static VNFramePacing capturePacing;
@@ -67,6 +73,9 @@ static gint64 capturedWall,capturedMono,lastCapture,firstPTS,lastEncode;
 // another draw or the 1 Hz idle refresh (typing would otherwise lag seconds).
 static BOOL sourceDirty,encodeDirty;
 static const gint64 encodeInterval=16667;
+// Capture is already on a 60 Hz slot grid; a copy admitted a hair early on that grid
+// must not wait another flush tick, or the stream averages 54 fps instead of 60.
+static const gint64 encodeSlack=3000;
 static int generationFD=-1;
 static NSMutableData *input;
 static const NSUInteger maxAU=4*1024*1024;
@@ -105,8 +114,8 @@ static void compressed(void *context,void *source,OSStatus status,VTEncodeInfoFl
  const uint8_t *parameter=NULL;size_t parameterSize=0,parameterCount=0;int lengthSize=0;
  OSStatus result=useHEVC?CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(format,0,&parameter,&parameterSize,&parameterCount,&lengthSize):CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format,0,&parameter,&parameterSize,&parameterCount,&lengthSize);
  if(result!=noErr||lengthSize!=4||parameterCount<(useHEVC?3:2)){fail(@"Missing parameter sets or unsupported NAL length");return;}
- if(!useHEVC&&(parameterSize<4||(parameter[0]&31)!=7||parameter[1]!=0x42||(parameter[2]&0x4f)!=0x40||parameter[3]!=0x1f)){fail(@"Actual H264 SPS does not match constrained Baseline3.1 (RFC6184 profile42 / iop x1xx0000)");return;}
- if(!useHEVC&&!actualH264Profile){actualH264Profile=[NSString stringWithFormat:@"%02x%02x%02x",parameter[1],parameter[2],parameter[3]];diagnostic(@{@"event":@"codec-parameters",@"codec":codecName,@"actual_h264_profile_level_id":actualH264Profile,@"h264_subprofile":@"Constrained Baseline",@"level":@31});}
+ if(!useHEVC&&(parameterSize<4||(parameter[0]&31)!=7||parameter[1]!=0x42||(parameter[2]&0x4f)!=0x40||!(h264Level==40?(parameter[3]==0x1f||parameter[3]==0x20||parameter[3]==0x28):parameter[3]==0x1f))){fail(h264Level==40?@"Actual H264 SPS does not match constrained Baseline up to 4.0 (profile42 / iop x1xx0000 / level 3.1, 3.2 or 4.0)":@"Actual H264 SPS does not match constrained Baseline3.1 (RFC6184 profile42 / iop x1xx0000)");return;}
+ if(!useHEVC&&!actualH264Profile){actualH264Profile=[NSString stringWithFormat:@"%02x%02x%02x",parameter[1],parameter[2],parameter[3]];diagnostic(@{@"event":@"codec-parameters",@"codec":codecName,@"actual_h264_profile_level_id":actualH264Profile,@"h264_subprofile":@"Constrained Baseline",@"level":@(h264Level)});}
  if(useHEVC){
   BOOL found=NO;VeynodeHEVCProfile profile={0};
   for(size_t i=0;i<parameterCount;i++){
@@ -142,15 +151,20 @@ static BOOL createEncoderWith(CVPixelBufferRef pixel,NSDictionary *spec,BOOL rep
     NSString *problem=nil;
     if(result!=noErr){encoder=NULL;problem=[NSString stringWithFormat:@"Required hardware %@ creation failed: %d",codecName,(int)result];}
     if(!problem){
+    // The colour description is written into the stream: untagged, decoders (ffmpeg,
+    // some browsers) assume BT.601 and shift every colour of the BT.709 conversion.
     // The H.264 hint stays at 30: at 60 the encoder picks a level above the
     // Constrained Baseline 3.1 this helper guarantees. Frames still go at 60.
-    NSDictionary *properties=@{(__bridge NSString *)kVTCompressionPropertyKey_RealTime:@YES,(__bridge NSString *)kVTCompressionPropertyKey_AllowFrameReordering:@NO,(__bridge NSString *)kVTCompressionPropertyKey_AverageBitRate:@8000000,(__bridge NSString *)kVTCompressionPropertyKey_ExpectedFrameRate:useHEVC?@60:@30,(__bridge NSString *)kVTCompressionPropertyKey_MaxKeyFrameInterval:@120,(__bridge NSString *)kVTCompressionPropertyKey_ProfileLevel:(__bridge NSString *)(useHEVC?kVTProfileLevel_HEVC_Main_AutoLevel:kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel)};
+    NSDictionary *properties=@{(__bridge NSString *)kVTCompressionPropertyKey_RealTime:@YES,(__bridge NSString *)kVTCompressionPropertyKey_AllowFrameReordering:@NO,(__bridge NSString *)kVTCompressionPropertyKey_AverageBitRate:@8000000,(__bridge NSString *)kVTCompressionPropertyKey_ExpectedFrameRate:useHEVC?@60:@30,(__bridge NSString *)kVTCompressionPropertyKey_ColorPrimaries:(__bridge NSString *)kCVImageBufferColorPrimaries_ITU_R_709_2,(__bridge NSString *)kVTCompressionPropertyKey_TransferFunction:(__bridge NSString *)kCVImageBufferTransferFunction_ITU_R_709_2,(__bridge NSString *)kVTCompressionPropertyKey_YCbCrMatrix:(__bridge NSString *)kCVImageBufferYCbCrMatrix_ITU_R_709_2,(__bridge NSString *)kVTCompressionPropertyKey_MaxKeyFrameInterval:@120,(__bridge NSString *)kVTCompressionPropertyKey_ProfileLevel:(__bridge NSString *)(useHEVC?kVTProfileLevel_HEVC_Main_AutoLevel:kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel)};
     for(NSString *key in properties){result=VTSessionSetProperty(encoder,(__bridge CFStringRef)key,(__bridge CFTypeRef)properties[key]);if(result!=noErr){problem=[NSString stringWithFormat:@"Encoder property rejected %@: %d",key,(int)result];break;}}
     }
     if(!problem){
     // Best effort: not every encoder generation exposes these latency knobs.
     VTSessionSetProperty(encoder,kVTCompressionPropertyKey_MaxFrameDelayCount,(__bridge CFTypeRef)@0);
     VTSessionSetProperty(encoder,kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,kCFBooleanTrue);
+    // Quality only counts when set before the session is prepared; it is what lifts a photographic
+    // keyframe from SSIM 0.94 to 0.99 (1920x1080: 300 KB to 1.1 MB, hence only for a still screen).
+    if(creatingStill){VTSessionSetProperty(encoder,kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,kCFBooleanFalse);VTSessionSetProperty(encoder,kVTCompressionPropertyKey_Quality,(__bridge CFTypeRef)@0.9);}
     if(VTCompressionSessionPrepareToEncodeFrames(encoder)!=noErr)problem=@"Encoder preparation failed";
     }
     if(!problem){
@@ -164,6 +178,7 @@ static BOOL createEncoderWith(CVPixelBufferRef pixel,NSDictionary *spec,BOOL rep
      if(encoder){VTCompressionSessionInvalidate(encoder);CFRelease(encoder);encoder=NULL;}
      if(reportFailure)fail(problem);return NO;
     }
+    if(creatingStill)return YES; // the still session is outside rate control
     // A set_scale rebuild is the same encoder instance to rate control: keep its target and sequence.
     if(carriedBitrate){if(VTSessionSetProperty(encoder,kVTCompressionPropertyKey_AverageBitRate,(__bridge CFNumberRef)carriedBitrate)!=noErr)rateFenced=YES;carriedBitrate=nil;}
     else{rateReset();rateSubmitted=0;}return YES;
@@ -226,7 +241,18 @@ static NSDictionary *displayCapabilities(void){
  return @{@"rate_control_version":@1,@"rate_min_bps":@(rateMinimum),@"rate_max_bps":@(rateMaximum),@"native_window":@NO,@"native_window_protocol":@1,@"display_only":@YES,@"input_enabled":@NO};
 #endif
 }
+static void invalidateSession(VTCompressionSessionRef session){
+ if(!session)return;
+ if(VTCompressionSessionCompleteFrames(session,kCMTimeInvalid)!=noErr)fail(@"Encoder drain failed");
+ VTCompressionSessionInvalidate(session);CFRelease(session);
+}
+// Back to the speed-first session; its next frame is a keyframe (the two reference chains differ).
+static void leaveStill(void){
+ if(!stillActive)return;
+ VTCompressionSessionRef still=encoder;encoder=parkedEncoder;parkedEncoder=still;stillActive=NO;forceKeyframe=YES;
+}
 static void closeEncoder(void){
+ leaveStill();invalidateSession(parkedEncoder);parkedEncoder=NULL;stillFailed=NO;lastChange=lastStill=0;
  if(encoder){if(VTCompressionSessionCompleteFrames(encoder,kCMTimeInvalid)!=noErr)fail(@"Encoder drain failed");VTCompressionSessionInvalidate(encoder);CFRelease(encoder);encoder=NULL;}
  if(scaled){CVPixelBufferRelease(scaled);scaled=NULL;}active=NO;forceKeyframe=NO;
 }
@@ -241,7 +267,7 @@ static BOOL resolveView(View *v){
  if(sourceWidth<2||sourceHeight<2)return NO;
  if(!cropWidth){v->x=v->y=0;v->w=sourceWidth;v->h=sourceHeight;}
  else{v->x=MIN(cropX,sourceWidth-2);v->y=MIN(cropY,sourceHeight-2);v->w=MIN(cropWidth,sourceWidth-v->x)&~(size_t)1;v->h=MIN(cropHeight,sourceHeight-v->y)&~(size_t)1;}
- if(!VNEncodedGeometry(v->w,v->h,useHEVC,&v->fitW,&v->fitH))return NO;
+ if(!VNEncodedGeometryForLevel(v->w,v->h,useHEVC,h264Level,&v->fitW,&v->fitH))return NO;
  v->outW=scaleWidth?MIN(scaleWidth,v->fitW):v->fitW;v->outH=scaleHeight?MIN(scaleHeight,v->fitH):v->fitH;return YES;
 }
 static NSDictionary *viewFields(const View *v){
@@ -252,8 +278,25 @@ static void sessionFailure(void){
  emit(epoch,@{@"event":@"session-error",@"epoch":@(epoch),@"error":@{@"code":@"encoder_failed",@"message":message}});
 }
 static View view;
+// A guest that redraws a still screen (Windows Basic Display flushes its ramfb at
+// ~27 Hz) would otherwise be encoded 27 times a second as identical frames. The
+// previous source bytes are kept to recognise them; the 1 Hz idle refresh and
+// keyframe requests still encode.
+static uint8_t *previousFrame;static size_t previousSize;
+static BOOL sourceUnchanged(CVPixelBufferRef pixel){
+ if(CVPixelBufferLockBaseAddress(pixel,kCVPixelBufferLock_ReadOnly)!=kCVReturnSuccess)return NO;
+ const void *base=CVPixelBufferGetBaseAddress(pixel);size_t size=CVPixelBufferGetBytesPerRow(pixel)*CVPixelBufferGetHeight(pixel);BOOL same=NO;
+ if(base&&size){
+  same=previousFrame&&previousSize==size&&!memcmp(previousFrame,base,size);
+  if(!same){if(previousSize!=size){free(previousFrame);previousFrame=malloc(size);previousSize=previousFrame?size:0;}if(previousFrame)memcpy(previousFrame,base,size);}
+ }
+ CVPixelBufferUnlockBaseAddress(pixel,kCVPixelBufferLock_ReadOnly);return same;
+}
 static void encodeLatest(gint64 now,BOOL idle){
  if(!active||!cacheValid())return;
+ BOOL same=encoder&&sourceUnchanged(owned); // always refreshes the kept copy
+ if(same&&!idle&&!forceKeyframe){encodeDirty=NO;return;}
+ if(!same){lastChange=now;leaveStill();}
  if(!encoder){
   if(!resolveView(&view)){fail(@"Source geometry cannot fit even codec bounds");sessionFailure();return;}
   width=view.outW;height=view.outH;
@@ -273,6 +316,26 @@ static void encodeLatest(gint64 now,BOOL idle){
  CVPixelBufferRetain(pixel);OSStatus status=VTCompressionSessionEncodeFrame(encoder,pixel,pts,CMTimeMake(1,30),(__bridge CFDictionaryRef)options,NULL,NULL);
  if(status!=noErr)fail(@"Frame submission failed");else {rateSubmitted++;if(VTCompressionSessionCompleteFrames(encoder,pts)!=noErr)fail(@"Frame completion failed");}CVPixelBufferRelease(pixel);
  if(idle)idleFrames++;sessionFailure();
+}
+// A screen that stopped changing: one keyframe at full quality, from the second session.
+// Not above about 4.2 Mpx (a photographic keyframe would near the 4 MiB access unit bound),
+// not more than once per 3 s, and a failed creation leaves the speed-first session alone.
+static void enterStill(gint64 now){
+ if(stillActive||stillFailed||!encoder||!cacheValid())return;
+ if(width*height>4200000){stillFailed=YES;return;}
+ // The bitrate control is the network's say: a viewer it has backed off for would stall on a 1 MB keyframe.
+ CFTypeRef raw=NULL;BOOL backedOff=VTSessionCopyProperty(encoder,kVTCompressionPropertyKey_AverageBitRate,NULL,&raw)==noErr&&raw&&[(__bridge_transfer NSNumber *)raw unsignedLongLongValue]<8000000;
+ if(backedOff){lastStill=now;return;}
+ VTCompressionSessionRef speedFirst=encoder;
+ if(parkedEncoder){encoder=parkedEncoder;parkedEncoder=NULL;}
+ else{
+  encoder=NULL;creatingStill=YES;
+  BOOL ok=createEncoderWith(scaled?:owned,@{(__bridge NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder:@YES},NO);
+  creatingStill=NO;
+  if(!ok||!encoder){encoder=speedFirst;stillFailed=YES;return;}
+ }
+ parkedEncoder=speedFirst;stillActive=YES;forceKeyframe=YES;lastStill=now;
+ encodeLatest(now,YES);
 }
 static void awaitSource(NSString *reason){
 #ifdef VEYNODE_NATIVE_DISPLAY
@@ -331,7 +394,7 @@ static BOOL captureSource(gint64 now){
  sourceDirty=NO;encodeDirty=YES;return YES;
 }
 static void encodeIfDue(gint64 now){
- if(!fatal&&active&&cacheValid()&&encodeDirty&&(!lastEncode||now-lastEncode>=encodeInterval))encodeLatest(now,NO);
+ if(!fatal&&active&&cacheValid()&&encodeDirty&&(!lastEncode||now-lastEncode>=encodeInterval-encodeSlack))encodeLatest(now,NO);
 }
 static void draw(SpiceDisplayChannel *channel,guint32 x,guint32 y,guint32 w,guint32 h,gpointer context){@autoreleasepool{
  received++;gint64 now=g_get_monotonic_time();
@@ -489,6 +552,8 @@ static void command(NSData *line){
  if([method isEqual:@"start"]){
   if(active){reject(ident,e,@"encoding_busy");return;}if(e<=lastEpoch){reject(ident,e,@"stale_epoch");return;}
   NSString *codec=request[@"codec"];if(![codec isKindOfClass:NSString.class]||(![codec isEqual:@"h264"]&&![codec isEqual:@"hevc"])){reject(ident,e,@"unsupported_codec");return;}
+  id level=request[@"level"];if(level&&(![level isKindOfClass:NSNumber.class]||CFGetTypeID((__bridge CFTypeRef)level)==CFBooleanGetTypeID()||![codec isEqual:@"h264"]||([level intValue]!=31&&[level intValue]!=40))){reject(ident,e,@"unsupported_level");return;}
+  h264Level=level?[level intValue]:31;
   epoch=lastEpoch=e;codecName=codec;useHEVC=[codec isEqual:@"hevc"];active=YES;forceKeyframe=YES;cropX=cropY=cropWidth=cropHeight=scaleWidth=scaleHeight=0;carriedBitrate=nil;firstPTS=lastEncode=0;encoded=keyframes=idleFrames=0;actualH264Profile=nil;actualHEVCProfile=nil;hardwareVerified=NO;failure=nil;
   reply(ident,e,@{@"state":cacheValid()?@"encoding":@"waiting-frame",@"epoch":@(epoch),@"frame_available":@(cacheValid())});if(cacheValid())encodeLatest(g_get_monotonic_time(),NO);return;
  }
@@ -497,6 +562,7 @@ static void command(NSData *line){
   NSDictionary *strict=rateParse(line);if(!strict){reject(ident,e,@"invalid_request");return;}
   NSMutableDictionary *q=[strict mutableCopy];[q removeObjectForKey:@"id"];q[@"request_id"]=ident;
   if([method isEqual:@"rate_status"])[q removeObjectForKey:@"epoch"];
+  leaveStill();
   NSDictionary *answer=rateApply(q,encoder,hardwareVerified,epoch,rateSubmitted);
   if(answer[@"error"])reject(ident,e,answer[@"error"][@"code"]);else reply(ident,e,answer[@"result"]);return;
  }
@@ -510,6 +576,7 @@ static void command(NSData *line){
   else{if(!scaleFits(v[0],v[1],before.fitW,before.fitH)){reject(ident,e,@"scale_outside_bound");return;}scaleWidth=v[0];scaleHeight=v[1];}
   // Any change is a new compression session (rebuilt by the next encode) whose first frame is a keyframe.
   View after;resolveView(&after);
+  leaveStill();invalidateSession(parkedEncoder);parkedEncoder=NULL;stillFailed=NO;lastChange=lastStill=0;
   if(encoder){
    CFTypeRef raw=NULL;if(VTSessionCopyProperty(encoder,kVTCompressionPropertyKey_AverageBitRate,NULL,&raw)==noErr)carriedBitrate=CFBridgingRelease(raw);else if(raw)CFRelease(raw);
    if(VTCompressionSessionCompleteFrames(encoder,kCMTimeInvalid)!=noErr)fail(@"Encoder drain failed");VTCompressionSessionInvalidate(encoder);CFRelease(encoder);encoder=NULL;
@@ -530,7 +597,9 @@ static gboolean control(GIOChannel *channel,GIOCondition condition,gpointer data
 }
 static gboolean tick(gpointer data){@autoreleasepool{
  if(generationFD>=0&&!surfaceLive()){awaitSource(@"generation_retired");return G_SOURCE_CONTINUE;}
- gint64 now=g_get_monotonic_time();if(active&&cacheValid()&&((forceKeyframe&&now-lastEncode>=33333)||now-lastEncode>=1000000))encodeLatest(now,YES);return G_SOURCE_CONTINUE;
+ gint64 now=g_get_monotonic_time();
+ if(active&&encoder&&!stillActive&&!stillFailed&&!forceKeyframe&&lastChange&&now-lastChange>=700000&&now-lastStill>=3000000){enterStill(now);return G_SOURCE_CONTINUE;}
+ if(active&&cacheValid()&&((forceKeyframe&&now-lastEncode>=33333)||now-lastEncode>=1000000))encodeLatest(now,YES);return G_SOURCE_CONTINUE;
 }}
 static int probeCodecs(void){
  hardwareProbe=YES;width=height=64;NSMutableDictionary *result=[NSMutableDictionary new];
@@ -559,7 +628,7 @@ int main(int argc,char **argv){@autoreleasepool{
  outputWriter=[[VNRecordWriter alloc] initWithFD:STDOUT_FILENO];if(!outputWriter)return 1;
 #endif
  loop=g_main_loop_new(NULL,FALSE);SpiceSession *session=spice_session_new();g_object_set(session,"unix-path",argv[1],NULL);g_signal_connect(session,"channel-new",G_CALLBACK(newChannel),NULL);
- GIOChannel *channel=g_io_channel_unix_new(STDIN_FILENO);g_io_add_watch(channel,G_IO_IN|G_IO_HUP|G_IO_ERR,control,NULL);g_timeout_add(100,tick,NULL);g_timeout_add(4,flush,NULL);
+ GIOChannel *channel=g_io_channel_unix_new(STDIN_FILENO);g_io_add_watch(channel,G_IO_IN|G_IO_HUP|G_IO_ERR,control,NULL);g_timeout_add(100,tick,NULL);g_timeout_add(2,flush,NULL);
 #ifdef VEYNODE_NATIVE_DISPLAY
  g_timeout_add(10,screenshotTick,NULL);
 #endif

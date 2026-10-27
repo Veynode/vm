@@ -6,7 +6,10 @@
 #include <time.h>
 
 static double monotonic(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec/1e9;}
-static const NSUInteger recordLimit=4*1024*1024,queueLimit=8*1024*1024,countLimit=16;
+// A JSON record (kind 1) may carry a full-resolution screenshot: up to 8 MiB of PNG is about 10.7 MiB of
+// base64, the 12 MiB `console_wire::MAX_JSON_BODY`. At most one such record is queued, outside the 8 MiB
+// budget of every other record, whose 4 MiB bound is unchanged.
+static const NSUInteger recordLimit=4*1024*1024,jsonLimit=12*1024*1024,queueLimit=8*1024*1024,countLimit=16;
 @interface VNWriteReceipt ()
 - (void)complete:(BOOL)success began:(double)began admitted:(double)admitted bytes:(NSUInteger)bytes;
 @end
@@ -19,7 +22,7 @@ static const NSUInteger recordLimit=4*1024*1024,queueLimit=8*1024*1024,countLimi
 @end
 @implementation VNRecordWriter {
  int _fd; NSCondition *_condition; dispatch_queue_t _queue; BOOL _failed;
- NSUInteger _pending,_bytes;
+ NSUInteger _pending,_bytes;BOOL _largePending;
 }
 - (instancetype)initWithFD:(int)fd {
  if((self=[super init])){_fd=fd;_condition=[NSCondition new];_queue=dispatch_queue_create("veynode.console-output",DISPATCH_QUEUE_SERIAL);
@@ -32,16 +35,17 @@ static const NSUInteger recordLimit=4*1024*1024,queueLimit=8*1024*1024,countLimi
 - (VNWriteReceipt *)enqueueKind:(uint8_t)kind epoch:(uint64_t)epoch body:(NSData *)body {
  double admitted=monotonic();NSUInteger length=body.length;
  [_condition lock];
- if(_failed||!length||length>recordLimit||_pending>=countLimit||length+13>queueLimit-_bytes){_failed=YES;[_condition broadcast];[_condition unlock];return nil;}
+ BOOL large=kind==1&&length>recordLimit;
+ if(_failed||!length||length>(kind==1?jsonLimit:recordLimit)||_pending>=countLimit||(large?_largePending:(_bytes>=queueLimit||length+13>queueLimit-_bytes))){_failed=YES;[_condition broadcast];[_condition unlock];return nil;}
  // Compact independent wire bytes; mutable caller storage is never retained.
  uint8_t header[13];uint32_t n=CFSwapInt32HostToBig((uint32_t)length);uint64_t e=CFSwapInt64HostToBig(epoch);
  memcpy(header,&n,4);header[4]=kind;memcpy(header+5,&e,8);
  NSMutableData *wire=nil;VNWriteReceipt *receipt=nil;
  @try {wire=[NSMutableData dataWithBytes:header length:13];[wire appendBytes:body.bytes length:length];receipt=[VNWriteReceipt new];}
  @catch(NSException *exception){(void)exception;_failed=YES;[_condition broadcast];[_condition unlock];return nil;}
- _pending++;_bytes+=length+13;
+ _pending++;if(large)_largePending=YES;else _bytes+=length+13;
  dispatch_async(_queue,^{@autoreleasepool{
-  double began=monotonic(),deadline=admitted+.5;NSUInteger offset=0;BOOL success=YES;
+  double began=monotonic(),deadline=admitted+(large?2.:.5);NSUInteger offset=0;BOOL success=YES;
   while(offset<wire.length){
    if(self.failed||monotonic()>=deadline){success=NO;break;}
    ssize_t count=write(self->_fd,(const uint8_t *)wire.bytes+offset,wire.length-offset);
@@ -57,7 +61,7 @@ static const NSUInteger recordLimit=4*1024*1024,queueLimit=8*1024*1024,countLimi
   }
   if(!success)[self invalidate];
   [receipt complete:success began:began admitted:admitted bytes:offset];
-  [self->_condition lock];self->_pending--;self->_bytes-=wire.length;[self->_condition broadcast];[self->_condition unlock];
+  [self->_condition lock];self->_pending--;if(large)self->_largePending=NO;else self->_bytes-=wire.length;[self->_condition broadcast];[self->_condition unlock];
  }});
  [_condition unlock];
  return receipt;

@@ -22,7 +22,7 @@ mod session;
 mod ui;
 
 use anyhow::{bail, Context, Result};
-use args::{memory_mib, parse};
+use args::{desktop_size, memory_mib, parse};
 use serde_json::{json, Value};
 use std::{io::Write, path::PathBuf, time::Duration};
 use veynodevm_oci::Store;
@@ -38,7 +38,7 @@ Containers:
       -d, --detach  --rm  --name NAME  -p, --publish [IP:]HOST:GUEST[/udp]
       -v, --volume /HOST:/PATH[:ro]  -e, --env KEY[=VALUE]  -w, --workdir DIR
       -u, --user USER  --entrypoint CMD  --cpus N  -m, --memory SIZE
-      --disk-size GiB  --dns IP  --mtu N  --gpus all|virgl|venus  --desktop  --shared
+      --disk-size GiB  --dns IP  --mtu N  --gpus all|virgl|venus  --desktop [--desktop-size WxH]  --shared
       --init systemd   (boot the image's /sbin/init as PID 1: a full distribution)
       (--gpus selects QEMU/HVF; otherwise Apple Virtualization)
       macOS images (e.g. ghcr.io/cirruslabs/macos-tahoe-vanilla) run as macOS VMs
@@ -58,6 +58,15 @@ Containers:
   stop [-t SECONDS] CONTAINER...     Stop containers
   rm [-f] CONTAINER...               Remove containers
   inspect CONTAINER|IMAGE            Show low-level details
+  rename CONTAINER NEW_NAME           Rename a container
+  update [--cpus N] [-m SIZE] [--disk-size GiB] [--gpus none|virgl|venus]
+         [--desktop on|off] [--desktop-size WxH] [-p HOST:GUEST... | -p none]
+         [--dns IP... | --dns none] [--mtu N|default] [--new-mac] [--restart] CONTAINER
+                                     Change a container's hardware in one go: a GPU
+                                     switches QEMU/HVF <-> Apple Virtualization; the
+                                     disk only grows; --restart if it is running
+  icon CONTAINER [KIND[:COLOR]|--reset]
+                                     Show or set the icon the web UI draws
   desktop [--close] CONTAINER|VM     Open (or close) the native desktop window
 
 Checkpoints and forks (Linux containers; APFS clones of the writable layer):
@@ -99,7 +108,7 @@ Service:
                                     MCP over stdio; --tools lists only those groups
                                     (core exec files screen input desktop snapshots cua);
                                     --vm serves one VM's cua-driver tools
-  ui [--port N] [--open]            Web management UI on localhost
+  ui [--port N] [--no-open]         Web management UI on localhost; opens the browser
   version
 ";
 
@@ -167,6 +176,7 @@ const RUN_SPEC: &[(&str, Option<char>, bool)] = &[
     ("disk-size", None, true),
     ("gpus", None, true),
     ("desktop", None, false),
+    ("desktop-size", None, true),
     ("shared", None, false),
     ("dns", None, true),
     ("mtu", None, true),
@@ -220,6 +230,7 @@ fn run(rest: &[String], json_output: bool) -> Result<i32> {
             .context("invalid --disk-size")?,
         gpus: p.value("gpus").map(str::to_owned),
         desktop: p.has("desktop"),
+        desktop_size: p.value("desktop-size").map(desktop_size).transpose()?,
         engine: false,
         dns: p.values("dns").to_vec(),
         mtu: p
@@ -391,7 +402,7 @@ fn ps(rest: &[String], json_output: bool) -> Result<i32> {
         rows.push((c, state, status));
     }
     if json_output {
-        return print_json(&Value::Array(rows.iter().map(|(c, state, status)| json!({"id":c.id,"name":c.name,"image":c.image,"command":c.argv,"created_at":c.created_at,"state":state,"status":status,"ports":c.ports,"backend":c.backend,"gpus":c.gpus,"desktop":c.desktop,"vm_id":c.vm_id})).collect())).map(|_| 0);
+        return print_json(&Value::Array(rows.iter().map(|(c, state, status)| json!({"id":c.id,"name":c.name,"image":c.image,"command":c.argv,"created_at":c.created_at,"state":state,"status":status,"ports":c.ports,"backend":c.backend,"gpus":c.gpus,"desktop":c.desktop,"desktop_size":c.desktop_size,"vm_id":c.vm_id,"icon":c.icon,"os":c.os,"engine":c.engine,"cpus":c.cpus,"memory_mib":c.memory_mib})).collect())).map(|_| 0);
     }
     if p.has("quiet") {
         for (c, _, _) in rows {
@@ -842,6 +853,124 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
             }
             Ok(0)
         }
+        "rename" => {
+            let [old, new] = rest else {
+                bail!("rename requires CONTAINER NEW_NAME")
+            };
+            let mut c = container::find(old)?;
+            container::rename(&mut c, new)?;
+            if json_output {
+                print_json(&json!({"id":c.id,"name":c.name}))?;
+            }
+            Ok(0)
+        }
+        "update" => {
+            let p = parse(
+                rest,
+                &[
+                    ("cpus", None, true),
+                    ("memory", Some('m'), true),
+                    ("disk-size", None, true),
+                    ("gpus", None, true),
+                    ("desktop", None, true),
+                    ("desktop-size", None, true),
+                    ("publish", Some('p'), true),
+                    ("dns", None, true),
+                    ("mtu", None, true),
+                    ("new-mac", None, false),
+                    ("restart", None, false),
+                ],
+                false,
+            )?;
+            let [name] = p.positional.as_slice() else {
+                bail!("usage: veynodevm update [--cpus N] [-m SIZE] [--disk-size GiB] [--gpus none|virgl|venus] [--desktop on|off] [--desktop-size WxH] [-p HOST:GUEST[/udp]...|--publish none] [--dns IP...|--dns none] [--mtu N|default] [--new-mac] [--restart] CONTAINER")
+            };
+            // `none` alone clears a list.
+            let list = |name: &str| {
+                let values = p.values(name);
+                (!values.is_empty()).then(|| match values {
+                    [only] if only == "none" => Vec::new(),
+                    values => values.to_vec(),
+                })
+            };
+            let changes = container::Changes {
+                cpus: p
+                    .value("cpus")
+                    .map(|v| v.parse().with_context(|| format!("invalid --cpus {v}")))
+                    .transpose()?,
+                memory_mib: p.value("memory").map(memory_mib).transpose()?,
+                disk_gib: p
+                    .value("disk-size")
+                    .map(|v| {
+                        v.trim_end_matches(['g', 'G'])
+                            .parse()
+                            .with_context(|| format!("invalid --disk-size {v} (GiB)"))
+                    })
+                    .transpose()?,
+                gpus: p.value("gpus").map(str::to_owned),
+                desktop: p
+                    .value("desktop")
+                    .map(|v| match v {
+                        "on" => Ok(true),
+                        "off" => Ok(false),
+                        other => bail!("--desktop accepts on|off, got {other}"),
+                    })
+                    .transpose()?,
+                desktop_size: p.value("desktop-size").map(desktop_size).transpose()?,
+                ports: list("publish"),
+                dns: list("dns"),
+                mtu: p
+                    .value("mtu")
+                    .map(|v| match v {
+                        "default" => Ok(0),
+                        v => v.parse().with_context(|| format!("invalid --mtu {v}")),
+                    })
+                    .transpose()?,
+                new_mac: p.has("new-mac"),
+            };
+            if changes.cpus.is_none()
+                && changes.memory_mib.is_none()
+                && changes.disk_gib.is_none()
+                && changes.gpus.is_none()
+                && changes.desktop.is_none()
+                && changes.desktop_size.is_none()
+                && changes.ports.is_none()
+                && changes.dns.is_none()
+                && changes.mtu.is_none()
+                && !changes.new_mac
+            {
+                bail!("update needs something to change: --cpus, --memory, --disk-size, --gpus, --desktop, --desktop-size, --publish, --dns, --mtu or --new-mac")
+            }
+            let c = container::update(&container::find(name)?, &changes, p.has("restart"))?;
+            if json_output {
+                let (_, disk_bytes, _) = container::disk(&c)?;
+                print_json(
+                    &json!({"id":c.id,"backend":c.backend,"gpus":c.gpus,"desktop":c.desktop,"desktop_size":c.desktop_size,"cpus":c.cpus,"memory_mib":c.memory_mib,"disk_bytes":disk_bytes,"ports":c.ports,"mac_address":c.mac_address}),
+                )?;
+            } else {
+                println!("{}", c.name);
+            }
+            Ok(0)
+        }
+        "icon" => {
+            let p = parse(rest, &[("reset", None, false)], false)?;
+            let mut c =
+                container::find(p.positional.first().context("icon requires a CONTAINER")?)?;
+            match (p.positional.get(1), p.has("reset")) {
+                (Some(_), true) => bail!("give an icon or --reset, not both"),
+                (Some(icon), false) => c.icon = Some(container::parse_icon(icon)?),
+                (None, true) => c.icon = None,
+                (None, false) => {
+                    println!("{}", c.icon.as_deref().unwrap_or(""));
+                    return Ok(0);
+                }
+            }
+            container::save(&c)?;
+            if json_output {
+                print_json(&json!({"id":c.id,"icon":c.icon}))?;
+            }
+            Ok(0)
+        }
         "inspect" => {
             let name = rest.first().context("inspect requires a name")?;
             if let Ok(c) = container::find(name) {
@@ -935,7 +1064,7 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
         "build" => engine::build(rest),
         "vm" => vm(rest),
         "machine" => machine::command(rest, json_output),
-        "daemon" => daemon::command(rest),
+        "daemon" => daemon::command(rest, json_output),
         "mcp" => {
             let mut flags = Vec::new();
             let mut rest = rest.iter();
@@ -974,7 +1103,7 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
             [name, rows, cols, argv @ ..] => {
                 session::relay(name, rows.parse()?, cols.parse()?, argv.to_vec())
             }
-            _ => bail!("usage: veynodevm __terminal CONTAINER ROWS COLS [COMMAND...]"),
+            _ => bail!("usage: veynodevm __terminal CONTAINER|MACHINE ROWS COLS [COMMAND...]"),
         },
         "__desktop" => match rest {
             [vm, method, arguments] => {

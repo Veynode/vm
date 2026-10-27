@@ -1,7 +1,14 @@
 # XFCE desktop with Vulkan through Venus (Mesa's virtio ICD) and OpenGL
-# through virgl. Vulkan applications present to X11 over DRI3.
+# through Zink on Venus (`--gpus venus`) or virgl (`--gpus virgl`). Vulkan
+# applications present to X11 over DRI3.
 #   veynodevm build -t veynodevm/ubuntu-desktop -f guest/images/ubuntu-desktop/Dockerfile guest/images
 #   veynodevm run -d --desktop --gpus venus --name desk veynodevm/ubuntu-desktop
+FROM ubuntu:24.04 AS zink-layer
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gcc libc6-dev libvulkan-dev
+COPY zink/veynodevm_zink_layer.c /src/
+RUN cc -O2 -Wall -shared -fPIC -o /src/libVkLayer_veynodevm_zink.so /src/veynodevm_zink_layer.c
+
 FROM ubuntu:24.04
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -10,6 +17,8 @@ RUN apt-get update \
       mesa-vulkan-drivers libgl1-mesa-dri libegl1 mesa-utils vulkan-tools ca-certificates \
       at-spi2-core \
  && rm -rf /var/lib/apt/lists/*
+COPY --from=zink-layer /src/libVkLayer_veynodevm_zink.so /usr/lib/aarch64-linux-gnu/
+COPY zink/veynodevm_zink_layer.json /usr/share/vulkan/implicit_layer.d/
 # The desktop session's user (uid 1000); Xorg alone runs as root. input is
 # for uinput, which cua-driver's background pointer uses.
 RUN userdel -r ubuntu \

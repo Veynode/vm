@@ -2916,10 +2916,10 @@ impl Manager {
         }
         let mut desktop_events = None;
         if method == "desktop_input" {
-            let apple_linux = self.configs[id].backend == Backend::AppleVirtualization
-                && self.configs[id].guest == "linux";
-            if self.configs[id].backend != Backend::QemuHvf && !apple_linux {
-                bail!("unsupported: desktop_input needs a Linux desktop on QEMU/HVF or Apple Virtualization")
+            let apple_stream = self.configs[id].backend == Backend::AppleVirtualization
+                && matches!(self.configs[id].guest.as_str(), "linux" | "macos");
+            if self.configs[id].backend != Backend::QemuHvf && !apple_stream {
+                bail!("unsupported: desktop_input needs a Linux desktop on QEMU/HVF or Apple Virtualization, or a macOS desktop")
             }
             if args
                 .as_object()
@@ -2928,9 +2928,10 @@ impl Manager {
                 bail!("desktop_input accepts only id and events")
             }
             let events = desktop_input::parse(&args["events"])?;
-            if apple_linux {
-                // The guest agent's uinput devices are reached through the
-                // caller's desktop stream.
+            if apple_stream {
+                // The guest agent's uinput devices (Linux) and the Screen
+                // Sharing session (macOS) are reached through the caller's
+                // desktop stream.
                 return Ok(json!({"sent":false,"inject":"stream"}));
             }
             desktop_events = Some(desktop_input::qmp(&events)?);

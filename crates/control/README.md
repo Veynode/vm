@@ -887,8 +887,9 @@ sends no new draw can fail explicitly. Use the persistent console broker below t
 keep the capture connection from VM startup. Input needs separate input permission plus a recent frame observation token; a screenshot alone grants no input permission.
 The larger response bound applies only to an outstanding screenshot request;
 ordinary replies and all incoming requests remain <=1MiB. Persistent native/broker
-records remain <=4MiB. The full-resolution lossless PNG is never resized to fit;
-images above 2MiB fail explicitly, so not every 1440p/4K scene is guaranteed to fit.
+records remain <=4MiB, except one screenshot JSON record (<=12MiB) at a time. The
+full-resolution lossless PNG is never resized to fit; images above 8MiB fail
+explicitly, so not every 4K scene is guaranteed to fit.
 Screenshot JSON avoids optional slash escaping to keep worst-case base64 within
 its response budget. The macOS Guest JPEG producer and 700KiB validation remain
 unchanged. Fixed native error diagnostics report the stage and encoded byte count,
@@ -1186,8 +1187,8 @@ local RPC `desktop_input` with exactly `id` and `events` (1–64 of `move`,
 `button`, `wheel`, `key`; `crates/control/src/desktop_input.rs`). On QEMU/HVF
 the worker injects through QMP `input-send-event` and is refused while a
 frame-bound input operation or the native window input is active. On Apple
-Virtualization Linux the daemon only validates the batch and replies `{"inject":"stream"}`; the caller forwards the events over the guest
-desktop stream to the agent's uinput devices. It is not an MCP tool.
+Virtualization (Linux and macOS) the daemon only validates the batch and replies `{"inject":"stream"}`; the caller forwards the events over the guest
+desktop stream, to the agent's uinput devices (Linux) or the worker's Screen Sharing session (macOS). It is not an MCP tool.
 
 ### Apple Virtualization Linux desktops
 
@@ -1385,6 +1386,10 @@ code page (`tests/windows_scripts.rs`). The daemon needs a port forward to the G
 `veynodevm machine ssh-key NAME --user USER --key PRIVATE_KEY`
 (`machines/NAME/ssh`, 0600). Without either, calls fail and the error names
 the missing step; a stopped machine or an SSH failure says so too.
+`veynodevm machine display NAME WxH` is the one CLI user of that login besides MCP: it
+writes a temporary script to the guest's `%TEMP%` and runs it once as a scheduled task
+(`/it`, deleted afterwards) because display modes can only be changed from the
+interactive session.
 
 - `vm_exec`: argv runs without a shell (`Process.Start`; the command line is
   built with the Windows quoting rules), so `cmd /c …` and
@@ -1508,7 +1513,9 @@ only when freshly rechecked; there is no claim of atomicity across a later socke
 connect or input RPC. Host user/worker/controller remain trusted.
 
 Linux Apple Virtualization guests use the same bridge for the browser desktop
-(`docs/browser-desktop.md`). macOS browser input remains disabled. Guest service/console identity must still
+(`docs/browser-desktop.md`), and macOS guests use it with the worker's own
+Screen Sharing session standing in for the guest agent (a socketpair, no vsock).
+Neither is an identity claim about the Guest. Guest service/console identity must still
 be checked against capture and screenshot metadata before a future media/control
 integration can authorize it. Do not use this listener proof as that identity.
 

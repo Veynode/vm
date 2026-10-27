@@ -10,7 +10,8 @@ int main(void){VeynodeHEVCProfile p;uint8_t b[sizeof(actual)+4];
  memcpy(b,actual,sizeof(actual));b[3]=2;assert(!veynode_hevc_main_level4(b,sizeof(actual),&p)); // Main10
  b[3]=0x21;assert(!veynode_hevc_main_level4(b,sizeof(actual),&p)); // High tier
  b[3]=0x41;assert(!veynode_hevc_main_level4(b,sizeof(actual),&p)); // Other profile space
- b[3]=1;b[17]=123;assert(!veynode_hevc_main_level4(b,sizeof(actual),&p)); // level4.1
+ b[3]=1;b[17]=123;assert(veynode_hevc_main_level4(b,sizeof(actual),&p)); // level4.1: 1080p60
+ b[17]=150;assert(!veynode_hevc_main_level4(b,sizeof(actual),&p)); // level5
  b[17]=0;assert(!veynode_hevc_main_level4(b,sizeof(actual),&p));
  b[17]=93;assert(veynode_hevc_main_level4(b,sizeof(actual),&p));
  memcpy(b,actual,sizeof(actual));b[2]=3;assert(!veynode_hevc_main_level4(b,sizeof(actual),&p)); // sublayers
