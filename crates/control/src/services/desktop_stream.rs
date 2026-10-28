@@ -30,6 +30,13 @@
 //! `"error"`). QEMU's goes through the broker to the Guest's spice-vdagent, Apple
 //! Virtualization's through the guest stream to the agent's X11 clipboard, and a
 //! macOS container's over SSH to `macos_clipboard.js` in its login session.
+//! The Guest pointer and monitor (QEMU, through the broker; `"cursorShape"` and
+//! `"monitor"` true in `ready`): `{"cursor_watch":true}` reports the Guest's
+//! pointer shape now and on every change as `{"event":"cursor","width","height",
+//! "hot_x","hot_y","rgba"}` (base64 of straight-alpha RGBA rows) or
+//! `{"event":"cursor","hidden":true}`; `{"monitor":{"width","height"}}` asks the
+//! Guest's spice-vdagent for that size, answered as `{"event":"monitor",…}` with the
+//! size or an `error`.
 //! `control` messages: `{"events":[...]}` (see `crate::desktop_input`),
 //! `{"keyframe":true}`, or `{"encoder":"LINE"}`, one encoder command from
 //! docs/browser-desktop.md (`[@T ]keyframe|bitrate|crop|scale`, `fps N`, `track add|remove T`;
@@ -210,8 +217,18 @@ fn pump_audio(link: UnixStream, broker: bool, hearing: Arc<AtomicBool>, out: Out
             None | Some(3) => {}
             Some(1) => {
                 let reply: Value = serde_json::from_slice(&body)?;
-                if reply["event"] == "clipboard" {
+                if reply["event"] == "clipboard" || reply["event"] == "cursor" {
                     event(&out, reply)?;
+                } else if reply["request_id"] == "monitor" {
+                    let mut answer = json!({"event":"monitor"});
+                    match reply["error"].is_null() {
+                        true => {
+                            answer["width"] = reply["result"]["width"].clone();
+                            answer["height"] = reply["result"]["height"].clone();
+                        }
+                        false => answer["error"] = reply["error"].clone(),
+                    }
+                    event(&out, answer)?;
                 } else if !reply["error"].is_null() {
                     // Only a refusal matters; acknowledgements are not forwarded.
                     event(
@@ -220,6 +237,7 @@ fn pump_audio(link: UnixStream, broker: bool, hearing: Arc<AtomicBool>, out: Out
                             Some("clipboard") => {
                                 json!({"event":"clipboard","error":reply["error"]})
                             }
+                            Some("cursor") => json!({"event":"cursor","error":reply["error"]}),
                             _ => json!({"event":"audio_error","message":reply["error"]}),
                         },
                     )?;
@@ -228,6 +246,29 @@ fn pump_audio(link: UnixStream, broker: bool, hearing: Arc<AtomicBool>, out: Out
             Some(_) => {}
         }
     }
+}
+
+/// The broker line for a browser `{"cursor_watch"}` or `{"monitor"}` message;
+/// `None` when the message is neither, an error when it is malformed.
+pub fn pointer_line(message: &Value) -> Option<Result<Value, String>> {
+    if let Some(watch) = message["cursor_watch"].as_bool() {
+        return Some(Ok(json!({"request_id":"cursor",
+            "method":if watch {"cursor_watch"} else {"cursor_unwatch"}})));
+    }
+    let monitor = &message["monitor"];
+    if monitor.is_null() {
+        return None;
+    }
+    let side = |key: &str, low: u64| {
+        monitor[key]
+            .as_u64()
+            .filter(|v| (low..=8192).contains(v))
+            .ok_or_else(|| format!("monitor.{key} must be {low} through 8192"))
+    };
+    Some((|| {
+        Ok(json!({"request_id":"monitor","method":"monitor_config",
+            "width":side("width", 320)?,"height":side("height", 200)?}))
+    })())
 }
 
 /// JSON with every non-ASCII character as a `\u` escape: the input `macos_clipboard.js`
@@ -697,7 +738,7 @@ fn run(name: &str, codec: &str, tracks: bool, io: &StreamIo) -> Result<i32> {
     let qemu = matches!(session.backend, Backend::Qemu);
     event(
         &out,
-        json!({"event":"ready","vm":session.vm,"backend":if qemu {"qemu-hvf"} else {"apple-virtualization"},"codec":codec,"cursor":if session.guest_cursor {"guest"} else {"local"},"audio":session.audio,"clipboard":session.clipboard,"guest":session.guest}),
+        json!({"event":"ready","vm":session.vm,"backend":if qemu {"qemu-hvf"} else {"apple-virtualization"},"codec":codec,"cursor":if session.guest_cursor {"guest"} else {"local"},"audio":session.audio,"clipboard":session.clipboard,"guest":session.guest,"cursorShape":qemu && session.link.is_some(),"monitor":qemu && session.link.is_some()}),
     )?;
     // The broker connection takes requests from the input thread; the encoder's audio socket only reads.
     let hearing = Arc::new(AtomicBool::new(false));
@@ -797,6 +838,25 @@ fn run(name: &str, codec: &str, tracks: bool, io: &StreamIo) -> Result<i32> {
                         None => control.lock().unwrap().write_all(&line),
                     };
                 }
+                continue;
+            }
+            if let Some(line) = pointer_line(&message) {
+                let line = match (line, &broker) {
+                    (Ok(line), Some(broker)) => {
+                        let mut bytes = serde_json::to_vec(&line).unwrap_or_default();
+                        bytes.push(b'\n');
+                        let _ = broker.lock().unwrap().write_all(&bytes);
+                        continue;
+                    }
+                    (Ok(_), None) => "this desktop has no Guest pointer or monitor link".to_owned(),
+                    (Err(error), _) => error,
+                };
+                let kind = if message["monitor"].is_null() {
+                    "cursor"
+                } else {
+                    "monitor"
+                };
+                let _ = event(&input_out, json!({"event":kind,"error":line}));
                 continue;
             }
             if let Some(lines) = clipboard_lines(&message, broker.is_some()) {
@@ -915,6 +975,34 @@ fn run(name: &str, codec: &str, tracks: bool, io: &StreamIo) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pointer_and_monitor_messages_become_broker_lines() {
+        assert_eq!(
+            pointer_line(&json!({"cursor_watch":true}))
+                .unwrap()
+                .unwrap(),
+            json!({"request_id":"cursor","method":"cursor_watch"})
+        );
+        assert_eq!(
+            pointer_line(&json!({"cursor_watch":false}))
+                .unwrap()
+                .unwrap()["method"],
+            "cursor_unwatch"
+        );
+        assert_eq!(
+            pointer_line(&json!({"monitor":{"width":1920,"height":1080}}))
+                .unwrap()
+                .unwrap(),
+            json!({"request_id":"monitor","method":"monitor_config","width":1920,"height":1080})
+        );
+        assert!(
+            pointer_line(&json!({"monitor":{"width":100,"height":1080}}))
+                .unwrap()
+                .is_err()
+        );
+        assert!(pointer_line(&json!({"keyframe":true})).is_none());
+    }
 
     /// An encoder end that acknowledges like the console helper: a status receipt, then each
     /// `set_bitrate` echoed with its sequence, refusing the first as stale when `stale` is set.

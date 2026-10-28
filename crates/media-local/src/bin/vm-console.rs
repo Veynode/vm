@@ -164,6 +164,8 @@ struct Native {
     audio: Mutex<Option<(u64, Output)>>,
     /// Clients told of the Guest's clipboard (`clipboard_watch`).
     clipboard: Mutex<BTreeMap<u64, Output>>,
+    /// Clients told of the Guest's pointer shape (`cursor_watch`).
+    cursor: Mutex<BTreeMap<u64, Output>>,
     next_epoch: AtomicU64,
     snapshot: Mutex<()>,
     capabilities: Value,
@@ -191,6 +193,15 @@ fn receive_native(receive: &Native, pipe: &mut impl Read) -> Result<()> {
                     bail!("native clipboard event has an epoch")
                 }
                 for output in receive.clipboard.lock().unwrap().values() {
+                    output.offer(record.clone());
+                }
+                continue;
+            }
+            if value["event"] == "cursor" && value.get("id").is_none() {
+                if record.epoch != 0 {
+                    bail!("native cursor event has an epoch")
+                }
+                for output in receive.cursor.lock().unwrap().values() {
                     output.offer(record.clone());
                 }
                 continue;
@@ -934,8 +945,10 @@ fn connection(stream: UnixStream, native: Arc<Native>, client: u64) -> Result<()
                 bail!("unexpected screenshot fields")
             }
             if (request.method != "set_crop" && (request.x.is_some() || request.y.is_some()))
-                || (!matches!(request.method.as_str(), "set_scale" | "set_crop")
-                    && (request.width.is_some() || request.height.is_some()))
+                || (!matches!(
+                    request.method.as_str(),
+                    "set_scale" | "set_crop" | "monitor_config"
+                ) && (request.width.is_some() || request.height.is_some()))
             {
                 bail!("unexpected view fields")
             }
@@ -999,6 +1012,20 @@ fn connection(stream: UnixStream, native: Arc<Native>, client: u64) -> Result<()
                     native.clipboard.lock().unwrap().remove(&client);
                     Ok(json!({"watching":false}))
                 }
+                // The current shape follows as an event, then every new one.
+                "cursor_watch" => {
+                    native.cursor.lock().unwrap().insert(client, output.clone());
+                    native.clipboard_send(json!({"method":"cursor_get"}))?;
+                    Ok(json!({"watching":true}))
+                }
+                "cursor_unwatch" => {
+                    native.cursor.lock().unwrap().remove(&client);
+                    Ok(json!({"watching":false}))
+                }
+                // The viewer's size as the Guest's monitor, through its spice-vdagent.
+                "monitor_config" => native.call(
+                    json!({"method":"monitor_config","width":request.width.context("missing width")?,"height":request.height.context("missing height")?}),
+                ),
                 "keyframe" => native.keyframe(client),
                 "set_scale" => native.view(
                     client,
@@ -1118,6 +1145,7 @@ fn connection(stream: UnixStream, native: Arc<Native>, client: u64) -> Result<()
     let _ = native.close(client);
     let _ = native.audio_stop(client);
     native.clipboard.lock().unwrap().remove(&client);
+    native.cursor.lock().unwrap().remove(&client);
     let _ = shared.shutdown(std::net::Shutdown::Both);
     drop(output);
     let _ = writer.join();
@@ -1236,6 +1264,7 @@ fn run() -> Result<()> {
         owner: Mutex::new(None),
         audio: Mutex::new(None),
         clipboard: Mutex::new(BTreeMap::new()),
+        cursor: Mutex::new(BTreeMap::new()),
         next_epoch: AtomicU64::new(1),
         snapshot: Mutex::new(()),
         capabilities,
@@ -1446,6 +1475,7 @@ mod frame_diagnostic_id_tests {
                 owner: Mutex::new(None),
                 audio: Mutex::new(None),
                 clipboard: Mutex::new(BTreeMap::new()),
+                cursor: Mutex::new(BTreeMap::new()),
                 next_epoch: AtomicU64::new(1),
                 snapshot: Mutex::new(()),
                 capabilities: json!({"native_window":true,"native_window_protocol":1,"display_only":true,"input_enabled":false}),
@@ -1558,6 +1588,7 @@ mod frame_diagnostic_id_tests {
                 owner: Mutex::new(None),
                 audio: Mutex::new(None),
                 clipboard: Mutex::new(BTreeMap::new()),
+                cursor: Mutex::new(BTreeMap::new()),
                 next_epoch: AtomicU64::new(1),
                 snapshot: Mutex::new(()),
                 capabilities: json!({}),
@@ -1646,6 +1677,7 @@ mod frame_diagnostic_id_tests {
                 owner: Mutex::new(None),
                 audio: Mutex::new(None),
                 clipboard: Mutex::new(BTreeMap::new()),
+                cursor: Mutex::new(BTreeMap::new()),
                 next_epoch: AtomicU64::new(1),
                 snapshot: Mutex::new(()),
                 capabilities: json!({}),
@@ -1764,6 +1796,7 @@ mod screenshot_forward_tests {
             })),
             audio: Mutex::new(None),
             clipboard: Mutex::new(BTreeMap::new()),
+            cursor: Mutex::new(BTreeMap::new()),
             next_epoch: AtomicU64::new(1),
             snapshot: Mutex::new(()),
             capabilities: json!({}),
@@ -2144,6 +2177,7 @@ mod screenshot_forward_tests {
             owner: Mutex::new(None),
             audio: Mutex::new(None),
             clipboard: Mutex::new(BTreeMap::new()),
+            cursor: Mutex::new(BTreeMap::new()),
             next_epoch: AtomicU64::new(1),
             snapshot: Mutex::new(()),
             capabilities: json!({}),
@@ -2332,6 +2366,7 @@ mod screenshot_deadline_tests {
             owner: Mutex::new(None),
             audio: Mutex::new(None),
             clipboard: Mutex::new(BTreeMap::new()),
+            cursor: Mutex::new(BTreeMap::new()),
             next_epoch: AtomicU64::new(1),
             snapshot: Mutex::new(()),
             capabilities: json!({}),

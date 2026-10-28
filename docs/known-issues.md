@@ -337,10 +337,12 @@
     from GitHub's asset digest, viogpu3d DriverVer 08/30/2026).
   - **Licence.** The owner states Neptune is MIT, and the driver repositories
     (`virtio-win/kvm-guest-drivers-windows`, UTM's fork) carry a BSD 3-Clause
-    `LICENSE` (checked 2026-10-27; not legal advice). Not done: shipping the
-    guest tools as a default install. The prebuilt drivers may be unsigned,
-    so a bundled install still needs a signing plan; until then the tools
-    ISO stays a user-supplied file.
+    `LICENSE` (checked 2026-10-27; not legal advice). VeynodeVM ships no
+    guest tools: an unattended Neptune install has the daemon download
+    0.1.273 from UTM's release (pinned size and SHA-256) and run `pnputil`
+    at the first logon. Its `viogpu3d.cat` is signed through Microsoft's
+    hardware program (Windows Hardware Compatibility Publisher), so it
+    installs without a prompt or test signing.
   - viogpu3d is the only display adapter: dxdiag in the desktop session
     names "Red Hat VirtIO GPU 3D controller", chip "QEMU VIRTIO GPU",
     `neptune_umd.dll`, driver 100.6.101.58000, WDDM 2.2, DDI 11.1, feature

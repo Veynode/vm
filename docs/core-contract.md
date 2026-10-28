@@ -61,6 +61,11 @@ What changed for core when this merged onto the split:
 - `ports` work on Apple Virtualization machines too: the daemon publishes them on 127.0.0.1.
 - `machine.exec` and `files.copy` on a Linux cloud-image machine run over SSH, with no 30 s or 64 KiB limit.
 - Windows `unattended` needs `driversIso` and no longer `attach`.
+- Windows `unattended` with `gpu` `neptune` installs UTM's viogpu3d driver at the first logon. The daemon downloads
+  UTM's guest tools 0.1.273 (Neptune wire format 1, pinned size and SHA-256) into `<home>/downloads` and attaches
+  them; nothing is shipped.
+- `machine.display` on QEMU sends the pointer shape (2) after input 5 and copied text (3) after input 6, and lists
+  inputs 17 and 18 (the viewer's size, sent to the Guest as its monitor) in its capabilities (11).
 
 ## Verified, and what is not
 
@@ -80,7 +85,11 @@ Not verified:
 
 - `machine.microphone`: the daemon's frames reached the console broker, but the guest recorded silence.
 - `veynodevm daemon start` for core's home (loading a launchd agent was not run here).
-- The Windows install since it moved into the daemon, and the Neptune GPU with UTM's guest driver.
+- The Windows install since it moved into the daemon, and its Neptune driver step (the driver itself was verified
+  installed by hand, see [known issues](known-issues.md#windows-11-arm64-machines)).
+- The pointer shape, copied text and monitor size on `machine.display`: unit tests, and the SPICE helper compiles
+  against UTM's headers; no live run. The pointer's byte order (spice-gtk's ARGB32, swapped to RGBA) is unchecked.
+- Any live run after the merge: the host had under 20 GiB free.
 - macOS, skipped by decision.
 
 Unit and fixture tests cover the SSH exec and copy commands, the lease lookup, the qcow2 converter, the cloud-init

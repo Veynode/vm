@@ -414,7 +414,7 @@ pub fn published(machine: &Machine, config: &Value) -> Vec<(u16, u16)> {
 /// (`services::display`, `services::sound`).
 pub fn display(_: &Ctx, args: Value) -> Result<Value> {
     let (machine, epoch) = endpoint_args(&args)?;
-    super::display::display(&machine.name, epoch)
+    super::display::display(&machine.name, epoch, machine.backend == "qemu-hvf")
 }
 
 pub fn sound(_: &Ctx, args: Value) -> Result<Value> {

@@ -492,6 +492,32 @@ static void clipboardSet(NSData *text){
  hostClipboard=text;guestClipboard=NO;guint32 type=VD_AGENT_CLIPBOARD_UTF8_TEXT;
  spice_main_channel_clipboard_selection_grab(mainChannel,VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD,&type,1);
 }
+// Guest pointer shape (the SPICE cursor channel): each new shape becomes the
+// event {"event":"cursor","width","height","hot_x","hot_y","rgba"} (base64 of
+// straight-alpha RGBA rows) and a hidden pointer {"event":"cursor","hidden":true}.
+// `cursor_get` sends the current one again, for a viewer that starts watching.
+static NSDictionary *lastCursor;
+static void cursorEvent(NSDictionary *value){lastCursor=value;NSMutableDictionary *event=[value mutableCopy];event[@"event"]=@"cursor";emit(0,event);}
+static void cursorSet(SpiceCursorChannel *channel,gint width,gint height,gint hotX,gint hotY,gpointer data,gpointer user){
+ if(width<=0||height<=0||width>512||height>512||!data)return;
+ // spice-gtk hands over native-endian ARGB32 (B, G, R, A in memory here).
+ NSMutableData *rgba=[NSMutableData dataWithLength:(NSUInteger)width*(NSUInteger)height*4];const uint8_t *in=data;uint8_t *out=rgba.mutableBytes;
+ for(NSUInteger i=0;i<(NSUInteger)width*(NSUInteger)height;i++){out[i*4]=in[i*4+2];out[i*4+1]=in[i*4+1];out[i*4+2]=in[i*4];out[i*4+3]=in[i*4+3];}
+ cursorEvent(@{@"width":@(width),@"height":@(height),@"hot_x":@(MIN(MAX(hotX,0),width-1)),@"hot_y":@(MIN(MAX(hotY,0),height-1)),@"rgba":[rgba base64EncodedStringWithOptions:0]});
+}
+static void cursorHide(SpiceCursorChannel *channel,gpointer user){cursorEvent(@{@"hidden":@YES});}
+static void cursorReset(SpiceCursorChannel *channel,gpointer user){lastCursor=nil;}
+// The viewer's size as the Guest's one monitor (SPICE monitor config). The
+// Guest's spice-vdagent applies it; without one there is nothing to tell.
+static NSString *monitorConfig(NSNumber *width,NSNumber *height){
+ if(![width isKindOfClass:NSNumber.class]||![height isKindOfClass:NSNumber.class])return @"invalid_size";
+ int w=width.intValue,h=height.intValue;if(w<320||h<200||w>8192||h>8192)return @"invalid_size";
+ gboolean agent=FALSE;if(mainChannel)g_object_get(mainChannel,"agent-connected",&agent,NULL);
+ if(!agent)return @"no_agent";
+ spice_main_channel_update_display_enabled(mainChannel,0,TRUE,FALSE);
+ spice_main_channel_update_display(mainChannel,0,0,0,w&~1,h&~1,FALSE);
+ return spice_main_channel_send_monitor_config(mainChannel)?nil:@"monitor_config_refused";
+}
 static void clipboardGet(void){
  if(guestClipboard&&mainChannel)spice_main_channel_clipboard_selection_request(mainChannel,VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD,VD_AGENT_CLIPBOARD_UTF8_TEXT);
  else if(hostClipboard)clipboardEvent(@{@"text":[[NSString alloc] initWithData:hostClipboard encoding:NSUTF8StringEncoding]});
@@ -524,6 +550,7 @@ static void newChannel(SpiceSession *session,SpiceChannel *channel,gpointer data
  if(SPICE_IS_PLAYBACK_CHANNEL(channel))VeynodeAudioAvailable();
 #endif
  if(SPICE_IS_PLAYBACK_CHANNEL(channel)){g_signal_connect(channel,"playback-start",G_CALLBACK(playbackStart),NULL);g_signal_connect(channel,"playback-stop",G_CALLBACK(playbackStop),NULL);g_signal_connect(channel,"playback-data",G_CALLBACK(playbackData),NULL);spice_channel_connect(channel);return;}
+ if(SPICE_IS_CURSOR_CHANNEL(channel)){g_signal_connect(channel,"cursor-set",G_CALLBACK(cursorSet),NULL);g_signal_connect(channel,"cursor-hide",G_CALLBACK(cursorHide),NULL);g_signal_connect(channel,"cursor-reset",G_CALLBACK(cursorReset),NULL);spice_channel_connect(channel);return;}
  if(SPICE_IS_RECORD_CHANNEL(channel)){recordChannel=SPICE_RECORD_CHANNEL(channel);g_signal_connect(channel,"record-start",G_CALLBACK(recordStart),NULL);g_signal_connect(channel,"record-stop",G_CALLBACK(recordStop),NULL);spice_channel_connect(channel);return;}
  if(SPICE_IS_DISPLAY_CHANNEL(channel)){g_signal_connect(channel,"notify::gl-scanout",G_CALLBACK(scanout),NULL);g_signal_connect(channel,"gl-draw",G_CALLBACK(draw),NULL);g_signal_connect(channel,"channel-event",G_CALLBACK(channelEvent),NULL);spice_channel_connect(channel);}
  else if(SPICE_IS_MAIN_CHANNEL(channel))g_signal_connect(channel,"channel-event",G_CALLBACK(channelEvent),NULL);
@@ -621,12 +648,14 @@ static void command(NSData *line){
   if(!part||clipboardParts.length+part.length>clipboardMax){clipboardParts=nil;clipboardEvent(@{@"error":@"clipboard text must be UTF-8 of at most 200 KiB"});return;}
   [clipboardParts appendData:part];if([request[@"last"] boolValue]){clipboardSet(clipboardParts);clipboardParts=nil;}return;}
  if([request[@"method"] isEqual:@"clipboard_get"]&&request.count==1){clipboardGet();return;}
+ if([request[@"method"] isEqual:@"cursor_get"]&&request.count==1){if(lastCursor)cursorEvent(lastCursor);return;}
  if(!([ident isKindOfClass:NSString.class]&&[ident length]>0&&[ident length]<=128)){reject(nil,0,@"invalid_id");return;}
 #ifdef VEYNODE_NATIVE_DISPLAY
  if(shutdownID){reject(ident,0,@"shutdown_pending");return;}
 #endif
  NSString *method=request[@"method"];if(![method isKindOfClass:NSString.class]){reject(ident,0,@"invalid_method");return;}
  if([method isEqual:@"audio_start"]||[method isEqual:@"audio_stop"]){if(request.count!=2){reject(ident,0,@"invalid_request");return;}audioListening=[method isEqual:@"audio_start"];reply(ident,0,@{@"listening":@(audioListening),@"playback":@(playbackRate>0),@"record":@(recordChannel!=NULL)});return;}
+ if([method isEqual:@"monitor_config"]){if(request.count!=4){reject(ident,0,@"invalid_request");return;}NSString *error=monitorConfig(request[@"width"],request[@"height"]);if(error)reject(ident,0,error);else reply(ident,0,@{@"width":@([request[@"width"] intValue]&~1),@"height":@([request[@"height"] intValue]&~1)});return;}
  if([method isEqual:@"capabilities"]){if(request.count!=2){reject(ident,0,@"invalid_window_request");return;}reply(ident,0,displayCapabilities());return;}
  if([@[@"show_window",@"close_window",@"window_status",@"validate_displayed_frame"] containsObject:method]){
   BOOL validating=[method isEqual:@"validate_displayed_frame"];id diagnosticID=request[@"diagnostic_id"];

@@ -160,6 +160,13 @@ header of core's `apps/macos-runtime/native/screen-stream.swift`):
 - The viewer sends `token` and a newline within 5 s, then input messages: kind u8 and a fixed-size payload.
 - The endpoint sends kind u8, length u32 BE, payload: capabilities (11) first, then video (1: width and height u16
   BE, flags u8 with 1 = key frame, Annex B H.264 or HEVC) and codec changes (12).
+- After input 5 (the viewer draws the pointer) the endpoint sends the Guest's pointer shape (2: hot spot x, y,
+  width, height u16 BE, then RGBA rows with straight alpha; a hidden pointer is one clear pixel), and after input 6
+  the Guest's copied text (3: UTF-8). A QEMU machine's come from SPICE (the Guest needs spice-vdagent for the
+  text); an Apple Virtualization Linux machine sends copied text through the guest agent and no pointer shape.
+- On QEMU the capabilities list inputs 17 and 18 (the viewer's width and height u16 BE): the size becomes the
+  Guest's one monitor through its spice-vdagent (Linux on Xorg with `virtio-gpu-gl`). The capabilities always list
+  19 (codec).
 - The newest viewer replaces the one before it.
 - The same `epoch` answers the same endpoint. A new one replaces it, with a new port and token, and cuts its viewers.
   The endpoint ends when the machine stops.

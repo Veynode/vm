@@ -8,7 +8,11 @@
 //! token and a newline, then input messages (kind u8 and a fixed-size
 //! payload); the endpoint sends kind u8, length u32 BE, payload:
 //! capabilities (11) first, then video (1: width, height u16 BE, flags u8
-//! with 1 = key frame, Annex B) and codec changes (12). Each connection runs
+//! with 1 = key frame, Annex B) and codec changes (12). Input 5 asks for the
+//! Guest's pointer shape (2: hot spot, width, height u16 BE, RGBA) and input 6
+//! for its copied text (3: UTF-8). On QEMU, where those come from SPICE, the
+//! capabilities also list inputs 17 and 18, the viewer's size, which becomes
+//! the Guest's monitor through its spice-vdagent. Each connection runs
 //! a `desktop.stream` (`services::desktop_stream`: QEMU's SPICE console encoder, or the Apple
 //! Virtualization guest agent / Screen Sharing encoder) and translates its
 //! records; the newest connection replaces the one before it. A new epoch
@@ -68,7 +72,9 @@ type Endpoints = HashMap<(String, &'static str), Endpoint>;
 static ENDPOINTS: Mutex<Option<Endpoints>> = Mutex::new(None);
 
 /// `machine.display`: the endpoint of `epoch`, started if it is new.
-pub fn display(name: &str, epoch: u64) -> Result<Value> {
+/// `spice`: a QEMU machine, whose SPICE console gives the pointer shape,
+/// copied text and the monitor size.
+pub fn display(name: &str, epoch: u64, spice: bool) -> Result<Value> {
     // Held by the viewer whose encoder owns the desktop.
     let desktop = Arc::new(Mutex::new(()));
     endpoint(
@@ -76,8 +82,15 @@ pub fn display(name: &str, epoch: u64) -> Result<Value> {
         "display",
         epoch,
         json!({"format":"stream"}),
-        Arc::new(move |name, stream| serve(name, stream, &desktop)),
+        Arc::new(move |name, stream| serve(name, stream, &desktop, spice)),
     )
+}
+
+/// The capabilities message: the inputs beyond the oldest viewers' that this
+/// endpoint takes (codec, and on SPICE the viewer's size).
+pub fn capabilities(spice: bool) -> Vec<u8> {
+    let inputs: &[u8] = if spice { &[19, 17, 18] } else { &[19] };
+    message(11, inputs)
 }
 
 /// The machine's endpoint of `stream` for `epoch`: the running one, or a new
@@ -529,6 +542,12 @@ pub enum Action {
     KeyFrame,
     Bitrate(u64),
     Codec(bool),
+    /// Input 5: the viewer draws the pointer, so it wants its shape.
+    PointerShape(bool),
+    /// Input 6: the viewer wants the Guest's copied text.
+    CopiedText(bool),
+    /// Inputs 17 and 18: the viewer's size.
+    Size(u16, u16),
     None,
 }
 
@@ -586,6 +605,9 @@ impl Input {
                 }
             }
             4 => Action::KeyFrame,
+            5 => Action::PointerShape(m[1] == 1),
+            6 => Action::CopiedText(m[1] == 1),
+            17 | 18 => Action::Size(be16(1), be16(3)),
             7 => {
                 let kbps = u32::from_be_bytes([m[1], m[2], m[3], m[4]]) as u64;
                 Action::Bitrate((kbps * 1000).clamp(250_000, 40_000_000))
@@ -699,6 +721,9 @@ fn relay(
                 if event["event"] == "error" {
                     bail!("{}", event["message"].as_str().unwrap_or("encoder error"))
                 }
+                if let Some(out) = guest_message(&event) {
+                    socket.lock().unwrap().write_all(&out)?;
+                }
             }
             2 if payload.len() > 9 => {
                 let key = payload[8] != 0;
@@ -728,11 +753,44 @@ fn relay(
     }
 }
 
+/// A `desktop.stream` event as the endpoint message it carries: the Guest's
+/// pointer shape (2) or copied text (3). A hidden pointer is one clear pixel.
+pub fn guest_message(event: &Value) -> Option<Vec<u8>> {
+    use base64::Engine;
+    match event["event"].as_str()? {
+        "cursor" if event["hidden"] == true => {
+            let mut body = vec![0u8, 0, 0, 0, 0, 1, 0, 1];
+            body.extend_from_slice(&[0, 0, 0, 0]);
+            Some(message(2, &body))
+        }
+        "cursor" => {
+            let side = |key: &str| event[key].as_u64().filter(|v| *v <= u16::MAX as u64);
+            let (w, h) = (side("width")?, side("height")?);
+            let (x, y) = (side("hot_x")?, side("hot_y")?);
+            let rgba = base64::engine::general_purpose::STANDARD
+                .decode(event["rgba"].as_str()?)
+                .ok()?;
+            if w == 0 || h == 0 || rgba.len() as u64 != w * h * 4 {
+                return None;
+            }
+            let mut body = Vec::with_capacity(8 + rgba.len());
+            for v in [x, y, w, h] {
+                body.extend_from_slice(&(v as u16).to_be_bytes());
+            }
+            body.extend_from_slice(&rgba);
+            Some(message(2, &body))
+        }
+        "clipboard" => Some(message(3, event["text"].as_str()?.as_bytes())),
+        _ => None,
+    }
+}
+
 /// Serves one authorized viewer until it disconnects or is replaced.
-fn serve(name: &str, stream: TcpStream, desktop: &Mutex<()>) -> Result<()> {
+fn serve(name: &str, stream: TcpStream, desktop: &Mutex<()>, spice: bool) -> Result<()> {
     let socket: Socket = Arc::new(Mutex::new(stream.try_clone()?));
-    // The inputs beyond the oldest viewers' that this endpoint takes.
-    socket.lock().unwrap().write_all(&message(11, &[19]))?;
+    socket.lock().unwrap().write_all(&capabilities(spice))?;
+    // What the viewer asked for, asked again of each new encoder.
+    let (mut pointer, mut copied) = (false, false);
     let size = Arc::new(Mutex::new(None));
     let sent_codec = Arc::new(Mutex::new(false));
     let mut hevc = false;
@@ -762,19 +820,36 @@ fn serve(name: &str, stream: TcpStream, desktop: &Mutex<()>) -> Result<()> {
                 Action::Events(events) => send(json!({"events":events})),
                 Action::KeyFrame => send(json!({"keyframe":true})),
                 Action::Bitrate(bits) => send(json!({"encoder":format!("bitrate {bits}")})),
+                Action::PointerShape(on) => {
+                    pointer = on;
+                    !spice || send(json!({"cursor_watch":on}))
+                }
+                Action::CopiedText(on) => {
+                    copied = on;
+                    send(json!({"clipboard_watch":on}))
+                }
+                Action::Size(w, h) if spice => send(json!({"monitor":{"width":w,"height":h}})),
+                Action::Size(..) => true,
                 Action::Codec(wanted) if wanted != hevc => {
                     hevc = wanted;
                     // One encoder per desktop: the old one lets go first.
                     if let Some(old) = pipeline.take() {
                         old.stop();
                     }
-                    pipeline = Some(Pipeline::start(
+                    let mut started = Pipeline::start(
                         name,
                         hevc,
                         socket.clone(),
                         size.clone(),
                         sent_codec.clone(),
-                    )?);
+                    )?;
+                    if pointer && spice {
+                        started.send(&json!({"cursor_watch":true}));
+                    }
+                    if copied {
+                        started.send(&json!({"clipboard_watch":true}));
+                    }
+                    pipeline = Some(started);
                     true
                 }
                 Action::Codec(_) | Action::None => true,
@@ -1063,7 +1138,7 @@ mod tests {
         );
         assert_eq!(input.act(&[7, 0, 0, 0, 1]), Action::Bitrate(250_000));
         assert_eq!(input.act(&[19, 1]), Action::Codec(true));
-        assert_eq!(input.act(&[17, 0, 1, 0, 1]), Action::None);
+        assert_eq!(input.act(&[8, 1]), Action::None);
     }
 
     #[test]
@@ -1111,5 +1186,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_guest_pointer_text_and_size_reach_their_messages() {
+        assert_eq!(capabilities(false), message(11, &[19]));
+        assert_eq!(capabilities(true), message(11, &[19, 17, 18]));
+        let mut input = Input::default();
+        assert_eq!(input.act(&[5, 1]), Action::PointerShape(true));
+        assert_eq!(input.act(&[6, 0]), Action::CopiedText(false));
+        assert_eq!(input.act(&[18, 7, 128, 4, 56]), Action::Size(1920, 1080));
+        assert_eq!(input.act(&[17, 5, 0, 2, 208]), Action::Size(1280, 720));
+
+        // A 1x2 pointer with its hot spot on the second row.
+        let rgba = [1u8, 2, 3, 255, 4, 5, 6, 0];
+        let cursor = json!({"event":"cursor","width":1,"height":2,"hot_x":0,"hot_y":1,
+            "rgba":crate::services::machines::base64(&rgba)});
+        let mut body = vec![0, 0, 0, 1, 0, 1, 0, 2];
+        body.extend_from_slice(&rgba);
+        assert_eq!(guest_message(&cursor), Some(message(2, &body)));
+        let hidden = guest_message(&json!({"event":"cursor","hidden":true})).unwrap();
+        assert_eq!(hidden, message(2, &[0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0]));
+        // A shape whose pixels don't fill it is dropped.
+        let short = json!({"event":"cursor","width":2,"height":2,"hot_x":0,"hot_y":0,
+            "rgba":crate::services::machines::base64(&rgba)});
+        assert_eq!(guest_message(&short), None);
+
+        assert_eq!(
+            guest_message(&json!({"event":"clipboard","text":"héllo"})),
+            Some(message(3, "héllo".as_bytes()))
+        );
+        assert_eq!(
+            guest_message(&json!({"event":"clipboard","error":"x"})),
+            None
+        );
+        assert_eq!(guest_message(&json!({"event":"ready"})), None);
     }
 }
