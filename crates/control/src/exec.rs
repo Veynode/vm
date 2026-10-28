@@ -214,13 +214,16 @@ pub(crate) fn advertised_async_timeout(info: &Value, qemu_exec: bool) -> u64 {
             maximum.min(ASYNC_EXEC_MAX_TIMEOUT_MS)
         })
 }
-/// The pause after the `polls`-th `exec_poll` of a synchronous command that is
-/// still running: 2, 4, 8, 16, 32 ms, then every 50 ms. A short command is
-/// answered a few milliseconds after it ends; a long one costs no more polls
-/// than a steady 50 ms. There is no server-side wait to block on: each poll
-/// is answered by the Guest.
-pub(crate) fn exec_poll_delay(polls: u32) -> Duration {
-    Duration::from_millis((2u64 << polls.min(5)).min(50))
+/// The pause after the `polls`-th `exec_poll` of a synchronous command that has
+/// been running for `elapsed`: 2, 4, 8, 16, 32 ms, then 50 ms, and from half a
+/// second on a tenth of the run time, at most 250 ms. A short command is
+/// answered a few milliseconds after it ends; a long one is answered at most
+/// ~10% late and costs 4 polls a second, not 20 (on QEMU each poll is a serial
+/// round trip that wakes the Guest's vCPUs). There is no server-side wait to
+/// block on: each poll is answered by the Guest.
+pub(crate) fn exec_poll_delay(polls: u32, elapsed: Duration) -> Duration {
+    let ramp = Duration::from_millis((2u64 << polls.min(5)).min(50));
+    ramp.max((elapsed / 10).min(Duration::from_millis(250)))
 }
 pub(crate) fn synchronous_exec(dir: &Path, arguments: Value, peer: &UnixStream) -> Result<Value> {
     // The shared asynchronous start route has a longer host ceiling. Do not
@@ -235,7 +238,8 @@ pub(crate) fn synchronous_exec(dir: &Path, arguments: Value, peer: &UnixStream) 
         .as_str()
         .context("guest returned no job identity")?;
     let job = json!({"id":arguments["id"],"job_id":job_id});
-    let deadline = std::time::Instant::now() + Duration::from_secs(35);
+    let started_at = std::time::Instant::now();
+    let deadline = started_at + Duration::from_secs(35);
     let mut polls = 0;
     let result = (|| loop {
         if peer_disconnected(&[peer.as_raw_fd()]) {
@@ -248,7 +252,7 @@ pub(crate) fn synchronous_exec(dir: &Path, arguments: Value, peer: &UnixStream) 
         if let Some(result) = completed_exec_result(&reply)? {
             return Ok(result);
         }
-        thread::sleep(exec_poll_delay(polls));
+        thread::sleep(exec_poll_delay(polls, started_at.elapsed()));
         polls += 1;
     })();
     if let Err(error) = result {
@@ -269,11 +273,20 @@ mod poll_tests {
     use super::*;
 
     #[test]
-    fn synchronous_polls_start_fast_and_settle_at_50_ms() {
+    fn synchronous_polls_start_fast_and_slow_down_with_the_run_time() {
+        let early = Duration::from_millis(5);
         let delays: Vec<u64> = (0..8)
-            .map(|n| exec_poll_delay(n).as_millis() as u64)
+            .map(|n| exec_poll_delay(n, early).as_millis() as u64)
             .collect();
         assert_eq!(delays, [2, 4, 8, 16, 32, 50, 50, 50]);
-        assert_eq!(exec_poll_delay(u32::MAX), Duration::from_millis(50));
+        let ms = |elapsed| exec_poll_delay(9, Duration::from_millis(elapsed)).as_millis();
+        assert_eq!(
+            [ms(400), ms(1_000), ms(2_000), ms(30_000)],
+            [50, 100, 200, 250]
+        );
+        assert_eq!(
+            exec_poll_delay(u32::MAX, Duration::MAX),
+            Duration::from_millis(250)
+        );
     }
 }

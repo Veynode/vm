@@ -7,6 +7,7 @@ use std::{
     io::{Read, Write},
     os::unix::process::ExitStatusExt,
     process::{Command, Stdio},
+    sync::mpsc::{self, Receiver, RecvTimeoutError},
     thread,
     time::Duration,
 };
@@ -35,6 +36,7 @@ pub fn run_with(
         .spawn()
         .context("cannot start the command")?;
     let pid = child.id() as libc::pid_t;
+    let exited = exit_notice(child.id());
     let readers = [
         (
             child
@@ -104,10 +106,46 @@ pub fn run_with(
                 }
                 Some(Input::Eof | Input::Closed) => input = None,
                 Some(Input::Idle) => {}
-                None => thread::sleep(Duration::from_millis(20)),
+                // Without input, the exit wakes the loop at once; the timeout
+                // only bounds how late a signal or the client leaving is seen.
+                None => match exited.recv_timeout(Duration::from_millis(20)) {
+                    Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => thread::sleep(Duration::from_millis(20)),
+                },
             }
         }
     })
+}
+
+/// Fires once `pid`, a child of this process, has exited, without polling: a
+/// thread blocks in `waitid(WNOWAIT)`, which leaves the child unreaped, so its
+/// PID stays reserved for a later kill or wait.
+pub(crate) fn exit_notice(pid: u32) -> Receiver<()> {
+    let (exited, notice) = mpsc::channel();
+    thread::spawn(move || loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if rc != 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        // Darwin can report a stopped child even with WEXITED alone.
+        if rc == 0
+            && ![libc::CLD_EXITED, libc::CLD_KILLED, libc::CLD_DUMPED].contains(&info.si_code)
+        {
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        let _ = exited.send(());
+        break;
+    });
+    notice
 }
 
 /// The signal a `control` message names.
@@ -119,4 +157,20 @@ pub fn signal_number(name: &str) -> Option<libc::c_int> {
         "KILL" => libc::SIGKILL,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_notice_fires_at_the_exit_and_leaves_the_child_to_reap() {
+        let mut child = Command::new("/bin/sleep").arg("0.05").spawn().unwrap();
+        let exited = exit_notice(child.id());
+        assert!(exited.recv_timeout(Duration::from_millis(5)).is_err());
+        let started = std::time::Instant::now();
+        exited.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(child.try_wait().unwrap().unwrap().success());
+    }
 }

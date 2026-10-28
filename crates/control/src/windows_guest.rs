@@ -316,31 +316,12 @@ impl Ssh {
     }
 }
 
-/// Waits up to `timeout` for `child` to exit, without polling: a thread
-/// blocks in `waitid(WNOWAIT)`, which leaves the child unreaped, so its PID
-/// stays reserved and the caller can still kill it after a timeout (None);
-/// the caller then kills and reaps it, which ends that thread.
+/// Waits up to `timeout` for `child` to exit, without polling (see
+/// [`crate::services::pump::exit_notice`]); the child stays unreaped, so after a
+/// timeout (None) the caller can still kill it, then reaps it.
 fn wait_timeout(child: &mut Child, timeout: Duration) -> std::io::Result<Option<ExitStatus>> {
-    let pid = child.id() as libc::id_t;
-    let (exited, wait) = std::sync::mpsc::channel();
-    std::thread::spawn(move || loop {
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let rc =
-            unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
-        if rc != 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-            continue;
-        }
-        // Darwin can report a stopped child even with WEXITED alone.
-        if rc == 0
-            && ![libc::CLD_EXITED, libc::CLD_KILLED, libc::CLD_DUMPED].contains(&info.si_code)
-        {
-            std::thread::sleep(Duration::from_millis(20));
-            continue;
-        }
-        let _ = exited.send(());
-        break;
-    });
-    match wait.recv_timeout(timeout) {
+    let exited = crate::services::pump::exit_notice(child.id());
+    match exited.recv_timeout(timeout) {
         Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => child.wait().map(Some),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
     }
