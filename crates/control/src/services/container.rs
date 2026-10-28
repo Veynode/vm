@@ -48,6 +48,19 @@ const SEED_OFFSET: usize = CONFIG_DISK_BYTES - 4096;
 const SEED_BYTES: usize = 64;
 pub const MARKER: &str = "@@veynodevm ";
 
+/// A container micro-VM's kernel command line. Past the console and init, it
+/// turns off what woke an idle Guest's vCPUs on a timer (on QEMU/HVF each
+/// wakeup is a VM exit): KFENCE's 100 ms sampling, the soft-lockup watchdog,
+/// proactive compaction (every 500 ms), and it folds per-CPU memory
+/// statistics every 10 s instead of every second.
+fn kernel_command_line(qemu: bool) -> String {
+    format!(
+        "console={} rdinit=/veynode/init quiet loglevel=1 panic=-1 kfence.sample_interval=0 nowatchdog \
+         sysctl.vm.compaction_proactiveness=0 sysctl.vm.stat_interval=10",
+        if qemu { "ttyAMA0" } else { "hvc0" }
+    )
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PortSpec {
     pub host_address: std::net::Ipv4Addr,
@@ -716,7 +729,7 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
             "memory_mib": memory_mib,
             "kernel": boot.kernel,
             "initrd": boot.initrd,
-            "command_line": format!("console={} rdinit=/veynode/init quiet loglevel=1 panic=-1", if qemu {"ttyAMA0"} else {"hvc0"}),
+            "command_line": kernel_command_line(qemu),
             "disk": rw,
             "extra_disks": [
                 {"path": rootfs, "read_only": true},
@@ -1655,7 +1668,7 @@ mod tests {
     fn vm(qemu: bool) -> Value {
         let mut vm = json!({"backend":if qemu {"qemu-hvf"} else {"apple-virtualization"},"id":"c-a","guest":"linux","cpus":2,
             "memory_mib":if qemu {2048} else {512},"kernel":"/k","initrd":"/i",
-            "command_line":format!("console={} rdinit=/veynode/init quiet loglevel=1 panic=-1", if qemu {"ttyAMA0"} else {"hvc0"}),
+            "command_line":kernel_command_line(qemu),
             "disk":"/h/c/a/rw.raw","extra_disks":[{"path":"/r","read_only":true},{"path":"/h/c/a/config.img","read_only":true},{"path":"/m","read_only":true}],
             "serial_log":"/h/c/a/console.log","shares":[{"tag":"v0","path":"/h/data","read_only":false}]});
         if qemu {
