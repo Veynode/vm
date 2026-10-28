@@ -21,7 +21,7 @@ import subprocess
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location('godot_blender_collect', ROOT/'archive/benchmarks/blender-macos/collect.py')
+spec = importlib.util.spec_from_file_location('godot_blender_collect', ROOT/'scripts/blender-macos-collect.py')
 shared = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(shared)
 CASES = ('OmniLightNoShadows', 'OmniLightWithShadows', 'OmniLightWithPCSSShadows',

@@ -26,6 +26,6 @@ The adapter explicitly disables Keychain UI for its calling process, fails if in
 
 ## Reproduction and boundaries
 
-See [the crate wire and CLI contract](../../crates/session-auth/README.md), its checked-in public golden fixture, protocol tests and explicitly opted-in real Keychain integration test. Original Keychain failures are preserved in [the evidence](../../archive/docs-evidence/session-auth/keychain-initial-failures.json). State files are private, bounded, locked and atomically replaced; they contain public identities and grants, not private keys or SDP bodies.
+See [the crate wire and CLI contract](../../crates/session-auth/README.md), its checked-in public golden fixture, protocol tests and explicitly opted-in real Keychain integration test. Original Keychain failures are preserved in the evidence (`vm-archive/docs-evidence/session-auth/keychain-initial-failures.json`). State files are private, bounded, locked and atomically replaced; they contain public identities and grants, not private keys or SDP bodies.
 
 These tests establish cryptographic binding and local access behavior. They do not test hostile signaling over the Internet, direct-versus-TURN negotiation, cloud confidentiality, browser code provenance, persistent revocation transport cleanup, or real desktop traffic after authenticated negotiation. Those require separate end-to-end tests through the actual media path.

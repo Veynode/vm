@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /* Development-only CLI adapter for the pinned official UTM QEMU dylib.
  * Does not patch/re-sign upstream binaries or relax macOS security settings.
  * Calling convention follows UTM v5.0.5 QEMULauncher/Bootstrap.c. */

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 // Independent diagnostic loader. Never edits the official QEMU/app images.
 #include <dlfcn.h>
 #include <mach-o/dyld.h>

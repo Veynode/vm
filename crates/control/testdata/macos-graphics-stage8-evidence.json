@@ -1,0 +1,140 @@
+{
+  "schema": 1,
+  "guest_binary_sha256": "925a34302d0f5088548ec2766f1386c3b5519f708718d7c853cdb3a2251a3a0e",
+  "validation": {
+    "schema": 1,
+    "passed": true,
+    "actual_mcp_query": true,
+    "cleanup_confirmed": true,
+    "started_at_unix": 1791493237.486047,
+    "scope": "Guest public graphics properties only; no image capture, GPU work, input, file mutation or VM lifecycle action",
+    "probe_log_sha256": "de9886e30acc2169148b8d6674fb3fd0414ef33403114ee91b12b365177e6625",
+    "controller_sha256": "b9ea887d2fed0b96dc7d55df889af319f557d7fada8920a2c3077506f7456e47",
+    "observation": {
+      "metal_device": "Apple Paravirtual device",
+      "graphics": {
+        "api": "metal",
+        "assessment": {
+          "per_kernel_limits": "unavailable-without-pipeline",
+          "performance": "not-measured",
+          "shader_rendering": "not-tested-by-this-query"
+        },
+        "device": {
+          "architecture_name": "air64_v27",
+          "argument_buffers_support": {
+            "raw_value": 1,
+            "tier": "tier2"
+          },
+          "family_support": {
+            "apple1": true,
+            "apple10": false,
+            "apple2": true,
+            "apple3": true,
+            "apple4": true,
+            "apple5": true,
+            "apple6": false,
+            "apple7": false,
+            "apple8": false,
+            "apple9": false,
+            "common1": true,
+            "common2": true,
+            "common3": true,
+            "mac2": true,
+            "metal3": false,
+            "metal4": false
+          },
+          "interpretation": "Reported public capabilities are context, not proof that a particular kernel compiles, nor a diagnosis of nil pipeline creation.",
+          "limit_semantics": "Thread axes are independent device maxima, not multiplied into a total. Per-kernel thread total, execution width and static memory require a successfully created pipeline.",
+          "max_argument_buffer_sampler_count": 96,
+          "max_buffer_bytes": 2147483648,
+          "max_threadgroup_memory_bytes": 32768,
+          "max_threads_per_threadgroup_axes": {
+            "depth": 1024,
+            "height": 1024,
+            "width": 1024
+          },
+          "name": "Apple Paravirtual device",
+          "os_version": "Version 26.6.2 (Build 25G83)",
+          "per_kernel_limits": null,
+          "read_write_texture_support": {
+            "raw_value": 2,
+            "tier": "tier2"
+          },
+          "registry_id": "4294967682",
+          "schema": 1,
+          "supports_dynamic_libraries_compute": false,
+          "supports_dynamic_libraries_render": false,
+          "supports_function_pointers_compute": false,
+          "supports_function_pointers_render": false,
+          "supports_raytracing_compute": false,
+          "supports_raytracing_render": false,
+          "unified_memory": true
+        },
+        "device_selection": "system-default",
+        "evidence": "public-device-properties",
+        "queried_at_unix_ms": 1791493237478,
+        "schema": 1,
+        "scope": "Read-only properties of the Guest service's system-default Metal device. This query does not compile, render, benchmark, authorize input or change permissions.",
+        "status": "reported"
+      }
+    },
+    "comparison": {
+      "properties_equal": true,
+      "different_property_names": [],
+      "registry_ids": {
+        "info": "4294967682",
+        "probe": "4294967682",
+        "equal": true
+      },
+      "info_queried_at_unix_ms": 1791493237478,
+      "comparison_scope": "Public properties; registry IDs may change across reboot/device incarnation. Probe has no query timestamp. This comparison does not authenticate console identity or prove rendering."
+    }
+  },
+  "existing_regressions": {
+    "files_idle": {
+      "active_transfers": 0,
+      "staged_upload_files": 0,
+      "chunk_bytes": 32768,
+      "max_file_bytes": 8388608
+    },
+    "screenshot_passed": true,
+    "independent_image_decode": {
+      "codec_name": "mjpeg",
+      "width": 2560,
+      "height": 1440
+    },
+    "frames": [
+      {
+        "width": 2560,
+        "height": 1440,
+        "byte_length": 609737,
+        "mime_type": "image/jpeg",
+        "sha256": "e9adf98a5126549f247108027fa52f6b793dcff6d477a6f530c8c3f2cd656356",
+        "point_pixel_scale": 2,
+        "resized": false
+      },
+      {
+        "width": 2560,
+        "height": 1440,
+        "byte_length": 609772,
+        "mime_type": "image/jpeg",
+        "sha256": "a3b6958db41f465897ef6c40a67336891de9ef178dfe97354acf2372efa0d693",
+        "point_pixel_scale": 2,
+        "resized": false
+      }
+    ]
+  },
+  "source_sha256": {
+    "initial_info": "9714889e40a0c820715333d48f70a81a29d4eae0ac638bfd00adec6c9e3273b7",
+    "screenshot_regression": "2e318ea14790caec613141119e735d8a640c0658f7098d96be47ffc5322a6975",
+    "mcp_reproduction": "c1f8626b40dada186ec6bb55f9071a404bd106794b980282d3ba2e093e860d7f",
+    "independent_probe": "de9886e30acc2169148b8d6674fb3fd0414ef33403114ee91b12b365177e6625",
+    "build": "cfc1f2290e525b63e0fc9b07b8612047316e3503d8b437a795366dd82fe40161"
+  },
+  "privacy": "No image bodies, username, file root, console session identity, input text or file content archived.",
+  "limitations": [
+    "Reported public capabilities only; no rendering/performance acceptance.",
+    "Registry IDs and query times are recorded separately; property equality is not physical-device or console authentication.",
+    "Screenshot regression is the previous independent actual run; the new graphics validator did not capture images."
+  ]
+}

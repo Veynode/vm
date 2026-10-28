@@ -105,8 +105,8 @@ Linux, macOS and Windows), and each VM's status repeats its own cells under
 registered QEMU capture, console and graphics runtime). Each of the 23 cells has
 a `status` and a `reason`:
 
-- `supported`: implemented, with an `evidence` path to a real-Guest record
-  retained in this tree (`archive/docs-evidence/`);
+- `supported`: implemented, with an `evidence` path (`vm-archive/docs-evidence/...`)
+  naming a real-Guest record in the project's unpublished archive repository;
 - `implemented_unverified`: code exists, but no real-Guest record is retained
   here (offline tests at most);
 - `requires_guest_permission`: code exists, only the refusal without the Guest
@@ -801,9 +801,10 @@ public-release certification.
 
 ## Product licensing
 
-The product source license has not been selected. Package metadata intentionally
-does not declare a license grant; a licensing decision and dependency license
-review remain required before public distribution.
+The project is licensed under the Apache License 2.0; the code that runs inside
+the QEMU or SPICE process is GPL-2.0-or-later. [NOTICE](../../NOTICE) lists the
+exceptions, and the GPU runtime's own licenses are reviewed separately
+([licenses/README.md](../../licenses/README.md)).
 
 ## Scoped file transfer
 
@@ -947,7 +948,7 @@ python3 scripts/test-control-qemu.py --output .local/evidence/control-qemu-new.j
 The 1536MiB QEMU fixture and 512MiB VZ isolation fixture never attach a disk. The
 stock graphics stack in this test retains known 2D/text rendering defects. The
 controller test is not pixel correctness, Windows GPU, native-window, performance,
-release packaging or licensing acceptance. See `archive/docs-evidence/control-qemu.md`.
+release packaging or licensing acceptance. See `vm-archive/docs-evidence/control-qemu.md`.
 
 
 ### Persistent console registration
@@ -978,7 +979,7 @@ transitions, a server ESTALE publication race, and a Darwin zombie-only process-
 cleanup edge. Static MCP screenshots across new clients and the browser-adapter
 lifetime now pass. Separate actual Chromium154 reports now verify HEVC and H264 decoding and
 confirmed disconnect from this static source; those reports are independent of
-the controller pass. Internet operation is not validated. See `archive/docs-evidence/control-qemu-persistent.md`.
+the controller pass. Internet operation is not validated. See `vm-archive/docs-evidence/control-qemu-persistent.md`.
 
 The explicit static integration command is:
 

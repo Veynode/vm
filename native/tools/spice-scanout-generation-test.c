@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 #include "spice-scanout-generation.h"
 #include <IOSurface/IOSurface.h>
 #include <CoreFoundation/CoreFoundation.h>

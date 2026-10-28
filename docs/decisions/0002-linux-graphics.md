@@ -13,7 +13,7 @@
 | Same 3.23.6 guest, compiled GLES3 shader triangle, 64×64 pbuffer, 120 draw iterations | Renderer guard `virgl`; center `(255,0,0,255)`, corner `(0,0,255,255)`; guest powers off and QEMU exits 0 | Real rendering and pixel readback pass. No local video encoding involved. This does not measure 1440p/60, frame pacing, desktop compositing, CAD, or games. |
 | QEMU Venus blob mode + MoltenVK, Alpine 3.24.2 Mesa Venus/Zink | Capsets 3, but actual `vkCreateInstance` fails `ERROR_OUT_OF_HOST_MEMORY` with virtio control errors | Vulkan **failed/unverified**. Error name does not establish RAM exhaustion; render-server/context/transport needs investigation. Not marked supported. |
 
-Successful recorded evidence: [JSON](../../archive/docs-evidence/windows-linux-gpu-2026-10-08.json). Raw local logs `.local/runtime/utm/verified-linux-gpu.serial.log`, failed Venus log `.local/runtime/utm/linux-venus-failed.log`. Apple VZ raw baseline is `.local/evidence/control-smoke-serial.log`. These are separate guest runs. No matched performance comparison was performed.
+Successful recorded evidence: JSON (`vm-archive/docs-evidence/windows-linux-gpu-2026-10-08.json`). Raw local logs `.local/runtime/utm/verified-linux-gpu.serial.log`, failed Venus log `.local/runtime/utm/linux-venus-failed.log`. Apple VZ raw baseline is `.local/evidence/control-smoke-serial.log`. These are separate guest runs. No matched performance comparison was performed.
 
 ## Reproduction
 
@@ -22,7 +22,7 @@ Prerequisites: the repository's existing Alpine fixture (`python3 scripts/prepar
 ```sh
 ./runtime/fetch-utm.sh
 ./runtime/build-utm-loader.sh
-python3 archive/scripts/windows-probe-linux-gpu.py --output .local/runtime/utm/verified-linux-gpu.json
+python3 vm-archive/scripts/windows-probe-linux-gpu.py --output .local/runtime/utm/verified-linux-gpu.json
 ```
 
 The probe downloads pinned Alpine 3.23.6 minirootfs and verifies SHA-256, overlays it in a temporary cpio in RAM, keeps the existing kernel/module fixture read-only, boots a new diskless 1 GiB/2-vCPU guest, installs Mesa and a compiler from Alpine's signed repositories inside the guest, builds the project's GLES test, reads pixels and powers off. No persistent guest disk, host share, or forwarded network port is created. The SPICE Unix socket resides inside a private temporary directory. Dependencies' actual versions appear in the serial log; repositories can update, so exact package versions and original logs must accompany comparisons. This is a reproducible diagnostic command, not a hermetic release image.
@@ -43,7 +43,7 @@ Next gates: resolve Venus and newer Mesa compatibility; native console presentat
 
 A second, **actual Xorg desktop** experiment uses the same virgl/ANGLE/Metal path, 1.5 GiB RAM and 2 vCPUs, Alpine 3.23.6, Xorg modesetting/glamor, twm, xterm and glxgears. `glxinfo -B` reports direct rendering, `Device: virgl`, `Accelerated: yes`, GL 2.1 and GLES 3.0. This is distinct from the earlier 64×64 offscreen test. glxgears' printed unsynchronized FPS is **not** a measured display frame rate or comparative benchmark.
 
-Evidence: [structured results](../../archive/docs-evidence/windows-linux-desktop-2026-10-08.json), [native UTM console](../../archive/docs-evidence/windows-linux-desktop-native-2026-10-08.png), [windowless SPICE frame](../../archive/docs-evidence/windows-linux-desktop-host-2026-10-08.png), [guest X11 readback](../../archive/docs-evidence/windows-linux-desktop-guest-2026-10-08.png). The native image is from a separate native UTM run of the same fixture, not a claim that both clients were attached simultaneously. The last two are from the same standalone VM run, at different instants.
+Evidence: structured results (`vm-archive/docs-evidence/windows-linux-desktop-2026-10-08.json`), native UTM console (`vm-archive/docs-evidence/windows-linux-desktop-native-2026-10-08.png`), windowless SPICE frame (`vm-archive/docs-evidence/windows-linux-desktop-host-2026-10-08.png`), guest X11 readback (`vm-archive/docs-evidence/windows-linux-desktop-guest-2026-10-08.png`). The native image is from a separate native UTM run of the same fixture, not a claim that both clients were attached simultaneously. The last two are from the same standalone VM run, at different instants.
 
 Measured outcomes:
 
@@ -94,13 +94,13 @@ The actual guest pixel probe in [`scripts/linux-xrender-probe.c`](../../scripts/
 | Same depth-one font bitmap copied to depth 24 with XCopyPlane | Exact pixels pass, validating the bitmap oracle/foreground mapping independently of PolyText |
 | XDrawImageString `Hi` versus bitmap plus independently computed font background rectangle | Fails consistently: background is correct but all 31 foreground glyph pixels are missing |
 
-The normal [baseline JSON](../../archive/docs-evidence/windows-xrender-2026-10-08/baseline.json) and [filtered package/renderer/case log](../../archive/docs-evidence/windows-xrender-2026-10-08/baseline.log) accompany per-case actual and expected PNGs. In particular: [actual PolyText](../../archive/docs-evidence/windows-xrender-2026-10-08/baseline/core_text_vs_depth1.png), [expected PolyText](../../archive/docs-evidence/windows-xrender-2026-10-08/baseline/core_text_vs_depth1.expected.png), [actual ImageText](../../archive/docs-evidence/windows-xrender-2026-10-08/baseline/core_image_text_vs_depth1.png), [expected ImageText](../../archive/docs-evidence/windows-xrender-2026-10-08/baseline/core_image_text_vs_depth1.expected.png). These small 64×64 pictures are diagnostic samples, not scaled screenshots of the desktop.
+The normal baseline JSON (`vm-archive/docs-evidence/windows-xrender-2026-10-08/baseline.json`) and filtered package/renderer/case log (`vm-archive/docs-evidence/windows-xrender-2026-10-08/baseline.log`) accompany per-case actual and expected PNGs. In particular: actual PolyText (`vm-archive/docs-evidence/windows-xrender-2026-10-08/baseline/core_text_vs_depth1.png`), expected PolyText (`vm-archive/docs-evidence/windows-xrender-2026-10-08/baseline/core_text_vs_depth1.expected.png`), actual ImageText (`vm-archive/docs-evidence/windows-xrender-2026-10-08/baseline/core_image_text_vs_depth1.png`), expected ImageText (`vm-archive/docs-evidence/windows-xrender-2026-10-08/baseline/core_image_text_vs_depth1.expected.png`). These small 64×64 pictures are diagnostic samples, not scaled screenshots of the desktop.
 
 Most oracles are analytic colors/geometry from known requests, not copies of implementation output. The core-font oracle deliberately uses the same selected `fixed` font drawn through a separate **depth-one bitmap path**, then compared with the accelerated depth-24 text output; it is not an independent font rasterizer. The passing bitmap copy and independently supplied A8 glyph help distinguish font loading, bitmap upload and composition from direct core-font drawing. Pixel extraction uses `XGetImage`/`XGetPixel` within the guest, avoiding the host scanout/capture path. Both preflight `glxinfo` and the probe's own GLX context reject software fallback.
 
 Source-level lead, **not a proven faulty component**: installed Xorg is 21.1.23-r0. The official [Xorg 21.1.23 source archive](https://www.x.org/releases/individual/xserver/xorg-server-21.1.23.tar.xz), SHA-256 `e39832e5617dadaf072fdf9f0e19e5d2e1c2a13607ac280bac1aba9f8fe14634`, shows `glamor_font.c:glamor_font_get` storing core fonts in `GL_R8UI` integer textures; `glamor_text.c:glamor_text` uses instanced vertex attributes and core-font shader integer texel/bit operations. `glamor_program.c` can select an EXT_gpu_shader4 compatibility path for GLSL 1.20. A8 XRender glyphs are a different path. The [XRender protocol](https://www.x.org/releases/current/doc/renderproto/renderproto.txt) defines the mask/composition behavior used by the independent expected-color calculations.
 
-A bounded control set `MESA_EXTENSION_OVERRIDE=-GL_EXT_gpu_shader4` **only on the Xorg process**. It **did not fix the two text cases**: 2,231 mismatches for PolyText and 31 for ImageText; the other 13 cases still passed and the separate application GLX context remained virgl. [Control JSON](../../archive/docs-evidence/windows-xrender-2026-10-08/extension-control.json). We have not instrumented the actual Xorg GL context to prove which internal path it selected after that override, so this is an ineffective control, not proof that a particular extension, Mesa, virglrenderer or ANGLE is responsible. No workaround was applied to the product.
+A bounded control set `MESA_EXTENSION_OVERRIDE=-GL_EXT_gpu_shader4` **only on the Xorg process**. It **did not fix the two text cases**: 2,231 mismatches for PolyText and 31 for ImageText; the other 13 cases still passed and the separate application GLX context remained virgl. Control JSON (`vm-archive/docs-evidence/windows-xrender-2026-10-08/extension-control.json`). We have not instrumented the actual Xorg GL context to prove which internal path it selected after that override, so this is an ineffective control, not proof that a particular extension, Mesa, virglrenderer or ANGLE is responsible. No workaround was applied to the product.
 
 Reproduction (expected nonzero exit until the genuine text defect is fixed):
 
@@ -121,7 +121,7 @@ A separate real **GLES 3 / GLSL 300 ES** context permits isolated integer-atlas 
 
 The larger uniform-mode diagnostic shader still produces wrong pixels even though each draw verifies the actual current program, `glGetUniformiv` mode/sampler values, active texture/unit/binding, framebuffer, viewport, completeness and GL errors. Its separate non-instanced glyph case also fails. These failures are preserved, but no component has been assigned blame: there is no reduction proving whether shader translation, a particular control-flow interaction, generic vertex attributes, or an unmeasured diagnostic state causes them. The float `exp2`/`floor` bit surrogate is **not** a reliable exact arithmetic oracle at integer boundaries, so its failure is not evidence of an invalid GL implementation. No release claim counts this exploratory suite as passing.
 
-The state-checked source is saved independently with SHA-256 `e05e8061e01f1a504bf7e3b020c6b2f495e346e0c71a276fca36b7356755a1c3` in [the evidence directory](../../archive/docs-evidence/windows-gl-font-2026-10-08/verified-state-source.c), along with [results](../../archive/docs-evidence/windows-gl-font-2026-10-08/gl-font-verified-state.json), actual/expected PNGs and filtered state/package logs. Earlier expression experiments remain in `.local/runtime/utm/gl-font-{gles,integer-ops,straightline}.*`; their progression must not be read as a confirmed integer-driver defect. Reproduction:
+The state-checked source is saved independently with SHA-256 `e05e8061e01f1a504bf7e3b020c6b2f495e346e0c71a276fca36b7356755a1c3` in the evidence directory (`vm-archive/docs-evidence/windows-gl-font-2026-10-08/verified-state-source.c`), along with results (`vm-archive/docs-evidence/windows-gl-font-2026-10-08/gl-font-verified-state.json`), actual/expected PNGs and filtered state/package logs. Earlier expression experiments remain in `.local/runtime/utm/gl-font-{gles,integer-ops,straightline}.*`; their progression must not be read as a confirmed integer-driver defect. Reproduction:
 
 ```sh
 # Refuses missing GLX integer extension; this is the expected capability result.
@@ -148,7 +148,7 @@ Before every draw, queried `GL_POINT_SIZE` is 1.0. `GL_VERTEX_PROGRAM_POINT_SIZE
 
 This is a concrete narrow graphics-stack failure and a useful next driver investigation target. It does not locate the faulty layer among guest Mesa, virglrenderer and ANGLE/Metal, nor prove that changing Xorg's macro repairs every desktop defect. The explicit shader assignment is a **diagnostic control**, not a product workaround or completed Xorg patch. Actual Xorg GL requests/state still need instrumentation or a controlled source build to connect this reduction causally to the core-font failure.
 
-[JSON](../../archive/docs-evidence/windows-gl-font-2026-10-08/gl-font-points.json), [state log](../../archive/docs-evidence/windows-gl-font-2026-10-08/gl-font-points.log), [exact tested source](../../archive/docs-evidence/windows-gl-font-2026-10-08/points-source.c), and actual/expected PNGs in `archive/docs-evidence/windows-gl-font-2026-10-08/points-pixels/` are retained. Source SHA-256: `2876eb3d4698355545ac9f0211deb0eedc5bd28e853f1a0ea3771fa1c0361aad`. The 1,536 MiB VM quit normally (QEMU exit 0) after preserving the failing diagnostic exit 1. No performance measured.
+JSON (`vm-archive/docs-evidence/windows-gl-font-2026-10-08/gl-font-points.json`), state log (`vm-archive/docs-evidence/windows-gl-font-2026-10-08/gl-font-points.log`), exact tested source (`vm-archive/docs-evidence/windows-gl-font-2026-10-08/points-source.c`), and actual/expected PNGs in `vm-archive/docs-evidence/windows-gl-font-2026-10-08/points-pixels/` are retained. Source SHA-256: `2876eb3d4698355545ac9f0211deb0eedc5bd28e853f1a0ea3771fa1c0361aad`. The 1,536 MiB VM quit normally (QEMU exit 0) after preserving the failing diagnostic exit 1. No performance measured.
 
 ```sh
 python3 scripts/qemu-linux-desktop-probe.py --gl-font-probe --gl-font-api glx-points --output .local/runtime/utm/font-points.json
@@ -158,9 +158,9 @@ python3 scripts/qemu-linux-desktop-probe.py --gl-font-probe --gl-font-api glx-po
 
 The next experiment has connected the point-list reduction to the **actual Xorg server**, and a narrowly scoped workaround now passes the existing pixel suite. This supersedes the earlier statement that actual server tracing remained undone for this path. It does not repair or identify the underlying guest/host graphics-driver defect.
 
-[`archive/scripts/windows-probe-glamor.py`](../../archive/scripts/windows-probe-glamor.py) builds only `libglamoregl.so` from the hash-verified Xorg21.1.23 source inside the disposable 1,536MiB Guest, using at most two compiler jobs. The saved [Alpine21.1.23-r0 packaging recipe](../../archive/docs-evidence/windows-glamor-causal-2026-10-08/alpine-APKBUILD) declares the same source and a single `termio.h`→`termios.h` preparation change, which the build applies. The new binary is not asserted identical to Alpine's build: unused server targets/docs and LTO are omitted. Both experiment variants use the same configuration and source objects.
+`vm-archive/scripts/windows-probe-glamor.py` builds only `libglamoregl.so` from the hash-verified Xorg21.1.23 source inside the disposable 1,536MiB Guest, using at most two compiler jobs. The saved Alpine21.1.23-r0 packaging recipe (`vm-archive/docs-evidence/windows-glamor-causal-2026-10-08/alpine-APKBUILD`) declares the same source and a single `termio.h`→`termios.h` preparation change, which the build applies. The new binary is not asserted identical to Alpine's build: unused server targets/docs and LTO are omitted. Both experiment variants use the same configuration and source objects.
 
-The first module adds only bounded logging immediately before the real core-glyph point draws. The second changes only that facet's vertex shader to write `gl_PointSize=1.0` unconditionally, plus its diagnostic label. It leaves the shared macro and other shader facets unchanged. Separate module directories are selected with `Xorg -modulepath`; the host and existing VMs receive no installation. The full build command and two small patches are checked in as `archive/scripts/windows-build-glamor.sh`, `windows-glamor-trace.patch` and `windows-glamor-size.patch`.
+The first module adds only bounded logging immediately before the real core-glyph point draws. The second changes only that facet's vertex shader to write `gl_PointSize=1.0` unconditionally, plus its diagnostic label. It leaves the shared macro and other shader facets unchanged. Separate module directories are selected with `Xorg -modulepath`; the host and existing VMs receive no installation. The full build command and two small patches are checked in as `vm-archive/scripts/windows-build-glamor.sh`, `windows-glamor-trace.patch` and `windows-glamor-size.patch`.
 
 **Actual result:**
 
@@ -172,12 +172,12 @@ The first module adds only bounded logging immediately before the real core-glyp
 - SPICE capture remains independent of a local window; no native viewer was opened for this run. QMP CPU framebuffer stays black, as before. Guest XWD and host CoreImage PNG colors differ, so color fidelity is not accepted by this experiment.
 - QEMU quits with exit0. The source-built baseline diagnostic exits1, the controlled15case suite exits0, and the causal comparison/actual capture wrapper exits0. No performance measurement or software-renderer fallback was used.
 
-Evidence: [result and traces](../../archive/docs-evidence/windows-glamor-causal-2026-10-08/result.json), [build/run log](../../archive/docs-evidence/windows-glamor-causal-2026-10-08/build-and-run.log), [Guest desktop](../../archive/docs-evidence/windows-glamor-causal-2026-10-08/guest-desktop.png), [host desktop](../../archive/docs-evidence/windows-glamor-causal-2026-10-08/host-desktop.png), and per-case actual/expected PNGs in the same evidence directory. Full module binaries, configuration headers, Meson logs and compile commands remain in `.local/runtime/utm/glamor-causal-artifacts/`; their hashes are recorded in the repository.
+Evidence: result and traces (`vm-archive/docs-evidence/windows-glamor-causal-2026-10-08/result.json`), build/run log (`vm-archive/docs-evidence/windows-glamor-causal-2026-10-08/build-and-run.log`), Guest desktop (`vm-archive/docs-evidence/windows-glamor-causal-2026-10-08/guest-desktop.png`), host desktop (`vm-archive/docs-evidence/windows-glamor-causal-2026-10-08/host-desktop.png`), and per-case actual/expected PNGs in the same evidence directory. Full module binaries, configuration headers, Meson logs and compile commands remain in `.local/runtime/utm/glamor-causal-artifacts/`; their hashes are recorded in the repository.
 
 ```sh
-python3 archive/scripts/windows-probe-glamor.py --output .local/runtime/utm/glamor-causal.json
+python3 vm-archive/scripts/windows-probe-glamor.py --output .local/runtime/utm/glamor-causal.json
 # Reparse saved actual-run evidence without starting another VM:
-python3 archive/scripts/windows-probe-glamor.py --analyze-only --output .local/runtime/utm/glamor-causal.json
+python3 vm-archive/scripts/windows-probe-glamor.py --analyze-only --output .local/runtime/utm/glamor-causal.json
 ```
 
 Acceptance requires exactly the original15uniquecases, precisely the original two baseline failures, all15fixed cases passing, actual31point/state traces for both variants, and both selected module paths in the real process maps. The ordinary desktop fixture retains its default180s readiness bound; this explicit source-build experiment uses a bounded600s setup allowance. This is not a relaxation of a rendering assertion.
@@ -194,7 +194,7 @@ Meson, only `x11-glesv2` and two compiler jobs. The source archive SHA256 is
 actual Guest binary SHA256 is
 `9319c38cfa78cc3f3e607123c4acaf4579cf20df45dae3e24e99234da29d8acd`.
 Package versions, build/runtime/source hashes, filtered logs and images are saved
-in [the actual-run record](../../archive/docs-evidence/linux-glmark2/README.md).
+in the actual-run record (`vm-archive/docs-evidence/linux-glmark2/`).
 
 All six unchanged upstream pixel validations pass: client-array and VBO model
 submission, mipmapped texture sampling, Phong lighting, normal-map bump and
@@ -220,5 +220,5 @@ other exploratory GLES failures, installed-Guest packaging, redistribution, broa
 compatibility, or performance gates documented above.
 
 ```sh
-python3 archive/scripts/test-linux-glmark2.py --output-dir .local/evidence/linux-glmark2-next
+python3 vm-archive/scripts/test-linux-glmark2.py --output-dir .local/evidence/linux-glmark2-next
 ```

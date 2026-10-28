@@ -189,7 +189,7 @@ def run(argv, dry):
 def package(root, out, profile, identity, web, version, commit, dry=False):
     files, helpers, missing = inputs(root, profile, web)
     if missing:
-        raise SystemExit('missing built pieces (see README "Quick start"):\n  ' + '\n  '.join(missing))
+        raise SystemExit('missing built pieces (see docs/guides/building.md):\n  ' + '\n  '.join(missing))
     out.mkdir(parents=True)
     for source, dest in files:
         copy(source, out / dest)

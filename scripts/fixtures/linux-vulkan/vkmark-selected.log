@@ -1,0 +1,106 @@
+VULKAN_PACKAGES_BEGIN
+alpine-baselayout-3.7.2-r1
+alpine-baselayout-data-3.7.2-r1
+alpine-keys-2.6-r0
+alpine-release-3.24.2-r0
+apk-tools-3.0.8-r0
+assimp-libs-6.0.4-r0
+busybox-1.37.0-r31
+busybox-binsh-1.37.0-r31
+ca-certificates-bundle-20260909-r0
+eudev-libs-3.2.14-r6
+hwdata-pci-0.408-r0
+libapk-3.0.8-r0
+libbsd-0.12.2-r0
+libcrypto3-3.5.8-r0
+libdisplay-info-0.3.0-r0
+libdrm-2.4.134-r0
+libelf-0.195-r0
+libexpat-2.8.5-r0
+libffi-3.5.2-r1
+libgcc-15.2.0-r5
+libmd-1.2.0-r0
+libpciaccess-0.19-r0
+libssl3-3.5.8-r0
+libstdc++-15.2.0-r5
+libx11-1.8.13-r0
+libxau-1.0.12-r0
+libxcb-1.17.0-r2
+libxdmcp-1.1.5-r1
+libxml2-2.13.9-r2
+libxshmfence-1.3.3-r0
+llvm22-libs-22.1.3-r0
+mesa-26.1.6-r0
+mesa-vulkan-virtio-26.1.6-r0
+musl-1.2.6-r2
+musl-utils-1.2.6-r2
+scanelf-1.3.9-r1
+spirv-tools-1.4.341.0-r0
+ssl_client-1.37.0-r31
+vkmark-2025.01-r2
+vulkan-loader-1.4.347-r0
+vulkan-tools-1.4.347-r0
+wayland-libs-client-1.25.0-r0
+xcb-util-wm-0.4.2-r0
+xz-libs-5.8.4-r0
+zlib-1.3.2-r0
+zstd-libs-1.5.7-r2
+VULKAN_PACKAGES_END
+VULKAN_INSTANCE_BEGIN
+	apiVersion         = 1.4.334
+	deviceType         = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+	deviceName         = Virtio-GPU Venus (Apple M1 Pro)
+	driverID           = DRIVER_ID_MESA_VENUS
+	driverName         = venus
+VULKAN_INSTANCE_EXIT 0
+VKMARK_FEATURES_BEGIN
+	VK_EXT_headless_surface                : extension revision 1
+	apiVersion        = 1.4.334 (4211022)
+	deviceType        = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+	deviceName        = Virtio-GPU Venus (Apple M1 Pro)
+			deviceName = Apple M1 Pro
+	driverID                                             = DRIVER_ID_MESA_VENUS
+	driverName                                           = venus
+	VK_KHR_swapchain                            : extension revision 70
+	VK_KHR_swapchain_maintenance1               : extension revision 1
+	VK_KHR_swapchain_mutable_format             : extension revision 1
+	samplerAnisotropy                       = true
+VKMARK_FEATURES_END
+VKMARK_CASE_BEGIN vertex-interleaved
+    Vendor ID:      0x106B
+    Device ID:      0x1A040207
+    Device Name:    Virtio-GPU Venus (Apple M1 Pro)
+    Driver Version: 109056006
+[vertex] interleave=true:duration=4.0: FPS: 1272 FrameTime: 0.786 ms
+VKMARK_CASE_EXIT vertex-interleaved 0
+VKMARK_CASE_BEGIN vertex-separated
+    Vendor ID:      0x106B
+    Device ID:      0x1A040207
+    Device Name:    Virtio-GPU Venus (Apple M1 Pro)
+    Driver Version: 109056006
+[vertex] interleave=false:duration=4.0: FPS: 1295 FrameTime: 0.772 ms
+VKMARK_CASE_EXIT vertex-separated 0
+VKMARK_CASE_BEGIN texture-linear
+    Vendor ID:      0x106B
+    Device ID:      0x1A040207
+    Device Name:    Virtio-GPU Venus (Apple M1 Pro)
+    Driver Version: 109056006
+[texture] texture-filter=linear:anisotropy=16:duration=4.0: FPS: 1236 FrameTime: 0.809 ms
+VKMARK_CASE_EXIT texture-linear 0
+VKMARK_CASE_BEGIN shading-phong
+    Vendor ID:      0x106B
+    Device ID:      0x1A040207
+    Device Name:    Virtio-GPU Venus (Apple M1 Pro)
+    Driver Version: 109056006
+[shading] shading=phong:duration=4.0: FPS: 1262 FrameTime: 0.792 ms
+VKMARK_CASE_EXIT shading-phong 0
+VKMARK_CASE_BEGIN shading-cel
+    Vendor ID:      0x106B
+    Device ID:      0x1A040207
+    Device Name:    Virtio-GPU Venus (Apple M1 Pro)
+    Driver Version: 109056006
+[shading] shading=cel:duration=4.0: FPS: 1330 FrameTime: 0.752 ms
+VKMARK_CASE_EXIT shading-cel 0
+VKMARK_APPLICATION_DONE
+[   40.286074] reboot: Power down
+Oct  9 21:54:57  virgl_render_server[63398] <Debug>: socket disconnected

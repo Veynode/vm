@@ -1,0 +1,11 @@
+# Windows 11 ARM64 machines
+
+Windows runs as a QEMU/HVF machine installed from your own Windows 11 ARM64 ISO (Apple Virtualization has no Windows support). `--os windows` puts the ISO and seed images on USB CD-ROMs (Setup reads them before any driver loads), the disk on virtio-blk (`--disk-bus nvme` for the inbox NVMe driver instead), and adds virtio-net, virtio-serial, balloon, RNG, virtio keyboard/tablet and pvpanic; their drivers come from the virtio-win ISO. The display is UTM's `virtio-ramfb` (Basic Display, no GPU acceleration); `--gpus neptune` is an experimental Triton profile with hardware D3D11 through DXMT on Metal, pixel-checked and benchmarked, which needs UTM's guest tools 0.1.273 in the guest. With Neptune the guest defaults to 1280x1024; `veynodevm machine display NAME 1920x1080` sets the mode (the driver lists up to 2048x1152; it persists across boots) through that SSH login. Guest reboots restart QEMU, because edk2 hangs after an in-process reset. `install-distro.py windows` also sets up Windows' OpenSSH Server with a generated key, forwarded to `127.0.0.1:2222` (`machine create --publish HOST:GUEST`), and records that login (`veynodevm machine ssh-key`) so the MCP tools `vm_exec`, file transfer, `vm_desktop_state`, window actions, app launch and the UI Automation accessibility tree work over it, without installing anything in the guest. There is no TPM, no Secure Boot key enrolment and no guest agent, so Setup's Windows 11 checks are bypassed by the answer file.
+
+```sh
+scripts/install-distro.py windows --name win11 --iso ~/Downloads/Windows11_Client_arm64_en-us.iso \
+    --drivers-iso virtio-win.iso --evidence .local/evidence/windows-installed.png
+# or by hand: veynodevm machine create win11 --os windows --iso WIN.iso --attach answer.iso --monitor
+```
+
+The script writes an `Autounattend.xml` seed (Windows 11 Pro with the generic, non-activating key unless `--edition`/`--product-key` say otherwise; local administrator `veynode` with automatic logon), taps Enter for the CD's "Press any key" prompt, loads the virtio storage and network drivers in Setup and the rest offline, waits for the first logon to power off, ejects the media and boots the disk. See [known issues](../known-issues.md#windows-11-arm64-machines) for what is verified.

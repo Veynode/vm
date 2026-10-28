@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Retired FIFO generation is not a client failure; patch isolated SPICE only."""
 import difflib,pathlib
 ROOT=pathlib.Path(__file__).resolve().parents[1];SOURCE=ROOT/'.local/spice-reconnect-build/spice-0.14.3/server/dcc-send.c'
@@ -22,7 +23,7 @@ text=SOURCE.read_text()
 if text.count(old)==1:
  changed=text.replace(old,new);SOURCE.write_text(changed)
  patch=''.join(difflib.unified_diff(text.splitlines(True),changed.splitlines(True),fromfile='a/server/dcc-send.c',tofile='b/server/dcc-send.c',n=0))
- (ROOT/'archive/docs-evidence/apple-spice-retired-publication.patch').write_text(patch)
+ (ROOT/'.local/evidence').mkdir(parents=True,exist_ok=True);(ROOT/'.local/evidence/apple-spice-retired-publication.patch').write_text(patch)
  print('Applied retired-publication fix to isolated SPICE source')
 elif text.count(new)==1:print('Retired-publication fix already present')
 else:raise SystemExit('Unexpected isolated SPICE source; refusing ambiguous edit')

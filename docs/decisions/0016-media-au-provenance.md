@@ -12,8 +12,8 @@ evicts its expired identity. A real localhost Peer regression reproduces this
 with only one cached packet and 129 registrations: a delayed remote NACK triggers
 `au_unknown`, not the required known-expiry outcome. The exact failing source,
 command, exit 101 and limited transport evidence are preserved in
-[the before archive](../../archive/docs-evidence/media-au-provenance-before/README.md). A separate
-[actual browser loss case](../../archive/docs-evidence/media-nack-loss-live/v2-au-unknown/README.md)
+the before archive (`vm-archive/docs-evidence/media-au-provenance-before/`). A separate
+actual browser loss case (`vm-archive/docs-evidence/media-nack-loss-live/v2-au-unknown/`)
 also failed with unknown AU. It does not prove every detail of the synthetic
 reproduction happened identically in that session.
 
@@ -57,7 +57,7 @@ best-effort header lookup. No encrypted payload is logged for this matching.
 
 ## Required evidence
 
-The [component record](../../archive/docs-evidence/media-au-provenance-component-v1/README.md)
+The component record (`vm-archive/docs-evidence/media-au-provenance-component-v1/`)
 preserves the failing regression and the corrected original-deadline assertions.
 Recorded checks passed: 104 wrapper tests, 42 core handler tests (a subset of the
 upstream suite), five actual localhost Peer tests, and 157 main tests with eight
@@ -69,7 +69,7 @@ now reports known expiry with zero unknown/rejected datagrams; close releases
 Peer transport is non-RTX and does not decode video; RTX is separately covered
 by wrapper component paths.
 
-The [independent audit](../../archive/docs-evidence/media-au-provenance-audit-v1/README.md)
+The independent audit (`vm-archive/docs-evidence/media-au-provenance-audit-v1/`)
 verified frozen artifact/source/log hashes and reconstructed the exact vendored
 RTC tree from the published archive plus patch. It did not rerun the tests or
 establish a reproducible binary build. Logical ownership bounds do not measure

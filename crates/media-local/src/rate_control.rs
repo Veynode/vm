@@ -12,8 +12,7 @@ use std::{
 pub const MIN_BPS: u64 = 250_000;
 pub const MAX_BPS: u64 = 40_000_000;
 // Half-framing-limit AU ceiling: (4 * 1024 * 1024) / 2 = 2,097,152 bytes.
-// archive/docs-evidence/encoder-rate-live/baseline-v1/encoder-rate-live-v1/
-// {h264,hevc}-result.json: max(records[].bytes) = 987,750 and 1,687,652;
+// crates/media-local/testdata/encoder-rate-live/{h264,hevc}-result.json: max(records[].bytes) = 987,750 and 1,687,652;
 // records[0].bytes = 821,922 and 1,437,745 (initial_status.target_bps = 8e6).
 // 2 MiB is the next power of two above the measured maximum, with
 // 2,097,152 - 1,687,652 = 409,500 bytes of headroom, inside the 4 MiB

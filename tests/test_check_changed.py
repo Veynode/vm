@@ -96,8 +96,8 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(len(p.notes), 2)
         self.assertEqual(p.unmapped, ['nowhere/file'])
 
-    def test_generated_and_archived_paths_are_ignored(self):
-        self.assertEqual(plan('target/debug/x', 'archive/old.rs', '.local/run/a.json').stages, {})
+    def test_generated_and_local_paths_are_ignored(self):
+        self.assertEqual(plan('target/debug/x', '.claude/old.rs', '.local/run/a.json').stages, {})
 
     def test_stages_run_cheapest_first(self):
         kinds = [s.kind for s in plan('crates/oci/src/tart.rs', 'native/worker/main.swift').ordered()]

@@ -10,7 +10,7 @@ VeynodeVM is a Docker-like runtime for Apple Silicon Macs: each container is a m
 
 | Area | Path | Read | Check |
 |---|---|---|---|
-| `veynodevm` CLI (an API 1 client: flags, output, terminal, launchd) | `crates/cli` | README "Quick start" | `check-changed.py` |
+| `veynodevm` CLI (an API 1 client: flags, output, terminal, launchd) | `crates/cli` | [usage guide](docs/guides/usage.md) | `check-changed.py` |
 | MCP HTTPS endpoint (`vm-mcp-http`), tool groups, cua-driver scopes, resource URIs | `crates/mcp` | the "HTTPS endpoint" section of [crates/control/README.md](crates/control/README.md) | `check-changed.py` |
 | Local API 1: wire, codes, frames, client | `crates/api` | [docs/api.md](docs/api.md), [decision 0028](docs/decisions/0028-core-split-and-api-1.md) | `check-changed.py` |
 | Control daemon, its services (`src/services/`: machines, containers, images, engine, sessions, desktop relay), MCP, QEMU worker (`bin/vm-qemu.rs`) | `crates/control` | the matching section of [crates/control/README.md](crates/control/README.md) | `check-changed.py` |
@@ -20,13 +20,13 @@ VeynodeVM is a Docker-like runtime for Apple Silicon Macs: each container is a m
 | Linux guest agent (PID 1 in micro-VMs) | `guest/veynode-agent` | [guest/veynode-agent/README.md](guest/veynode-agent/README.md) | `check-changed.py` |
 | Web UI (TanStack Start, xterm.js, WebCodecs desktop; `web/daemon.mjs` speaks API 1) | `web/` | [docs/design/DESIGN.md](docs/design/DESIGN.md) (core's design system), then the file it names | `check-changed.py` |
 | Apple Virtualization worker, native tools | `native/worker`, `native/tools` | [native/README.md](native/README.md) | `check-changed.py` (builds to a temp dir) |
-| QEMU native console (needs the UTM runtime) | `native/console` | README "Build and check" | `native/console/test.sh` on a staged app |
+| QEMU native console (needs the UTM runtime) | `native/console` | [building guide](docs/guides/building.md#gpu-runtime) | `native/console/test.sh` on a staged app |
 | Kernel, initramfs, official images | `guest/kernel`, `guest/images` | [guest/images/README.md](guest/images/README.md) | live only |
-| GPU runtime (UTM QEMU, virglrenderer, Venus, SPICE) | `runtime/` | README "Build and check" | live only |
+| GPU runtime (UTM QEMU, virglrenderer, Venus, SPICE) | `runtime/` | [building guide](docs/guides/building.md#gpu-runtime) | live only |
 
 ## Rules
 
-- Search with `rg`. `target/` (15 GB), `vendor/`, `archive/`, `.local/` and `node_modules/` are not source: never search or read them in bulk. [.ignore](.ignore) hides `archive/`, `vendor/`, licenses, lockfiles and generated routes from `rg` and Claude Code's search; reach them with `rg --no-ignore-dot` (never `rg -u`, which also walks `target/`). `archive/` is history: don't edit it or cite it as current behavior. `vendor/webrtc-*` and `vendor/rtc-*` are patched copies wired through `[patch.crates-io]`; change them only on purpose.
+- Search with `rg`. `target/` (15 GB), `vendor/`, `.local/` and `node_modules/` are not source: never search or read them in bulk. [.ignore](.ignore) hides `vendor/`, licenses, lockfiles and generated routes from `rg` and Claude Code's search; reach them with `rg --no-ignore-dot` (never `rg -u`, which also walks `target/`). History and evidence from the earlier phase live in the separate, private Veynode/vm-archive repository (paths written `vm-archive/...`); don't cite it as current behavior. `vendor/webrtc-*` and `vendor/rtc-*` are patched copies wired through `[patch.crates-io]`; change them only on purpose.
 - Rust: always use the default `target/`. Never pass `--target-dir` or `-j`; a new target dir is a cold build of every dependency.
 - Live VMs: don't start VMs or the daemon, and don't run `scripts/check.sh --real` or `scripts/test-*.py`, unless the task needs live evidence or the user asks. Anything that touches runtime state uses a disposable `VEYNODEVM_HOME` or an explicit `--state-dir`, never `~/Library/Application Support/VeynodeVM`.
 - Disk: VM disks, images and clones fill the host fast. Check `df -h /System/Volumes/Data` before a large operation (install, image pull, clone, download) and stay above 20 GiB free. Clean up what you created once it's no longer needed (superseded clones, failed machine disks, temporary state dirs, staged builds, screenshots no doc references); keep the ISOs in `.local/iso/` and evidence that docs cite; never remove what you didn't create.

@@ -1,4 +1,18 @@
 use super::*;
+
+/// A cited record is a path in the unpublished vm-archive repository, never a
+/// link; when that repository is checked out next to this one, the record must
+/// exist there.
+pub(crate) fn assert_archived(evidence: &str) {
+    let path = evidence
+        .strip_prefix("vm-archive/")
+        .unwrap_or_else(|| panic!("{evidence}"));
+    assert!(path.starts_with("docs-evidence/"), "{evidence}");
+    let archive = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../vm-archive");
+    if archive.is_dir() {
+        assert!(archive.join(path).exists(), "{evidence}");
+    }
+}
 #[test]
 fn known_limits_state_the_two_macos_guest_graphics_limits_and_nothing_for_other_guests() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -58,16 +72,8 @@ fn known_limits_state_the_two_macos_guest_graphics_limits_and_nothing_for_other_
             repo.join(limit["decision"].as_str().unwrap()).exists(),
             "{limit}"
         );
-        // A cited record is one retained in this tree.
         if let Some(evidence) = limit.get("evidence") {
-            assert!(
-                evidence
-                    .as_str()
-                    .unwrap()
-                    .starts_with("archive/docs-evidence/"),
-                "{limit}"
-            );
-            assert!(repo.join(evidence.as_str().unwrap()).exists(), "{limit}");
+            assert_archived(evidence.as_str().unwrap());
         }
     }
     let metal = &limits[0];
@@ -120,7 +126,6 @@ fn known_limits_state_the_two_macos_guest_graphics_limits_and_nothing_for_other_
 }
 fn assert_control_features_pair(backend: Backend, guest: &str) {
     let cells = control_features(backend, guest);
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     assert_eq!(cells.as_object().unwrap().len(), CONTROL_FEATURES.len());
     for name in CONTROL_FEATURES {
         let cell = &cells[name];
@@ -131,10 +136,7 @@ fn assert_control_features_pair(backend: Backend, guest: &str) {
         let reason = cell["reason"].as_str().unwrap();
         assert!(reason.len() > 20 && reason.len() < 260, "{name}: {cell}");
         if cell["status"] == "supported" {
-            let evidence = cell["evidence"].as_str().unwrap();
-            assert!(
-                evidence.starts_with("archive/docs-evidence/") && repo.join(evidence).is_file()
-            );
+            assert_archived(cell["evidence"].as_str().unwrap());
         }
     }
     for name in ["balloon", "clipboard"] {
@@ -217,12 +219,11 @@ fn control_features_qemu_windows_completeness() {
 }
 #[test]
 fn control_features_macos_gpu_requires_evidence_and_states_limits() {
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     for backend in [Backend::AppleVirtualization, Backend::QemuHvf] {
         let cells = control_features(backend, "macos");
         let gpu = &cells["gpu_3d"];
         if gpu["status"] == "supported" {
-            assert!(repo.join(gpu["evidence"].as_str().unwrap()).is_file());
+            assert_archived(gpu["evidence"].as_str().unwrap());
             let reason = gpu["reason"].as_str().unwrap();
             for part in [
                 "Narrow",
@@ -286,11 +287,7 @@ fn control_features_gpu_narrows_by_qemu_runtime_and_profile() {
         .as_str()
         .unwrap()
         .contains("no general compatibility, per-VM Guest verification or performance claim"));
-    let evidence = venus["evidence"].as_str().unwrap();
-    assert!(Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(evidence)
-        .is_file());
+    assert_archived(venus["evidence"].as_str().unwrap());
     assert_eq!(
         manager.view("linux").unwrap()["capabilities"]["graphics_profile"]["guest_verified"],
         false

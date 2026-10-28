@@ -2,6 +2,7 @@
 name = "veynodevm-oci"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 description = "OCI image pull, content-addressed store and squashfs root conversion (plus Tart macOS images) for VeynodeVM"
 
 [dependencies]

@@ -9,7 +9,7 @@ Implementation: `native/console/DrawTiming.h`, `native/console/DrawTiming.m`, th
 - Helper flag: `--draw-timing-diagnostic`, default absent (off).
 - Parsed in the trailing-flag loop of `Display.m` `main` with `--input-frame-diagnostic` and `--native-frame-acquisition`. It may follow `SOCKET --persistent [--control-socket PATH --vm-id ID --worker-instance HEX]`.
 - Planned: the wrapper appends the flag at the end only when the second argument is `--persistent`. The broker's `--probe-capabilities` call passes through unchanged. Rust argument protocol is unchanged.
-- **Pending:** no wrapper is wired into the repository or any run yet. The generator is being built under `archive/benchmarks/linux-stk-native-stage-v1/`. Until it exists and is pinned, the flag is parsed but cannot be reached through the broker.
+- **Pending:** no wrapper is wired into the repository or any run yet. The generator is being built under `vm-archive/benchmarks/linux-stk-native-stage-v1/`. Until it exists and is pinned, the flag is parsed but cannot be reached through the broker.
 - When off, the object is `{"version":1,"enabled":false,"authority":false,"capacity":32}`. The diagnostic adds no timestamp reads, stores no records, and changes no draw decision. The presented handler's existing `NSProcessInfo.systemUptime` read (`received`, passed to `commitCandidate`) predates this change at `b5d6e8d` and is unchanged; it is not a diagnostic read.
 
 ## Export
@@ -112,6 +112,6 @@ Durations are millisecond values rounded to 1 µs. A stage not reached is null, 
 2. Real `VNDisplay` saturated status self-test with 32 populated draw timing records: 8 evicted, 0 pending, wire below 56 KiB. Passing.
 3. `native/console/test.sh` on a fresh staged app: 14 PASS lines, exit 0. Passing.
 4. Independent read-only review of the native diff (decision preservation, locking, counts, size). No blocker or major findings. Its minor findings are fixed: clear-only identity is 0, presented stages after command failure are late, status copies the ring under the lock before building records, and blocks capture a local `timing`. Re-verified with the component suite and the staged app's `test.sh`.
-5. Frozen private build and wrapper pins, then runtime only through `archive/benchmarks/linux-stk-native-stage-v1`. Pending.
+5. Frozen private build and wrapper pins, then runtime only through `vm-archive/benchmarks/linux-stk-native-stage-v1`. Pending.
 
 This is a diagnostic contract only. It is not a smoothness, latency, or photon measurement.

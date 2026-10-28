@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Build isolated matching host virgl + server, preserving owned process group.
 No VM/GPU execution. Original vendor artifacts are read-only dependencies.
 """

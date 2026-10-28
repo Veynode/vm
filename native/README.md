@@ -69,7 +69,7 @@ belong to the control service; this worker must not be exposed to the internet.
 requires the real Linux direct-kernel fixture prepared by the repository script.
 It boots the kernel, checks native window close continuity, executes a real
 serial shell command, and verifies owner-EOF cleanup. Evidence is saved in
-`archive/docs-evidence/apple-linux-lifecycle.txt`. It is a boot/console test, not a
+`vm-archive/docs-evidence/apple-linux-lifecycle.txt`. It is a boot/console test, not a
 Linux desktop or 3D acceptance test.
 
 `native/tools/build-probes.sh` builds standalone diagnostics in `.local/bin`:
@@ -84,7 +84,7 @@ Linux desktop or 3D acceptance test.
   encoding availability; capture, remote transport, browser decoding, dynamic
   adaptation, and end-to-end encryption remain separate work.
 
-Existing host probe outputs are in `archive/docs-evidence/apple-host-*.json`. No result
+Existing host probe outputs are in `vm-archive/docs-evidence/apple-host-*.json`. No result
 establishes parity with or superiority to Parallels.
 
 For a verified local macOS IPSW:

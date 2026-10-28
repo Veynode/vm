@@ -1,6 +1,6 @@
 # Native current-frame acquisition receipt
 
-**Version1 contract implemented and component-tested; runtime acceptance is separate and is not claimed by this document.** The [v9 exact trace](../../archive/docs-evidence/native-input-frame-race-live-v1/) proves an event can acquire an old but current picture and become ineligible in less than1ms when another presentation commits. This proposal changes native eligibility explicitly: an event proved to have acquired the current picture may finish bounded delivery after that picture is replaced. It does not renew the picture's timestamp or reinterpret diagnostic IDs as authority.
+**Version1 contract implemented and component-tested; runtime acceptance is separate and is not claimed by this document.** The v9 exact trace (`vm-archive/docs-evidence/native-input-frame-race-live-v1`) proves an event can acquire an old but current picture and become ineligible in less than1ms when another presentation commits. This proposal changes native eligibility explicitly: an event proved to have acquired the current picture may finish bounded delivery after that picture is replaced. It does not renew the picture's timestamp or reinterpret diagnostic IDs as authority.
 
 ## Contract
 

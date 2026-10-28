@@ -1,0 +1,18 @@
+proxy: proxy server with pid 57531
+VULKAN_INSTANCE_BEGIN
+	vendorID: 0x106b
+	apiVersion         = 1.4.334
+	vendorID           = 0x106b
+	deviceType         = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+	deviceName         = Virtio-GPU Venus (Apple M1 Pro)
+	driverName         = venus
+	driverInfo         = Mesa 26.1.6
+VULKAN_INSTANCE_EXIT 0
+	vendorID: 0x106b
+VK_PIXEL_DEVICE name=Virtio-GPU Venus (Apple M1 Pro) driver=venus vendor=106b type=1 api=4202830
+VK_PIXEL_CASE frame=0 tested=3522 mismatches=0
+VK_PIXEL_CASE frame=1 tested=3522 mismatches=0
+VK_PIXEL_CASE frame=2 tested=3522 mismatches=0
+VK_PIXEL_PASS frames=3 size=64x64
+[   13.963265] reboot: Power down
+Oct  9 21:37:06  virgl_render_server[57531] <Debug>: socket disconnected

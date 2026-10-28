@@ -43,7 +43,7 @@ pub fn known_limits(backend: Backend, guest: &str) -> Value {
             "classification":KNOWN_LIMIT_CLASSIFICATION,
             "measured_on":"macOS 26.6.2 Guest on one host (Apple M1 Pro, macOS 26.4.1); other macOS versions and hosts were not measured, and the limit may move with an Apple update",
             "decision":"docs/decisions/0023-macos-guest-metal-compute-limit.md",
-            "evidence":"archive/docs-evidence/blender-cycles-error-propagation/guest-baseline-app-v1/README.md",
+            "evidence":"vm-archive/docs-evidence/blender-cycles-error-propagation/guest-baseline-app-v1/README.md",
         },
         {
             "code":MACOS_GUEST_OPENGL_NOT_ACCELERATED,
@@ -52,7 +52,7 @@ pub fn known_limits(backend: Backend, guest: &str) -> Value {
             "classification":KNOWN_LIMIT_CLASSIFICATION,
             "measured_on":"macOS 26.6.2 Guest with 4 CPUs and 4 GiB on one host (Apple M1 Pro); other macOS versions and hosts were not measured, and this is not a claim about future Apple releases",
             "decision":"docs/decisions/0017-macos-opengl-capability-gap.md",
-            "evidence":"archive/docs-evidence/freecad-macos-live/cgl1-no-accelerated-renderer/README.md",
+            "evidence":"vm-archive/docs-evidence/freecad-macos-live/cgl1-no-accelerated-renderer/README.md",
         },
     ])
 }
@@ -203,7 +203,7 @@ pub fn control_features(backend: Backend, guest: &str) -> Value {
         json!({"status":"unsupported","reason":"not implemented: no Guest accessibility tree query exists for this backend and Guest"})
     };
     out["gpu_3d"] = if backend == Backend::AppleVirtualization && guest == "macos" {
-        json!({"status":"supported","reason":"Narrow: Godot Metal Forward+ sample on one macOS 26.6.2 Guest; no accelerated OpenGL (decision 0017), large Metal compute/Cycles unavailable (decision 0023); see known_limits; no general compatibility or performance claim","evidence":"archive/docs-evidence/godot-macos-live/README.md"})
+        json!({"status":"supported","reason":"Narrow: Godot Metal Forward+ sample on one macOS 26.6.2 Guest; no accelerated OpenGL (decision 0017), large Metal compute/Cycles unavailable (decision 0023); see known_limits; no general compatibility or performance claim","evidence":"vm-archive/docs-evidence/godot-macos-live/README.md"})
     } else if backend == Backend::QemuHvf && guest == "linux" {
         qemu_gpu_3d(qemu_graphics::Profile::Virgl)
     } else if backend == Backend::QemuHvf && guest == "windows" {
@@ -226,10 +226,10 @@ pub(crate) fn qemu_gpu_3d(profile: qemu_graphics::Profile) -> Value {
             json!({"status":"implemented_unverified","reason":"Experimental: D3D11 through UTM's Triton driver, Neptune and DXMT on Metal, pixel-checked and benchmarked on one Windows machine with guest tools 0.1.273; no D3D12 or game claim (docs/known-issues.md)"})
         }
         qemu_graphics::Profile::Virgl => {
-            json!({"status":"supported","reason":"Narrow: registered QEMU virgl/ANGLE Metal, SolveSpace OpenGL 2.1 sample only; requires a matching Guest driver; no general compatibility, per-VM Guest verification or performance claim","evidence":"archive/docs-evidence/linux-cad-interaction-live-v11/README.md"})
+            json!({"status":"supported","reason":"Narrow: registered QEMU virgl/ANGLE Metal, SolveSpace OpenGL 2.1 sample only; requires a matching Guest driver; no general compatibility, per-VM Guest verification or performance claim","evidence":"vm-archive/docs-evidence/linux-cad-interaction-live-v11/README.md"})
         }
         qemu_graphics::Profile::VenusMoltenvkExperimental => {
-            json!({"status":"supported","reason":"Narrow: opt-in registered Venus runtime, one Linux Guest raster/vkmark sample; requires a matching Guest driver; registered host Geometry contract is not accepted (see host_api_constraints); no general compatibility, per-VM Guest verification or performance claim","evidence":"archive/docs-evidence/linux-vulkan-control-live/v2-accepted/README.md","host_api_constraints":qemu_graphics::host_api_constraints(profile)})
+            json!({"status":"supported","reason":"Narrow: opt-in registered Venus runtime, one Linux Guest raster/vkmark sample; requires a matching Guest driver; registered host Geometry contract is not accepted (see host_api_constraints); no general compatibility, per-VM Guest verification or performance claim","evidence":"vm-archive/docs-evidence/linux-vulkan-control-live/v2-accepted/README.md","host_api_constraints":qemu_graphics::host_api_constraints(profile)})
         }
     }
 }
@@ -301,26 +301,26 @@ pub(crate) fn base_control_features(backend: Backend, guest: &str) -> Value {
         no("unsupported: the scaled JPEG screenshot request form is refused on the Apple backend; requires a Linux Guest on QEMU with a registered console broker")
     };
     if mac {
-        out["lifecycle"] = yes("register an installed disk, start, power-button shutdown request, confirmed force stop; a locked Guest does not act on the power-button request", "archive/docs-evidence/apple-macos-installation.json");
+        out["lifecycle"] = yes("register an installed disk, start, power-button shutdown request, confirmed force stop; a locked Guest does not act on the power-button request", "vm-archive/docs-evidence/apple-macos-installation.json");
         let exec = "not implemented: the macOS Guest service has no exec_start, exec_poll or exec_cancel and its legacy exec is not exposed (decision 0014); the Guest answers unsupported";
         out["command_execution"] = no(exec);
         out["async_jobs"] = no(exec);
-        out["file_transfer"] = yes("Guest service --allow-files --files-root with a private same-UID directory; single filenames, 8 MiB", "archive/docs-evidence/macos-files-live/README.md");
-        out["screenshot"] = yes("Guest service --allow-observe with existing Guest Screen Recording permission; main display", "archive/docs-evidence/control-macos-screenshot.md");
+        out["file_transfer"] = yes("Guest service --allow-files --files-root with a private same-UID directory; single filenames, 8 MiB", "vm-archive/docs-evidence/macos-files-live/README.md");
+        out["screenshot"] = yes("Guest service --allow-observe with existing Guest Screen Recording permission; main display", "vm-archive/docs-evidence/control-macos-screenshot.md");
         out["pointer_key_input"] = st("requires_guest_permission", "implemented; needs Guest service --allow-observe --allow-input and a Guest Accessibility grant; only the refusal accessibility_permission_required is recorded on a real Guest");
-        out["window_metadata"] = yes("Guest service --allow-observe with existing Guest Screen Recording permission; no titles, focus, stacking order or Accessibility tree", "archive/docs-evidence/macos-windows-live/README.md");
+        out["window_metadata"] = yes("Guest service --allow-observe with existing Guest Screen Recording permission; no titles, focus, stacking order or Accessibility tree", "vm-archive/docs-evidence/macos-windows-live/README.md");
         out["retina_input_mapping"] = st("implemented_unverified", "Guest maps bound-screenshot pixels to Quartz points on its main display; Guest unit test of the 2x mapping only, and input itself needs the Guest Accessibility grant");
         out["accessibility_metadata"] = unverified("accessibility_metadata");
         out["application_tools"] = unverified("application_tools");
         out["memory_reclaim"] = no("not implemented: no balloon device is configured for macOS Guests and nothing returns Guest memory to the host");
-        out["shared_folders"] = yes("shared_dir at registration only: one read-only virtiofs share tagged veynode, mounted from inside the Guest", "archive/docs-evidence/apple-macos-desktop-probe.md");
+        out["shared_folders"] = yes("shared_dir at registration only: one read-only virtiofs share tagged veynode, mounted from inside the Guest", "vm-archive/docs-evidence/apple-macos-desktop-probe.md");
         out["guest_shutdown"] = no("not implemented: the macOS Guest service has no shutdown method, so vm_shutdown mode guest is answered unsupported; mode backend is the power-button request");
     } else if !qemu {
-        out["lifecycle"] = yes("register a direct-boot kernel, start, power-button shutdown request, confirmed force stop; the Guest kernel may ignore the power button", "archive/docs-evidence/apple-linux-lifecycle.txt");
+        out["lifecycle"] = yes("register a direct-boot kernel, start, power-button shutdown request, confirmed force stop; the Guest kernel may ignore the power button", "vm-archive/docs-evidence/apple-linux-lifecycle.txt");
         let exec = "enabled Guest service with asynchronous jobs; argv only; synchronous and unknown/reconnecting Guest host limit 30 s; only opted-in QEMU Linux exec-v2 can use up to 120 s after vm_guest_info reports its bound no-reconnect policy";
-        out["command_execution"] = yes(exec, "archive/docs-evidence/control-sync-cancel.md");
-        out["async_jobs"] = yes(exec, "archive/docs-evidence/control-sync-cancel.md");
-        out["file_transfer"] = yes("Guest service files integration with a dedicated non-root files account; single filenames, 8 MiB", "archive/docs-evidence/control-files.md");
+        out["command_execution"] = yes(exec, "vm-archive/docs-evidence/control-sync-cancel.md");
+        out["async_jobs"] = yes(exec, "vm-archive/docs-evidence/control-sync-cancel.md");
+        out["file_transfer"] = yes("Guest service files integration with a dedicated non-root files account; single filenames, 8 MiB", "vm-archive/docs-evidence/control-files.md");
         out["screenshot"] = st("implemented_unverified", "Linux desktop containers (--desktop) only: guest agent DRM scanout, PNG (JPEG when large); vm_guest_info reports capabilities.screenshot");
         out["pointer_key_input"] = st("implemented_unverified", "Linux desktop containers (--desktop) only: guest agent uinput keyboard and absolute tablet, against a fresh screenshot anchor");
         out["window_metadata"] = unverified("window_metadata");
@@ -328,21 +328,21 @@ pub(crate) fn base_control_features(backend: Backend, guest: &str) -> Value {
         out["application_tools"] = unverified("application_tools");
         out["memory_reclaim"] = no("not supported: a virtio balloon device is attached but nothing drives it; measured 2026-10-12, a 512 MiB balloon target raised the host footprint by 933 MiB");
         out["shared_folders"] = st("implemented_unverified", "shared_dir at registration attaches one read-only virtiofs share tagged veynode; no real-Guest record of a Linux Guest mounting it through this daemon");
-        out["guest_shutdown"] = yes("vm_shutdown mode guest; Guest service running as root with shutdown enabled; request acceptance is not completion", "archive/docs-evidence/apple-linux-normal-shutdown.json");
+        out["guest_shutdown"] = yes("vm_shutdown mode guest; Guest service running as root with shutdown enabled; request acceptance is not completion", "vm-archive/docs-evidence/apple-linux-normal-shutdown.json");
     } else {
-        out["lifecycle"] = yes("QEMU registered by the daemon operator; direct-boot kernel with optional raw disk; start, QMP power-button request, confirmed force stop", "archive/docs-evidence/installed-qemu-retention-normal-live/README.md");
+        out["lifecycle"] = yes("QEMU registered by the daemon operator; direct-boot kernel with optional raw disk; start, QMP power-button request, confirmed force stop", "vm-archive/docs-evidence/installed-qemu-retention-normal-live/README.md");
         let exec = "VM registered with qemu_guest_exec and a rootless cgroup-v2 Guest service on the execution transport; refused with an explicit unsupported error otherwise";
         out["command_execution"] = yes(
             exec,
-            "archive/docs-evidence/installed-qemu-exec-live/README.md",
+            "vm-archive/docs-evidence/installed-qemu-exec-live/README.md",
         );
         out["async_jobs"] = yes(
             exec,
-            "archive/docs-evidence/installed-qemu-exec-live/README.md",
+            "vm-archive/docs-evidence/installed-qemu-exec-live/README.md",
         );
         out["file_transfer"] = no("not implemented: the QEMU serial transports carry no file capability; the daemon refuses file calls with an explicit unsupported error");
-        out["screenshot"] = yes("QEMU capture registered by the daemon operator; refused with an explicit unsupported error otherwise", "archive/docs-evidence/spice-screenshot.md");
-        out["pointer_key_input"] = yes("registered QEMU persistent console; absolute click, drag, wheel and physical key codes on an unscaled single-display Xorg desktop", "archive/docs-evidence/control-input.md");
+        out["screenshot"] = yes("QEMU capture registered by the daemon operator; refused with an explicit unsupported error otherwise", "vm-archive/docs-evidence/spice-screenshot.md");
+        out["pointer_key_input"] = yes("registered QEMU persistent console; absolute click, drag, wheel and physical key codes on an unscaled single-display Xorg desktop", "vm-archive/docs-evidence/control-input.md");
         out["unicode_text_input"] = st("implemented_unverified", "vm_input_text: qemu_guest_exec, Guest service --allow-text-input, X11 with XTEST (no Wayland); full requirements and limits under product_capabilities.unicode_text_input");
         out["memory_reclaim"] = no("not supported: no balloon or free page reporting device is configured; measured 2026-10-12, free page reporting discarded 594 MiB without lowering the host footprint");
         out["shared_folders"] =

@@ -82,9 +82,9 @@ licensing/security audit and distribution rights remain release gates.
 DTLS/SRTP encrypts this peer transport, but the localhost HTTP signaling and served
 browser code are trusted by this diagnostic. The bare mode does not authenticate
 remote users. The explicitly configured paired path implements signed
-offer/answer fingerprint binding and scoped grants; see [pairing evidence](../../archive/docs-evidence/session-auth/README.md) and paired control below. Trusted
+offer/answer fingerprint binding and scoped grants; see pairing evidence (`vm-archive/docs-evidence/session-auth/`) and paired control below. Trusted
 short-lived ICE configuration and local TURN tests are separate from default
-host-only behavior; see [TURN cleanup evidence](../../archive/docs-evidence/turn-allocation-cleanup.md). Internet deployment/E2EE acceptance remains unverified.
+host-only behavior; see TURN cleanup evidence (`vm-archive/docs-evidence/turn-allocation-cleanup.md`). Internet deployment/E2EE acceptance remains unverified.
 No Parallels/performance or release-readiness claim follows from these local tests.
 
 ## Persistent VM console
@@ -152,16 +152,16 @@ start ordering, EOF, truncated native output, native stop errors/timeouts,
 malformed acknowledgements and inconsistent session-error epochs. Their native
 fixture is synthetic and proves no graphics or hardware encoding. Reproduce with
 `cargo test -p vm-media-local --test console_protocol`. See
-[broker protocol evidence](../../archive/docs-evidence/console-broker.md),
-[persistent control/browser evidence](../../archive/docs-evidence/control-qemu-persistent.md)
-and [native capture evidence](../../archive/docs-evidence/apple-spice-console.md) for the
+broker protocol evidence (`vm-archive/docs-evidence/console-broker.md`),
+persistent control/browser evidence (`vm-archive/docs-evidence/control-qemu-persistent.md`)
+and native capture evidence (`vm-archive/docs-evidence/apple-spice-console.md`) for the
 separate accepted paths and preserved failures.
 
 ## Paired encrypted console control
 
-With production `--console SOCKET` plus `--auth-state DIR --auth-namespace NAME --vm ID --control-state DIR`, confirmed paired sessions may use the exact reliable ordered `veynode-control-v1` / `veynode-control/v1` DataChannel on the signed peer. Observe-only grants receive fresh snapshots; input additionally requires explicit scope and a fresh screenshot's frame identity. `/auth/control` is absent. Native browser code rejects a server that advertises control without this transport version. See [real acceptance and reproduction](../../archive/docs-evidence/browser-control-channel/README.md).
+With production `--console SOCKET` plus `--auth-state DIR --auth-namespace NAME --vm ID --control-state DIR`, confirmed paired sessions may use the exact reliable ordered `veynode-control-v1` / `veynode-control/v1` DataChannel on the signed peer. Observe-only grants receive fresh snapshots; input additionally requires explicit scope and a fresh screenshot's frame identity. `/auth/control` is absent. Native browser code rejects a server that advertises control without this transport version. See real acceptance and reproduction (`vm-archive/docs-evidence/browser-control-channel/`).
 
-No command, clipboard or MCP protocol is exposed by this proprietary channel. The separate explicitly enabled `--allow-files` path requires strict Guest binding and a `files` grant; it grants no input authority. See [actual file-channel evidence](../../archive/docs-evidence/browser-files-live/README.md). HTTP signaling remains loopback-only. Limits apply to application messages and RTC queues separately; this is not a claim of Internet or total-memory acceptance. Freeze a single binary for Keychain-backed pairing administration and serving; executable identity changes are a separate upgrade/signing gate.
+No command, clipboard or MCP protocol is exposed by this proprietary channel. The separate explicitly enabled `--allow-files` path requires strict Guest binding and a `files` grant; it grants no input authority. See actual file-channel evidence (`vm-archive/docs-evidence/browser-files-live/`). HTTP signaling remains loopback-only. Limits apply to application messages and RTC queues separately; this is not a claim of Internet or total-memory acceptance. Freeze a single binary for Keychain-backed pairing administration and serving; executable identity changes are a separate upgrade/signing gate.
 
 Control replies have three forms. `{"sequence","result"}` is success. `{"sequence","error":"control rejected"}` is a refusal that fences the session's control; the service prints `control channel failure category=<word>`, where the word is a fixed sub-reason (for example `request_replay`, `input_authorization`, `vm_status_mismatch`, `frame_anchor`, `controller_unavailable`, `controller_reply_invalid`, `screenshot_reply_too_large`, `screenshot_reply_invalid`, `png_decode_corrupt`, `frame_verification`) and `dispatch_rejected` only for what has no word yet. `{"sequence","error":"frame unavailable","reason":<word>}` answers `observe_frame` alone and fences nothing: the request was authentic and in sequence, but the controller had no usable picture (`controller_refused`, `controller_deadline`, `png_decode_unsupported`, `scaled_frame_over_cap`). The session and the video stay as they were; the service prints `control frame unavailable reason=<word>`. No log line or reply carries controller or Guest error text. Tested offline only (2026-10-12); the browser page does not accept the third form yet.
 
@@ -183,7 +183,7 @@ for recovery through the originally pinned listener. Ledger retention is120s/32
 terminal captures; no proof on expiry, service restart, missing receipt or failed
 host cleanup. Durable restart recovery remains unfinished.
 
-[Actual HEVC bridge loss, H264 encoder crash and same-server reconnect](../../archive/docs-evidence/browser-cleanup-recovery-live/README.md).
+Actual HEVC bridge loss, H264 encoder crash and same-server reconnect (`vm-archive/docs-evidence/browser-cleanup-recovery-live/`).
 
 ### Optional local encoder rate actuator diagnostic
 
@@ -404,7 +404,7 @@ final-poll deadline remains authoritative for all repairs.
 wire bytes/counts, dedup/suppression/failure counts and actual unbind/close
 state, tied only to the independent Peer `fence_id`. Main requires the actual
 close callback and empty resources for confirmed cleanup. See
-[component boundaries and tests](../../archive/docs-evidence/media-nack-budget-component-v1/README.md).
+component boundaries and tests (`vm-archive/docs-evidence/media-nack-budget-component-v1/`).
 
 ## Status codes (offer admission)
 

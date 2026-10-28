@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 #ifndef VEYNODE_SPICE_SCANOUT_GENERATION_H
 #define VEYNODE_SPICE_SCANOUT_GENERATION_H
 #include <stdint.h>

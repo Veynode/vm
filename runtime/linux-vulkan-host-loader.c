@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /* Dedicated diagnostic loader: select one exact independent virgl host image.
  * QEMU and vendor frameworks remain unchanged. No substitute API implementation. */
 #include <dlfcn.h>

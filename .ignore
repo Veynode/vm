@@ -1,6 +1,4 @@
 # Hidden from rg and Claude Code's search; `rg --no-ignore-dot` (or reading the path directly) still reaches them.
-# History and evidence from the earlier phase.
-archive/
 # Patched upstream copies, licenses and generated or locked files.
 vendor/
 licenses/

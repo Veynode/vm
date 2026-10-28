@@ -116,11 +116,11 @@ follows from the execution results.
 
 | Test | Observed result | Limit |
 |---|---|---|
-| [Normal execution](../../archive/docs-evidence/installed-qemu-exec-live/README.md) | 26 checks; escaped descendants cannot write after cancellation, timeout, completion, takeover or EOF; normal ACPI exit0 | Single-VM functional sample |
-| [Worker SIGSTOP](../../archive/docs-evidence/installed-qemu-exec-guardian-live/README.md) | QEMU reaped in5.195s while worker remained stopped | Independent guardian boundary; no Guest scope-empty ACK |
-| [Whole QEMU SIGSTOP](../../archive/docs-evidence/installed-qemu-pause-live/README.md) | Host serial failure retired original QEMU in3.644s without resume | No host sleep or stale queued dispatch proof |
-| [Daemon exit plus stopped worker](../../archive/docs-evidence/installed-qemu-daemon-exit-live/README.md) | Original three VM processes absent in0.240s; MCP cleanup unconfirmed | Not guardian-timeout attribution; OS signal cause was not traced; earlier failed oracle preserved |
-| [Lost start ACK](../../archive/docs-evidence/installed-qemu-lost-ack-live/README.md) | Original owner received no job ID; actual scope-empty ACK and stopped descendant writes; same VM later normally shut down | Worker-to-daemon ACK loss, not serial ACK loss |
+| Normal execution (`vm-archive/docs-evidence/installed-qemu-exec-live/`) | 26 checks; escaped descendants cannot write after cancellation, timeout, completion, takeover or EOF; normal ACPI exit0 | Single-VM functional sample |
+| Worker SIGSTOP (`vm-archive/docs-evidence/installed-qemu-exec-guardian-live/`) | QEMU reaped in5.195s while worker remained stopped | Independent guardian boundary; no Guest scope-empty ACK |
+| Whole QEMU SIGSTOP (`vm-archive/docs-evidence/installed-qemu-pause-live/`) | Host serial failure retired original QEMU in3.644s without resume | No host sleep or stale queued dispatch proof |
+| Daemon exit plus stopped worker (`vm-archive/docs-evidence/installed-qemu-daemon-exit-live/`) | Original three VM processes absent in0.240s; MCP cleanup unconfirmed | Not guardian-timeout attribution; OS signal cause was not traced; earlier failed oracle preserved |
+| Lost start ACK (`vm-archive/docs-evidence/installed-qemu-lost-ack-live/`) | Original owner received no job ID; actual scope-empty ACK and stopped descendant writes; same VM later normally shut down | Worker-to-daemon ACK loss, not serial ACK loss |
 
 A separate restart review found that in-memory scope obligations disappear with
 the daemon and can cause a false old-session cleanup receipt after restart.
@@ -132,11 +132,11 @@ physical power-loss/storage behavior remain separate unfinished gates.
 ### Durable journal and explicit witness acceptance update (2026-10-09)
 
 The preceding checkpoint's journal/reconciliation work was pending at that time.
-[Actual v5 evidence](../../archive/docs-evidence/installed-qemu-journal-live/README.md) now records
+Actual v5 evidence (`vm-archive/docs-evidence/installed-qemu-journal-live/`) now records
 normal26-check cleanup with an empty journal and a21-check restart fence: the old
 owner's EOF remains unconfirmed and cannot erase its persisted obligation.
 
-[Actual frozen v6 /5a0737a witness acceptance](../../archive/docs-evidence/installed-qemu-witness-live/README.md)
+Actual frozen v6 /5a0737a witness acceptance (`vm-archive/docs-evidence/installed-qemu-witness-live/`)
 then passes36checks: active original-incarnation lock denies reconciliation;
 after original process retirement and daemon restart, explicit reconciliation
 uses the original file identity and exclusive lifetime witness. A new incarnation
@@ -148,13 +148,13 @@ The tested v6 still requires explicit reconciliation after normal clean shutdown
 later auto-reconciliation work has separate acceptance requirements. No overlapping
 daemon generations, host sleep, same-incarnation resume or power-loss durability
 was established. The Guest-service crash experiment remains a separate
-[failed framing acceptance](../../archive/docs-evidence/installed-qemu-guest-crash-failure/README.md),
+failed framing acceptance (`vm-archive/docs-evidence/installed-qemu-guest-crash-failure/`),
 not a pass inferred from these successful recovery tests.
 
 ### Guest service crash acceptance update (2026-10-09)
 
 The previously recorded failed framing run remains failed.
-[A fresh actual run](../../archive/docs-evidence/installed-qemu-guest-crash-live/README.md), with
+A fresh actual run (`vm-archive/docs-evidence/installed-qemu-guest-crash-live/`), with
 watcher framing fix `dcf4c7c` and timestamped pre-cleanup observations `64ba8ad`,
 now passes9checks on unchanged frozen host bin-v5. Acknowledged rootless work and
 an actively writing detached descendant precede pidfd SIGKILL of the exact Guest
@@ -170,7 +170,7 @@ host-sleep, universal latency or queued-byte replay guarantee is inferred.
 
 The earlier frozen-v6 requirement for explicit reconciliation after clean normal
 exit is superseded for the tested **same live daemon, exact owned worker exit0**
-path. [Actual frozen v7r3 / dcefab5 evidence](../../archive/docs-evidence/installed-qemu-normal-restart-live/README.md)
+path. Actual frozen v7r3 / dcefab5 evidence (`vm-archive/docs-evidence/installed-qemu-normal-restart-live/`)
 passes20 checks: two installed boots, independent15-pixel/command/PNG checks,
 old owner/job/epoch denial, two stopped/exit0 process retirements and automatic
 exact completed receipts. The next boot requires no manual reconciliation.
@@ -191,9 +191,9 @@ collected; a retained receipt remains idempotent after collection. Unknown or
 expired receipts fail with cleanup unconfirmed and cannot clear a newer instance.
 Retention is count-based, not a promised wall-clock TTL. Valid v2 migration uses
 its stored serialized receipt order, not reconstructed historical time; v1 stays
-conservatively fenced. See [component semantics and fault tests](../../archive/docs-evidence/qemu-completion-retention/README.md).
+conservatively fenced. See component semantics and fault tests (`vm-archive/docs-evidence/qemu-completion-retention/`).
 
-[Actual explicit-v3 normal acceptance](../../archive/docs-evidence/installed-qemu-retention-normal-live/README.md)
+Actual explicit-v3 normal acceptance (`vm-archive/docs-evidence/installed-qemu-retention-normal-live/`)
 now passes22checks: two installed Guest boots, old-authority refusal, real commands
 and captures, two normal exit0 automatic receipts, and each exact completed
 witness file absent afterward. Both process chains are gone and the source base
@@ -203,7 +203,7 @@ retention, crash auto-recovery, host sleep or physical power-loss behavior.
 
 ### Same-daemon peer isolation with a retained pending obligation (2026-10-09)
 
-[Actual frozen v8 peer acceptance](../../archive/docs-evidence/installed-qemu-peer-isolation-live/README.md)
+Actual frozen v8 peer acceptance (`vm-archive/docs-evidence/installed-qemu-peer-isolation-live/`)
 passes12checks: two installed Linux VMs share one daemon; real Guest-service
 SIGKILL retires B's original host incarnation, while A's existing rootless job
 continues and fresh execution/capture still works on A's original instance.

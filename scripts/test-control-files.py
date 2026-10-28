@@ -4,7 +4,7 @@ import argparse,base64,hashlib,importlib.util,json,os,subprocess,tempfile,time,u
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location('sync_client',ROOT/'scripts/test-control-sync-cancel.py');module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);MCP=module.MCP
-p=argparse.ArgumentParser(description=__doc__);p.add_argument('--config',type=Path,required=True);p.add_argument('--output',type=Path,default=ROOT/'archive/docs-evidence/control-files.json');p.add_argument('--expiry',action='store_true',help='Wait for actual60second idle cleanup');args=p.parse_args()
+p=argparse.ArgumentParser(description=__doc__);p.add_argument('--config',type=Path,required=True);p.add_argument('--output',type=Path,default=ROOT/'.local/evidence/control-files.json');p.add_argument('--expiry',action='store_true',help='Wait for actual60second idle cleanup');args=p.parse_args()
 config=json.loads(args.config.read_text());assert Path(config['disk']).resolve().is_relative_to(ROOT/'.local/vms');assert config['memory_mib']<=1024
 config['id']='files-validation';evidence={'started_at_unix':time.time(),'checks':[],'scope':'One actual1GiB installed Linux; dedicated files UID1001, execution UID1000; single filenames only','config_path':str(args.config.resolve())}
 def record(name,value):evidence['checks'].append({'name':name,'evidence':value})

@@ -64,7 +64,7 @@ def main():
     parser.add_argument('--binary', type=Path, default=CONTROL)
     parser.add_argument('--backend', type=Path, default=ROOT / '.local/bin/vm-apple')
     parser.add_argument('--config', type=Path, required=True)
-    parser.add_argument('--output', type=Path, default=ROOT / 'archive/docs-evidence/control-sync-cancel.json')
+    parser.add_argument('--output', type=Path, default=ROOT / '.local/evidence/control-sync-cancel.json')
     args = parser.parse_args()
     CONTROL = args.binary.resolve(strict=True)
     assert not args.output.exists() and not args.output.with_suffix('.failed.json').exists(), 'refusing evidence overwrite'

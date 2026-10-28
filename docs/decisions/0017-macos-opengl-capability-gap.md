@@ -10,13 +10,13 @@ for the current host/Guest combination, not a claim about all future Apple relea
 Official native ARM FreeCAD1.1.4 on the existing4CPU/4GiB macOS26.6.2 Guest
 constructed the first constrained solid, but its selected Qt OpenGL context
 reported Apple Software Renderer2.1. Strict GPU acceptance failed before capture
-and the edit. [Original actual failure](../../archive/docs-evidence/freecad-macos-live/cad1-software-renderer/README.md).
+and the edit. Original actual failure (`vm-archive/docs-evidence/freecad-macos-live/cad1-software-renderer/`).
 
 An independent identical binary enumerated only one online CGL renderer in the
 Guest, acceleration0. Legacy,3.2-core and4.1-core required-accelerated choices all
 returned kCGLBadPixelFormat10002/no matches. Unrestricted choices were software,
 including4.1. On the host, the same binary found Apple M1 Pro accelerated and all
-three required-accelerated choices succeeded. [Host/Guest evidence](../../archive/docs-evidence/freecad-macos-live/cgl1-no-accelerated-renderer/README.md).
+three required-accelerated choices succeeded. Host/Guest evidence (`vm-archive/docs-evidence/freecad-macos-live/cgl1-no-accelerated-renderer/`).
 No shader, draw, performance or presentation was measured by this enumeration.
 The v1 FreeCAD widget ownership was not recorded, but this independent result
 means simply selecting a different current CGL profile is not an evidenced fix.

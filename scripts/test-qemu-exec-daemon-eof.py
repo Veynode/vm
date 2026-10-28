@@ -9,7 +9,7 @@ signals. Oracle v2 verifies original process retirement, not guardian timeout.
 POSIX orphan-group SIGHUP/SIGCONT may end/resume the worker before our next sample:
 https://pubs.opengroup.org/onlinepubs/9799919799/functions/_exit.html
 No signal trace establishes which mechanism caused a particular exit. The prior
-failed oracle remains archived in archive/docs-evidence/installed-qemu-daemon-eof-failure.
+failed oracle remains archived in Veynode/vm-archive docs-evidence/installed-qemu-daemon-eof-failure.
 No durable cleanup reconciliation or Guest cgroup ACK is claimed.
 """
 import argparse

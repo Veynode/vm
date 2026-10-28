@@ -45,11 +45,11 @@ WEB_BUILD_INPUTS = ('web/package.json', 'web/package-lock.json', 'web/vite.confi
 LIVE_ONLY = {
     'guest/kernel/': 'python3 guest/kernel/build.py && python3 scripts/test-containers.py',
     'guest/images/': 'veynodevm build -t <image> guest/images/<name> && veynodevm run --rm <image>',
-    'runtime/': 'the matching runtime/*.sh or *.py build (see README "Build and check")',
+    'runtime/': 'the matching runtime/*.sh or *.py build (see docs/guides/building.md)',
     'native/': 'the build or test script next to the file (no offline check is mapped for it)',
     'tests/mcp-client/': 'the scripts/test-macos-*.py harness that loads it (needs a macOS guest)',
 }
-NOT_SOURCE = ('archive/', 'target/', '.local/', 'vendor/', '.claude/', '.gitignore', '.ignore', 'licenses/')
+NOT_SOURCE = ('target/', '.local/', 'vendor/', '.claude/', '.gitignore', '.ignore', 'licenses/')
 ORDER = {'fmt': 0, 'lint': 1, 'test': 2, 'build': 3}
 
 

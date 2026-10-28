@@ -61,7 +61,8 @@ That cannot be released as is ([license gate](../../licenses/README.md)):
    recipe, relinking and installation, redistribution review, product license) come from this pipeline.
 7. **Our glue that runs inside the QEMU or SPICE process is licensed separately from the rest of the project.** This
    covers the loaders, `spice-scanout-generation.c` and the patches. It is offered as GPL-2.0-or-later, so it can be
-   combined with GPL-2.0-only QEMU whatever license the rest of the project takes.
+   combined with GPL-2.0-only QEMU whatever license the rest of the project takes. The rest of the project is
+   Apache-2.0; [NOTICE](../../NOTICE) lists the GPL files, which carry an SPDX header.
 
 ## Component inventory
 

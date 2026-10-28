@@ -209,11 +209,11 @@ async fn encoder_budget_capabilities_are_additive() {
 fn encoder_frame_size_recorded_hardware_sequences_are_admitted() {
     for (raw, maximum) in [
         (
-            include_str!("../../../archive/docs-evidence/encoder-rate-live/baseline-v1/encoder-rate-live-v1/h264-result.json"),
+            include_str!("../testdata/encoder-rate-live/h264-result.json"),
             987_750,
         ),
         (
-            include_str!("../../../archive/docs-evidence/encoder-rate-live/baseline-v1/encoder-rate-live-v1/hevc-result.json"),
+            include_str!("../testdata/encoder-rate-live/hevc-result.json"),
             1_687_652,
         ),
     ] {

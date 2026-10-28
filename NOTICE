@@ -1,0 +1,51 @@
+VeynodeVM
+Copyright 2026 Jayden <j893412899@outlook.com>
+
+Licensed under the Apache License, Version 2.0 (see LICENSE), except for the
+files listed below.
+
+Code that runs inside the QEMU or SPICE process
+-----------------------------------------------
+
+These files are loaded into, compiled into or patch the GPU runtime's QEMU,
+SPICE or virglrenderer code (docs/decisions/0026-gpu-runtime-source-build.md,
+item 7). They are licensed under the GNU General Public License, version 2 or
+(at your option) any later version (SPDX: GPL-2.0-or-later; see
+licenses/GPL-2.0.txt):
+
+  runtime/utm-loader.c
+  runtime/linux-vulkan-host-loader.c
+  runtime/linux-vulkan-build-host-runtime.py
+  runtime/linux-vulkan-build-render-server.py
+  runtime/apply-spice-reconnect-fix.py
+  runtime/apply-spice-retired-publication-fix.py
+  native/tools/spice-reconnect-loader.c
+  native/tools/spice-scanout-generation.c
+  native/tools/spice-scanout-generation.h
+  native/tools/spice-scanout-generation-test.c
+
+Patch to DXMT
+-------------
+
+runtime/dxmt-gpu-completed-event.patch modifies DXMT, which is licensed under
+the GNU Lesser General Public License, version 2.1 or later. The patch is
+licensed under the same terms (SPDX: LGPL-2.1-or-later; see
+licenses/LGPL-2.1.txt).
+
+Third-party code in this repository
+-----------------------------------
+
+vendor/webrtc-0.21.0 and vendor/rtc-0.21.0
+  webrtc-rs (https://github.com/webrtc-rs/webrtc), Copyright (c) 2021
+  WebRTC.rs, licensed under the MIT license or the Apache License 2.0. Their
+  license files are kept in those directories. Both copies are modified; see
+  vendor/README.md.
+
+crates/media-local/src/rtcp_forwarder.rs
+  Adapts the webrtc-rs rtcp-processing example, Copyright (c) 2021 WebRTC.rs,
+  used under the MIT license; the notice is kept in the file.
+
+The GPU runtime (UTM's QEMU, SPICE, virglrenderer, MoltenVK and their
+dependencies) is not part of this repository. It is fetched or built
+separately and keeps its own licenses; see licenses/README.md and
+docs/decisions/0026-gpu-runtime-source-build.md.

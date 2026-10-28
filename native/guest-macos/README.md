@@ -226,7 +226,7 @@ and [CGPreflightScreenCaptureAccess](https://developer.apple.com/documentation/c
 The capture and point-scale APIs used here are available from macOS14.
 
 Actual production observation acceptance is recorded in
-[control-macos-screenshot](../../archive/docs-evidence/control-macos-screenshot.md): two
+control-macos-screenshot (`vm-archive/docs-evidence/control-macos-screenshot.md`): two
 fresh frames with the native window open and two after closing it, all2560×1440,
 Guest point scale2, selected JPEG quality0.65, command execution disabled. The
 same installed Guest remained running. This does not establish continuous capture,
@@ -440,7 +440,7 @@ with CoreGraphics; switching between final check and event submission remains a
 documented race. There is no long-running public session-notification watcher,
 cross-process capture-stream identity, host bridge-incarnation binding or macOS
 browser-input enablement in this change. See
-`archive/docs-evidence/apple-console-service-integration.md` for exact evidence.
+`vm-archive/docs-evidence/apple-console-service-integration.md` for exact evidence.
 
 ## Opt-in desktop sound (`--allow-audio`)
 

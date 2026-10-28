@@ -1044,7 +1044,6 @@ fn control_features_state_every_cell_with_status_reason_and_real_guest_evidence(
         ("window_list", [S, I, N, I]),
     ];
     assert_eq!(table.map(|(name, _)| name), CONTROL_FEATURES);
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let pairs = [
         (Backend::AppleVirtualization, "macos"),
         (Backend::AppleVirtualization, "linux"),
@@ -1072,9 +1071,7 @@ fn control_features_state_every_cell_with_status_reason_and_real_guest_evidence(
                 2 + usize::from(expected[column] == S)
             );
             if let Some(evidence) = cell.get("evidence") {
-                let evidence = evidence.as_str().unwrap();
-                assert!(evidence.starts_with("archive/docs-evidence/"), "{at}");
-                assert!(repo.join(evidence).exists(), "{at}");
+                crate::capabilities_tests::assert_archived(evidence.as_str().unwrap());
             }
             // The older report never claims more than this one.
             let old = &product_capabilities(backend, guest)[name];
@@ -2381,7 +2378,7 @@ fn guest_metal_device_retained_real_swift_wire_is_a_valid_presence_report() {
     // Replay the independently recorded actual Guest/MCP public properties.
     // This is wire compatibility evidence, not a fresh Guest recovery test.
     let evidence: Value = serde_json::from_str(include_str!(
-        "../../../archive/docs-evidence/macos-graphics-stage8/evidence.json"
+        "../testdata/macos-graphics-stage8-evidence.json"
     ))
     .unwrap();
     assert_eq!(evidence["validation"]["actual_mcp_query"], true);
