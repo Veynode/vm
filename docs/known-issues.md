@@ -73,6 +73,30 @@ interleaved rounds per variant, medians; the full rows are in
   GL display refresh runs every 30 ms in the prebuilt runtime. The Guest's
   own wakeups are mostly the serial execution heartbeat (500 ms, decision
   0015). Removing the rest needs runtime (QEMU/SPICE) changes.
+- Later the same day the QEMU process of that idle container went from
+  ~3.6% to ~2.1% and then ~1.1% of a core. The Guest agent no longer
+  reopens the cua-driver port every 250 ms while no host is connected (it
+  waits for the host's open on the port), and new containers boot with
+  `kfence.sample_interval=0 nowatchdog sysctl.vm.compaction_proactiveness=0
+  sysctl.vm.stat_interval=10`: traced in the Guest, KFENCE's sampling (a work
+  item every 100 ms), the once-a-second vmstat fold, proactive compaction and
+  the soft-lockup watchdog were the largest timed wakeups left. Containers
+  created before keep their command line.
+- Most of the rest is the pinned runtime's interrupt controller. UTM 5.0.5's
+  QEMU 10.0.12 emulates the GIC, so every Guest timer interrupt and IPI exits
+  to QEMU, and a Guest that wakes every 10 ms costs ~174% of a host core
+  (headless Alpine kernel, 3 rounds; the same in a container). UTM 5.0.8
+  (the same QEMU with HVF's in-kernel GICv3, on by default) costs ~11–14%;
+  upstream QEMU 11.1.0 with `-accel hvf,kernel-irqchip=on` costs ~5–14%. With
+  the in-kernel GIC turned off, 5.0.8 and 11.1.0 cost the same as 5.0.5, so
+  the gain is the in-kernel GIC, not the GIC version. On 5.0.8 the idle
+  container's QEMU uses ~0.5% of a core instead of ~1.0%, and `exec true` takes
+  ~5 ms instead of ~8 ms (p50). The idle Windows 11 desktop (2 rounds, 6 minutes
+  to settle): QEMU ~5–8% instead of ~10–12%, `machine exec` unchanged
+  (~250 ms). A Windows installed on 5.0.8 (GICv3) boots on 5.0.5. The runtime
+  is still pinned to 5.0.5: moving the pin also moves the Venus registration,
+  the Neptune wire format, DXMT, the SPICE build and the release licences
+  (decisions 0001, 0026, 0029).
 - The Guest agent turns off fbcon's blinking cursor when virtio-gpu is
   loaded: it redrew and flushed the scanout every 200 ms (~3% of a host core
   on QEMU). The console broker and the serial transport block on events
@@ -114,7 +138,7 @@ interleaved rounds per variant, medians; the full rows are in
   seen at once. The High performance plan and Balanced measured the same
   within noise.
 - Published ports (Apple Virtualization's publisher) block in `poll` between
-  connections instead of a 100 ms accept step with the wake RPC inline: a
+  connections instead of a 100 ms accept step: a
   new connection's connect, one-byte echo and close went from ~108 ms to
   ~0.46 ms; an open connection's round trip is unchanged (~0.25 ms). QEMU
   publishes through its own `hostfwd` (~0.45 ms).
