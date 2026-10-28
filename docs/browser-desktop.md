@@ -68,8 +68,10 @@ guest does it. With `--desktop`, container-init starts the agent with
 `--desktop-stream`, which listens on vsock 5001 (host CID 2 only, one viewer
 at a time; `guest/veynode-agent/desktop_linux.go`):
 
-- Every 8 ms it reads the active CRTC's framebuffer (`GETCRTC`, `GETFB2`,
-  `MAP_DUMB`, read-only mmap; XRGB8888, linear). It diffs 64x64 tiles against
+- Every 8 ms while the screen changes it reads the active CRTC's framebuffer
+  (`GETCRTC`, `GETFB2`, `MAP_DUMB`, read-only mmap; XRGB8888, linear); after
+  16 still polls it backs off to 16 ms and then 33 ms, and returns to 8 ms on
+  the next change or input event. It compares whole rows first and diffs 64x64 tiles against
   a shadow copy and sends each changed 64-row band as one BGRX rectangle,
   followed by a frame-end record. A still desktop sends nothing; typing sends
   a few KiB.
@@ -92,7 +94,8 @@ on Apple Virtualization too: 62 fps with glxgears under software rendering and
 On the host, `vz-desktop-stream` (`native/tools/vz-desktop-stream.m`,
 registered by `scripts/install-dev-runtime.py` as `vz_desktop_stream`)
 connects to the worker's bridge socket, patches rectangles into a canvas,
-copies it into a pooled IOSurface and encodes once per guest frame. It
+copies into a pooled IOSurface only the tiles changed since that buffer was
+last filled, and encodes once per guest frame. It
 re-encodes once more 300 ms after the screen settles, because a speed-first
 encode of a change can be soft.
 
@@ -295,7 +298,7 @@ admitted a fraction early waited a tick and the stream averaged 54 of 60 fps.
 `encodeSlack` and a 2 ms flush timer fixed that without changing key latency
 (median 37 ms). On Apple Virtualization (XFCE `ubuntu-desktop`, no GPU) the same measures give
 17.9 ms median key (typing in a terminal) to first frame, 125 fps encoded for a
-continuously redrawing app (one encode per guest frame, 8 ms scanout poll), and
+continuously redrawing app (one encode per guest frame, 8 ms scanout poll while drawing), and
 static SSIM 0.997 (HEVC) / 0.998 (H.264) once tagged. A viewer started by a
 client that is killed without closing stdin (SIGTERM) leaks the daemon's single
 bridge slot until `stop_guest_stream_bridge`; the web server closes stdin. Browser decode adds 2–5 ms. The guest scanout diff costs 0.2–0.5 ms per poll

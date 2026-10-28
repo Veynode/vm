@@ -8,5 +8,5 @@ if [[ $# != 0 ]]; then
 fi
 mkdir -p "$(dirname "$OUTPUT")"
 xcrun clang -O2 -fobjc-arc -Wall -Wextra -Wno-unused-parameter -Werror \
- -framework Foundation -framework VideoToolbox -framework CoreVideo -framework CoreMedia \
+ -framework Foundation -framework VideoToolbox -framework CoreVideo -framework CoreMedia -framework IOSurface \
  "$ROOT/native/tools/vz-desktop-stream.m" -o "$OUTPUT"

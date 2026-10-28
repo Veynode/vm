@@ -4,8 +4,9 @@ package main
 
 // Browser desktop for Apple Virtualization Linux guests. The host has no
 // capture API for a Linux VZ display, so the guest polls the primary DRM
-// scanout, sends changed 64x64 tiles as BGRX rectangles over vsock 5001 and
-// drives two uinput devices (keyboard, absolute tablet) from host input.
+// scanout (every 8-33 ms, pollPacer in desktop.go), sends changed 64x64 tiles
+// as BGRX rectangles over vsock 5001 and drives two uinput devices (keyboard,
+// absolute tablet) from host input.
 //
 // host -> guest: JSON lines of at most 4 KiB. {"method":"start"} first, then
 //   {"input":[{"t":"abs","x":0..32767,"y":0..32767} |
@@ -36,7 +37,6 @@ import (
 
 const (
 	desktopPort    = 5001
-	desktopPoll    = 8 * time.Millisecond
 	desktopMaxSide = 4096
 	// A clipboard line carries up to 200 KiB of text, JSON-escaped.
 	desktopMaxLine = 2 << 20
@@ -419,6 +419,8 @@ func serveDesktop(conn *os.File) {
 	defer clipboard.close()
 	done := make(chan struct{})
 	reports := make(chan error, 1)
+	// Host input wakes a backed-off poll loop.
+	inputs := make(chan struct{}, 1)
 	go func() {
 		defer close(done)
 		for lines.Scan() {
@@ -450,6 +452,10 @@ func serveDesktop(conn *os.File) {
 			if err == nil {
 				err = input.apply(message.Input)
 			}
+			select {
+			case inputs <- struct{}{}:
+			default:
+			}
 			if err != nil {
 				select {
 				case reports <- err:
@@ -458,11 +464,18 @@ func serveDesktop(conn *os.File) {
 			}
 		}
 	}()
-	ticker := time.NewTicker(desktopPoll)
-	defer ticker.Stop()
+	var pacer pollPacer
+	timer := time.NewTimer(pacer.next(true))
+	defer timer.Stop()
+	due := time.Now().Add(desktopPoll)
+	schedule := func(from time.Time, wait time.Duration) {
+		due = from.Add(wait)
+		timer.Reset(max(time.Until(due), 0))
+	}
 	waiting := ""
 	var head [8]byte
-	// Every 5 s: poll count, frames sent and the capture (diff + copy) cost.
+	// Every 5 s: poll count, frames sent, the capture (diff + copy) cost and
+	// the poll interval in effect.
 	var polls, frames int
 	var spent, worst time.Duration
 	reported := time.Now()
@@ -475,11 +488,19 @@ func serveDesktop(conn *os.File) {
 				return
 			}
 			continue
-		case <-ticker.C:
+		case <-inputs:
+			// Poll within one fast interval of the input, not a backed-off one.
+			if wait := pacer.input(); time.Until(due) > wait {
+				schedule(time.Now(), wait)
+			}
+			continue
+		case <-timer.C:
 		}
+		tick := time.Now()
 		changed, err := screen.refresh()
 		if err != nil {
 			// The desktop may still be starting; report once and keep polling.
+			schedule(tick, pacer.next(false))
 			if err.Error() != waiting {
 				waiting = err.Error()
 				if w.event(map[string]any{"event": "waiting", "message": waiting}) != nil {
@@ -514,9 +535,11 @@ func serveDesktop(conn *os.File) {
 		if err != nil {
 			return
 		}
+		schedule(tick, pacer.next(sent))
 		if time.Since(reported) >= 5*time.Second {
 			if w.event(map[string]any{"event": "stats", "polls": polls, "frames": frames,
-				"capture_ms": float64(spent.Microseconds()) / float64(polls) / 1000, "capture_max_ms": float64(worst.Microseconds()) / 1000}) != nil {
+				"capture_ms": float64(spent.Microseconds()) / float64(polls) / 1000, "capture_max_ms": float64(worst.Microseconds()) / 1000,
+				"interval_ms": float64(pacer.interval.Microseconds()) / 1000}) != nil {
 				return
 			}
 			polls, frames, spent, worst, reported = 0, 0, 0, 0, time.Now()

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"testing"
+	"time"
 )
 
 type rect struct{ x, y, w, h int }
@@ -58,6 +59,63 @@ func TestTileDiffSendsFullFrameThenOnlyChangedBands(t *testing.T) {
 	}
 	if rects, _ = captureRects(t, d, mem, pitch, ox, oy); len(rects) != 0 {
 		t.Fatalf("shadow not updated: %v", rects)
+	}
+}
+
+func TestTileDiffNarrowBandsDoNotAlias(t *testing.T) {
+	// Two narrow bands in one capture reuse one scratch buffer; each body
+	// must be right while emit holds it, and the shadow must stay intact.
+	const width, height, pitch = 256, 128, 256 * 4
+	mem := make([]byte, pitch*height)
+	d := &tileDiff{width: width, height: height}
+	captureRects(t, d, mem, pitch, 0, 0)
+	mem[10*pitch+5*4] = 9
+	mem[100*pitch+200*4] = 7
+	rects, bodies := captureRects(t, d, mem, pitch, 0, 0)
+	if len(rects) != 2 || rects[0] != (rect{0, 0, 64, 64}) || rects[1] != (rect{192, 64, 64, 64}) {
+		t.Fatalf("narrow capture %v", rects)
+	}
+	if bodies[0][(10*64+5)*4] != 9 || bodies[1][(36*64+8)*4] != 7 {
+		t.Fatal("band body does not carry its own change")
+	}
+	if !bytes.Equal(d.shadow, mem) {
+		t.Fatal("shadow differs from the scanout after capture")
+	}
+}
+
+func TestPollPacerBacksOffWhileStillAndSnapsBack(t *testing.T) {
+	var p pollPacer
+	if got := p.next(true); got != desktopPoll {
+		t.Fatalf("first wait %v", got)
+	}
+	var waits []time.Duration
+	for i := 0; i < 3*desktopIdlePolls; i++ {
+		waits = append(waits, p.next(false))
+	}
+	if waits[desktopIdlePolls-2] != desktopPoll || waits[desktopIdlePolls-1] != 2*desktopPoll {
+		t.Fatalf("first backoff after %d still polls: %v", desktopIdlePolls, waits)
+	}
+	if waits[2*desktopIdlePolls-2] != 2*desktopPoll || waits[2*desktopIdlePolls-1] != desktopPollIdle {
+		t.Fatalf("second backoff: %v", waits)
+	}
+	if waits[len(waits)-1] != desktopPollIdle {
+		t.Fatalf("backoff past the idle interval: %v", waits)
+	}
+	if got := p.next(true); got != desktopPoll {
+		t.Fatalf("a change waits %v", got)
+	}
+	for i := 0; i < 2*desktopIdlePolls; i++ {
+		p.next(false)
+	}
+	if got := p.input(); got != desktopPoll || p.next(false) != desktopPoll {
+		t.Fatalf("input waits %v", got)
+	}
+	// An animation that changes every few polls never backs off.
+	p = pollPacer{}
+	for i := 0; i < 10*desktopIdlePolls; i++ {
+		if got := p.next(i%(desktopIdlePolls-1) == 0); got != desktopPoll {
+			t.Fatalf("poll %d backed off to %v", i, got)
+		}
 	}
 }
 
@@ -125,4 +183,58 @@ func TestDesktopInputRejectsOutOfBound(t *testing.T) {
 	if _, _, err := encodeDesktopInput(many); err == nil {
 		t.Error("accepted oversized batch")
 	}
+}
+
+// benchScreen is a 1920x1080 scanout with a padded pitch, primed so the next
+// capture diffs against an identical shadow.
+func benchScreen(b *testing.B) (*tileDiff, []byte, int) {
+	b.Helper()
+	const width, height, pitch = 1920, 1080, 2048 * 4
+	mem := make([]byte, pitch*height)
+	for i := range mem {
+		mem[i] = byte(i * 7)
+	}
+	d := &tileDiff{width: width, height: height}
+	if _, err := d.capture(mem, pitch, 0, 0, func(int, int, int, int, []byte) error { return nil }); err != nil {
+		b.Fatal(err)
+	}
+	return d, mem, pitch
+}
+
+func benchCapture(b *testing.B, change func(mem []byte, pitch, i int)) {
+	d, mem, pitch := benchScreen(b)
+	sink := 0
+	emit := func(_, _, _, _ int, rows []byte) error { sink += len(rows); return nil }
+	b.SetBytes(int64(d.width * d.height * 4))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		change(mem, pitch, i)
+		if _, err := d.capture(mem, pitch, 0, 0, emit); err != nil {
+			b.Fatal(err)
+		}
+	}
+	_ = sink
+}
+
+// A still desktop: every poll reads the whole scanout and finds nothing.
+func BenchmarkTileDiffStill(b *testing.B) {
+	benchCapture(b, func([]byte, int, int) {})
+}
+
+// Typing: one pixel in one tile changes per poll.
+func BenchmarkTileDiffOneTile(b *testing.B) {
+	benchCapture(b, func(mem []byte, pitch, i int) { mem[500*pitch+900*4] = byte(i) })
+}
+
+// Scrolling: one pixel in every band and tile column changes per poll, so
+// every band goes out full width.
+func BenchmarkTileDiffEveryBand(b *testing.B) {
+	benchCapture(b, func(mem []byte, pitch, i int) {
+		for y := 0; y < 1080; y += desktopTile {
+			for x := 0; x < 1920; x += desktopTile {
+				mem[(y+i%desktopTile%(1080-y))*pitch+x*4] = byte(i)
+			}
+		}
+	})
 }

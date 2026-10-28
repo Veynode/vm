@@ -2,6 +2,8 @@
 // The guest agent sends changed BGRX rectangles of its DRM scanout over the
 // worker's vsock 5001 bridge (protocol in guest/veynode-agent/desktop_linux.go);
 // this helper patches them into a host canvas and encodes once per guest frame.
+// Each encode copies into a pooled IOSurface only the canvas tiles changed since
+// that buffer was last filled (copyCanvas).
 // Only one helper can hold the bridge, so one process serves every viewer: each
 // track is its own compression session over the same canvas, with its own
 // crop, output size and bitrate.
@@ -31,6 +33,7 @@
 #import <Foundation/Foundation.h>
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreVideo/CoreVideo.h>
+#import <IOSurface/IOSurfaceRef.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <poll.h>
@@ -58,6 +61,7 @@ typedef struct {
     size_t cropX, cropY, cropW, cropH, scaleW, scaleH;
     // In effect: the source rectangle (x, y, w, h) and the encoded size.
     size_t x, y, w, h, outW, outH;
+    uint64_t cropBase; // changeSeq when cropPool was created
 } Track;
 static Track tracks[maxTracks];
 static CVPixelBufferPoolRef sourcePool;
@@ -65,6 +69,15 @@ static BOOL useHEVC, multiTrack, dirty, failed, stopping, settled = YES;
 static int64_t lastStill;
 static size_t sourceWidth, sourceHeight;
 static uint8_t *canvas;
+// The change (numbered by changeSeq) that last wrote each 64x64 canvas tile. A
+// pooled buffer keeps, as an IOSurface value, the change it was last filled up
+// to; one from its pool's current incarnation (at or after the pool's base)
+// only takes the tiles changed since, any other buffer the whole view.
+static uint64_t changeSeq, sourceBase, *tileSeq;
+static size_t tileColumns;
+static const CFStringRef filledKey = CFSTR("veynode.canvas-filled");
+// Bytes copied from the canvas into pooled buffers, and how many copies were whole.
+static uint64_t copiedBytes, copies, wholeCopies;
 static int64_t epoch, lastChange;
 // A guest frame that ends before its slot at fps a second waits for it.
 static const uint64_t maxFPS = VN_VISIBLE_FPS;
@@ -230,6 +243,7 @@ static NSString *buildTrack(size_t i) {
     if (problem) { t->encoder = NULL; return problem; }
     if (!(t->pool = createPool(t->outW, t->outH))) { destroyTrack(t); return @"pixel buffer pool failed"; }
     if (!fullView(t) && !(t->cropPool = createPool(t->w, t->h))) { destroyTrack(t); return @"pixel buffer pool failed"; }
+    t->cropBase = ++changeSeq;
     if (t->outW != t->w || t->outH != t->h) {
         if (VTPixelTransferSessionCreate(NULL, &t->transfer) != noErr) { t->transfer = NULL; destroyTrack(t); return @"scaling session failed"; }
         VTSessionSetProperty(t->transfer, kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_Normal);
@@ -241,14 +255,54 @@ static NSString *buildTrack(size_t i) {
 
 static void removeTrack(size_t i) { destroyTrack(&tracks[i]); tracks[i] = (Track){0}; }
 
-static CVPixelBufferRef copyCanvas(CVPixelBufferPoolRef from, size_t x, size_t y, size_t w, size_t h) {
+static BOOL filledSince(IOSurfaceRef surface, uint64_t base, uint64_t *filled) {
+    CFTypeRef value = surface ? IOSurfaceCopyValue(surface, filledKey) : NULL;
+    BOOL known = value && CFGetTypeID(value) == CFNumberGetTypeID() && CFNumberGetValue(value, kCFNumberSInt64Type, filled) && *filled >= base;
+    if (value) CFRelease(value);
+    return known;
+}
+
+// The view (x, y, w, h) of the canvas in a pooled buffer of base's pool.
+static CVPixelBufferRef copyCanvas(CVPixelBufferPoolRef from, uint64_t base, size_t x, size_t y, size_t w, size_t h) {
     CVPixelBufferRef pixel = NULL;
     if (CVPixelBufferPoolCreatePixelBuffer(NULL, from, &pixel) != kCVReturnSuccess) return NULL;
+    IOSurfaceRef surface = CVPixelBufferGetIOSurface(pixel);
+    uint64_t filled = 0;
+    BOOL partial = filledSince(surface, base, &filled);
     CVPixelBufferLockBaseAddress(pixel, 0);
-    uint8_t *base = CVPixelBufferGetBaseAddress(pixel); size_t stride = CVPixelBufferGetBytesPerRow(pixel);
-    for (size_t row = 0; row < h; row++) memcpy(base + row * stride, canvas + ((y + row) * sourceWidth + x) * 4, w * 4);
+    uint8_t *pixels = CVPixelBufferGetBaseAddress(pixel); size_t stride = CVPixelBufferGetBytesPerRow(pixel);
+    if (!partial) {
+        for (size_t row = 0; row < h; row++) memcpy(pixels + row * stride, canvas + ((y + row) * sourceWidth + x) * 4, w * 4);
+        copiedBytes += w * h * 4; wholeCopies++;
+    } else {
+        // Per 64-row band, the column span of tiles changed since this buffer's fill.
+        for (size_t band = y / tile; band * tile < y + h; band++) {
+            size_t first = SIZE_MAX, last = 0;
+            for (size_t column = x / tile; column * tile < x + w; column++)
+                if (tileSeq[band * tileColumns + column] > filled) { if (first == SIZE_MAX) first = column; last = column; }
+            if (first == SIZE_MAX) continue;
+            size_t left = MAX(first * tile, x), right = MIN((last + 1) * tile, x + w);
+            size_t top = MAX(band * tile, y), bottom = MIN((band + 1) * tile, y + h);
+            for (size_t row = top; row < bottom; row++)
+                memcpy(pixels + (row - y) * stride + (left - x) * 4, canvas + (row * sourceWidth + left) * 4, (right - left) * 4);
+            copiedBytes += (right - left) * (bottom - top) * 4;
+        }
+    }
     CVPixelBufferUnlockBaseAddress(pixel, 0);
+    copies++;
+    if (surface) {
+        int64_t mark = (int64_t)changeSeq;
+        CFNumberRef number = CFNumberCreate(NULL, kCFNumberSInt64Type, &mark);
+        if (number) { IOSurfaceSetValue(surface, filledKey, number); CFRelease(number); }
+    }
     return pixel;
+}
+
+// Record that the canvas rectangle (x, y, w, h), already clipped to it, changed.
+static void markChanged(size_t x, size_t y, size_t w, size_t h) {
+    changeSeq++;
+    for (size_t band = y / tile; band * tile < y + h; band++)
+        for (size_t column = x / tile; column * tile < x + w; column++) tileSeq[band * tileColumns + column] = changeSeq;
 }
 
 // Copy into fresh pooled buffers so no encoder reads pixels that the next guest
@@ -258,9 +312,9 @@ static void encodeTrack(size_t i, CVPixelBufferRef *full) {
     Track *t = &tracks[i];
     CVPixelBufferRef input = NULL, pixel = NULL;
     if (fullView(t)) {
-        if (!*full && !(*full = copyCanvas(sourcePool, 0, 0, sourceWidth, sourceHeight))) { fail(@"pixel buffer pool exhausted"); return; }
+        if (!*full && !(*full = copyCanvas(sourcePool, sourceBase, 0, 0, sourceWidth, sourceHeight))) { fail(@"pixel buffer pool exhausted"); return; }
         input = CVPixelBufferRetain(*full);
-    } else if (!(input = copyCanvas(t->cropPool, t->x, t->y, t->w, t->h))) { fail(@"pixel buffer pool exhausted"); return; }
+    } else if (!(input = copyCanvas(t->cropPool, t->cropBase, t->x, t->y, t->w, t->h))) { fail(@"pixel buffer pool exhausted"); return; }
     if (t->transfer) {
         if (CVPixelBufferPoolCreatePixelBuffer(NULL, t->pool, &pixel) != kCVReturnSuccess) { CVPixelBufferRelease(input); fail(@"pixel buffer pool exhausted"); return; }
         OSStatus r = VTPixelTransferSessionTransferImage(t->transfer, input, pixel);
@@ -464,8 +518,11 @@ static BOOL handleRecord(const uint8_t *body, size_t length) {
                 || w.unsignedLongValue > maxSide || h.unsignedLongValue > maxSide || ![event[@"format"] isEqual:@"bgrx"]) { fail(@"guest mode outside bound"); return NO; }
             sourceWidth = w.unsignedLongValue & ~1UL; sourceHeight = h.unsignedLongValue & ~1UL;
             free(canvas); canvas = calloc(sourceWidth * sourceHeight, 4);
+            tileColumns = (sourceWidth + tile - 1) / tile;
+            free(tileSeq); tileSeq = calloc(tileColumns * ((sourceHeight + tile - 1) / tile), sizeof *tileSeq);
             if (sourcePool) CVPixelBufferPoolRelease(sourcePool);
-            if (!canvas || !(sourcePool = createPool(sourceWidth, sourceHeight))) { fail(@"canvas allocation failed"); return NO; }
+            if (!canvas || !tileSeq || !(sourcePool = createPool(sourceWidth, sourceHeight))) { fail(@"canvas allocation failed"); return NO; }
+            sourceBase = ++changeSeq;
             diagnostic(@{@"event": @"mode", @"width": @(sourceWidth), @"height": @(sourceHeight), @"codec": useHEVC ? @"hevc" : @"h264"});
             // Crops and scales carry over, clamped to the new mode.
             for (size_t i = 0; i < maxTracks; i++) {
@@ -487,9 +544,11 @@ static BOOL handleRecord(const uint8_t *body, size_t length) {
         if (w == 0 || h == 0 || h > tile || length != 8 + w * h * 4) { fail(@"rectangle outside bound"); return NO; }
         const uint8_t *rows = body + 8;
         // The canvas may be a pixel narrower or shorter than the guest mode (even sizes); clip.
-        for (size_t row = 0; row < h && y + row < sourceHeight; row++) {
-            if (x >= sourceWidth) break;
-            memcpy(canvas + ((y + row) * sourceWidth + x) * 4, rows + row * w * 4, MIN(w, sourceWidth - x) * 4);
+        if (x < sourceWidth && y < sourceHeight) {
+            size_t clippedW = MIN(w, sourceWidth - x), clippedH = MIN(h, sourceHeight - y);
+            for (size_t row = 0; row < clippedH; row++)
+                memcpy(canvas + ((y + row) * sourceWidth + x) * 4, rows + row * w * 4, clippedW * 4);
+            markChanged(x, y, clippedW, clippedH);
         }
         dirty = YES; inFrame = YES; lastChange = nowUs();
         return YES;
@@ -600,8 +659,8 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < maxTracks; i++) destroyTrack(&tracks[i]);
         if (sourcePool) CVPixelBufferPoolRelease(sourcePool);
         close(guest);
-        free(canvas);
-        diagnostic(@{@"event": @"stopped"});
+        free(canvas); free(tileSeq);
+        diagnostic(@{@"event": @"stopped", @"copies": @(copies), @"whole_copies": @(wholeCopies), @"copied_bytes": @(copiedBytes)});
         return 0;
     }
 }

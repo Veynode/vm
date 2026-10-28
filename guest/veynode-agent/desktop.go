@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"time"
 )
 
 const (
@@ -31,13 +32,57 @@ const (
 	keyboardLast = 248
 )
 
+// The scanout is polled every 8 ms while it changes. A still screen backs off
+// to 16 ms and then 33 ms, after desktopIdlePolls unchanged polls at each
+// step (about 130 ms, then about 260 ms more); a change or host input snaps
+// back to 8 ms. A whole scanout compare costs about as much as a small
+// change, so a still desktop is where the polling cost goes.
+const (
+	desktopPoll      = 8 * time.Millisecond
+	desktopPollIdle  = 33 * time.Millisecond
+	desktopIdlePolls = 16
+)
+
+type pollPacer struct {
+	interval time.Duration
+	idle     int
+}
+
+// next returns the wait before the poll after one that did or did not send.
+func (p *pollPacer) next(changed bool) time.Duration {
+	if changed || p.interval == 0 {
+		p.interval, p.idle = desktopPoll, 0
+		return p.interval
+	}
+	if p.idle++; p.idle >= desktopIdlePolls && p.interval < desktopPollIdle {
+		p.idle = 0
+		if p.interval < 2*desktopPoll {
+			p.interval = 2 * desktopPoll
+		} else {
+			p.interval = desktopPollIdle
+		}
+	}
+	return p.interval
+}
+
+// input reports host input: the screen is likely to change soon.
+func (p *pollPacer) input() time.Duration {
+	p.interval, p.idle = desktopPoll, 0
+	return p.interval
+}
+
 // tileDiff keeps a packed copy of the visible scanout.
 type tileDiff struct {
 	width, height int
 	shadow        []byte
+	// dirty and band are reused across polls: one flag per tile column and
+	// the packed body of a band narrower than the screen.
+	dirty []bool
+	band  []byte
 }
 
-// capture appends one rectangle per 64-row band spanning its changed tiles.
+// capture emits one rectangle per 64-row band spanning its changed tiles.
+// rows is only valid during emit.
 func (s *tileDiff) capture(mem []byte, pitch, originX, originY int, emit func(x, y, w, h int, rows []byte) error) (bool, error) {
 	stride := s.width * 4
 	full := s.shadow == nil
@@ -45,20 +90,26 @@ func (s *tileDiff) capture(mem []byte, pitch, originX, originY int, emit func(x,
 		s.shadow = make([]byte, stride*s.height)
 	}
 	tiles := (s.width + desktopTile - 1) / desktopTile
-	dirty := make([]bool, tiles)
+	if len(s.dirty) != tiles {
+		s.dirty = make([]bool, tiles)
+	}
+	dirty := s.dirty
 	sent := false
 	for top := 0; top < s.height; top += desktopTile {
 		rows := min(desktopTile, s.height-top)
 		first, last := tiles, -1
-		for t := range dirty {
-			dirty[t] = full
-		}
 		if full {
 			first, last = 0, tiles-1
 		} else {
-			for y := top; y < top+rows; y++ {
-				src := mem[(originY+y)*pitch+originX*4:]
-				dst := s.shadow[y*stride:]
+			clear(dirty)
+			found := 0
+			for y := top; y < top+rows && found < tiles; y++ {
+				src := mem[(originY+y)*pitch+originX*4:][:stride]
+				dst := s.shadow[y*stride:][:stride]
+				// A still screen is the common case: one compare per row.
+				if bytes.Equal(src, dst) {
+					continue
+				}
 				for t := 0; t < tiles; t++ {
 					if dirty[t] {
 						continue
@@ -66,6 +117,7 @@ func (s *tileDiff) capture(mem []byte, pitch, originX, originY int, emit func(x,
 					a, b := t*desktopTile*4, min((t+1)*desktopTile, s.width)*4
 					if !bytes.Equal(src[a:b], dst[a:b]) {
 						dirty[t] = true
+						found++
 						first, last = min(first, t), max(last, t)
 					}
 				}
@@ -75,11 +127,19 @@ func (s *tileDiff) capture(mem []byte, pitch, originX, originY int, emit func(x,
 			continue
 		}
 		x, w := first*desktopTile, min((last+1)*desktopTile, s.width)-first*desktopTile
-		body := make([]byte, 0, w*rows*4)
 		for y := top; y < top+rows; y++ {
-			src := mem[(originY+y)*pitch+(originX+x)*4:][:w*4]
-			copy(s.shadow[y*stride+x*4:], src)
-			body = append(body, s.shadow[y*stride+x*4:][:w*4]...)
+			copy(s.shadow[y*stride+x*4:][:w*4], mem[(originY+y)*pitch+(originX+x)*4:])
+		}
+		// A full-width band is already packed in the shadow.
+		body := s.shadow[top*stride:][:rows*stride]
+		if w != s.width {
+			if cap(s.band) < w*rows*4 {
+				s.band = make([]byte, 0, desktopTile*stride)
+			}
+			body = s.band[:0]
+			for y := top; y < top+rows; y++ {
+				body = append(body, s.shadow[y*stride+x*4:][:w*4]...)
+			}
 		}
 		if err := emit(x, top, w, rows, body); err != nil {
 			return sent, err

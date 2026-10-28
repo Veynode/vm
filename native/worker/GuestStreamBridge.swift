@@ -117,6 +117,10 @@ final class GuestStreamBridge {
     private let socketDevice: dev_t
     private let socketInode: ino_t
     private let listener: Int32
+    // stop() writes a byte; the listener and relay loops block in poll() on
+    // it instead of waking on a timer. Closed by run() under lock.
+    private let wakeRead: Int32
+    private let wakeWrite: Int32
     private let connector: Connector
     private let event: (String) -> Void
     private let queue = DispatchQueue(label: "veynode.guest-stream-bridge", qos: .userInitiated)
@@ -160,6 +164,7 @@ final class GuestStreamBridge {
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { Darwin.close(parent); throw invalid("Cannot create bridge socket") }
         var bound = false
+        var wake: [Int32] = [-1, -1]
         do {
             try Self.configure(fd)
             address.sun_family = sa_family_t(AF_UNIX)
@@ -180,11 +185,20 @@ final class GuestStreamBridge {
                   metadata.st_mode & 0o777 == 0o600, Darwin.listen(fd, 1) == 0 else {
                 throw invalid("Cannot secure or listen on bridge socket")
             }
+            guard Darwin.pipe(&wake) == 0 else { throw invalid("Cannot create bridge wake pipe") }
+            for end in wake {
+                let flags = fcntl(end, F_GETFL)
+                guard flags >= 0, fcntl(end, F_SETFL, flags | O_NONBLOCK) == 0, fcntl(end, F_SETFD, FD_CLOEXEC) == 0 else {
+                    throw invalid("Cannot configure bridge wake pipe")
+                }
+            }
         } catch {
             Darwin.close(fd)
+            for end in wake where end >= 0 { Darwin.close(end) }
             if bound { unlinkat(parent, name, 0) }
             Darwin.close(parent); throw error
         }
+        wakeRead = wake[0]; wakeWrite = wake[1]
         socketPath = path; directoryFD = parent; socketName = name
         socketDevice = metadata.st_dev; socketInode = metadata.st_ino; listener = fd
         self.connector = connector; self.event = event
@@ -220,7 +234,11 @@ final class GuestStreamBridge {
     func stop(completion: @escaping () -> Void = {}) {
         lock.lock()
         if stopped { lock.unlock(); DispatchQueue.main.async(execute: completion); return }
-        stopping = true; completions.append(completion); lock.unlock()
+        stopping = true; completions.append(completion)
+        // Under lock: run() closes the pipe under the same lock once stopped.
+        var byte: UInt8 = 1
+        _ = Darwin.write(wakeWrite, &byte, 1)
+        lock.unlock()
     }
     private var shouldStop: Bool { lock.lock(); defer { lock.unlock() }; return stopping }
     private func rejectWaitingClients() {
@@ -266,15 +284,16 @@ final class GuestStreamBridge {
                 unlinkat(directoryFD, socketName, 0)
             }
             Darwin.close(directoryFD)
-            lock.lock(); stopped = true; let callbacks = completions; completions.removeAll(); lock.unlock()
+            lock.lock(); stopped = true; let callbacks = completions; completions.removeAll()
+            Darwin.close(wakeRead); Darwin.close(wakeWrite); lock.unlock()
             DispatchQueue.main.async { callbacks.forEach { $0() } }
         }
+        var items = [pollfd(fd: listener, events: Int16(POLLIN), revents: 0), pollfd(fd: wakeRead, events: Int16(POLLIN), revents: 0)]
         while !shouldStop {
-            var item = pollfd(fd: listener, events: Int16(POLLIN), revents: 0)
-            let result = Darwin.poll(&item, 1, 50)
+            let result = Darwin.poll(&items, nfds_t(items.count), -1)
             if result < 0 && errno == EINTR { continue }
-            if result < 0 || item.revents & Int16(POLLERR | POLLNVAL) != 0 { event("listener_failed"); return }
-            guard result > 0 else { continue }
+            if result < 0 || items[0].revents & Int16(POLLERR | POLLNVAL) != 0 { event("listener_failed"); return }
+            guard items[0].revents & Int16(POLLIN) != 0 else { continue }
             let client = Darwin.accept(listener, nil, nil)
             if client < 0 { continue }
             do {
@@ -320,19 +339,29 @@ final class GuestStreamBridge {
             pending.since = DispatchTime.now().uptimeNanoseconds
             pending.offset = 0; pending.count = amount
         }
+        // Blocks until a descriptor is ready, stop() writes the wake pipe or
+        // the oldest pending write reaches its deadline.
+        func timeout() -> Int32 {
+            let since = [toGuest.since, toClient.since].compactMap { $0 }.min()
+            guard let since else { return -1 }
+            let left = (since + writeTimeout).subtractingReportingOverflow(DispatchTime.now().uptimeNanoseconds)
+            return left.overflow || left.partialValue == 0 ? 0 : Int32(min(left.partialValue / 1_000_000 + 1, UInt64(Int32.max)))
+        }
+        var descriptors = [pollfd(fd: listener, events: Int16(POLLIN), revents: 0), pollfd(fd: client, events: 0, revents: 0),
+                           pollfd(fd: guest, events: 0, revents: 0), pollfd(fd: wakeRead, events: Int16(POLLIN), revents: 0)]
         while !shouldStop {
             try writePending(guest, &toGuest); try writePending(client, &toClient)
             // A disconnected endpoint terminates the session after flushing its
             // already-read bytes. The next client gets a fresh fixed-port VZ link.
             if (clientEOF && toGuest.isEmpty) || (guestEOF && toClient.isEmpty) { return }
-            var descriptors = [pollfd(fd: listener, events: Int16(POLLIN), revents: 0),
-                pollfd(fd: client, events: Int16((!clientEOF && toGuest.isEmpty ? POLLIN : 0) | (!toClient.isEmpty ? POLLOUT : 0)), revents: 0),
-                pollfd(fd: guest, events: Int16((!guestEOF && toClient.isEmpty ? POLLIN : 0) | (!toGuest.isEmpty ? POLLOUT : 0)), revents: 0)]
-            let result = Darwin.poll(&descriptors, nfds_t(descriptors.count), 25)
+            descriptors[1].events = Int16((!clientEOF && toGuest.isEmpty ? POLLIN : 0) | (!toClient.isEmpty ? POLLOUT : 0))
+            descriptors[2].events = Int16((!guestEOF && toClient.isEmpty ? POLLIN : 0) | (!toGuest.isEmpty ? POLLOUT : 0))
+            for i in descriptors.indices { descriptors[i].revents = 0 }
+            let result = Darwin.poll(&descriptors, nfds_t(descriptors.count), timeout())
             if result < 0 && errno == EINTR { continue }
             guard result >= 0 else { throw failure("Bridge poll failed") }
             if descriptors[0].revents & Int16(POLLIN) != 0 { rejectWaitingClients() }
-            if descriptors.dropFirst().contains(where: { $0.revents & Int16(POLLNVAL) != 0 }) { throw failure("Bridge invalid descriptor") }
+            if descriptors[1...2].contains(where: { $0.revents & Int16(POLLNVAL) != 0 }) { throw failure("Bridge invalid descriptor") }
             // Read on HUP to drain kernel-buffered data before observing EOF.
             if descriptors[1].revents & Int16(POLLIN | POLLHUP | POLLERR) != 0 { try readAvailable(client, &toGuest, &clientEOF) }
             if descriptors[2].revents & Int16(POLLIN | POLLHUP | POLLERR) != 0 { try readAvailable(guest, &toClient, &guestEOF) }
