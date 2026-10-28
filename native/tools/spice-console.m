@@ -371,10 +371,12 @@ static void scanout(SpiceDisplayChannel *channel,GParamSpec *spec,gpointer conte
  // mode transitions. It carries no usable source; never read/revive its ID.
  int polled=poll(&p,1,0);if(polled>=0&&(p.revents&POLLHUP))return;
  if(ioctl(info->fd,FIONREAD,&available)!=0||available!=4||polled!=1||!(p.revents&POLLIN)||(p.revents&(POLLERR|POLLNVAL))){captureFail(@"fresh_scanout_unavailable");return;}
+ // y0top is accepted as is: UTM's IOSurface for such a scanout already holds
+ // its rows in display order (seen live on a Debian 13 virgl console).
  IOSurfaceID ident=0;if(read(info->fd,&ident,4)!=4){captureFail(@"incomplete_scanout_id");return;}
  IOSurfaceRef observed=IOSurfaceLookup(ident);
  if(scanoutLogCount++<32){NSDictionary *event=@{@"event":@"scanout-observed",@"source_generation":@(generation),@"width":@(info->width),@"height":@(info->height),@"y0top":@(info->y0top),@"surface_available":@(observed!=NULL),@"surface_width":@(observed?IOSurfaceGetWidth(observed):0),@"surface_height":@(observed?IOSurfaceGetHeight(observed):0),@"pixel_format":@(observed?IOSurfaceGetPixelFormat(observed):0)};NSData *json=[NSJSONSerialization dataWithJSONObject:event options:NSJSONWritingSortedKeys error:nil];fwrite(json.bytes,1,json.length,stderr);fputc('\n',stderr);fflush(stderr);}
- if(!info->width||!info->height||info->width>3840||info->height>2160||info->width%2||info->height%2||info->y0top){emit(0,@{@"event":@"source-unavailable",@"reason":@"unsupported_scanout_geometry",@"source_generation":@(generation),@"width":@(info->width),@"height":@(info->height),@"y0top":@(info->y0top),@"frame_available":@NO});if(observed)CFRelease(observed);return;}
+ if(!info->width||!info->height||info->width>3840||info->height>2160||info->width%2||info->height%2){emit(0,@{@"event":@"source-unavailable",@"reason":@"unsupported_scanout_geometry",@"source_generation":@(generation),@"width":@(info->width),@"height":@(info->height),@"y0top":@(info->y0top),@"frame_available":@NO});if(observed)CFRelease(observed);return;}
  surface=observed;
  if(!surface){struct pollfd latest={.fd=info->fd,.events=POLLIN};if(poll(&latest,1,0)>=0&&(latest.revents&POLLHUP))return;captureFail(@"invalid_scanout_surface");return;}
  if(IOSurfaceGetWidth(surface)!=info->width||IOSurfaceGetHeight(surface)!=info->height){captureFail(@"invalid_scanout_surface_geometry");return;}

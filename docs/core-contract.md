@@ -81,6 +81,10 @@ Before the merge, on the `machine-contract` branch, through the API, macOS 27, d
   and capabilities message, `gpu` none and virgl through `machine.update`.
 - `hello.runtime.gpu` on a host with UTM's runtime: `neptune` true.
 
+After the merge, through the branch's SPICE helper and the owner's running daemon: `machine.display` on a Debian 13
+machine on QEMU/HVF with virgl sends video (53 frames in 10 s at 1280x800, the console upright). Its console
+switches to a scanout with `y0top` set, which the helper used to refuse, leaving the endpoint without video.
+
 Not verified:
 
 - `machine.microphone`: the daemon's frames reached the console broker, but the guest recorded silence.
@@ -89,7 +93,7 @@ Not verified:
   installed by hand, see [known issues](known-issues.md#windows-11-arm64-machines)).
 - The pointer shape, copied text and monitor size on `machine.display`: unit tests, and the SPICE helper compiles
   against UTM's headers; no live run. The pointer's byte order (spice-gtk's ARGB32, swapped to RGBA) is unchecked.
-- Any live run after the merge: the host had under 20 GiB free.
+- Any other live run after the merge: the host had under 20 GiB free.
 - macOS, skipped by decision.
 
 Unit and fixture tests cover the SSH exec and copy commands, the lease lookup, the qcow2 converter, the cloud-init
