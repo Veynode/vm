@@ -961,8 +961,6 @@ case "run", "install":
         guard restoreCount == 0 || (restoreCount == 4 && args[1] == "run" && config.guest == "linux") else { throw NativeError(message:"Linux saved-state restore requires all four restore bindings") }
         let saved = restoreCount == 0 ? nil : LinuxSnapshotRestore(path:options[restoreFields[0]]!,sha256:options[restoreFields[1]]!,
             configurationSHA256:options[restoreFields[2]]!,captureID:options[restoreFields[3]]!)
-        let app = NSApplication.shared
-        app.setActivationPolicy(.accessory)
         var runner: Runner?
         func launch(_ keyEventLog: KeyEventLogQueue?) throws {
             let worker = Runner(config,keyEventLog:keyEventLog,snapshotRestore:saved)
@@ -970,7 +968,7 @@ case "run", "install":
                 guard args[1] == "run", config.guest == "linux", saved == nil else { fail("--restore-machine-state is for a Linux run without snapshot restore") }
                 worker.machineStateRestore = path
             }
-            runner = worker; app.delegate = worker
+            runner = worker
             setWorkerOutputDisconnectHandler { [weak worker] in worker?.controlOwnerDisconnected() }
             if args[1] == "install" {
                 guard config.guest == "macos" else { fail("install requires macos guest") }
@@ -985,14 +983,22 @@ case "run", "install":
                 }
             } else { worker.start() }
         }
-        if let logPath = options["--log-key-events"] {
+        // A headless run starts the VM before AppKit: the Virtualization XPC
+        // launch (~100 ms) then overlaps NSApplication's WindowServer
+        // connection (~50 ms). A window needs the application first.
+        let early = args[1] == "run" && !(config.window ?? false) && options["--log-key-events"] == nil
+        if early { try launch(nil) }
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        if early { app.delegate = runner }
+        else if let logPath = options["--log-key-events"] {
             KeyEventLogQueue.open(path:logPath) { result in
                 DispatchQueue.main.async {
-                    do { try launch(result.get()) }
+                    do { try launch(result.get()); app.delegate = runner }
                     catch { fail(error.localizedDescription) }
                 }
             }
-        } else { try launch(nil) }
+        } else { try launch(nil); app.delegate = runner }
         app.run()
         withExtendedLifetime(runner) {}
     } catch { fail(error.localizedDescription) }
