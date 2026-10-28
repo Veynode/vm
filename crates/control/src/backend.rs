@@ -340,7 +340,9 @@ fn probe_process_args(
             }
         }
     }
-    let deadline = Instant::now() + Duration::from_secs(8);
+    // A release's first run on a Mac waits for macOS to assess each newly
+    // signed binary and framework the helper loads, several seconds each time.
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     loop {

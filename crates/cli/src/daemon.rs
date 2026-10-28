@@ -97,7 +97,9 @@ pub fn running() -> bool {
 }
 
 fn wait(up: bool) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    // The first start of a newly unpacked release probes its console helper
+    // while macOS assesses it (vm_control::backend's probe deadline).
+    let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
         if running() == up {
             return Ok(());
