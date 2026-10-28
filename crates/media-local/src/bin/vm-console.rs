@@ -54,6 +54,111 @@ fn wait_listener_readable(fd: std::os::fd::RawFd, timeout: Duration) -> Result<b
     }
     Ok(result > 0 && pollfd.revents & libc::POLLIN != 0)
 }
+/// The accept loop sleeps until a connection, the capture child's exit or SIGTERM/SIGINT
+/// instead of stepping every 20 ms. Without a kqueue it keeps the step.
+struct BrokerWake {
+    #[cfg(target_os = "macos")]
+    queue: Option<std::os::fd::OwnedFd>,
+    listener: std::os::fd::RawFd,
+    /// Darwin can post the exit note just before the child is waitable. From then on step.
+    child_noted: bool,
+}
+impl BrokerWake {
+    /// Bounds how late a capture pipe failure with the child still running is noticed.
+    const MAINTENANCE: Duration = Duration::from_secs(1);
+    const STEP: Duration = Duration::from_millis(20);
+    #[cfg(target_os = "macos")]
+    fn new(listener: &UnixListener, child: &Child) -> Self {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let queue = (|| {
+            let raw = unsafe { libc::kqueue() };
+            if raw < 0 {
+                return None;
+            }
+            let queue = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+            if unsafe { libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                return None;
+            }
+            // The child is ours and unreaped, so its PID cannot have been reused. A caught
+            // signal still posts its EVFILT_SIGNAL event after the handler sets STOP.
+            for (ident, filter, fflags) in [
+                (
+                    listener.as_raw_fd() as libc::uintptr_t,
+                    libc::EVFILT_READ,
+                    0,
+                ),
+                (
+                    child.id() as libc::uintptr_t,
+                    libc::EVFILT_PROC,
+                    libc::NOTE_EXIT,
+                ),
+                (libc::SIGTERM as libc::uintptr_t, libc::EVFILT_SIGNAL, 0),
+                (libc::SIGINT as libc::uintptr_t, libc::EVFILT_SIGNAL, 0),
+            ] {
+                let mut change: libc::kevent = unsafe { std::mem::zeroed() };
+                change.ident = ident;
+                change.filter = filter;
+                change.flags = libc::EV_ADD;
+                change.fflags = fflags;
+                if unsafe {
+                    libc::kevent(raw, &change, 1, std::ptr::null_mut(), 0, std::ptr::null())
+                } != 0
+                {
+                    return None;
+                }
+            }
+            Some(queue)
+        })();
+        Self {
+            queue,
+            listener: listener.as_raw_fd(),
+            child_noted: false,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    fn new(listener: &UnixListener, _child: &Child) -> Self {
+        use std::os::fd::AsRawFd;
+        Self {
+            listener: listener.as_raw_fd(),
+            child_noted: false,
+        }
+    }
+    fn wait(&mut self) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        if let (Some(queue), false) = (&self.queue, self.child_noted) {
+            use std::os::fd::AsRawFd;
+            let timeout = libc::timespec {
+                tv_sec: Self::MAINTENANCE.as_secs() as libc::time_t,
+                tv_nsec: Self::MAINTENANCE.subsec_nanos() as libc::c_long,
+            };
+            let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+            let ready = unsafe {
+                libc::kevent(
+                    queue.as_raw_fd(),
+                    std::ptr::null(),
+                    0,
+                    &mut event,
+                    1,
+                    &timeout,
+                )
+            };
+            if ready > 0 && event.filter == libc::EVFILT_PROC {
+                self.child_noted = true;
+            } else if ready > 0
+                && event.filter == libc::EVFILT_READ
+                && event.flags & libc::EV_ERROR != 0
+            {
+                bail!("console listener readiness failed");
+            } else if ready < 0
+                && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+            {
+                self.queue = None;
+            }
+            return Ok(());
+        }
+        wait_listener_readable(self.listener, Self::STEP).map(|_| ())
+    }
+}
 
 struct OwnedChild(Child);
 impl Drop for OwnedChild {
@@ -1152,8 +1257,15 @@ fn connection(stream: UnixStream, native: Arc<Native>, client: u64) -> Result<()
     result
 }
 fn probe(path: &Path) -> Result<Value> {
-    let display = vm_control::backend::probe_native_window(path)?;
-    let (status, bytes, _) = vm_control::backend::probe_process(path, "--probe-codecs")?;
+    // Two separate helper processes; running them together keeps the slower codec
+    // probe (VideoToolbox sessions) the only one on the startup path.
+    let (display, codecs) = thread::scope(|scope| {
+        let codecs = scope.spawn(|| vm_control::backend::probe_process(path, "--probe-codecs"));
+        let display = vm_control::backend::probe_native_window(path);
+        (display, codecs.join().expect("codec probe thread panicked"))
+    });
+    let display = display?;
+    let (status, bytes, _) = codecs?;
     // A codec allocation failure must not disable a verified display-only path.
     let mut value = if status.success() {
         let value: Value =
@@ -1231,7 +1343,8 @@ fn run() -> Result<()> {
     let _path = SocketPath(path.clone());
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
-    let capabilities = probe(&encoder)?;
+    // The persistent helper connects to SPICE while the probes run; a failed
+    // probe drops (and so kills) it.
     let mut child = OwnedChild(
         Command::new(&encoder)
             .arg(spice)
@@ -1242,6 +1355,7 @@ fn run() -> Result<()> {
             .stderr(Stdio::inherit())
             .spawn()?,
     );
+    let capabilities = probe(&encoder)?;
     let mut pipe = child.0.stdout.take().unwrap();
     use std::os::fd::AsRawFd;
     let input_fd = child.0.stdin.as_ref().unwrap().as_raw_fd();
@@ -1303,6 +1417,7 @@ fn run() -> Result<()> {
     }
     let active = Arc::new(Mutex::new(BTreeMap::<u64, UnixStream>::new()));
     let mut next = 1;
+    let mut wake = BrokerWake::new(&listener, &child.0);
     while !STOP.load(Ordering::Acquire) && native.alive.load(Ordering::Acquire) {
         if child.0.try_wait()?.is_some() {
             break;
@@ -1325,10 +1440,7 @@ fn run() -> Result<()> {
                     active.lock().unwrap().remove(&client);
                 });
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                use std::os::fd::AsRawFd;
-                wait_listener_readable(listener.as_raw_fd(), Duration::from_millis(20))?;
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => wake.wait()?,
             Err(e) => return Err(e.into()),
         }
     }
@@ -1439,6 +1551,29 @@ mod listener_readiness_tests {
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
+    }
+    #[test]
+    fn broker_wake_returns_for_a_connection_and_for_the_child_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wake.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut child = Command::new("/bin/sleep").arg("0.3").spawn().unwrap();
+        let mut wake = BrokerWake::new(&listener, &child);
+        let connect = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            UnixStream::connect(path).unwrap()
+        });
+        let started = Instant::now();
+        wake.wait().unwrap();
+        assert!(started.elapsed() < Duration::from_millis(250));
+        let _client = connect.join().unwrap();
+        listener.accept().unwrap();
+        let started = Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            wake.wait().unwrap();
+        }
+        assert!(started.elapsed() < Duration::from_millis(800));
     }
     #[test]
     fn invalid_listener_fd_is_failure_not_readiness() {
