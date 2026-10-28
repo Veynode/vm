@@ -83,6 +83,9 @@ class InstallDistroTests(unittest.TestCase):
         plain = self.windows_first_logon(guest_tuning=False)
         self.assertEqual(plain, [c for c in commands if c not in tuning])
         self.assertIn('powercfg /hibernate off', plain)
+        # Native images for Windows PowerShell change no setting: always built.
+        self.assertIn(install_distro.NGEN, plain)
+        self.assertIn('FrameworkArm64', install_distro.NGEN)
 
     def test_windows_guest_tuning_is_on_by_default_with_an_opt_out_flag(self):
         argv = ['install-distro.py', 'windows', '--name', 'w', '--iso', 'w.iso', '--drivers-iso', 'v.iso']

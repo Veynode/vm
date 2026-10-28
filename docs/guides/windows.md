@@ -20,4 +20,6 @@ The first logon also tunes the guest the way development and test VMs usually ar
 
 Windows Defender is left as it is.
 
+With or without the tuning, the first logon also compiles the .NET Framework assemblies Windows queued for ARM64 (`ngen.exe executeQueuedItems`, ~30 s), which Windows otherwise does only when it next idles long enough. Without those native images every Windows PowerShell start JIT-compiles for ~1 s, and every exec, desktop and file call starts one: a `machine exec` of `cmd /c exit 0` took ~1.3 s, and ~0.3 s with them. On a machine installed before this, run that command once as an administrator (`C:\Windows\Microsoft.NET\FrameworkArm64\v4.0.30319\ngen.exe executeQueuedItems`).
+
 The daemon reaches the guest over that SSH login. Calls to one machine share a single SSH connection (OpenSSH multiplexing): the first leaves a connection master in the background, with its socket in `<home>/state/ssh-mux` (0700), and later calls open a session on it instead of connecting and authenticating again. The master exits 60 s after its last session ends, or when the machine's QEMU process exits. If that socket path would exceed the 104-byte Unix socket limit (a very long home directory), every call connects on its own, as before. The web terminal always connects on its own.

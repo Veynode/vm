@@ -486,6 +486,9 @@ GUEST_TUNING = [
 ]
 
 
+NGEN = r'C:\Windows\Microsoft.NET\FrameworkArm64\v4.0.30319\ngen.exe executeQueuedItems /nologo'
+
+
 def windows_answer(work, user, password, edition, product_key, authorized_key=None, guest_tuning=True):
     component = lambda name: (f'<component name="{name}" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" '
                               'language="neutral" versionScope="nonSxS">')
@@ -507,6 +510,11 @@ def windows_answer(work, user, password, edition, product_key, authorized_key=No
         *[f'cmd /c for %d in ({" ".join(DRIVE_LETTERS)}) do @if exist %d:\\{d}\\w11\\ARM64 pnputil /add-driver %d:\\{d}\\w11\\ARM64\\*.inf /install'
           for d in VIRTIO_DRIVERS],
         *(GUEST_TUNING if guest_tuning else []),
+        # Compile the queued .NET Framework assemblies for ARM64 now (~30 s),
+        # not whenever Windows next idles: until then every Windows PowerShell
+        # start, and so every exec, desktop or file call, JIT-compiles for
+        # ~1 s (with native images ~0.2 s). It changes no setting.
+        NGEN,
         'powercfg /change monitor-timeout-ac 0',
         'powercfg /change standby-timeout-ac 0',
         # No Fast Startup: QEMU/HVF aborts (assert isv) resuming its hybrid
