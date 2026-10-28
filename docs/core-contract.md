@@ -76,6 +76,10 @@ What changed for core when this merged onto the split:
   inputs 17 and 18 (the viewer's size, sent to the Guest as its monitor) in its capabilities (11).
 - `machine.display` endpoints and epochs are per client (`hello.client`): another client's viewer, such as the web
   UI's, with a larger epoch no longer cuts core's. Sound and microphone endpoints stay one per machine.
+- A macOS machine is reached over virtio-vsock, not its vmnet address, which Local Network privacy keeps from a
+  launchd-started daemon: `machine.create` writes a port relay and its LaunchAgent into the image login's home on the
+  disk, and `machine.exec`, `files.copy`, published ports and `machine.display` go through it. Linux machines on
+  Apple Virtualization still use the vmnet address ([known issues](known-issues.md#networking)).
 - Shares of a Linux cloud-image machine on QEMU mount 9p with `cache=mmap`, so files on them take writable
   `MAP_SHARED` maps (Chromium's disk cache, SQLite's WAL). The seed is written at create, so a machine created
   before this keeps its `/etc/fstab` until that line gains `cache=mmap` and the share is mounted again.
@@ -103,7 +107,7 @@ hardened runtime) from an isolated unpack and `VEYNODEVM_HOME`: `daemon start` w
 second directory, which rewrote the LaunchAgent; `hello.runtime` `qemu` and `gpu.virgl` true; a Debian 13 machine on
 QEMU/HVF created, started, ran `machine.exec` (exit 0), reported `gpu` virgl, stopped and was removed, with the QEMU
 worker on the archive's SPICE server. A Linux machine on Apple Virtualization started, but `machine.exec` timed out:
-see [Local Network privacy](known-issues.md#networking).
+its daemon cannot reach the vmnet address ([known issues](known-issues.md#networking)).
 
 Not verified:
 

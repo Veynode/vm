@@ -10,7 +10,8 @@ fn main() {
 }
 fn run() -> Result<()> {
     // Helpers the daemon runs as its own processes: a container's port
-    // publisher, and a macOS Guest's driver link and desktop methods.
+    // publisher, ssh's way to a macOS machine's relay, and a macOS Guest's
+    // driver link and desktop methods.
     let argv: Vec<String> = std::env::args().skip(1).collect();
     match argv
         .iter()
@@ -19,6 +20,9 @@ fn run() -> Result<()> {
         .as_slice()
     {
         ["__proxy", id] => return vm_control::services::proxy::run(id),
+        ["__guest_port", socket, port] => {
+            return vm_control::services::macos_relay::proxy(socket, port)
+        }
         ["__driver", vm] => std::process::exit(vm_control::services::macos_driver::run(vm)?),
         ["__desktop", vm, method, arguments] => {
             let value = vm_control::services::macos_desktop::run(vm, method, arguments)?;

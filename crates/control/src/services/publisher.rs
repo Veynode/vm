@@ -3,12 +3,15 @@
 //! lease address at `guest`. It runs as threads of the daemon from
 //! `machine.start` until `machine.stop`, `machine.rm` or the machine stops by
 //! itself. QEMU machines forward their ports in the VM (user networking).
+//! A macOS machine with a port relay is reached through it instead of its
+//! lease address ([`super::macos_relay`]).
 use anyhow::{bail, Context, Result};
 use serde_json::json;
 use std::{
     collections::HashMap,
     io::{Read, Write},
     net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
+    os::unix::net::UnixStream,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -30,6 +33,39 @@ pub struct Published {
     pub mac_address: Option<String>,
     /// `(host, guest)` TCP ports.
     pub ports: Vec<(u16, u16)>,
+    /// The machine's port relay socket, if it has one.
+    pub relay: Option<PathBuf>,
+}
+
+/// Where a published port leads.
+#[derive(Clone)]
+enum Target {
+    Lease(SocketAddr),
+    Relay(PathBuf, u16),
+}
+
+/// The two ends a relay splices.
+trait Stream: Read + Write + Send + Sized + 'static {
+    fn split(&self) -> std::io::Result<Self>;
+    fn close(&self, how: Shutdown);
+}
+
+impl Stream for TcpStream {
+    fn split(&self) -> std::io::Result<Self> {
+        self.try_clone()
+    }
+    fn close(&self, how: Shutdown) {
+        let _ = self.shutdown(how);
+    }
+}
+
+impl Stream for UnixStream {
+    fn split(&self) -> std::io::Result<Self> {
+        self.try_clone()
+    }
+    fn close(&self, how: Shutdown) {
+        let _ = self.shutdown(how);
+    }
 }
 
 /// Starts the machine's publisher, replacing a running one. Binding happens
@@ -124,10 +160,22 @@ fn run(
     listeners: Vec<(TcpListener, u16)>,
     stopped: &Arc<AtomicBool>,
 ) -> Result<()> {
-    let ip = wait_lease(machine)?;
-    let targets: Vec<(TcpListener, SocketAddr)> = listeners
+    let ip = match &machine.relay {
+        Some(_) => None,
+        None => Some(wait_lease(machine)?),
+    };
+    let targets: Vec<(TcpListener, Target)> = listeners
         .into_iter()
-        .map(|(listener, guest)| Ok((listener, format!("{ip}:{guest}").parse()?)))
+        .map(|(listener, guest)| {
+            Ok((
+                listener,
+                match (&machine.relay, &ip) {
+                    (Some(socket), _) => Target::Relay(socket.clone(), guest),
+                    (None, Some(ip)) => Target::Lease(format!("{ip}:{guest}").parse()?),
+                    (None, None) => unreachable!(),
+                },
+            ))
+        })
         .collect::<Result<_>>()?;
     let mut checked = Instant::now();
     while !stopped.load(Ordering::SeqCst) {
@@ -136,7 +184,7 @@ fn run(
             match listener.accept() {
                 Ok((client, _)) => {
                     idle = false;
-                    relay(client, *target, stopped.clone());
+                    relay(client, target.clone(), stopped.clone());
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(_) => {}
@@ -155,38 +203,49 @@ fn run(
     Ok(())
 }
 
-fn relay(client: TcpStream, target: SocketAddr, stopped: Arc<AtomicBool>) {
+fn relay(client: TcpStream, target: Target, stopped: Arc<AtomicBool>) {
     let _ = client.set_nonblocking(false);
-    thread::spawn(move || {
-        let upstream = match TcpStream::connect_timeout(&target, Duration::from_secs(5)) {
-            Ok(upstream) => upstream,
-            Err(_) => {
-                let _ = client.shutdown(Shutdown::Both);
-                return;
+    thread::spawn(move || match target {
+        Target::Lease(address) => {
+            match TcpStream::connect_timeout(&address, Duration::from_secs(5)) {
+                Ok(upstream) => carry(client, upstream, stopped),
+                Err(_) => client.close(Shutdown::Both),
             }
-        };
-        let (Ok(a), Ok(b)) = (client.try_clone(), upstream.try_clone()) else {
-            return;
-        };
-        // A stopped publisher cuts its connections.
-        let (watch_a, watch_b) = (client.try_clone(), upstream.try_clone());
-        thread::spawn(move || {
-            while !stopped.load(Ordering::SeqCst) {
-                thread::sleep(Duration::from_millis(200));
-                if watch_a.as_ref().is_ok_and(|s| s.peer_addr().is_err()) {
-                    return;
-                }
-            }
-            for s in [watch_a, watch_b].into_iter().flatten() {
-                let _ = s.shutdown(Shutdown::Both);
-            }
-        });
-        thread::spawn(move || splice(b, a));
-        splice(client, upstream);
+        }
+        Target::Relay(socket, port) => match super::macos_relay::connect(&socket, port) {
+            Ok(upstream) => carry(client, upstream, stopped),
+            Err(_) => client.close(Shutdown::Both),
+        },
     });
 }
 
-fn splice(mut from: TcpStream, mut to: TcpStream) {
+/// Splices `client` and `upstream` both ways until both end or the
+/// publisher stops.
+fn carry<U: Stream>(client: TcpStream, upstream: U, stopped: Arc<AtomicBool>) {
+    let (Ok(a), Ok(b)) = (client.split(), upstream.split()) else {
+        return;
+    };
+    // A stopped publisher cuts its connections.
+    let (watch_a, watch_b) = (client.split(), upstream.split());
+    thread::spawn(move || {
+        while !stopped.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(200));
+            if watch_a.as_ref().is_ok_and(|s| s.peer_addr().is_err()) {
+                return;
+            }
+        }
+        if let Ok(s) = watch_a {
+            s.close(Shutdown::Both);
+        }
+        if let Ok(s) = watch_b {
+            s.close(Shutdown::Both);
+        }
+    });
+    thread::spawn(move || splice(b, a));
+    splice(client, upstream);
+}
+
+fn splice<A: Stream, B: Stream>(mut from: A, mut to: B) {
     let mut buffer = [0u8; 65536];
     loop {
         match from.read(&mut buffer) {
@@ -198,8 +257,8 @@ fn splice(mut from: TcpStream, mut to: TcpStream) {
             }
         }
     }
-    let _ = to.shutdown(Shutdown::Write);
-    let _ = from.shutdown(Shutdown::Read);
+    to.close(Shutdown::Write);
+    from.close(Shutdown::Read);
 }
 
 #[cfg(test)]
@@ -222,7 +281,7 @@ mod tests {
         let relay_stopped = stopped.clone();
         thread::spawn(move || {
             let (client, _) = front.accept().unwrap();
-            relay(client, target, relay_stopped);
+            relay(client, Target::Lease(target), relay_stopped);
         });
         let mut client = TcpStream::connect(address).unwrap();
         client.write_all(b"published").unwrap();
@@ -231,5 +290,41 @@ mod tests {
         client.read_to_end(&mut back).unwrap();
         assert_eq!(back, b"published");
         stopped.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_relayed_port_opens_with_its_port_line() {
+        let dir = std::env::temp_dir().join(format!("publisher-relay-{}", std::process::id()));
+        fs_reset(&dir);
+        let socket = dir.join("r.sock");
+        let fake = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        thread::spawn(move || {
+            let (mut s, _) = fake.accept().unwrap();
+            let mut got = Vec::new();
+            s.read_to_end(&mut got).unwrap();
+            s.write_all(&got).unwrap();
+        });
+        let front = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = front.local_addr().unwrap();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let relay_stopped = stopped.clone();
+        let target = Target::Relay(socket, 8080);
+        thread::spawn(move || {
+            let (client, _) = front.accept().unwrap();
+            relay(client, target, relay_stopped);
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client.write_all(b"published").unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut back = Vec::new();
+        client.read_to_end(&mut back).unwrap();
+        assert_eq!(back, b"8080\npublished");
+        stopped.store(true, Ordering::SeqCst);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn fs_reset(dir: &Path) {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
     }
 }

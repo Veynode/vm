@@ -16,6 +16,8 @@ Writes <VEYNODEVM_HOME or ~/Library/Application Support/VeynodeVM>/runtime.json:
             (native/tools/build-vm-vision.sh)
   macos_desktop  .local/bin/vm-macos-desktop, the desktop and accessibility helper
             macOS containers run over SSH (native/tools/build-vm-macos-desktop.sh)
+  macos_relay  .local/bin/veynode-macos-relay, the vsock port relay machine.create
+            writes into a macOS machine's disk (native/tools/build-macos-relay.sh)
   cua_driver  .local/runtime/cua-driver, the pinned cua-driver binaries the daemon
             copies into Windows and macOS Guests (runtime/fetch-cua-driver.sh)
 
@@ -100,6 +102,9 @@ def main():
     macos_desktop = ROOT / '.local/bin/vm-macos-desktop'
     if macos_desktop.exists():
         runtime['macos_desktop'] = str(macos_desktop.resolve())
+    macos_relay = ROOT / '.local/bin/veynode-macos-relay'
+    if macos_relay.exists():
+        runtime['macos_relay'] = str(macos_relay.resolve())
     cua_driver = ROOT / '.local/runtime/cua-driver'
     if cua_driver.exists():
         runtime['cua_driver'] = str(cua_driver.resolve())

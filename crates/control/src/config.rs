@@ -81,6 +81,11 @@ pub struct Config {
     /// instead of the in-Guest service, so no Guest TCC grants are needed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screen_sharing_login: Option<PathBuf>,
+    /// macOS Guest with the port relay (`services::macos_relay`): the Unix
+    /// socket on which the worker splices connections to the relay's vsock
+    /// port, instead of the Guest's vmnet address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guest_ports_socket: Option<PathBuf>,
     /// Apple Linux containers: persistent generic machine identifier (created
     /// by the worker on first start), so saved machine state can be restored.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -234,6 +239,15 @@ impl Config {
                 || !login.is_file()
             {
                 bail!("screen_sharing_login needs an Apple macOS Guest with mac_address and an existing absolute login file")
+            }
+        }
+        if let Some(socket) = &self.guest_ports_socket {
+            if self.backend != Backend::AppleVirtualization
+                || self.guest != "macos"
+                || !socket.is_absolute()
+                || socket.as_os_str().len() >= 104
+            {
+                bail!("guest_ports_socket needs an Apple macOS Guest and an absolute path under 104 bytes")
             }
         }
         if self.extra_disks.len() > 4 || self.shares.len() > 8 || self.ports.len() > 32 {

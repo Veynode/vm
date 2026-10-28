@@ -140,6 +140,15 @@ final class RFBClient {
     private(set) var height = 0
     private var framebuffer: [UInt8] = []
 
+    /// A session on `connected`, a stream to the Guest's port 5900 (the Guest relay's).
+    init(connected: Int32, user: String, password: String) throws {
+        fd = connected
+        var timeout = timeval(tv_sec: 5, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        do { try handshake(user: user, password: password) } catch { close(fd); throw error }
+    }
+
     init(host: String, user: String, password: String) throws {
         fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { throw ScreenSharingError(code: "screen_sharing_unavailable", message: "socket failed") }
@@ -363,6 +372,8 @@ let screenSharingButtons: [String: UInt8] = ["left": 1, "middle": 2, "right": 4,
 final class ScreenSharingGuest {
     let mac: String
     let loginFile: String
+    /// A stream to the Guest's port 5900 through its port relay, instead of its vmnet address.
+    var relay: (() throws -> Int32)?
     let queue = DispatchQueue(label: "veynode.screen-sharing")
     private var client: RFBClient?
     private struct Frame { let id: String; let generation: UInt64; let width: Int; let height: Int; let captured: UInt64 }
@@ -388,11 +399,17 @@ final class ScreenSharingGuest {
     }
     /// A new Screen Sharing connection with the Guest login; the browser desktop keeps its own.
     func connect() throws -> RFBClient {
-        guard let address = dhcpLeaseAddress(mac: mac) else { throw ScreenSharingError(code: "guest_unavailable", message: "Guest has no DHCP lease yet") }
+        let address = relay == nil ? dhcpLeaseAddress(mac: mac) : nil
+        guard relay != nil || address != nil else { throw ScreenSharingError(code: "guest_unavailable", message: "Guest has no DHCP lease yet") }
         guard let text = try? String(contentsOfFile: loginFile, encoding: .utf8) else { throw ScreenSharingError(code: "screen_sharing_auth", message: "Guest login file unreadable") }
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
         guard lines.count >= 2 else { throw ScreenSharingError(code: "screen_sharing_auth", message: "Guest login file must contain user and password lines") }
-        return try RFBClient(host: address, user: String(lines[0]), password: String(lines[1]))
+        if let relay {
+            let fd: Int32
+            do { fd = try relay() } catch { throw ScreenSharingError(code: "screen_sharing_unavailable", message: error.localizedDescription) }
+            return try RFBClient(connected: fd, user: String(lines[0]), password: String(lines[1]))
+        }
+        return try RFBClient(host: address!, user: String(lines[0]), password: String(lines[1]))
     }
     /// One reconnect on a dropped session; authentication errors are final.
     func withSession<T>(_ body: (RFBClient) throws -> T) throws -> T {

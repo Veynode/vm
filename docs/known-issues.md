@@ -16,12 +16,16 @@
   enables packetization-layer PMTU discovery (`tcp_mtu_probing=1`), which
   recovers at 1500 after a few seconds of blackhole detection, and the engine
   defaults to MTU 1280 for its NIC and dockerd bridges (`--mtu` overrides).
-- **Local Network privacy blocks a released daemon's SSH to Apple Virtualization guests.** `machine.exec`,
-  `files.copy` and published ports on a Linux machine on Apple Virtualization connect to the guest's vmnet address
-  (`192.168.64.x`). From a signed release's daemon started by launchd, those connections time out until macOS allows
-  the daemon on the local network (Privacy & Security, Local Network), while the same SSH from a shell works. QEMU
-  machines (loopback forwards) and the Apple Virtualization display (vsock) are not affected. Seen with the 0.1.0
-  archive on macOS 27; a vsock transport for exec and copy would avoid it.
+- **Local Network privacy and Apple Virtualization guests.** macOS refuses a launchd-started daemon's own
+  connections to the local network (EHOSTUNREACH) until the person allows it under Privacy & Security, Local
+  Network, and a guest's vmnet address (`192.168.64.x`) counts as local. A macOS machine reaches its guest over
+  virtio-vsock instead: `machine.create` writes a port relay into the image login's home on the disk
+  (`services::macos_relay`), and SSH (`machine.exec`, `files.copy`), published ports and the worker's Screen Sharing
+  (`machine.display`) go through it. Where the relay is not installed it still uses the vmnet address: a host user
+  whose uid is not the guest login's (501 in Tart images), a runtime without `macos_relay`, a machine created before
+  the relay, and macOS containers. Linux machines on Apple Virtualization also still use it (`machine.exec`,
+  `files.copy`, published ports), so from a released daemon they time out until the person allows it; core runs
+  Linux on QEMU, whose forwards are on loopback.
 
 ## Shared engine
 

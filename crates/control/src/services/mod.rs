@@ -21,6 +21,7 @@ pub mod macos;
 pub mod macos_desktop;
 pub mod macos_driver;
 pub mod macos_grant;
+pub mod macos_relay;
 pub mod mcp;
 pub mod proxy;
 pub mod publisher;

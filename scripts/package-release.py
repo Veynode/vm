@@ -45,7 +45,8 @@ import tarfile
 ROOT = Path(__file__).resolve().parents[1]
 # The daemon finds vm-console-stream, and the CLI vm-control, next to itself.
 BINARIES = ('veynodevm', 'vm-control', 'vm-image', 'vm-mcp-http', 'vm-qemu', 'vm-console', 'vm-console-stream')
-HELPERS = {'vz_desktop_stream': 'vz-desktop-stream', 'vision': 'vm-vision', 'macos_desktop': 'vm-macos-desktop'}
+HELPERS = {'vz_desktop_stream': 'vz-desktop-stream', 'vision': 'vm-vision', 'macos_desktop': 'vm-macos-desktop',
+           'macos_relay': 'veynode-macos-relay'}
 BOOT = {'kernel': 'Image', 'initrd': 'initramfs.gz', 'modloop': 'modloop'}
 WEB = ('server.mjs', 'auth.mjs', 'daemon.mjs', 'desktop.mjs', 'terminal.mjs')
 EXCLUDED = ['QEMU/GPU runtime (UTM, virglrenderer, Venus): redistribution not reviewed',
