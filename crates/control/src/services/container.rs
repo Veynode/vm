@@ -1380,16 +1380,19 @@ pub fn stop(container: &Container, timeout: Duration) -> Result<()> {
     if container.os == "darwin" {
         return super::macos::stop(container, timeout);
     }
-    // The guest service powers the micro-VM off; fall back to a hard stop.
-    // Under systemd that is `systemctl poweroff`: units stop in order. QEMU's
-    // shutdown is a power-button press the micro-VM kernel has no driver for,
-    // so ask systemd through the guest service there.
+    // Apple Virtualization: the guest service powers the micro-VM off. QEMU's
+    // serial transport has no shutdown, so press the ACPI power button: the
+    // Guest's tiny-power-button sends PID 1 SIGTERM (systemd: SIGRTMIN+4).
+    // Under systemd, ask `systemctl poweroff` first: units stop in order.
+    // Either way, fall back to a hard stop.
+    let qemu = container.backend == "qemu-hvf";
     let asked = container.init.is_some()
-        && container.backend == "qemu-hvf"
+        && qemu
         && exec_once(container, &systemd_poweroff(), 10_000, &json!({}))
             .is_ok_and(|r| r["exit_code"].as_i64() == Some(0));
     if !asked {
-        let _ = daemon_call("shutdown", json!({"id":container.vm_id,"mode":"guest"}));
+        let mode = if qemu { "backend" } else { "guest" };
+        let _ = daemon_call("shutdown", json!({"id":container.vm_id,"mode":mode}));
     }
     if wait_stopped(container, timeout) {
         return Ok(());

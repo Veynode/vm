@@ -90,8 +90,13 @@ interleaved rounds per variant, medians; the full rows are in
   journal replay or fsck; a host crash or forced quit cannot.
 - QEMU writable disks run on their own I/O thread with discard passed
   through: random 4 KiB reads ~35k → ~43k IOPS, others within noise.
-- Published ports block in `poll` between connections (no 100 ms accept
-  step); latency per new connection ~0.2–0.3 ms on both backends, unchanged.
+- `stop` of an idle container: 0.36 s on both backends (QEMU was a 10 s
+  timeout, then a hard stop).
+- Published ports (Apple Virtualization's publisher) block in `poll` between
+  connections instead of a 100 ms accept step with the wake RPC inline: a
+  new connection's connect, one-byte echo and close went from ~108 ms to
+  ~0.46 ms; an open connection's round trip is unchanged (~0.25 ms). QEMU
+  publishes through its own `hostfwd` (~0.45 ms).
 
 ## Checkpoints, rollback and forks
 
@@ -641,8 +646,8 @@ Virtualization (llvmpipe) and on QEMU with `--gpus virgl` (GLX renderer
 
 - `veynodevm stop` is graceful: on Apple Virtualization the guest service runs
   `/sbin/poweroff` (`systemctl poweroff`); on QEMU the CLI runs
-  `systemctl --no-block poweroff` through `exec`, because the micro-VM kernel
-  has no driver for the virt power button. Without `-t` the stop waits 30 s
+  `systemctl --no-block poweroff` through `exec`, then falls back to the ACPI
+  power button (systemd gets SIGRTMIN+4). Without `-t` the stop waits 30 s
   before a hard stop (10 s for ordinary containers). Shutdown logs
   `Failed unmounting /usr/lib/modules` (the read-only bind of the kernel
   modules); it is harmless.
@@ -813,9 +818,16 @@ Virtualization (llvmpipe) and on QEMU with `--gpus virgl` (GLX renderer
 - `exec` right after `run -d` waits (up to 60 s) for the guest service. On
   QEMU the daemon refuses `exec_start` until the worker reports its serial
   transport `ready`.
-- QEMU containers (other than `--init systemd`) stop with a hard stop: container-init does not handle the
-  virt power button and the serial agent has no shutdown permission, so the
-  entrypoint gets no SIGTERM.
+- QEMU containers stop through the ACPI power button: the serial agent has no
+  shutdown permission, so container-init loads `tiny-power-button`, which
+  turns the press into SIGTERM for PID 1; the entrypoint gets SIGTERM and 10 s
+  before SIGKILL, as on Apple Virtualization. `stop` took 0.36 s for an idle
+  container on both backends (QEMU waited out the 10 s timeout and hard-stopped
+  before). This needs the Guest's ACPI, so QEMU containers keep booting
+  through EDK2, which costs ~0.5 s of their start (the guest is ready ~260 ms
+  after `cont` without it, ~800 ms with it). Dropping EDK2 needs another stop
+  path, such as a power line on its own virtio port; the micro-VM kernel has
+  no driver for the device-tree power button (`gpio-keys`).
 - `veynodevm update --gpus none|virgl|venus` (and the web UI's GPU entry)
   moves an existing Linux container between Apple Virtualization and QEMU/HVF.
   It keeps the writable layer, image, ports, volumes, env and session token

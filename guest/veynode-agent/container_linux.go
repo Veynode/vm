@@ -193,6 +193,21 @@ func modprobe(names ...string) {
 	}
 }
 
+// loadPowerButton makes QEMU's ACPI power button (the host's `stop`) a
+// signal to PID 1: SIGTERM, which container-init forwards to the entrypoint
+// before powering off, or systemd's SIGRTMIN+4 (poweroff), the module's
+// default. Without it the press went unanswered and the host waited out
+// its stop timeout, then powered the VM off hard.
+func loadPowerButton(systemd bool) {
+	args := []string{"-q", "tiny-power-button"}
+	if !systemd {
+		args = append(args, fmt.Sprintf("power_signal=%d", syscall.SIGTERM))
+	}
+	if out, err := exec.Command("/sbin/modprobe", args...).CombinedOutput(); err != nil {
+		marker("warning", fmt.Sprintf("power button: %v %s", err, strings.TrimSpace(string(out))))
+	}
+}
+
 // fbcon binds a text console to virtio-gpu's framebuffer. Its blinking
 // cursor redraws, uploads and flushes the scanout every 200 ms with nobody
 // looking: on QEMU that was ~3% of a host core for an idle container. A
@@ -513,6 +528,9 @@ func prepareRoot(config containerConfig) error {
 		return err
 	}
 	modprobe("ext4", "vsock", "vmw_vsock_virtio_transport", "virtiofs", "9pnet_virtio", "9p", "fuse", "tun")
+	if _, err := os.Stat("/sys/firmware/acpi"); err == nil {
+		go loadPowerButton(config.Init == "systemd")
+	}
 	if config.GPU || config.Desktop {
 		go func() {
 			modprobe("virtio-gpu")
