@@ -39,7 +39,7 @@ fn strings(args: &Value, field: &str) -> Result<Vec<String>> {
 /// A `container.ls` row.
 pub fn row(c: &container::Container) -> Value {
     let (state, status) = container::status_text(c);
-    json!({"id":c.id,"name":c.name,"image":c.image,"command":c.argv,"created_at":c.created_at,"state":state,"status":status,"ports":c.ports,"backend":c.backend,"gpus":c.gpus,"desktop":c.desktop,"desktop_size":c.desktop_size,"vm_id":c.vm_id,"icon":c.icon,"os":c.os,"engine":c.engine,"init":c.init,"cpus":c.cpus,"memory_mib":c.memory_mib,"tty":c.tty,"stdin":c.stdin,"auto_remove":c.auto_remove,"idle_pause_s":c.idle_pause_s.unwrap_or(0)})
+    json!({"id":c.id,"name":c.name,"image":c.image,"command":c.argv,"created_at":c.created_at,"state":state,"status":status,"ports":c.ports,"backend":c.backend,"gpus":c.gpus,"desktop":c.desktop,"desktop_size":c.desktop_size,"vm_id":c.vm_id,"icon":c.icon,"os":c.os,"engine":c.engine,"init":c.init,"cpus":c.cpus,"memory_mib":c.memory_mib,"tty":c.tty,"stdin":c.stdin,"auto_remove":c.auto_remove,"idle_pause_s":c.idle_pause_s.unwrap_or(0),"idle_hibernate_s":c.idle_hibernate_s.unwrap_or(0)})
 }
 
 /// `container.run`: creates and starts a container. A macOS container with
@@ -52,6 +52,12 @@ pub fn run(_: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
     options.idle_pause_s = options
         .idle_pause_s
         .map(container::check_idle_pause)
+        .transpose()
+        .map_err(|e| refuse(ErrorCode::Invalid, e.to_string()))?
+        .flatten();
+    options.idle_hibernate_s = options
+        .idle_hibernate_s
+        .map(container::check_idle_hibernate)
         .transpose()
         .map_err(|e| refuse(ErrorCode::Invalid, e.to_string()))?
         .flatten();
@@ -149,13 +155,20 @@ pub fn update(_: &Ctx, args: Value) -> Result<Value> {
         container::check_idle_pause(seconds)
             .map_err(|e| refuse(ErrorCode::Invalid, e.to_string()))?;
     }
+    if let Some(seconds) = changes.idle_hibernate_s {
+        container::check_idle_hibernate(seconds)
+            .map_err(|e| refuse(ErrorCode::Invalid, e.to_string()))?;
+    }
     let mut c = container::update(&c, &changes, flag(&args, "restart")?)?;
     if let Some(seconds) = changes.idle_pause_s {
         container::set_idle_pause(&mut c, seconds)?;
     }
+    if let Some(seconds) = changes.idle_hibernate_s {
+        container::set_idle_hibernate(&mut c, seconds)?;
+    }
     let (_, disk_bytes, _) = container::disk(&c)?;
     Ok(
-        json!({"id":c.id,"name":c.name,"backend":c.backend,"gpus":c.gpus,"desktop":c.desktop,"desktop_size":c.desktop_size,"cpus":c.cpus,"memory_mib":c.memory_mib,"disk_bytes":disk_bytes,"ports":c.ports,"mac_address":c.mac_address,"idle_pause_s":c.idle_pause_s.unwrap_or(0)}),
+        json!({"id":c.id,"name":c.name,"backend":c.backend,"gpus":c.gpus,"desktop":c.desktop,"desktop_size":c.desktop_size,"cpus":c.cpus,"memory_mib":c.memory_mib,"disk_bytes":disk_bytes,"ports":c.ports,"mac_address":c.mac_address,"idle_pause_s":c.idle_pause_s.unwrap_or(0),"idle_hibernate_s":c.idle_hibernate_s.unwrap_or(0)}),
     )
 }
 

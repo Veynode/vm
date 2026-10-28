@@ -89,6 +89,36 @@
   Machines, macOS containers, desktops and the native console were not
   checked, and the web UI has no pause buttons (it shows `Up (Paused)`).
 
+## Idle hibernation
+
+- `--idle-hibernate` frees the Guest's memory, but only for Apple
+  Virtualization Linux containers: VZ saves machine state only for VMs with a
+  fixed MAC and machine identifier, and QEMU cannot migrate with virgl or
+  Venus. macOS containers, machines and QEMU containers have `--idle-pause`
+  alone.
+- What wakes it is what keeps `--idle-pause` from pausing (see above); the
+  first use after hibernation waits for the restore, which costs about
+  1.2 s per GiB of Guest memory in use (the same as a warm checkpoint), and
+  the state file takes that much disk until the restore removes it.
+- A request that arrives while the worker is still saving is refused rather
+  than queued; a connection through a published port then fails, and the
+  next one restores the VM.
+- The idle policy lives in the daemon's memory and the container record: a
+  daemon restart forgets it until the container's next start, but a
+  hibernated VM is still restored on its next use.
+- Saving needs the VM's disk to stay as it was: anything that replaces the
+  writable layer (a checkpoint rollback, a snapshot restore) discards the
+  hibernation, and the VM boots afresh.
+- Checked live once, 2026-10-29, with an `alpine:3.20` Apple container
+  (512 MiB) answering HTTP on a published port: with `--idle-hibernate 60s`
+  the worker saved a 33 MiB state and exited 60-70 s after the last
+  activity; an HTTP request through the port restored it and was answered
+  in 1.05 s, `exec` in 0.34 s, and the Guest clock matched the host's; with
+  `--idle-pause 60s --idle-hibernate 120s` it paused at 69 s and hibernated
+  at 129 s; `start` restored a hibernated container, and `stop` discarded
+  the state (1.2 s) so the next start booted afresh. Larger memory, desktops,
+  volumes and a daemon restart while hibernated were not checked.
+
 ## Checkpoints, rollback and forks
 
 - Memory is saved only on Apple Virtualization, for containers created since

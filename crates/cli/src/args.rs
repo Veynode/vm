@@ -136,7 +136,7 @@ pub fn desktop_size(value: &str) -> Result<(u32, u32)> {
     Ok((w, h))
 }
 
-/// `--idle-pause`: `off` or `0`, or a duration in seconds (`300`, `300s`),
+/// `--idle-pause`, `--idle-hibernate`: `off` or `0`, or a duration in seconds (`300`, `300s`),
 /// minutes (`5m`), hours (`2h`) or days (`1d`) → seconds, 0 for off.
 pub fn idle_seconds(value: &str) -> Result<u64> {
     let lower = value.to_ascii_lowercase();
@@ -151,7 +151,9 @@ pub fn idle_seconds(value: &str) -> Result<u64> {
         _ => (lower.as_str(), 1),
     };
     let n: u64 = digits.parse().map_err(|_| {
-        anyhow::anyhow!("invalid --idle-pause {value}: expected off or a duration like 300, 5m, 2h")
+        anyhow::anyhow!(
+            "invalid idle duration {value}: expected off or a duration like 300, 5m, 2h"
+        )
     })?;
     Ok(n * factor)
 }

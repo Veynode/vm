@@ -31,6 +31,9 @@ Containers:
       --disk-size GiB  --dns IP  --mtu N  --gpus all|virgl|venus  --desktop [--desktop-size WxH]  --shared
       --init systemd   (boot the image's /sbin/init as PID 1: a full distribution)
       --idle-pause DURATION  (pause the VM after 5m, 1h, ... without activity)
+      --idle-hibernate DURATION  (save the VM's memory to disk and stop it after
+                     that long without activity; the next use restores it.
+                     Apple Virtualization Linux containers only)
       (--gpus selects QEMU/HVF; otherwise Apple Virtualization)
       macOS images (e.g. ghcr.io/cirruslabs/macos-tahoe-vanilla) run as macOS VMs
       with Metal; COMMAND runs over SSH (-d: in the background, see logs; no
@@ -55,11 +58,12 @@ Containers:
   update [--cpus N] [-m SIZE] [--disk-size GiB] [--gpus none|virgl|venus]
          [--desktop on|off] [--desktop-size WxH] [-p HOST:GUEST... | -p none]
          [--dns IP... | --dns none] [--mtu N|default] [--new-mac] [--restart]
-         [--idle-pause DURATION|off] CONTAINER
+         [--idle-pause DURATION|off] [--idle-hibernate DURATION|off] CONTAINER
                                      Change a container's hardware in one go: a GPU
                                      switches QEMU/HVF <-> Apple Virtualization; the
                                      disk only grows; --restart if it is running.
-                                     --idle-pause applies at once, running or not
+                                     --idle-pause and --idle-hibernate apply at
+                                     once, running or not
   icon CONTAINER [KIND[:COLOR]|--reset]
                                      Show or set the icon the web UI draws
   desktop [--close] CONTAINER|VM     Open (or close) the native desktop window
@@ -219,6 +223,7 @@ const RUN_SPEC: &[(&str, Option<char>, bool)] = &[
     ("init", None, true),
     ("quiet", Some('q'), false),
     ("idle-pause", None, true),
+    ("idle-hibernate", None, true),
 ];
 
 fn run(rest: &[String], json_output: bool) -> Result<i32> {
@@ -230,8 +235,8 @@ fn run(rest: &[String], json_output: bool) -> Result<i32> {
         .clone();
     let command: Vec<String> = p.positional[1..].to_vec();
     if p.has("shared") {
-        if p.has("idle-pause") {
-            bail!("--idle-pause applies to micro-VM containers; the shared engine is not paused")
+        if p.has("idle-pause") || p.has("idle-hibernate") {
+            bail!("--idle-pause and --idle-hibernate apply to micro-VM containers; the shared engine is not paused")
         }
         let os = api_call("image.inspect", json!({"reference":image}))
             .map(|i| i["config"]["os"].clone())
@@ -306,6 +311,10 @@ fn run(rest: &[String], json_output: bool) -> Result<i32> {
     set(
         "idlePauseS",
         json!(p.value("idle-pause").map(idle_seconds).transpose()?),
+    );
+    set(
+        "idleHibernateS",
+        json!(p.value("idle-hibernate").map(idle_seconds).transpose()?),
     );
     set("quiet", json!(p.has("quiet") || json_output));
     set("tty", json!(p.has("tty")));
@@ -915,11 +924,12 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
                     ("new-mac", None, false),
                     ("restart", None, false),
                     ("idle-pause", None, true),
+                    ("idle-hibernate", None, true),
                 ],
                 false,
             )?;
             let [name] = p.positional.as_slice() else {
-                bail!("usage: veynodevm update [--cpus N] [-m SIZE] [--disk-size GiB] [--gpus none|virgl|venus] [--desktop on|off] [--desktop-size WxH] [-p HOST:GUEST[/udp]...|--publish none] [--dns IP...|--dns none] [--mtu N|default] [--new-mac] [--restart] [--idle-pause DURATION|off] CONTAINER")
+                bail!("usage: veynodevm update [--cpus N] [-m SIZE] [--disk-size GiB] [--gpus none|virgl|venus] [--desktop on|off] [--desktop-size WxH] [-p HOST:GUEST[/udp]...|--publish none] [--dns IP...|--dns none] [--mtu N|default] [--new-mac] [--restart] [--idle-pause DURATION|off] [--idle-hibernate DURATION|off] CONTAINER")
             };
             // `none` alone clears a list.
             let list = |name: &str| {
@@ -996,8 +1006,12 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
                 "idlePauseS",
                 json!(p.value("idle-pause").map(idle_seconds).transpose()?),
             );
+            change(
+                "idleHibernateS",
+                json!(p.value("idle-hibernate").map(idle_seconds).transpose()?),
+            );
             if changes.is_empty() {
-                bail!("update needs something to change: --cpus, --memory, --disk-size, --gpus, --desktop, --desktop-size, --publish, --dns, --mtu, --new-mac or --idle-pause")
+                bail!("update needs something to change: --cpus, --memory, --disk-size, --gpus, --desktop, --desktop-size, --publish, --dns, --mtu, --new-mac, --idle-pause or --idle-hibernate")
             }
             let c = api_call(
                 "container.update",

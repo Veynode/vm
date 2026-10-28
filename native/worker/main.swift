@@ -803,6 +803,7 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
             linuxSnapshotCommand(object)
         case "machine_state_save": machineStateSave(object)
         case "pause", "resume": pauseResume(object)
+        case "hibernate": hibernate(object)
         case "guest_request": guestRequest(object)
         case "guest_stream_probe":
             guard Set(object.keys).isSubset(of:["id","method"]) else { error("invalid_request","Expected only id and method"); return }
@@ -971,6 +972,8 @@ case "run", "install":
             if let path = options["--restore-machine-state"] {
                 guard args[1] == "run", config.guest == "linux", saved == nil else { fail("--restore-machine-state is for a Linux run without snapshot restore") }
                 worker.machineStateRestore = path
+                // Requests that arrive before the restored VM runs wait for it (`restoreContainerState`).
+                worker.resumeQueue = []
             }
             runner = worker; app.delegate = worker
             setWorkerOutputDisconnectHandler { [weak worker] in worker?.controlOwnerDisconnected() }

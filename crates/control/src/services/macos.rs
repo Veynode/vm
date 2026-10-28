@@ -741,6 +741,11 @@ pub fn create_and_start(
             "audio": true,
             "shares": volumes.iter().enumerate().map(|(i, v)| json!({"tag":format!("v{i}"),"path":v.host,"read_only":v.read_only})).collect::<Vec<_>>(),
         });
+        if options.idle_hibernate_s.is_some() {
+            bail!(
+                "--idle-hibernate needs an Apple Virtualization Linux container; use --idle-pause"
+            )
+        }
         let container = Container {
             id: id.clone(),
             name,
@@ -776,6 +781,7 @@ pub fn create_and_start(
             tty: false,
             stdin: false,
             idle_pause_s: options.idle_pause_s,
+            idle_hibernate_s: None,
         };
         container::save(&container)?;
         daemon_call("create", vm)?;

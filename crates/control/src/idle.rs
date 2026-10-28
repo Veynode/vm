@@ -12,6 +12,14 @@
 //!
 //! A VM paused with `pause` stays paused until `resume`: other methods are
 //! refused, except `shutdown`, which resumes it first.
+//!
+//! The idle hibernation (`idle_hibernate_s`, Apple Linux VMs with a fixed
+//! MAC and machine identifier) goes further: the worker saves the machine
+//! state to [`container_state::hibernation_path`] and exits, which frees the
+//! Guest's memory. While that file exists and no worker runs, the VM reports
+//! `hibernated`; `start`, `resume`, `wake` and every method that needs the
+//! Guest restore it from the file, which goes once the restored VM runs (or
+//! its restore fails). `shutdown` and `force_stop` discard it.
 use super::*;
 use std::time::Instant;
 
@@ -37,19 +45,28 @@ impl PausedBy {
 }
 
 /// One VM's idle policy and what the daemon last asked of it.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct Idle {
     pub(crate) after: Option<Duration>,
+    /// Quiet time before the VM is hibernated.
+    pub(crate) hibernate: Option<Duration>,
     pub(crate) last: Instant,
     /// Who asked for the pause, and when.
     pub(crate) paused: Option<(PausedBy, Instant)>,
+    /// The worker's reply to `hibernate`, while it saves.
+    pub(crate) hibernating: Option<mpsc::Receiver<Value>>,
+    /// The worker was started from the hibernation file.
+    pub(crate) restoring: bool,
 }
 impl Idle {
     pub(crate) fn new(now: Instant) -> Self {
         Self {
             after: None,
+            hibernate: None,
             last: now,
             paused: None,
+            hibernating: None,
+            restoring: false,
         }
     }
     /// Who holds the VM paused: the daemon asked, and the worker reports it.
@@ -62,6 +79,20 @@ impl Idle {
             state == "running"
                 && self.paused.is_none()
                 && !busy
+                && now.duration_since(self.last) >= after
+        })
+    }
+    /// Whether the monitor hibernates the VM now: quiet for its policy,
+    /// running or paused by the idle monitor (not on request).
+    pub(crate) fn hibernate_due(&self, state: &str, busy: bool, now: Instant) -> bool {
+        self.hibernate.is_some_and(|after| {
+            self.hibernating.is_none()
+                && !busy
+                && match state {
+                    "running" => self.paused.is_none(),
+                    "paused" => self.held(state) == Some(PausedBy::Idle),
+                    _ => false,
+                }
                 && now.duration_since(self.last) >= after
         })
     }
@@ -103,14 +134,27 @@ pub(crate) fn passive(method: &str) -> bool {
 
 /// `idle_pause_s`: absent, null or 0 is no idle pause.
 pub(crate) fn policy(args: &Value) -> Result<Option<Duration>> {
-    match &args["idle_pause_s"] {
+    seconds(args, "idle_pause_s")
+}
+
+/// `idle_hibernate_s`, the same way, for a VM that can be hibernated.
+pub(crate) fn hibernate_policy(args: &Value, config: &Config) -> Result<Option<Duration>> {
+    let after = seconds(args, "idle_hibernate_s")?;
+    if after.is_some() {
+        container_state::hibernation_path(config).context("idle_hibernate_s")?;
+    }
+    Ok(after)
+}
+
+pub(crate) fn seconds(args: &Value, key: &str) -> Result<Option<Duration>> {
+    match &args[key] {
         Value::Null => Ok(None),
         value => match value.as_u64() {
             Some(0) => Ok(None),
             Some(seconds) if (MIN_SECONDS..=MAX_SECONDS).contains(&seconds) => {
                 Ok(Some(Duration::from_secs(seconds)))
             }
-            _ => bail!("idle_pause_s must be 0 or {MIN_SECONDS}..{MAX_SECONDS} seconds"),
+            _ => bail!("{key} must be 0 or {MIN_SECONDS}..{MAX_SECONDS} seconds"),
         },
     }
 }
@@ -184,28 +228,164 @@ impl Manager {
         Ok(completion)
     }
 
-    /// Before any other VM method: it is activity, and a VM the idle monitor
-    /// paused is resumed for it. A VM paused on request refuses it.
-    fn idle_gate(&mut self, method: &str, id: &str) -> Result<()> {
-        if passive(method) || !self.configs.contains_key(id) {
-            return Ok(());
+    /// The hibernation file of a VM no worker runs, which its next start restores.
+    pub(crate) fn hibernated(&mut self, id: &str) -> Option<PathBuf> {
+        self.settle_restore(id);
+        if self.live_state(id).is_some() {
+            return None;
         }
-        let Some(state) = self.live_state(id) else {
-            return Ok(());
+        let path = container_state::hibernation_path(self.configs.get(id)?).ok()?;
+        path.is_file().then_some(path)
+    }
+
+    /// The hibernation file is used once: it goes when the VM restored from
+    /// it runs, or when its worker exits before that.
+    fn settle_restore(&mut self, id: &str) {
+        if !self.idle.get(id).is_some_and(|idle| idle.restoring) {
+            return;
+        }
+        let state = self.live_state(id);
+        if state.as_deref().is_some_and(|state| state != "running") {
+            return;
+        }
+        self.idle.get_mut(id).unwrap().restoring = false;
+        if let Ok(path) = container_state::hibernation_path(&self.configs[id]) {
+            let _ = fs::remove_file(path);
+        }
+        match state {
+            Some(_) => self.events.publish(
+                id,
+                "restored",
+                json!({"state":"running","from":"hibernation"}),
+            ),
+            None => log_line(&format!(
+                "vm-control: restore of {id} from hibernation failed; its next start boots afresh"
+            )),
+        }
+    }
+
+    /// Reads the worker's answer to `hibernate`: a refusal leaves the VM as it was.
+    fn settle_hibernating(&mut self, id: &str) {
+        let Some(idle) = self.idle.get_mut(id) else {
+            return;
         };
+        let reply = match idle.hibernating.as_ref().map(mpsc::Receiver::try_recv) {
+            None | Some(Err(mpsc::TryRecvError::Empty)) => return,
+            Some(reply) => reply,
+        };
+        idle.hibernating = None;
+        let Ok(reply) = reply else {
+            return;
+        };
+        if reply.get("error").is_some() {
+            if let Some(run) = self.running.get_mut(id) {
+                run.expected_exit = false;
+            }
+            log_line(&format!(
+                "vm-control: idle hibernation of {id} failed: {}",
+                reply["error"]
+            ));
+            self.events
+                .publish(id, "hibernate_failed", json!({"error":reply["error"]}));
+        }
+    }
+
+    /// Asks the worker to save the machine state and exit.
+    fn hibernate(&mut self, id: &str) -> Result<()> {
+        let path = container_state::hibernation_path(&self.configs[id])?;
+        // A file no restore removed would make the worker refuse.
+        let _ = fs::remove_file(&path);
+        let (_, reply) = self.write_command(id, json!({"method":"hibernate","path":path}))?;
+        self.running.get_mut(id).unwrap().expected_exit = true;
+        let idle = self.idle.get_mut(id).unwrap();
+        idle.hibernating = Some(reply);
+        idle.paused = None;
+        self.events
+            .publish(id, "hibernating", json!({"reason":"idle"}));
+        Ok(())
+    }
+
+    /// Starts a hibernated VM: `start` restores it from its file.
+    fn restore_hibernated(&mut self, id: &str) -> Result<()> {
+        self.dispatch(json!({"method":"start","arguments":{"id":id}}), &mut None)?;
+        Ok(())
+    }
+
+    fn discard_hibernation(&mut self, id: &str, path: &Path) -> Result<()> {
+        fs::remove_file(path).context("discarding the hibernation file")?;
+        self.events
+            .publish(id, "hibernation_discarded", json!({"state":"stopped"}));
+        Ok(())
+    }
+
+    /// The idle part of `start`: a fresh activity clock, the policies the
+    /// request names and, for a restore from hibernation, a clock step queued
+    /// behind the restore.
+    pub(crate) fn idle_started(
+        &mut self,
+        id: &str,
+        args: &Value,
+        after: Option<Duration>,
+        hibernate: Option<Duration>,
+        restoring: bool,
+    ) -> Result<()> {
+        let now = Instant::now();
+        let idle = self.idle.entry(id.into()).or_insert_with(|| Idle::new(now));
+        idle.paused = None;
+        idle.hibernating = None;
+        idle.restoring = restoring;
+        idle.last = now;
+        if args.get("idle_pause_s").is_some() {
+            idle.after = after;
+        }
+        if args.get("idle_hibernate_s").is_some() {
+            idle.hibernate = hibernate;
+        }
+        if restoring {
+            let number = self.running[id].next;
+            let request = container_state::clock_request(number)?;
+            let _ = self.write_command(id, json!({"method":"guest_request","request":request}));
+            self.events
+                .publish(id, "restoring", json!({"from":"hibernation"}));
+        }
+        Ok(())
+    }
+
+    /// Before any other VM method: it is activity, and a VM the idle monitor
+    /// paused is resumed for it, a hibernated one restored. A VM paused on
+    /// request refuses it.
+    fn idle_gate(&mut self, method: &str, id: &str) -> Result<Option<Value>> {
+        if passive(method) || !self.configs.contains_key(id) {
+            return Ok(None);
+        }
+        self.settle_hibernating(id);
+        let Some(state) = self.live_state(id) else {
+            if let Some(path) = self.hibernated(id) {
+                if method == "shutdown" {
+                    self.discard_hibernation(id, &path)?;
+                    return Ok(Some(json!({"state":"stopped","hibernation":"discarded"})));
+                }
+                // The worker holds the request until the restored VM runs.
+                self.restore_hibernated(id)?;
+            }
+            return Ok(None);
+        };
+        if state == "hibernated" || self.idle.get(id).is_some_and(|i| i.hibernating.is_some()) {
+            bail!("VM is hibernating; try again once it has stopped")
+        }
         let now = Instant::now();
         let idle = self.idle.entry(id.into()).or_insert_with(|| Idle::new(now));
         idle.last = now;
         match idle.held(&state) {
-            None => Ok(()),
-            Some(PausedBy::Request) if method == "show_window" => Ok(()),
+            None => Ok(None),
+            Some(PausedBy::Request) if method == "show_window" => Ok(None),
             Some(PausedBy::Request) if method != "shutdown" => {
                 bail!("VM is paused; resume it first")
             }
             Some(by) => {
                 // The request goes out right after; its reply, not resume's, is awaited.
                 drop(self.resume(id, by.name())?);
-                Ok(())
+                Ok(None)
             }
         }
     }
@@ -243,16 +423,28 @@ impl Manager {
         let Some(id) = args["id"].as_str() else {
             return Ok(None);
         };
+        if matches!(method, "force_stop" | "delete")
+            && args["confirm"] == id
+            && self.configs.contains_key(id)
+        {
+            if let Some(path) = self.hibernated(id) {
+                self.discard_hibernation(id, &path)?;
+                if method == "force_stop" {
+                    return Ok(Some(
+                        json!({"state":"stopped","forced":true,"hibernation":"discarded"}),
+                    ));
+                }
+            }
+        }
         if !matches!(method, "pause" | "resume" | "wake" | "idle_policy") {
-            self.idle_gate(method, id)?;
-            return Ok(None);
+            return self.idle_gate(method, id);
         }
         validate_id(id)?;
         if !self.configs.contains_key(id) {
             bail!("VM not found")
         }
         let allowed: &[&str] = if method == "idle_policy" {
-            &["id", "idle_pause_s"]
+            &["id", "idle_pause_s", "idle_hibernate_s"]
         } else {
             &["id"]
         };
@@ -264,23 +456,44 @@ impl Manager {
         }
         let now = Instant::now();
         if method == "idle_policy" {
-            if args.get("idle_pause_s").is_none() {
-                bail!("idle_policy requires idle_pause_s (0 turns the idle pause off)")
+            if args.get("idle_pause_s").is_none() && args.get("idle_hibernate_s").is_none() {
+                bail!("idle_policy requires idle_pause_s or idle_hibernate_s (0 turns it off)")
             }
             let after = policy(args)?;
+            let hibernate = hibernate_policy(args, &self.configs[id])?;
             let idle = self.idle.entry(id.into()).or_insert_with(|| Idle::new(now));
-            idle.after = after;
+            if args.get("idle_pause_s").is_some() {
+                idle.after = after;
+            }
+            if args.get("idle_hibernate_s").is_some() {
+                idle.hibernate = hibernate;
+            }
             idle.last = now;
-            return Ok(Some(
-                json!({"idle_pause_s":after.map_or(0, |a| a.as_secs())}),
-            ));
+            return Ok(Some(json!({
+                "idle_pause_s": idle.after.map_or(0, |a| a.as_secs()),
+                "idle_hibernate_s": idle.hibernate.map_or(0, |a| a.as_secs()),
+            })));
         }
+        self.settle_hibernating(id);
         let Some(state) = self.live_state(id) else {
+            if self.hibernated(id).is_some() {
+                if method == "pause" {
+                    bail!("VM is hibernated; it is not running")
+                }
+                self.restore_hibernated(id)?;
+                return Ok(Some(json!({"state":"restoring"})));
+            }
             if method == "wake" {
                 return Ok(Some(json!({"state":"stopped"})));
             }
             bail!("VM is not running")
         };
+        if state == "hibernated" || self.idle.get(id).is_some_and(|i| i.hibernating.is_some()) {
+            if method == "wake" {
+                return Ok(Some(json!({"state":"hibernating"})));
+            }
+            bail!("VM is hibernating; try again once it has stopped")
+        }
         let idle = self.idle.entry(id.into()).or_insert_with(|| Idle::new(now));
         idle.last = now;
         let held = idle.held(&state);
@@ -310,28 +523,36 @@ impl Manager {
     /// the VM paused, who asked.
     pub(crate) fn idle_view(&self, id: &str, state: &Value) -> Value {
         let Some(idle) = self.idle.get(id) else {
-            return json!({"idle_pause_s":0,"paused_by":null});
+            return json!({"idle_pause_s":0,"idle_hibernate_s":0,"paused_by":null});
         };
         let held = idle.held(state.as_str().unwrap_or_default());
         json!({
             "idle_pause_s": idle.after.map_or(0, |a| a.as_secs()),
+            "idle_hibernate_s": idle.hibernate.map_or(0, |a| a.as_secs()),
             "idle_s": Instant::now().duration_since(idle.last).as_secs(),
             "paused_by": held.map(PausedBy::name),
         })
     }
 }
 
-/// One monitor pass: pauses each VM whose policy is due.
+/// One monitor pass: hibernates or pauses each VM whose policy is due.
 pub(crate) fn monitor_pass(manager: &Mutex<Manager>) {
     let manager = &mut *manager.lock().unwrap();
     let now = Instant::now();
     let ids: Vec<String> = manager
         .idle
         .iter()
-        .filter(|(_, idle)| idle.after.is_some() || idle.paused.is_some())
+        .filter(|(_, idle)| {
+            idle.after.is_some()
+                || idle.hibernate.is_some()
+                || idle.paused.is_some()
+                || idle.restoring
+        })
         .map(|(id, _)| id.clone())
         .collect();
     for id in ids {
+        manager.settle_restore(&id);
+        manager.settle_hibernating(&id);
         let Some(state) = manager.live_state(&id) else {
             continue;
         };
@@ -345,6 +566,15 @@ pub(crate) fn monitor_pass(manager: &Mutex<Manager>) {
         idle.settle(&state, now);
         if busy {
             idle.last = now;
+            continue;
+        }
+        if idle.hibernate_due(&state, busy, now) {
+            let quiet = now.duration_since(idle.last).as_secs();
+            if let Err(error) = manager.hibernate(&id) {
+                log_line(&format!(
+                    "vm-control: idle hibernation of {id} after {quiet} s failed: {error:#}"
+                ));
+            }
             continue;
         }
         if !idle.due(&state, busy, now) {
@@ -410,6 +640,68 @@ mod tests {
     }
 
     #[test]
+    fn hibernate_due_when_quiet_running_or_idle_paused() {
+        let start = Instant::now();
+        let later = start + Duration::from_secs(600);
+        let mut idle = Idle::new(start);
+        assert!(!idle.hibernate_due("running", false, later), "no policy");
+        idle.hibernate = Some(Duration::from_secs(300));
+        assert!(idle.hibernate_due("running", false, later));
+        assert!(!idle.hibernate_due("running", true, later), "busy");
+        assert!(!idle.hibernate_due("running", false, start + Duration::from_secs(60)));
+        assert!(
+            !idle.hibernate_due("paused", false, later),
+            "paused by someone else"
+        );
+        idle.paused = Some((PausedBy::Idle, start));
+        assert!(idle.hibernate_due("paused", false, later));
+        idle.paused = Some((PausedBy::Request, start));
+        assert!(
+            !idle.hibernate_due("paused", false, later),
+            "paused on request"
+        );
+        idle.paused = None;
+        let (_tx, rx) = mpsc::channel();
+        idle.hibernating = Some(rx);
+        assert!(
+            !idle.hibernate_due("running", false, later),
+            "already saving"
+        );
+    }
+
+    #[test]
+    fn hibernate_policy_needs_a_restorable_vm() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        let disk = dir.join("rw.raw");
+        fs::write(&disk, b"").unwrap();
+        let mut value = json!({
+            "backend":"apple-virtualization","id":"c-a","guest":"linux","cpus":1,"memory_mib":512,
+            "kernel":"/k","disk":disk,"mac_address":"02:00:00:00:00:01",
+            "machine_identifier_file":dir.join("machine-id.bin"),
+        });
+        let config: Config = serde_json::from_value(value.clone()).unwrap();
+        let args = json!({"idle_hibernate_s":600});
+        assert_eq!(
+            hibernate_policy(&args, &config).unwrap(),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(
+            hibernate_policy(&json!({"idle_hibernate_s":0}), &config).unwrap(),
+            None
+        );
+        assert!(hibernate_policy(&json!({"idle_hibernate_s":30}), &config).is_err());
+        value["mac_address"] = Value::Null;
+        let no_mac: Config = serde_json::from_value(value).unwrap();
+        assert!(hibernate_policy(&args, &no_mac).is_err());
+        assert_eq!(
+            hibernate_policy(&json!({}), &no_mac).unwrap(),
+            None,
+            "no policy asks nothing of the VM"
+        );
+    }
+
+    #[test]
     fn held_needs_the_workers_word_and_settles() {
         let start = Instant::now();
         let mut idle = Idle::new(start);
@@ -430,7 +722,9 @@ mod tests {
 
     #[test]
     fn passive_methods_are_no_activity() {
-        for method in ["status", "log_read", "events", "pause", "resume", "wake"] {
+        for method in [
+            "status", "log_read", "events", "pause", "resume", "wake", "start",
+        ] {
             assert!(passive(method), "{method}");
         }
         for method in [

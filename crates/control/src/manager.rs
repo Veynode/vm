@@ -586,6 +586,13 @@ impl Manager {
                 result["idle"] = self.idle_view(id, &result["state"]);
             }
         }
+        if result["state"] == "stopped" {
+            if let Some(path) = self.hibernated(id) {
+                result["state"] = json!("hibernated");
+                let bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                result["hibernation"] = json!({"path":path,"bytes":bytes});
+            }
+        }
         if let Some(reason) = self.invalid.get(id) {
             // Never running: `start` refuses it and nothing was running when the registry was loaded.
             result["state"] = json!("invalid");
@@ -1023,6 +1030,8 @@ impl Manager {
                 }
             }
             let idle_after = idle::policy(args)?;
+            let hibernate_after = idle::hibernate_policy(args, &config)?;
+            let hibernation = self.hibernated(id);
             let assigned = self.assigned_memory_mib()?;
             self.memory.admit(assigned, config.memory_mib)?;
             let disk_identity = config.disk.as_deref().map(DiskIdentity::read).transpose()?;
@@ -1098,8 +1107,19 @@ impl Manager {
                 Some(_) => {
                     bail!("restore_machine_state cannot be combined with a snapshot restore")
                 }
+                // A hibernated VM resumes where it was.
+                None if restore_plan.is_none() => hibernation
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
                 None => None,
             };
+            let restoring = hibernation.is_some()
+                && restore_plan.is_none()
+                && args.get("restore_machine_state").is_none();
+            if let Some(path) = hibernation.as_ref().filter(|_| !restoring) {
+                // Another state replaces the disk the hibernated one belongs to.
+                fs::remove_file(path).context("discarding the hibernation file")?;
+            }
             snapshot_restore::append_start_arguments(
                 &mut command,
                 &start_args,
@@ -1292,13 +1312,7 @@ impl Manager {
             if let Some(plan) = &restore_plan {
                 plan.attach_worker(self.running.get_mut(id).unwrap())?;
             }
-            let idle = idle::Idle::new(std::time::Instant::now());
-            let idle = self.idle.entry(id.into()).or_insert(idle);
-            idle.paused = None;
-            idle.last = std::time::Instant::now();
-            if args.get("idle_pause_s").is_some() {
-                idle.after = idle_after;
-            }
+            self.idle_started(id, args, idle_after, hibernate_after, restoring)?;
             return self.view(id);
         }
         if method == "force_stop" {

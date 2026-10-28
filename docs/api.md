@@ -139,7 +139,7 @@ camelCase like the rest of the API.
 
 | Method | Kind | Arguments | Result |
 |---|---|---|---|
-| `container.run` | stream | `{image, command?, entrypoint?, name?, detach?, autoRemove?, ports?, volumes?, env?, workdir?, user?, cpus?, memoryMiB?, diskGiB?, gpus?, desktop?, desktopSize?: [w, h], dns?, mtu?, init?, quiet?, tty?, stdin?, idlePauseS?}` (the `veynodevm run` flags; `volumes` host paths are absolute) | the row; `progress` events. The client attaches afterwards when not `detach` |
+| `container.run` | stream | `{image, command?, entrypoint?, name?, detach?, autoRemove?, ports?, volumes?, env?, workdir?, user?, cpus?, memoryMiB?, diskGiB?, gpus?, desktop?, desktopSize?: [w, h], dns?, mtu?, init?, quiet?, tty?, stdin?, idlePauseS?, idleHibernateS?}` (the `veynodevm run` flags; `volumes` host paths are absolute) | the row; `progress` events. The client attaches afterwards when not `detach` |
 | `container.ls` | call | `{all?}` | rows |
 | `container.inspect` | call | `{name}` | `{container, state, status, ip, exit_code, gpu, errors, vm, directory, disk_bytes, …}` |
 | `container.start` | call | `{name}` | row |
@@ -147,7 +147,7 @@ camelCase like the rest of the API.
 | `container.pause` / `container.unpause` | call | `{name}` | row (`state` `paused`, `status` `Up (Paused)`) |
 | `container.rm` | call | `{name, force?}` | `{id, name}` |
 | `container.rename` | call | `{name, newName}` | row |
-| `container.update` | call | `{name, restart?, changes: {cpus?, memoryMiB?, diskGiB?, gpus?, desktop?, desktopSize?, ports?, dns?, mtu?, newMac?, idlePauseS?}}` | `{id, name, backend, gpus, cpus, memory_mib, disk_bytes, ports, mac_address, …}` |
+| `container.update` | call | `{name, restart?, changes: {cpus?, memoryMiB?, diskGiB?, gpus?, desktop?, desktopSize?, ports?, dns?, mtu?, newMac?, idlePauseS?, idleHibernateS?}}` | `{id, name, backend, gpus, cpus, memory_mib, disk_bytes, ports, mac_address, …}` |
 | `container.icon` | call | `{name, icon?: string \| null}`; without `icon` it only answers | `{id, icon}` |
 | `container.logs` | stream | `{name, follow?}` | `{exitCode}`; the output on `stdout`/`stderr` |
 | `container.exec` | stream | `{name, argv, env?, user?, workdir?, timeoutMs?, stdin?, tty?, rows?, cols?}`: Linux with `stdin` or `tty`, a guest session (an empty `argv` is a shell) with input on `stdin` and `{"resize":{rows, cols}}` on `control`; Linux otherwise, a bounded guest job (default 30 s) whose output comes at its end; macOS, SSH with `stdin` streamed | `{exitCode, timedOut}` |
@@ -222,3 +222,14 @@ refuses other methods (`state`) until `resume`; `shutdown` resumes it first. `st
 `idle: {idle_pause_s, idle_s, paused_by: "idle" | "request" | null}` while the VM runs, and `events` carries
 `idle_paused` and `resumed`. The `container.*`, `machine.*`, `terminal.open`, `desktop.stream` and `files.copy`
 streams hold their VM awake while open, and so does each connection through an Apple container's published ports.
+
+`idle_hibernate_s` (on `start` and `idle_policy`, same bounds; Apple Linux VMs with `machine_identifier_file` and
+`mac_address` only) hibernates the VM after that long without activity, whether it runs or the daemon paused it for
+idleness: the worker saves the machine state to `hibernate.vzstate` in the VM's disk directory and exits, which
+frees the Guest's memory. `status` then reports `hibernated` with `hibernation: {path, bytes}`, and `idle` carries
+`idle_hibernate_s`. `start`, `resume`, `wake` and every method that needs the Guest restore it from that file (the
+worker holds the request until the VM runs; the clock is stepped); the file is removed once the restored VM runs,
+or when its restore fails, and the next start boots afresh. `shutdown`, `force_stop` and `delete` discard it, as
+does a start with `restore_machine_state` or a snapshot restore. While the worker saves, methods that need the Guest
+are refused (`state`). `events` carries `hibernating`, `hibernate_failed`, `restoring`, `restored` and
+`hibernation_discarded`. A container's `state` is then `hibernated` and its `status` `Up (Hibernated)`.
