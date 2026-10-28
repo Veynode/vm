@@ -459,6 +459,71 @@
     1080p `fill` waiting every frame from 3.32–4.31 ms to 2.26–3.05 ms. An
     unmodified source build matched stock (1.38–1.61 ms), and the pixel
     test passed 9 of 9.
+  - **The render server's extra ~250 µs is the GPU waking up** (2026-10-28,
+    host microbenchmarks; 3 interleaved rounds on a host at load 10–29).
+    A Map dispatch is DXMT's `Map` plus one memcpy
+    (`npt_resource_map`), so the gap between the live 547 µs and the
+    host's ~280 µs isn't queueing. Idling between round trips, as the stock
+    guest does while it sleeps ~1.5 ms, slows the same DXMT readback from
+    260–314 µs p50 to 640–752 µs. Plain Metal behaves the same:
+    `waitUntilCompleted` goes from 259–268 µs to 615–800 µs. Committing a
+    one-pixel clear and `Flush` every 250 µs during the idle period (a
+    render-server keep-alive through D3D11 alone) brings DXMT back to
+    282–308 µs. That is still above the 0.26 ms yield budget, so a
+    keep-alive alone doesn't spare the stock driver its 1 ms sleep, and it
+    costs GPU power while the guest is idle. It isn't implemented.
+  - **DXMT's staging `Map` waits for command-buffer completion, not the
+    GPU.** In utmapp/dxmt `bcdcf6da` (UTM 5.0.5) a staging `Map` waits on
+    `cpu_coherent`. The finish thread advances that only after
+    `waitUntilCompleted` on the chunk's command buffer, so the wait is
+    completion plus two thread wake-ups. Plain Metal sees a shared event
+    signalled at the end of the same command buffer at 130 µs p50, whether
+    it spins, calls `waitUntilSignaledValue:timeoutMS:` or uses
+    `notifyListener`; `waitUntilCompleted` takes 215–271 µs.
+    [`runtime/dxmt-gpu-completed-event.patch`](../runtime/dxmt-gpu-completed-event.patch)
+    makes every chunk signal such an event as its last command and makes
+    the staging `Map` wait on it, falling back to `cpu_coherent` after
+    100 ms. Allocators still use `cpu_coherent`.
+    [`runtime/build-dxmt-native.sh`](../runtime/build-dxmt-native.sh)
+    builds it; an unmodified source build matches UTM's binary (251–253
+    vs 250–254 µs). With the patch, the host readback drops from 256–343 µs
+    to 141–148 µs at 64x64 and from 266 µs to 145 µs at 1080p, with the
+    pixel identical in every run. After a 1.5 ms idle it is still 461–599
+    µs, because the GPU wake-up remains, and with the keep-alive as well it
+    landed at 168–300 µs. Live (2026-10-28, Windows 11 ARM64, 3
+    interleaved rounds, host load 7–25, pixel test 12 of 12; a worker copy
+    whose DXMT path points at the build, confirmed with `lsof`): with the
+    patched guest UMD (variant C), 1000-frame rt64 p50 drops from
+    0.40–0.49 ms to 0.16–0.31 ms and 300-frame 1080p fill from 2.37–3.30
+    ms to 1.80–1.86 ms in every round, with less bench CPU per frame. The
+    400-frame rt64 agreed in two rounds of three (0.25–0.26 vs 0.46–0.58
+    ms). With the stock UMD the 1 ms sleep hides it (rt64 1.35 ms either
+    way in the suite). Present doesn't move in any configuration. The
+    Neptune profile still loads UTM's `dxmt-native`: shipping a patched
+    DXMT needs a decision (it changes the reviewed runtime).
+  - **Fewer guest spins trade round-trip latency for CPU** (2026-10-28,
+    live, one round only, host loaded). With the patched DXMT, variant C
+    (640 spins) rt64 0.33 ms at 0.69 bench cpu/wall; D (384) 0.48 ms at
+    0.39; A (256) 0.84 ms at 0.37. Idle dwm CPU is ~0% with any variant
+    and with the stock UMD. One round isn't enough to change the default
+    from C.
+  - **Present has no fixed sleep floor of its own** (static: Neptune
+    `44d3259f888` `triton/tritonDxgi.c`, virglrenderer `482f9d8b`). A
+    DWM-composited present (the bench's windowed flip swapchain) runs
+    `Signal` and `Flush` asynchronously, then one synchronous
+    `SetEventOnCompletion` arm, then waits on a kernel event that fires at
+    GPU completion. The host routes that completion through DXMT's shared
+    event listener, not a poll. Only the arm passes through
+    `npt_ring_relax`, the same 256-yield / 1 ms path as `Map`, so it pays
+    the floor only when the host takes longer than ~0.26 ms to answer.
+    Scanout (full-screen) presents differ: they pace run-ahead by polling
+    the fence in 1 ms high-resolution timer slices, which wake after
+    ~1.5 ms. That would be the next thing to shorten if full-screen
+    present times show it. `NPT_DEBUG=present_timing` in the app's
+    environment splits a present into those four stages; it hasn't been
+    run live yet. Live, the 1024x768 present p50 spans 1.15–2.45 ms with
+    the stock UMD and UTM's DXMT alone, and neither the patched UMD nor the
+    patched DXMT moves it consistently (3 rounds, 2026-10-28).
   - **Windows Fast Startup aborts QEMU.** Booting after a clean shutdown (a
     hybrid resume) hit `Assertion failed: (isv), function hvf_vcpu_exec, file
     hvf.c, line 2295` in 4 of 5 boots once viogpu3d was installed; boots

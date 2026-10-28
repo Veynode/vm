@@ -1,0 +1,109 @@
+From f55e92aa534ba6bfffc215006b127118699c3c50 Mon Sep 17 00:00:00 2001
+From: INS <playmaker.ins@gmail.com>
+Date: Wed, 28 Oct 2026 12:05:47 +1030
+Subject: [PATCH] staging Map waits on a GPU-signalled shared event
+
+Every chunk's command buffer signals a shared event with the chunk's seq as
+its last command. A staging Map waits on that event instead of cpu_coherent,
+which the finish thread advances only after waitUntilCompleted: a one-pixel
+readback at 64x64 drops from ~255 to ~145 us p50 on M3 Pro. Allocators keep
+using cpu_coherent.
+---
+ src/d3d11/d3d11_context_imm.cpp |  6 ++++--
+ src/dxmt/dxmt_command_queue.cpp |  2 ++
+ src/dxmt/dxmt_command_queue.hpp | 24 ++++++++++++++++++++++++
+ 3 files changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
+index 46326e1..81cba02 100644
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -235,6 +235,8 @@ public:
+       if (MapType > 3 || MapType == 0)
+           return E_INVALIDARG;
+ 
++      coherent_seq_id = cmd_queue.GpuCompletedSeqId();
++
+       if (ignore_map_flag_no_wait_)
+         MapFlags &= ~D3D11_MAP_FLAG_DO_NOT_WAIT;
+ 
+@@ -270,12 +272,12 @@ public:
+         TRACE("staging map block");
+         auto& statistics = cmd_queue.CurrentFrameStatistics();
+         auto t0 = clock::now();
+-        cmd_queue.WaitCPUFence(coherent_seq_id + uint64_t(result));
++        cmd_queue.WaitGPUCompletion(coherent_seq_id + uint64_t(result));
+         auto t1 = clock::now();
+         statistics.sync_count++;
+         statistics.sync_interval += (t1 - t0);
+         current_seq_id = cmd_queue.CurrentSeqId();
+-        coherent_seq_id = cmd_queue.CoherentSeqId();
++        coherent_seq_id = cmd_queue.GpuCompletedSeqId();
+       };
+     };
+     if (pMappedResource == nullptr) {
+diff --git a/src/dxmt/dxmt_command_queue.cpp b/src/dxmt/dxmt_command_queue.cpp
+index 89ffc37..bd5c77b 100644
+--- a/src/dxmt/dxmt_command_queue.cpp
++++ b/src/dxmt/dxmt_command_queue.cpp
+@@ -61,6 +61,7 @@ CommandQueue::CommandQueue(WMT::Device device) :
+     chunk.reset();
+   };
+   event = device.newSharedEvent();
++  gpu_completed_ = device.newSharedEvent();
+ 
+   std::string env = env::getEnvVar("DXMT_CAPTURE_FRAME");
+ 
+@@ -158,6 +159,7 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk, uint64_t seq) {
+     cmdbuf.encodeWaitForEvent(initializer.event(), chunk.resource_initializer_event_id);
+   }
+   chunk.encode(chunk.attached_cmdbuf, this->argument_encoding_ctx);
++  cmdbuf.encodeSignalEvent(gpu_completed_, seq);
+   cmdbuf.commit();
+ 
+   ready_for_commit.fetch_add(1, std::memory_order_release);
+diff --git a/src/dxmt/dxmt_command_queue.hpp b/src/dxmt/dxmt_command_queue.hpp
+index e109af7..424bde4 100644
+--- a/src/dxmt/dxmt_command_queue.hpp
++++ b/src/dxmt/dxmt_command_queue.hpp
+@@ -165,6 +165,11 @@ private:
+   std::atomic_uint64_t chunk_ongoing = 0;
+   CpuFence cpu_coherent;
+   CpuFence frame_latency_fence_;
++  /* Signalled with a chunk's seq as the last command of its command buffer.
++   * The CPU sees it as soon as the GPU is done, well before
++   * waitUntilCompleted returns in the finish thread and cpu_coherent
++   * follows (~130 vs ~250 us for a one-pixel readback on M3). */
++  WMT::Reference<WMT::SharedEvent> gpu_completed_;
+   std::atomic_bool stopped;
+ 
+   std::array<CommandChunk, kCommandChunkCount> chunks;
+@@ -281,6 +286,25 @@ public:
+     cpu_coherent.wait(seq);
+   };
+ 
++  /* Highest seq whose GPU work is complete.  For CPU reads of memory the GPU
++   * wrote (staging readback); allocators keep using cpu_coherent, which also
++   * covers the finish thread's bookkeeping. */
++  uint64_t
++  GpuCompletedSeqId() {
++    return std::max(cpu_coherent.signaledValue(), gpu_completed_.signaledValue());
++  };
++
++  void
++  WaitGPUCompletion(uint64_t seq) {
++    if (GpuCompletedSeqId() >= seq)
++      return;
++    /* A command buffer that errors never reaches its signal; the finish
++     * thread still advances cpu_coherent, so fall back to it. */
++    gpu_completed_.waitUntilSignaledValue(seq, 100);
++    if (gpu_completed_.signaledValue() < seq)
++      cpu_coherent.wait(seq);
++  };
++
+   std::tuple<WMT::Buffer, uint64_t>
+   AllocateStagingBuffer(size_t size, size_t alignment) {
+     auto [block, offset] = staging_allocator.allocate(ready_for_encode, cpu_coherent.signaledValue(), size, alignment);
+-- 
+2.54.0
+
