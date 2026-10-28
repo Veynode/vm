@@ -17,9 +17,7 @@
   <img src="https://img.shields.io/badge/macOS-14%2B-black?logo=apple" alt="macOS 14+">
   <img src="https://img.shields.io/badge/Apple%20Silicon-arm64-555" alt="Apple Silicon">
   <img src="https://img.shields.io/badge/Rust-2021-orange?logo=rust" alt="Rust">
-  <img src="https://img.shields.io/badge/Go-guest%20agent-00ADD8?logo=go&logoColor=white" alt="Go">
-  <img src="https://img.shields.io/badge/status-engineering%20preview-yellow" alt="Status: engineering preview">
-</p>
+  <img src="https://img.shields.io/badge/Go-guest%20agent-00ADD8?logo=go&logoColor=white" alt="Go"></p>
 
 <p align="center">
   <a href="#-quick-start">Quick start</a> ·
@@ -31,9 +29,6 @@
 ---
 
 Docker on macOS gives containers no GPU. VeynodeVM runs each container as its own micro-VM, on QEMU/HVF with virtio-gpu (OpenGL/GLES through virgl, Vulkan through Venus → MoltenVK → Metal) or on Apple Virtualization. A control daemon owns every VM and serves the CLI, a web UI and MCP.
-
-> [!WARNING]
-> **Engineering preview, not a release.** Read the [known issues](docs/known-issues.md) for what is verified and what is not.
 
 ## ✨ Highlights
 
