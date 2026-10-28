@@ -98,10 +98,17 @@ After the merge, through the branch's SPICE helper and the owner's running daemo
 machine on QEMU/HVF with virgl sends video (53 frames in 10 s at 1280x800, the console upright). Its console
 switches to a scanout with `y0top` set, which the helper used to refuse, leaving the endpoint without video.
 
+The release archive (`package-release.py --qemu-runtime --archive`, signed with an Apple Development identity,
+hardened runtime) from an isolated unpack and `VEYNODEVM_HOME`: `daemon start` with no registration, and again from a
+second directory, which rewrote the LaunchAgent; `hello.runtime` `qemu` and `gpu.virgl` true; a Debian 13 machine on
+QEMU/HVF created, started, ran `machine.exec` (exit 0), reported `gpu` virgl, stopped and was removed, with the QEMU
+worker on the archive's SPICE server. A Linux machine on Apple Virtualization started, but `machine.exec` timed out:
+see [Local Network privacy](known-issues.md#networking).
+
 Not verified:
 
 - `machine.microphone`: the daemon's frames reached the console broker, but the guest recorded silence.
-- `veynodevm daemon start` for core's home (loading a launchd agent was not run here).
+- `veynodevm daemon start` for core's own home and programs directory.
 - The Windows install since it moved into the daemon, and its Neptune driver step (the driver itself was verified
   installed by hand, see [known issues](known-issues.md#windows-11-arm64-machines)).
 - The pointer shape, copied text and monitor size on `machine.display`: unit tests, and the SPICE helper compiles

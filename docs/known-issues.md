@@ -16,6 +16,12 @@
   enables packetization-layer PMTU discovery (`tcp_mtu_probing=1`), which
   recovers at 1500 after a few seconds of blackhole detection, and the engine
   defaults to MTU 1280 for its NIC and dockerd bridges (`--mtu` overrides).
+- **Local Network privacy blocks a released daemon's SSH to Apple Virtualization guests.** `machine.exec`,
+  `files.copy` and published ports on a Linux machine on Apple Virtualization connect to the guest's vmnet address
+  (`192.168.64.x`). From a signed release's daemon started by launchd, those connections time out until macOS allows
+  the daemon on the local network (Privacy & Security, Local Network), while the same SSH from a shell works. QEMU
+  machines (loopback forwards) and the Apple Virtualization display (vsock) are not affected. Seen with the 0.1.0
+  archive on macOS 27; a vsock transport for exec and copy would avoid it.
 
 ## Shared engine
 
