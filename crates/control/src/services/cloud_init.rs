@@ -73,9 +73,13 @@ impl Seed<'_> {
         if !self.shares.is_empty() {
             out += "mounts:\n";
             for (tag, read_only) in self.shares {
+                // cache=mmap: without it 9p refuses writable MAP_SHARED maps
+                // (EINVAL), which Chromium's disk cache and SQLite's WAL need.
                 let options = match (self.qemu, read_only) {
-                    (true, true) => "trans=virtio,version=9p2000.L,msize=262144,ro,nofail",
-                    (true, false) => "trans=virtio,version=9p2000.L,msize=262144,nofail",
+                    (true, true) => {
+                        "trans=virtio,version=9p2000.L,msize=262144,cache=mmap,ro,nofail"
+                    }
+                    (true, false) => "trans=virtio,version=9p2000.L,msize=262144,cache=mmap,nofail",
                     (false, true) => "ro,nofail",
                     (false, false) => "defaults,nofail",
                 };
@@ -199,7 +203,7 @@ mod tests {
         assert!(apple.contains("veynode-agent --desktop-stream"));
         let qemu = seed(true, None);
         assert!(qemu.contains(
-            "[data, /mnt/data, 9p, \"trans=virtio,version=9p2000.L,msize=262144,ro,nofail\""
+            "[data, /mnt/data, 9p, \"trans=virtio,version=9p2000.L,msize=262144,cache=mmap,ro,nofail\""
         ));
         assert!(!qemu.contains("veynode-agent"));
         let meta = Seed {

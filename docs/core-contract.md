@@ -66,6 +66,9 @@ What changed for core when this merged onto the split:
   them; nothing is shipped.
 - `machine.display` on QEMU sends the pointer shape (2) after input 5 and copied text (3) after input 6, and lists
   inputs 17 and 18 (the viewer's size, sent to the Guest as its monitor) in its capabilities (11).
+- Shares of a Linux cloud-image machine on QEMU mount 9p with `cache=mmap`, so files on them take writable
+  `MAP_SHARED` maps (Chromium's disk cache, SQLite's WAL). The seed is written at create, so a machine created
+  before this keeps its `/etc/fstab` until that line gains `cache=mmap` and the share is mounted again.
 
 ## Verified, and what is not
 
