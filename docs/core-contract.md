@@ -111,6 +111,11 @@ its daemon cannot reach the vmnet address ([known issues](known-issues.md#networ
 
 Not verified:
 
+- The macOS port relay on a live Guest. Covered: its disk install on an APFS image with a Data volume, as this user
+  (attach, mount with ownership, the files owned by the user's uid, detach); the ProxyCommand, the SSH check and the
+  publisher through a stand-in relay socket; the relay and worker build. Not run: the relay in a macOS Guest, the
+  worker's vsock splice, and exec, copy, ports and display through it (ghcr.io served the macOS image at about
+  45 KB/s here).
 - `machine.microphone`: the daemon's frames reached the console broker, but the guest recorded silence.
 - `veynodevm daemon start` for core's own home and programs directory.
 - The Windows install since it moved into the daemon, and its Neptune driver step (the driver itself was verified
