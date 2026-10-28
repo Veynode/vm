@@ -92,6 +92,38 @@ class PackageReleaseTest(unittest.TestCase):
         self.assertFalse((self.out / 'web').exists())
         self.assertEqual(record['includes'], {'web': False, 'helpers': []})
 
+    def test_the_release_ships_its_layout_relative_to_share(self):
+        checkout(self.root)
+        self.package()
+        shipped = json.loads((self.out / 'share/runtime.json').read_text())
+        self.assertEqual(shipped['backend'], '../VeynodeVM.app/Contents/MacOS/vm-apple')
+        self.assertEqual(shipped['boot']['kernel'], 'boot/Image')
+        self.assertEqual(shipped['vision'], '../libexec/vm-vision')
+        self.assertNotIn('qemu', shipped)
+        for value in [shipped['backend'], shipped['vision'], *shipped['boot'].values()]:
+            self.assertTrue((self.out / 'share' / value).is_file(), value)
+        runtime = release.shipped_runtime({}, False, True)['qemu']
+        self.assertEqual(runtime['launcher'], '../libexec/qemu/probe-loader')
+        self.assertEqual(runtime['library'], '../libexec/qemu/Frameworks/' + release.QEMU_LIBRARY)
+
+    def test_the_runtime_notice_names_every_framework(self):
+        text, texts = release.notice(['qemu-aarch64-softmmu.framework', 'glib-2.0.0.framework', 'gio-2.0.0.framework'])
+        self.assertIn('QEMU (UTM fork)\n  version: 10.0.12-utm', text)
+        self.assertIn('files:   Frameworks/glib-2.0.0.framework, Frameworks/gio-2.0.0.framework', text)
+        self.assertIn('LGPL-2.1-or-later (LICENSES/LGPL-2.1.txt)', text)
+        for source in texts:
+            self.assertTrue((ROOT / source).is_file(), source)
+        for key, (_, _, _, _, source) in release.COMPONENTS.items():
+            self.assertTrue((ROOT / source).is_file(), key)
+        with self.assertRaises(KeyError):
+            release.notice(['unknown.framework'])
+
+    def test_the_loader_gets_its_entitlements(self):
+        plist = release.entitlements_plist(release.LOADER_ENTITLEMENTS)
+        self.assertIn('<key>com.apple.security.hypervisor</key><true/>', plist)
+        argv = release.signing_argv('Apple Development: X', pathlib.Path('/l'), pathlib.Path('/e'))
+        self.assertEqual(argv[-3:], ['--entitlements', '/e', '/l'])
+
     def test_install_registers_the_directory_and_keeps_the_rest(self):
         checkout(self.root)
         self.package()

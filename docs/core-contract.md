@@ -9,11 +9,19 @@ verified.
 
 ## What core installs
 
-Core's installer unpacks the release directory that `scripts/package-release.py` assembles (`bin/`, `libexec/`,
-`VeynodeVM.app`, `share/boot/`, `share/guest/`, `web/`, `install.py`, `MANIFEST.json`) and runs its `install.py`,
-which registers it in the home's `runtime.json`. It is the same archive as the standalone product, and both share
-one home and one daemon. The QEMU/HVF and GPU runtime is not in it: its redistribution follows
-[0026](decisions/0026-gpu-runtime-source-build.md), and until then a home registers UTM's runtime itself.
+Core's installer unpacks the archive that `scripts/package-release.py --qemu-runtime --archive` writes: a
+`VeynodeVM/` directory with `bin/` (`veynodevm`, `vm-control` and the daemon's siblings), `libexec/` (host helpers and
+`libexec/qemu/`, the QEMU/GPU runtime), `VeynodeVM.app`, `share/` (`runtime.json`, `boot/`, `guest/`), `LICENSES/`,
+`install.py` and `MANIFEST.json`. It is the same layout as the standalone product, and both share one home and one
+daemon. Core runs `bin/veynodevm daemon start` from the unpacked directory and nothing else: no Python, no
+registration. The daemon finds its pieces through `share/runtime.json`, relative to itself, and a `daemon start` from
+a newer version's directory moves the LaunchAgent onto it, restarting the daemon, which stops the machines it runs.
+
+The runtime is UTM 5.0.5's QEMU and the frameworks it loads (virglrenderer, libepoxy, ANGLE, GLib and the rest),
+the SPICE server with VeynodeVM's reconnect fix, QEMU's firmware and the native console app, re-signed with the
+release's identity; `LICENSES/NOTICE` lists each component's version, source and licence. Venus and Neptune are not
+in it (their registration pins the unsigned bytes), so `hello.runtime.gpu` reports `virgl` only, and a Windows
+machine gets the basic display. Its proper source build is [0026](decisions/0026-gpu-runtime-source-build.md).
 
 ## Starting the daemon
 

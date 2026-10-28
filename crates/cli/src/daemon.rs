@@ -52,6 +52,19 @@ fn escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// The daemon a LaunchAgent written by `plist` runs: its first program argument.
+fn program(plist: &str) -> Option<String> {
+    let arguments = &plist[plist.find("<key>ProgramArguments</key>")?..];
+    let first = &arguments[arguments.find("<string>")? + "<string>".len()..];
+    let value = &first[..first.find("</string>")?];
+    Some(
+        value
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&"),
+    )
+}
+
 pub fn plist(label: &str, control: &str, log: &str, home_dir: Option<&str>) -> String {
     let environment = home_dir
         .map(|h| format!("  <key>EnvironmentVariables</key>\n  <dict><key>VEYNODEVM_HOME</key><string>{}</string></dict>\n", escape(h)))
@@ -111,13 +124,22 @@ pub fn command(rest: &[String], json_output: bool) -> Result<i32> {
             Err(err.into())
         }
         "start" => {
-            if running() {
+            let control = sibling("vm-control")?;
+            let path = plist_path(&label)?;
+            // The agent names the daemon it runs; one from another build (an
+            // older release, a development checkout) is replaced, which stops
+            // that daemon and the machines it runs.
+            let registered = std::fs::read_to_string(&path).ok();
+            let current = registered.as_deref().and_then(program);
+            let ours = current.as_deref() == Some(&*control.to_string_lossy());
+            if running() && (ours || registered.is_none()) {
                 println!("daemon already running");
                 return Ok(0);
             }
+            if let Some(previous) = current.filter(|_| !ours) {
+                println!("replacing the daemon at {previous}");
+            }
             let root = home::private_dir(&home::root()?)?;
-            let control = sibling("vm-control")?;
-            let path = plist_path(&label)?;
             std::fs::create_dir_all(path.parent().unwrap())?;
             let custom_home = std::env::var("VEYNODEVM_HOME").ok();
             std::fs::write(
@@ -132,6 +154,7 @@ pub fn command(rest: &[String], json_output: bool) -> Result<i32> {
             let _ = Command::new("launchctl")
                 .args(["bootout", &format!("gui/{uid}/{label}")])
                 .output();
+            wait(false)?;
             let status = Command::new("launchctl")
                 .args(["bootstrap", &format!("gui/{uid}")])
                 .arg(&path)
@@ -208,6 +231,16 @@ mod tests {
                 && p.contains("/l&lt;og")
                 && p.contains("VEYNODEVM_HOME")
         );
+    }
+
+    #[test]
+    fn the_agent_names_its_daemon() {
+        let p = super::plist(super::LABEL, "/v/0.1.0/a&b/vm-control", "/log", None);
+        assert_eq!(
+            super::program(&p).as_deref(),
+            Some("/v/0.1.0/a&b/vm-control")
+        );
+        assert_eq!(super::program("<plist/>"), None);
     }
 
     #[test]

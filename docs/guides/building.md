@@ -16,13 +16,21 @@ Day to day, `scripts/check-changed.py` runs only the checks that the files chang
 ## Release directory
 
 A release directory for the standalone product and for Veynode core's plugin (nothing is built, notarized or
-published; the QEMU/GPU runtime is left out):
+published). `--qemu-runtime` ships the QEMU/GPU runtime this Mac uses (the [GPU runtime](#gpu-runtime) below, with
+`.local/bin/VeynodeQEMUConsole.app`) under `libexec/qemu/` and its licences under `LICENSES/`; `--archive` also
+writes `OUTPUT.tar.gz` and its SHA-256. Its helpers, `native/.build/vm-apple` and `.local/bin/veynode-guest` come from
+[the desktop helpers](#desktop-helpers), `scripts/build-native.sh` and the guest agent's `go build`.
 
 ```sh
 cargo build --release -p veynodevm -p vm-control -p veynodevm-mcp -p vm-media-local
-python3 scripts/package-release.py --output /tmp/VeynodeVM --web [--sign "Developer ID Application: …"]
-/tmp/VeynodeVM/install.py && /tmp/VeynodeVM/bin/veynodevm daemon start
+python3 scripts/package-release.py --output /tmp/VeynodeVM --web [--qemu-runtime] [--archive] [--sign "Developer ID Application: …"]
+/tmp/VeynodeVM/bin/veynodevm daemon start
 ```
+
+The directory needs no registration: the daemon reads `share/runtime.json`, whose paths are relative to it, and
+`install.py` is only for pointing an existing home's `runtime.json` at it. A home's registered `runtime.json` wins
+field by field (all of `qemu` at once). `daemon start` run from another directory than the one the home's
+LaunchAgent names rewrites the agent and restarts the daemon onto it, which stops the machines that daemon runs.
 
 ## Desktop helpers
 

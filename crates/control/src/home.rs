@@ -134,20 +134,27 @@ impl Runtime {
         Ok(runtime)
     }
 
-    /// `Contents/Resources/runtime.json` of the app bundle this executable
-    /// runs from (`Contents/MacOS`), with its relative paths resolved against
-    /// `Contents/Resources`: what an installed bundle ships
-    /// (scripts/package-core.sh). `None` outside a bundle.
+    /// The runtime.json shipped next to this executable, with its relative
+    /// paths resolved against its own directory: `Contents/Resources` of an
+    /// app bundle that runs it from `Contents/MacOS`, or `share/` of a
+    /// release directory that runs it from `bin/`
+    /// (scripts/package-release.py). `None` when neither has one.
     pub fn bundled() -> Result<Option<Self>> {
-        let Some(resources) = std::env::current_exe()
+        let Some(dir) = std::env::current_exe()
             .ok()
             .and_then(|e| e.canonicalize().ok())
-            .and_then(|e| e.parent().map(|d| d.join("../Resources")))
-            .and_then(|d| d.canonicalize().ok())
+            .and_then(|e| e.parent().map(Path::to_path_buf))
         else {
             return Ok(None);
         };
-        Self::resolved(&resources)
+        for shipped in ["../Resources", "../share"] {
+            if let Ok(shipped) = dir.join(shipped).canonicalize() {
+                if let Some(runtime) = Self::resolved(&shipped)? {
+                    return Ok(Some(runtime));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// `DIR/runtime.json` with its relative paths joined to `DIR`.
