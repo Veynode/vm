@@ -9,6 +9,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,9 +23,14 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 const containerConfigMagic = "VEYNODEVM-CONFIG-V1\n"
+
+// RNDADDENTROPY: _IOW('R', 0x03, int[2]).
+const rndAddEntropy = 0x40085203
+
 const containerRootDir = "/newroot"
 const containerRunDir = "/run/veynodevm"
 
@@ -76,6 +82,30 @@ type containerEnvFile struct {
 
 func marker(kind, value string) {
 	fmt.Printf("@@veynodevm %s %s\n", kind, value)
+}
+
+// creditSeed adds the host's seed to the kernel's entropy pool and credits it,
+// so the CRNG is ready at once instead of after seconds of jitter collection
+// (a micro-VM has no other entropy source this early; getrandom blocks until then).
+func creditSeed(raw []byte) {
+	seed := seedFrom(raw)
+	if seed == nil {
+		return
+	}
+	f, err := os.OpenFile("/dev/urandom", os.O_WRONLY, 0)
+	if err != nil {
+		marker("warning", "entropy seed: "+err.Error())
+		return
+	}
+	defer f.Close()
+	// struct rand_pool_info { int entropy_count; int buf_size; __u32 buf[]; }
+	request := make([]byte, 8+len(seed))
+	binary.LittleEndian.PutUint32(request[0:], uint32(len(seed)*8))
+	binary.LittleEndian.PutUint32(request[4:], uint32(len(seed)))
+	copy(request[8:], seed)
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), rndAddEntropy, uintptr(unsafe.Pointer(&request[0]))); errno != 0 {
+		marker("warning", "entropy seed: "+errno.Error())
+	}
 }
 
 func parseContainerConfig(raw []byte) (containerConfig, error) {
@@ -469,7 +499,7 @@ func prepareRoot(config containerConfig) error {
 	}
 	if !hasExt4(writableDevice) {
 		marker("status", "formatting writable layer")
-		if out, err := exec.Command("/sbin/mke2fs", "-q", "-F", "-t", "ext4", "-L", "veynodevm", "-E", "lazy_itable_init=1,lazy_journal_init=1", writableDevice).CombinedOutput(); err != nil {
+		if out, err := exec.Command("/sbin/mke2fs", "-q", "-F", "-t", "ext4", "-L", "veynodevm", "-E", "lazy_itable_init=1,lazy_journal_init=1,nodiscard", writableDevice).CombinedOutput(); err != nil {
 			return fmt.Errorf("mke2fs: %v %s", err, strings.TrimSpace(string(out)))
 		}
 	}
@@ -584,6 +614,7 @@ func containerInit() int {
 	}
 	n, _ := f.Read(raw)
 	f.Close()
+	creditSeed(raw[:n])
 	config, err := parseContainerConfig(raw[:n])
 	if err != nil {
 		return fail(err)

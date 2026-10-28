@@ -37,6 +37,15 @@ pub const CONFIG_MAGIC: &[u8] = b"VEYNODEVM-CONFIG-V1\n";
 /// Apple Virtualization generic machine identifier, created by the worker.
 pub const MACHINE_IDENTIFIER_FILE: &str = "vz-machine-id.bin";
 const CONFIG_DISK_BYTES: usize = 1 << 20;
+/// The configuration disk's last 4 KiB: a fresh random seed for every boot,
+/// which the guest agent credits to the kernel before anything else runs.
+/// Without it a micro-VM has no entropy source (no virtio-rng driver is loaded
+/// and the kernel does not trust a boot loader seed), so `getrandom` blocks
+/// for seconds: mke2fs alone waited ~4 s at the first boot. Older agents
+/// decode only the JSON at the start of the disk and ignore it.
+pub const SEED_MAGIC: &[u8] = b"VEYNODEVM-SEED-V1\n";
+const SEED_OFFSET: usize = CONFIG_DISK_BYTES - 4096;
+const SEED_BYTES: usize = 64;
 pub const MARKER: &str = "@@veynodevm ";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -295,10 +304,14 @@ pub fn write_config_disk(path: &Path, guest_config: &Value) -> Result<()> {
     let mut body = CONFIG_MAGIC.to_vec();
     body.extend(serde_json::to_vec(guest_config)?);
     body.push(b'\n');
-    if body.len() > CONFIG_DISK_BYTES {
+    if body.len() > SEED_OFFSET {
         bail!("container configuration exceeds 1 MiB")
     }
     body.resize(CONFIG_DISK_BYTES, 0);
+    let seed = &mut body[SEED_OFFSET..SEED_OFFSET + SEED_MAGIC.len() + SEED_BYTES];
+    seed[..SEED_MAGIC.len()].copy_from_slice(SEED_MAGIC);
+    let random = &mut seed[SEED_MAGIC.len()..];
+    unsafe { libc::arc4random_buf(random.as_mut_ptr().cast(), random.len()) };
     private_file(path)?.write_all(&body)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o400))?;
     Ok(())
@@ -1325,6 +1338,11 @@ pub fn start_from(container: &Container, machine_state: Option<&Path>) -> Result
         fs::rename(dir.join("console.log"), dir.join("console.prev.log"))?;
     }
     super::session::refresh_forward(container)?;
+    if machine_state.is_none() && container.os != "darwin" {
+        // A booting guest gets a seed it has not seen before.
+        let config_disk = dir.join("config.img");
+        replace_config_disk(&config_disk, &read_config_disk(&config_disk)?)?;
+    }
     let mut request = json!({"id":container.vm_id});
     if let Some(path) = machine_state {
         request["restore_machine_state"] = json!(path);
@@ -1537,6 +1555,31 @@ pub fn wait_for_ip(container: &Container, timeout: Duration) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn config_disk_carries_a_fresh_seed() {
+        let dir = std::env::temp_dir().join(format!("vvm-seed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.img");
+        let config = json!({"id":"c-1"});
+        write_config_disk(&path, &config).unwrap();
+        let first = fs::read(&path).unwrap();
+        assert_eq!(first.len(), CONFIG_DISK_BYTES);
+        assert_eq!(read_config_disk(&path).unwrap(), config);
+        let seed = SEED_OFFSET + SEED_MAGIC.len();
+        assert_eq!(&first[SEED_OFFSET..seed], SEED_MAGIC);
+        replace_config_disk(&path, &config).unwrap();
+        let second = fs::read(&path).unwrap();
+        assert_eq!(read_config_disk(&path).unwrap(), config);
+        assert_ne!(
+            first[seed..seed + SEED_BYTES],
+            second[seed..seed + SEED_BYTES]
+        );
+        assert!(
+            write_config_disk(&dir.join("big.img"), &json!({"x":"y".repeat(SEED_OFFSET)})).is_err()
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
     #[test]
     fn icons() {
         assert_eq!(parse_icon("box").unwrap(), "box");
