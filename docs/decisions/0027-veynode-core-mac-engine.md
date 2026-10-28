@@ -1,6 +1,8 @@
 # 0027 — VeynodeVM is Veynode core's only engine on a Mac; machines serve core, containers serve MCP
 
-Date: 2026-10-27. Status: **accepted direction**; nothing in core or here is implemented yet. VeynodeVM is
+Date: 2026-10-27. Status: **accepted direction**. On 2026-10-28 VeynodeVM's side of the contract became the daemon's
+API 1 ([api.md](../api.md), [core-contract.md](../core-contract.md); see [The contract](#the-contract)); core's
+plugin is being written against it. VeynodeVM is
 infrastructure, not a product people install on its own. Two consumers use it: Veynode core (`veynode/core`), and
 coding agents such as Codex and Claude Code through MCP.
 
@@ -22,8 +24,8 @@ coding agents such as Codex and Claude Code through MCP.
      program in the guest (`guests.provision`) and drives it over OCP.
    - **Containers and Docker compatibility** (`run`, `exec`, `engine`, compose, `build`, the `container_*` MCP tools):
      disposable environments for coding agents over MCP. Core does not use them.
-3. **Core's plugin drives VeynodeVM through `veynodevm --json`.** It works the way the Docker and Tart plugins drive
-   their CLIs, through core's `@veynode/container-engine` runner. The program is installed by core's installer as a
+3. **Core's plugin drives VeynodeVM through the daemon's local API.** It speaks API 1 on the daemon's socket
+   ([api.md](../api.md)); the `veynodevm` CLI is a wrapper and is not in core's archive. The program is installed by core's installer as a
    signed archive (`install.kind: "unpack"`, with our Team ID), and the GPU runtime comes separately
    ([0026](0026-gpu-runtime-source-build.md)). VeynodeVM's name appears only in that plugin, as core requires
    (`pnpm check:vm-neutrality`).
@@ -105,6 +107,36 @@ Gaps 1 and 2 block that; gaps 3 and 4 complete it.
    key, Screen Sharing input and first-boot grants move over from the container path unchanged. Apple's licence
    allows up to two additional macOS VMs on each Mac; the plugin should say so where it offers the engine.
 
+## The contract
+
+The contract is the daemon's versioned local API, not the CLI. [api.md](../api.md) and its JSON Schema
+([crates/api/v1.schema.json](../../crates/api/v1.schema.json)) state every method, shape and error code core relies
+on, at API 1; [core-contract.md](../core-contract.md) says what core ships and what was verified. The daemon, its
+workers and the API are the core layer. The CLI, the MCP servers, the web UI and the browser desktop relay are the
+wrapper layer: clients of the daemon, outside core's archive. The owner's later decisions changed how these gaps
+closed:
+
+- **Linux images.** Linux machines come from upstream cloud images, Ubuntu 24.04 or Debian 13 arm64, with cloud-init:
+  `machine.create` with `disk`. VeynodeVM does not publish Linux disks. The image is converted once per
+  digest and APFS-cloned per machine. A NoCloud seed carries the login, the per-home key, the shares and the guest
+  agent (gaps 1 and 2).
+- **macOS.** macOS uses `from` with a Tart image, on the container path's first boot (gap 4). `machine.grant`
+  turns on Screen Recording and Accessibility for a guest app, for core's own macOS program.
+- **Windows.** Windows is offered from the user's ISO, with `iso` and `unattended`. The daemon runs the unattended
+  install itself, so core's archive needs neither Python nor the CLI.
+- **exec.** `machine.exec` runs over SSH on all three guests, so the 30 s and 64 KiB bounds do not apply to it.
+- **clone.** `machine.clone` exists (gap 3).
+- **Ports.** Both answers to the port open question apply. `machine.endpoints` returns the guest's NAT address, and
+  `-p` on Apple Virtualization goes through a host publisher.
+- **Media.** Core owns the media stack. VeynodeVM serves each machine's display as a loopback endpoint in core's
+  screen-stream protocol (`machine.display` with an epoch). It offers raw PCM sound and microphone endpoints
+  (`machine.sound`, `machine.microphone`) only for QEMU, on its SPICE audio. It never offers them for macOS.
+- **Handshake.** Every connection opens with `hello`: the API version, and `methods`, core's capability check.
+- **Daemon.** `vm-control --home H service install` runs the daemon of core's own home as a launchd agent, beside
+  the owner's.
+- **Archive.** `scripts/package-core.sh` builds the minimal `veynodevm.app` archive: vm-control without its MCP
+  servers, the workers and their helpers.
+
 ## Container side (for MCP)
 
 The 1.0 surface for coding agents is the following:
@@ -147,5 +179,4 @@ without any engine:
 
 - Whether core uses VeynodeVM's Screen Sharing path for macOS guests, or provisions its own macOS machine program and
   asks for TCC grants.
-- Port publishing on Apple Virtualization machines: forwarding by VeynodeVM, or returning the guest's NAT address.
 - Which Linux distribution, or distributions, the base images use, and how they are updated.

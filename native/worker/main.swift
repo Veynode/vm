@@ -420,7 +420,9 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
                   stat(disk,&pathMetadata) == 0,lockedMetadata.st_dev == pathMetadata.st_dev,lockedMetadata.st_ino == pathMetadata.st_ino else {
                 throw NativeError(message:"Writable disk path changed after lock acquisition")
             }
-            let attachment = try VZDiskImageStorageDeviceAttachment(url: URL(fileURLWithPath:disk), readOnly:false)
+            // The default (automatic caching, full sync) corrupts ext4 metadata under sustained
+            // writes on Linux guests (checksum errors, then a read-only root); cached + fsync does not.
+            let attachment = try VZDiskImageStorageDeviceAttachment(url: URL(fileURLWithPath:disk), readOnly:false, cachingMode:.cached, synchronizationMode:.fsync)
             c.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment:attachment)]
         } else if config.guest == "macos" { throw NativeError(message:"macOS requires disk") }
         if let cdrom = config.cdrom {

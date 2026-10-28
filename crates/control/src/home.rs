@@ -127,6 +127,66 @@ impl Runtime {
         Ok(root()?.join(RUNTIME_FILE))
     }
     pub fn load() -> Result<Self> {
+        let mut runtime = Self::load_registered()?;
+        if let Some(bundled) = Self::bundled()? {
+            runtime.fill_from(bundled);
+        }
+        Ok(runtime)
+    }
+
+    /// `Contents/Resources/runtime.json` of the app bundle this executable
+    /// runs from (`Contents/MacOS`), with its relative paths resolved against
+    /// `Contents/Resources`: what an installed bundle ships
+    /// (scripts/package-core.sh). `None` outside a bundle.
+    pub fn bundled() -> Result<Option<Self>> {
+        let Some(resources) = std::env::current_exe()
+            .ok()
+            .and_then(|e| e.canonicalize().ok())
+            .and_then(|e| e.parent().map(|d| d.join("../Resources")))
+            .and_then(|d| d.canonicalize().ok())
+        else {
+            return Ok(None);
+        };
+        Self::resolved(&resources)
+    }
+
+    /// `DIR/runtime.json` with its relative paths joined to `DIR`.
+    pub fn resolved(dir: &Path) -> Result<Option<Self>> {
+        let file = dir.join("runtime.json");
+        let Ok(bytes) = fs::read(&file) else {
+            return Ok(None);
+        };
+        if bytes.len() > 64 * 1024 {
+            bail!("{} exceeds size limit", file.display())
+        }
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid {}", file.display()))?;
+        absolute_paths(&mut value, dir);
+        let runtime: Self =
+            serde_json::from_value(value).with_context(|| format!("invalid {}", file.display()))?;
+        runtime.validate()?;
+        Ok(Some(runtime))
+    }
+
+    /// Takes every piece `other` has and this registration lacks: a
+    /// registered runtime.json wins field by field.
+    fn fill_from(&mut self, other: Self) {
+        self.backend = self.backend.take().or(other.backend);
+        self.boot = self.boot.take().or(other.boot);
+        self.qemu = self.qemu.take().or(other.qemu);
+        self.memory_budget_mib = self.memory_budget_mib.or(other.memory_budget_mib);
+        if self.dns.is_empty() {
+            self.dns = other.dns;
+        }
+        self.mtu = self.mtu.or(other.mtu);
+        self.web = self.web.take().or(other.web);
+        self.vz_desktop_stream = self.vz_desktop_stream.take().or(other.vz_desktop_stream);
+        self.vision = self.vision.take().or(other.vision);
+        self.macos_desktop = self.macos_desktop.take().or(other.macos_desktop);
+        self.cua_driver = self.cua_driver.take().or(other.cua_driver);
+    }
+
+    fn load_registered() -> Result<Self> {
         let path = Self::path()?;
         if !path.exists() {
             return Ok(Self::default());
@@ -191,9 +251,56 @@ impl Runtime {
     }
 }
 
+/// Every relative path in a bundled runtime.json (each string but the DNS
+/// servers), joined to `dir`.
+fn absolute_paths(value: &mut serde_json::Value, dir: &Path) {
+    match value {
+        serde_json::Value::String(s) if !s.starts_with('/') => {
+            *s = dir.join(&*s).display().to_string();
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(|v| absolute_paths(v, dir)),
+        serde_json::Value::Object(fields) => fields
+            .iter_mut()
+            .filter(|(k, _)| k.as_str() != "dns")
+            .for_each(|(_, v)| absolute_paths(v, dir)),
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bundled_runtime_paths_resolve_against_resources_and_registrations_win() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("runtime.json"),
+            r#"{"backend":"../MacOS/vm-apple","vz_desktop_stream":"../MacOS/vz-desktop-stream","dns":["1.1.1.1"],
+               "qemu":{"worker":"../MacOS/vm-qemu","launcher":"runtime/qemu/probe-loader","library":"runtime/qemu/Frameworks/q","resources":"runtime/qemu/share"}}"#,
+        )
+        .unwrap();
+        let bundled = Runtime::resolved(dir.path()).unwrap().unwrap();
+        assert_eq!(bundled.backend, Some(dir.path().join("../MacOS/vm-apple")));
+        assert_eq!(
+            bundled.qemu.as_ref().unwrap().resources,
+            dir.path().join("runtime/qemu/share")
+        );
+        assert_eq!(
+            bundled.dns,
+            ["1.1.1.1".parse::<std::net::IpAddr>().unwrap()]
+        );
+        let mut registered = Runtime {
+            backend: Some("/dev/vm-apple".into()),
+            ..Default::default()
+        };
+        registered.fill_from(bundled);
+        assert_eq!(registered.backend, Some(PathBuf::from("/dev/vm-apple")));
+        assert!(registered.qemu.is_some() && registered.vz_desktop_stream.is_some());
+        assert!(Runtime::resolved(&dir.path().join("none"))
+            .unwrap()
+            .is_none());
+    }
+
     #[test]
     fn relative_runtime_paths_are_rejected() {
         let runtime: Runtime = serde_json::from_value(serde_json::json!({
