@@ -138,10 +138,14 @@ pub fn gpu_profile(value: &str, windows: bool) -> Result<&'static str> {
     })
 }
 
-/// The API's GPU name for a VM configuration's graphics profile.
-fn gpu_name(profile: &Value) -> Value {
-    match profile.as_str() {
+/// The API's GPU name for a VM configuration's graphics profile. The
+/// configuration leaves out the default, virgl on a Linux QEMU machine; a
+/// Windows one without a profile has the basic display.
+fn gpu_name(config: &Value) -> Value {
+    let linux_qemu = config["backend"] == "qemu-hvf" && config["guest"] == "linux";
+    match config["qemu_graphics_profile"].as_str() {
         Some("virgl") => json!("virgl"),
+        None if linux_qemu => json!("virgl"),
         Some("venus-moltenvk-experimental") => json!("venus"),
         Some("neptune-dxmt-experimental") => json!("neptune"),
         _ => Value::Null,
@@ -368,7 +372,7 @@ fn render(machine: &Machine, raw: &str, status: Option<Value>, used: u64) -> Val
         "cpus": config["cpus"],
         "memoryMiB": config["memory_mib"],
         "diskGiB": machine.disk_gib,
-        "gpu": gpu_name(&config["qemu_graphics_profile"]),
+        "gpu": gpu_name(&config),
         "macAddress": config["mac_address"],
         "shares": shares,
         "ports": ports,
@@ -1785,9 +1789,28 @@ mod tests {
         assert!(gpus(&linux, "neptune").is_err() && gpus(&windows, "virgl").is_err());
         let apple = machine("apple-virtualization", "linux");
         assert!(gpus(&apple, "virgl").is_err());
+        let config = |extra: Value| {
+            let mut c = json!({"backend":"qemu-hvf","guest":"linux"});
+            c.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            c
+        };
         assert_eq!(
-            gpu_name(&json!("venus-moltenvk-experimental")),
+            gpu_name(&config(
+                json!({"qemu_graphics_profile":"venus-moltenvk-experimental"})
+            )),
             json!("venus")
+        );
+        assert_eq!(gpu_name(&config(json!({}))), json!("virgl"));
+        assert_eq!(
+            gpu_name(&config(json!({"qemu_graphics_profile":"virtio-2d"}))),
+            Value::Null
+        );
+        assert_eq!(gpu_name(&config(json!({"guest":"windows"}))), Value::Null);
+        assert_eq!(
+            gpu_name(&json!({"backend":"apple-virtualization","guest":"linux"})),
+            Value::Null
         );
     }
 
