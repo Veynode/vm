@@ -58,6 +58,41 @@
 - Hard links whose target is hidden by a later layer are skipped during
   flattening (reported as a warning).
 
+## Overhead and power
+
+Measured live on Alpine containers (M-series host under other load, 3
+interleaved rounds per variant, medians; the full rows are in
+`.local/evidence/perf-overhead-2026-10-29.jsonl`).
+
+- Idle cost, as host CPU of the daemon and every process it starts: an Apple
+  Virtualization container's worker 0.02% of a core, plus 0.33% in the
+  system's `com.apple.Virtualization.VirtualMachine` process that runs its
+  vCPUs; a QEMU container with `--gpus virgl` ~4.1% (was ~10.3%). Of the QEMU
+  4.1%, 3.7% is QEMU itself: every Guest timer interrupt and IPI exits to
+  QEMU (~100 per second idle, against VZ's in-kernel handling), and SPICE's
+  GL display refresh runs every 30 ms in the prebuilt runtime. The Guest's
+  own wakeups are mostly the serial execution heartbeat (500 ms, decision
+  0015). Removing the rest needs runtime (QEMU/SPICE) changes.
+- The Guest agent turns off fbcon's blinking cursor when virtio-gpu is
+  loaded: it redrew and flushed the scanout every 200 ms (~3% of a host core
+  on QEMU). The console broker and the serial transport block on events
+  instead of stepping.
+- Start to first `exec`: Apple Virtualization 690 ms (was 1.2 s; 6.5 s before
+  the host-seeded CRNG), QEMU 1.3 s (was 1.7 s; 8.3 s). `exec true` 24 ms on
+  both (QEMU was ~140 ms). A refused first `exec` now retries after 10 ms,
+  doubling to 100 ms, instead of 500 ms.
+- Apple Virtualization writable disks are cached and sync with `fsync`, not
+  `F_FULLFSYNC` (the default full sync also corrupted ext4 under sustained
+  writes): a Guest flush takes 0.1–0.3 ms instead of 6.7 ms, fsync-heavy
+  4 KiB writes 154 → ~5,000–9,000 IOPS, small-file creation 163 →
+  ~2,000–3,500/s. A host power loss can lose writes the Guest flushed in the
+  last moments (the drive cache), which can leave the Guest's ext4 needing its
+  journal replay or fsck; a host crash or forced quit cannot.
+- QEMU writable disks run on their own I/O thread with discard passed
+  through: random 4 KiB reads ~35k → ~43k IOPS, others within noise.
+- Published ports block in `poll` between connections (no 100 ms accept
+  step); latency per new connection ~0.2–0.3 ms on both backends, unchanged.
+
 ## Checkpoints, rollback and forks
 
 - Memory is saved only on Apple Virtualization, for containers created since

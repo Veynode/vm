@@ -187,6 +187,28 @@ func modprobe(names ...string) {
 	}
 }
 
+// fbcon binds a text console to virtio-gpu's framebuffer. Its blinking
+// cursor redraws, uploads and flushes the scanout every 200 ms with nobody
+// looking: on QEMU that was ~3% of a host core for an idle container. A
+// desktop's display server takes the console over anyway.
+func stopCursorBlink() {
+	const blink = "/sys/class/graphics/fbcon/cursor_blink"
+	// A write before fbcon has taken the framebuffer over is ignored, so
+	// confirm it by reading the timer state back.
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		if _, err := os.Stat("/sys/class/graphics/fb0"); err != nil {
+			continue
+		}
+		if err := os.WriteFile(blink, []byte("0"), 0o644); err != nil {
+			marker("warning", fmt.Sprintf("fbcon cursor blink: %v", err))
+			return
+		}
+		if state, err := os.ReadFile(blink); err == nil && strings.TrimSpace(string(state)) == "0" {
+			return
+		}
+	}
+}
+
 func waitForDevice(path string) error {
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
@@ -483,6 +505,7 @@ func prepareRoot(config containerConfig) error {
 	modprobe("ext4", "vsock", "vmw_vsock_virtio_transport", "virtiofs", "9pnet_virtio", "9p", "fuse", "tun")
 	if config.GPU || config.Desktop {
 		modprobe("virtio-gpu")
+		go stopCursorBlink()
 	}
 	if config.Desktop {
 		// Apple Virtualization attaches USB keyboard and pointer; QEMU uses virtio input.
