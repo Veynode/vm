@@ -77,10 +77,17 @@ interleaved rounds per variant, medians; the full rows are in
   loaded: it redrew and flushed the scanout every 200 ms (~3% of a host core
   on QEMU). The console broker and the serial transport block on events
   instead of stepping.
-- Start to first `exec`: Apple Virtualization 690 ms (was 1.2 s; 6.5 s before
-  the host-seeded CRNG), QEMU 1.3 s (was 1.7 s; 8.3 s). `exec true` 24 ms on
-  both (QEMU was ~140 ms). A refused first `exec` now retries after 10 ms,
-  doubling to 100 ms, instead of 500 ms.
+- Start to first `exec`: Apple Virtualization ~560 ms (was 1.2 s; 6.5 s
+  before the host-seeded CRNG), QEMU ~1.1 s (was 1.7 s; 8.3 s). `exec true`
+  24 ms on both (QEMU was ~140 ms). A refused first `exec` retries after
+  5 ms, doubling to 20 ms, instead of 500 ms. Of the Apple Virtualization
+  start, ~100 ms is Virtualization's own XPC launch (the worker now overlaps
+  its AppKit setup with it), ~130 ms the kernel to init, and ~120 ms the
+  Guest's module loads and root assembly. The container initramfs is
+  uncompressed cpio (unpacked in ~40 ms instead of ~120 ms) and keeps only
+  the modules needed before the modloop, so an idle container uses ~88 MiB
+  of Guest memory instead of ~109 MiB. DHCP from Apple's NAT is ~30 ms,
+  except ~250 ms for the first container after the daemon starts.
 - Apple Virtualization writable disks are cached and sync with `fsync`, not
   `F_FULLFSYNC` (the default full sync also corrupted ext4 under sustained
   writes): a Guest flush takes 0.1–0.3 ms instead of 6.7 ms, fsync-heavy
