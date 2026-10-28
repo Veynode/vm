@@ -4,7 +4,9 @@
 Output (default .local/boot):
   Image          raw ARM64 kernel (Alpine linux-virt, from scripts/prepare-linux.py)
   initramfs.gz   Alpine initramfs-virt + overlay: guest agent as container init,
-                 mke2fs and resize2fs from pinned e2fsprogs packages
+                 mke2fs and resize2fs from pinned e2fsprogs packages. Stored as
+                 uncompressed cpio (the kernel detects the format; the name is
+                 the runtime layout's) and without the modules the modloop has
   modloop        the matching full kernel module squashfs, attached read-only
   manifest.json  SHA256 of every output and input
 
@@ -26,6 +28,9 @@ PACKAGES = {
 WANTED = {'sbin/mke2fs', 'usr/sbin/resize2fs', 'etc/mke2fs.conf', 'usr/lib/libe2p.so.2', 'usr/lib/libe2p.so.2.3',
           'usr/lib/libext2fs.so.2', 'usr/lib/libext2fs.so.2.4', 'usr/lib/libcom_err.so.2', 'usr/lib/libcom_err.so.2.1'}
 INIT = b'#!/bin/sh\nexec /veynode/agent container-init\n'
+# Modules container-init loads before it mounts the modloop. initramfs-virt's
+# other ~120 (14 MiB) are also in the modloop and would only occupy Guest memory.
+EARLY_MODULES = {'virtio_blk', 'squashfs', 'virtio_net', 'af_packet', 'overlay'}
 
 spec = importlib.util.spec_from_file_location('fixture', ROOT / 'scripts/build-linux-fixture.py')
 fixture = importlib.util.module_from_spec(spec)
@@ -53,6 +58,44 @@ def fetch(name, expected):
     if digest(path) != expected:
         raise SystemExit(f'checksum mismatch: {name}')
     return path
+
+
+def cpio_entries(data):
+    """Yield (name, raw entry bytes) of a newc archive, trailer excluded."""
+    position = 0
+    while position < len(data):
+        header = data[position:position + 110]
+        if header[:6] != b'070701':
+            raise SystemExit(f'initramfs-virt: no cpio header at {position}')
+        size, name_size = int(header[54:62], 16), int(header[94:102], 16)
+        name = data[position + 110:position + 110 + name_size - 1].decode()
+        end = (position + 110 + name_size + 3) & ~3
+        end = (end + size + 3) & ~3
+        if name == 'TRAILER!!!':
+            return
+        yield name, data[position:end]
+        position = end
+
+
+def early_initramfs(compressed):
+    """initramfs-virt uncompressed, with only EARLY_MODULES and their dependencies."""
+    entries = list(cpio_entries(gzip.decompress(compressed)))
+    [(prefix, table)] = [(name[:-len('modules.dep')], raw) for name, raw in entries if name.endswith('/modules.dep')]
+    size = int(table[54:62], 16)
+    body = table[(110 + int(table[94:102], 16) + 3) & ~3:][:size].decode()
+    dependencies = {name: rest.split() for name, _, rest in (line.partition(':') for line in body.splitlines())}
+    by_module = {pathlib.PurePosixPath(name).name.removesuffix('.ko').replace('-', '_'): name for name in dependencies}
+    keep = set()
+
+    def include(name):
+        if name not in keep:
+            keep.add(name)
+            for dependency in dependencies[name]:
+                include(dependency)
+    for module in EARLY_MODULES:
+        include(by_module[module])
+    return b''.join(raw for name, raw in entries
+                    if not name.endswith('.ko') or name.removeprefix(prefix) in keep)
 
 
 def package_entries(path):
@@ -98,7 +141,9 @@ def build(out, agent):
     add('etc/os-release', b'NAME="VeynodeVM micro-VM init"\nID=veynodevm\n', 0o100644)
     overlay += fixture.entry('TRAILER!!!', b'')
     initramfs = out / 'initramfs.gz'
-    initramfs.write_bytes((MEDIA / 'initramfs-virt').read_bytes() + gzip.compress(overlay, mtime=0))
+    # Uncompressed: the kernel unpacks it in ~40 ms instead of ~120 ms.
+    alpine = early_initramfs((MEDIA / 'initramfs-virt').read_bytes()) + fixture.entry('TRAILER!!!', b'')
+    initramfs.write_bytes(alpine + overlay)
     shutil.copyfile(MEDIA / 'Image', out / 'Image')
     shutil.copyfile(MEDIA / 'modloop-virt', out / 'modloop')
     for name in ('Image', 'initramfs.gz', 'modloop'):
