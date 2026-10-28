@@ -1032,12 +1032,12 @@ fn control_features_state_every_cell_with_status_reason_and_real_guest_evidence(
         ("application_tools", [I, I, N, I]),
         ("clipboard", [N, N, N, N]),
         ("snapshot", [N, I, N, N]),
-        ("memory_reclaim", [N, N, N, N]),
+        ("memory_reclaim", [N, N, I, N]),
         ("multi_display_input_mapping", [N, N, N, N]),
         ("retina_input_mapping", [I, N, N, N]),
         ("shared_folders", [S, I, N, N]),
         ("guest_shutdown", [N, S, N, N]),
-        ("balloon", [N, N, N, N]),
+        ("balloon", [N, N, I, N]),
         ("gpu_3d", [S, N, S, I]),
         ("application_launch_list", [I, I, N, I]),
         ("accessibility_tree", [I, I, N, I]),
@@ -1080,24 +1080,20 @@ fn control_features_state_every_cell_with_status_reason_and_real_guest_evidence(
             }
         }
     }
-    // Memory reclaim: neither backend returns Guest memory, and both Linux cells state the measurement.
-    for (backend, guest, measured) in [
-        (
-            Backend::AppleVirtualization,
-            "linux",
-            "raised the host footprint by 933 MiB",
-        ),
-        (
-            Backend::QemuHvf,
-            "linux",
-            "without lowering the host footprint",
-        ),
+    // Memory reclaim: Apple Virtualization returns no Guest memory (and says what was measured);
+    // QEMU Linux returns what free page reporting hands back.
+    let reason = control_features(Backend::AppleVirtualization, "linux")["memory_reclaim"]
+        ["reason"]
+        .to_string();
+    for part in [
+        "measured 2026-10-12",
+        "raised the host footprint by 933 MiB",
     ] {
-        let reason = control_features(backend, guest)["memory_reclaim"]["reason"].to_string();
-        for part in ["measured 2026-10-12", measured] {
-            assert!(reason.contains(part), "{reason}");
-        }
+        assert!(reason.contains(part), "{reason}");
     }
+    let reason =
+        control_features(Backend::QemuHvf, "linux")["memory_reclaim"]["reason"].to_string();
+    assert!(reason.contains("free page reporting"), "{reason}");
     let mac = control_features(Backend::AppleVirtualization, "macos");
     assert!(mac["pointer_key_input"]["reason"]
         .to_string()

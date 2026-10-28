@@ -1608,6 +1608,10 @@ fn run() -> Result<bool> {
                 "virtio-keyboard-pci",
                 "-device",
                 "virtio-tablet-pci",
+                // The Guest reports the memory it frees; the loader returns it to macOS
+                // (native/tools/qemu-ram-reclaim.h).
+                "-device",
+                vm_control::qemu_uefi::BALLOON_DEVICE,
             ])
             .arg("-kernel")
             .arg(config.kernel.as_ref().context("kernel required")?)

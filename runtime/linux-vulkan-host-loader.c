@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../native/tools/qemu-ram-reclaim.h"
 extern char **environ;
 static int verified(void *qemu, void *handle, const char *symbol, const char *needle) {
     void *expected = dlsym(handle, symbol), *bound = dlsym(qemu, symbol);
@@ -36,5 +37,6 @@ int main(int argc, char **argv) {
     void (*loop)(void) = dlsym(qemu, "qemu_main_loop");
     void (*cleanup)(void) = dlsym(qemu, "qemu_cleanup");
     if (!init || !loop || !cleanup) return 5;
+    qemu_ram_reclaim_install(qemu);
     init(argc-1, argv+1, environ); loop(); cleanup(); return 0;
 }

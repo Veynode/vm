@@ -97,6 +97,25 @@ interleaved rounds per variant, medians; the full rows are in
   is still pinned to 5.0.5: moving the pin also moves the Venus registration,
   the Neptune wire format, DXMT, the SPICE build and the release licences
   (decisions 0001, 0026, 0029).
+- Memory the Guest frees goes back to macOS on QEMU. Linux containers get a
+  virtio balloon with free page reporting (never inflated), and the agent
+  loads `virtio_balloon` for it. QEMU discards a reported range with
+  `madvise(MADV_DONTNEED)`, which macOS ignores for anonymous memory, so the
+  QEMU loader (`native/tools/qemu-ram-reclaim.h`) replaces such a range inside
+  HVF-mapped Guest RAM with fresh zero-fill pages (unmap it from the VM, map
+  anonymous memory over it, map it back). In a 2 GiB container with `--gpus
+  virgl`, writing 1.2 GB to tmpfs and deleting 1 GB of it left the QEMU process
+  at 1,022 MB instead of 1,817 MB, and after five 900 MB write/hash/delete rounds
+  it held 1,181 MB instead of 2,473 MB; the data that stayed hashed the same and
+  the Guest logged no errors. Windows' virtio-win balloon negotiates only the
+  stats queue, so Windows returns nothing by itself; inflating its balloon by
+  hand (QMP `balloon`, 8 → 3 GiB) does free the memory through the same path.
+  Apple Virtualization has no free page reporting, and its balloon stays
+  unloaded (see the blacklist below).
+- An idle QEMU container's own memory, beyond its Guest's: ~150 MB of QEMU
+  heap holds the boot images it keeps for a reset (the 64 MiB edk2 image, the
+  kernel and the initramfs), and the firmware is copied once more into its
+  ROM.
 - The Guest agent turns off fbcon's blinking cursor when virtio-gpu is
   loaded: it redrew and flushed the scanout every 200 ms (~3% of a host core
   on QEMU). The console broker and the serial transport block on events
@@ -706,7 +725,10 @@ Virtualization (llvmpipe) and on QEMU with `--gpus virgl` (GLX renderer
   isolated. The blacklist lives in `/run/modprobe.d/veynodevm.conf` and is
   written for every container, whatever its init: desktop entrypoints run
   `udevadm trigger` too, and an `ubuntu-desktop` run with both modules loaded
-  lost Xorg to a guest kernel oops (`docs/computer-use.md`, phase 0).
+  lost Xorg to a guest kernel oops (`docs/computer-use.md`, phase 0). On
+  QEMU, container-init loads `virtio_balloon` itself for free page reporting
+  (a blacklist stops only udev's autoload); that was run on Alpine
+  containers, not yet on a distribution desktop image.
 - The image's network stack keeps the address container-init obtained: udev
   renames `eth0` (to `enp0s1` on both backends) and NetworkManager
   shows it as "connected (externally)". DNS comes from `--dns`/runtime.json

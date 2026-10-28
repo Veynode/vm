@@ -528,6 +528,12 @@ func prepareRoot(config containerConfig) error {
 		return err
 	}
 	modprobe("ext4", "vsock", "vmw_vsock_virtio_transport", "virtiofs", "9pnet_virtio", "9p", "fuse", "tun")
+	if config.Transport == "virtio-serial-exec" {
+		// QEMU's balloon takes the memory the kernel frees (free page reporting)
+		// and returns it to the host. Apple Virtualization's stays unloaded:
+		// see modprobeConf.
+		modprobe("virtio_balloon")
+	}
 	if _, err := os.Stat("/sys/firmware/acpi"); err == nil {
 		go loadPowerButton(config.Init == "systemd")
 	}

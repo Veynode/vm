@@ -20,6 +20,8 @@ licenses/GPL-2.0.txt):
   runtime/apply-spice-reconnect-fix.py
   runtime/apply-spice-retired-publication-fix.py
   native/tools/spice-reconnect-loader.c
+  native/tools/qemu-ram-reclaim.h
+  native/tools/qemu-ram-reclaim-test.c
   native/tools/spice-scanout-generation.c
   native/tools/spice-scanout-generation.h
   native/tools/spice-scanout-generation-test.c

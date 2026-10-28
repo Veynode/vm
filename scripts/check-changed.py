@@ -38,6 +38,7 @@ NATIVE_BUILDS = {
     'native/tools/vm-vision.': ('native/tools/build-vm-vision.sh', ['--output', '{dir}/vm-vision']),
     'native/tools/vm-macos-desktop.': ('native/tools/build-vm-macos-desktop.sh', ['--output', '{dir}/vm-macos-desktop']),
     'native/guest-metal-fix/': ('native/guest-metal-fix/build.sh', ['{dir}/metal-fix']),
+    'native/tools/qemu-ram-reclaim': ('native/tools/test-qemu-ram-reclaim.sh', ['--output', '{dir}/qemu-ram-reclaim']),
 }
 WEB_BUILD_INPUTS = ('web/package.json', 'web/package-lock.json', 'web/vite.config.ts', 'web/server.mjs',
                     'web/src/routes/', 'web/src/router.tsx', 'web/src/start.ts', 'web/src/routeTree.gen.ts')

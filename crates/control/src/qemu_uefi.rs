@@ -25,6 +25,9 @@ use std::{
 pub const FLASH_BYTES: u64 = 64 << 20;
 pub const CODE_FILE: &str = "edk2-aarch64-code.fd";
 pub const VARS_TEMPLATE_FILE: &str = "edk2-arm-vars.fd";
+/// A balloon that is never inflated; with free page reporting the Guest hands back
+/// the memory it frees, which the loader returns to macOS.
+pub const BALLOON_DEVICE: &str = "virtio-balloon-pci,id=veynode-balloon,free-page-reporting=on";
 
 /// The flash contents of a variable template. UTM ships `edk2-arm-vars.fd` as
 /// a qcow2 image (QEMU auto-detects the format); copying its bytes verbatim
@@ -224,7 +227,7 @@ pub fn arguments(config: &Config, resources: &Path, monitor: Option<&Path>) -> R
                 "-device",
                 "virtio-tablet-pci,id=veynode-virtio-tablet",
                 "-device",
-                "virtio-balloon-pci,id=veynode-balloon",
+                BALLOON_DEVICE,
                 "-device",
                 "virtio-rng-pci,id=veynode-rng",
                 "-device",
@@ -488,6 +491,7 @@ mod tests {
         ] {
             assert!(joined.contains(device), "{device}");
         }
+        assert!(joined.contains("virtio-balloon-pci,id=veynode-balloon,free-page-reporting=on"));
         let nvme = config(&root, json!({"guest":"windows","qemu_disk_bus":"nvme"}));
         nvme.validate().unwrap();
         assert!(disk_device(&nvme).starts_with("nvme,drive=veynode-disk,"));

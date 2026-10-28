@@ -84,6 +84,8 @@ rc-manager=unmanaged
 // first boot in 3 of 3 runs; with them blacklisted the guests stayed clean
 // (docs/known-issues.md). Neither device is needed by a micro-VM: the kernel
 // seeds its RNG without virtio-rng, and VeynodeVM never inflates the balloon.
+// On QEMU, container-init loads virtio_balloon itself for free page reporting;
+// a blacklist stops only udev's autoload.
 const modprobeConf = `blacklist virtio_balloon
 blacklist virtio_rng
 `

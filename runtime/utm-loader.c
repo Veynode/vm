@@ -4,6 +4,7 @@
  * Calling convention follows UTM v5.0.5 QEMULauncher/Bootstrap.c. */
 #include <dlfcn.h>
 #include <stdio.h>
+#include "../native/tools/qemu-ram-reclaim.h"
 extern char **environ;
 int main(int argc, char **argv) {
     if (argc < 3) {
@@ -21,6 +22,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "QEMU lifecycle symbols missing\n");
         return 4;
     }
+    qemu_ram_reclaim_install(handle);
     init(argc - 1, argv + 1, environ);
     loop();
     cleanup();
