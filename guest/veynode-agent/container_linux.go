@@ -179,7 +179,13 @@ func mountAt(source, target, fstype string, flags uintptr, data string) error {
 	return nil
 }
 
+// modprobe loads names with one modprobe -a (each run reads the module
+// index again: one per module cost ~9 ms apiece at boot). It keeps going past
+// a failure, so only a failed batch is retried one by one to say which.
 func modprobe(names ...string) {
+	if exec.Command("/sbin/modprobe", append([]string{"-q", "-a"}, names...)...).Run() == nil {
+		return
+	}
 	for _, name := range names {
 		if out, err := exec.Command("/sbin/modprobe", "-q", name).CombinedOutput(); err != nil {
 			marker("warning", fmt.Sprintf("modprobe %s: %v %s", name, err, strings.TrimSpace(string(out))))
@@ -215,7 +221,8 @@ func waitForDevice(path string) error {
 		if _, err := os.Stat(path); err == nil {
 			return nil
 		}
-		time.Sleep(20 * time.Millisecond)
+		// Devices appear within tens of ms at boot; a stat is cheap.
+		time.Sleep(2 * time.Millisecond)
 	}
 	return fmt.Errorf("device %s did not appear", path)
 }
@@ -491,8 +498,11 @@ devices:
         - path: /dev/dri/card0
 `
 
+// gpuLoaded closes once virtio-gpu is loaded (at once without a GPU): its
+// DRM setup runs alongside the rest of the boot.
+var gpuLoaded = make(chan struct{})
+
 func prepareRoot(config containerConfig) error {
-	modprobe("squashfs", "virtio_net", "af_packet", "overlay")
 	if err := waitForDevice(modulesDevice); err != nil {
 		return err
 	}
@@ -504,8 +514,13 @@ func prepareRoot(config containerConfig) error {
 	}
 	modprobe("ext4", "vsock", "vmw_vsock_virtio_transport", "virtiofs", "9pnet_virtio", "9p", "fuse", "tun")
 	if config.GPU || config.Desktop {
-		modprobe("virtio-gpu")
-		go stopCursorBlink()
+		go func() {
+			modprobe("virtio-gpu")
+			close(gpuLoaded)
+			stopCursorBlink()
+		}()
+	} else {
+		close(gpuLoaded)
 	}
 	if config.Desktop {
 		// Apple Virtualization attaches USB keyboard and pointer; QEMU uses virtio input.
@@ -642,13 +657,18 @@ func containerInit() int {
 	if err != nil {
 		return fail(err)
 	}
+	// DHCP (~150 ms on Apple Virtualization's NAT) runs while the root is
+	// assembled; it needs only the NIC and packet sockets.
+	modprobe("squashfs", "virtio_net", "af_packet", "overlay")
+	network := make(chan string, 1)
+	go func() { network <- configureNetwork(config) }()
 	if err = prepareRoot(config); err != nil {
 		return fail(err)
 	}
 	if config.Hostname != "" {
 		_ = syscall.Sethostname([]byte(config.Hostname))
 	}
-	ip := configureNetwork(config)
+	ip := <-network
 	if ip != "" {
 		marker("ip", ip)
 	}
@@ -671,6 +691,7 @@ func containerInit() int {
 	for _, name := range []string{"resolv.conf", "hosts", "hostname"} {
 		bindFile(containerRunDir+"/"+name, filepath.Join(containerRootDir, "etc", name))
 	}
+	<-gpuLoaded
 	if config.GPU {
 		if _, err := os.Stat("/dev/dri/renderD128"); err == nil {
 			marker("gpu", "/dev/dri/renderD128")
