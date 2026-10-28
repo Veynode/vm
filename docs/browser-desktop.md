@@ -48,8 +48,10 @@ browser canvas ── WebSocket (/desktop/ws, exact Origin) ──────�
 
 The console helper (`native/tools/spice-console.m`) captures at the window
 cadence while a browser stream is active and encodes on the trailing edge of
-each draw (a 2 ms flush timer), so a lone keystroke is never held until the
-next idle tick. HEVC keeps the guest size (1280x800). H.264 is Constrained Baseline: 3.1
+each draw (a one-shot flush timer at the next slot), so a lone keystroke is
+never held until the next idle tick. With no stream and no visible window it
+copies nothing at draw time; a screenshot copies the latest drawn frame on
+demand (inside the next draw while the Guest is drawing, at most 50 ms later). HEVC keeps the guest size (1280x800). H.264 is Constrained Baseline: 3.1
 scaled to 1152x720 for the WebRTC console (it negotiates `profile-level-id`
 42e01f), and 4.0 at up to 1920x1080 for the WebCodecs desktop stream, which
 `vm-console-stream` asks for with `"level":40` in the `start` request (the
@@ -312,7 +314,7 @@ Measured on a Windows 11 ARM64 install (Insider 26300, 2026-10-27), HEVC:
 - Basic Display, the default, runs at **800x600**: an idle desktop produced 27
   fps of byte-identical frames, because the driver flushes the ramfb on a
   timer. The console helper now compares each source copy with the last one
-  and skips an unchanged frame (the 1 Hz idle refresh and keyframe requests
+  (the rows the draws damaged; the whole frame here) and skips an unchanged frame (the 1 Hz idle refresh and keyframe requests
   still encode), so an idle Windows desktop streams 1 fps. Hover-highlight to
   first frame: median 40 ms (17-47 ms). Static SSIM 0.987 (HEVC) / 0.988
   (H.264). The Start menu itself takes about 395 ms to appear in the guest.
@@ -484,7 +486,9 @@ beyond what MCP screenshots already use (Screen Sharing on, the login file).
   `maximumFramesPerSecond` (again on `windowDidChangeScreen:`) for its
   `MTKView` and the helper's visible capture admission; with both a window and
   a browser viewer the capture runs at the faster of the two and the encoder
-  at the viewer's rate. Hidden: 30 Hz. Both helpers pace on the same rational
+  at the viewer's rate. Hidden with no viewer: the QEMU helper copies nothing
+  at draw time and copies on demand (screenshot, stream start, window shown).
+  Both helpers pace on the same rational
   slot grid (`native/console/FramePacing.h`), which lets a frame claim its
   slot a quarter slot (at most 3 ms) early so that work taking nearly a slot
   does not push every other frame past the next one. Before this the QEMU

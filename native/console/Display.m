@@ -471,6 +471,8 @@ int VeynodeDisplaySelfTest(void){@autoreleasepool{
     NSCAssert(frames==300,@"background 30 Hz admits half a 60 Hz source");
     NSCAssert(VNFramePacingAdmit(&pacing,30000000,VN_BACKGROUND_FPS)&&!VNFramePacingAdmit(&pacing,30000000,VN_BACKGROUND_FPS),@"late event cannot create catch-up burst");
     NSCAssert(VNFramePacingAdmit(&pacing,30000001,60),@"a rate change starts fresh cadence");
+    NSCAssert(VNFramePacingDue(&pacing,120)==0,@"another rate is due at once");
+    for(unsigned fps=1;fps<=1000;fps+=fps<60?7:fps<300?60:350){VNFramePacing due={0};VNFramePacingAdmit(&due,50000000,fps);for(int i=0;i<4;i++){int64_t at=VNFramePacingDue(&due,fps);VNFramePacing early=due;NSCAssert(!VNFramePacingAdmit(&early,at-1,fps)&&VNFramePacingAdmit(&due,at,fps),@"due is the first admitted time");}}
     CVPixelBufferRef a=VeynodeDisplayAcquire(128,80),b=VeynodeDisplayAcquire(128,80),c=VeynodeDisplayAcquire(128,80);NSCAssert(a&&b&&c&&a!=b&&b!=c&&a!=c,@"three owned slots");NSCAssert(!VeynodeDisplayAcquire(128,80),@"bounded pool");
     [publicationLock lock];enabled=YES;[publicationLock unlock];
     VeynodeDisplayPublish(a,1,1,1000);NSCAssert([pool retainPixel:a],@"GPU lease");VeynodeDisplayRelease(a);VeynodeDisplayInvalidate();

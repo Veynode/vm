@@ -74,6 +74,20 @@ static gint64 capturedWall,capturedMono,lastCapture,firstPTS,lastEncode;
 // interval is captured and encoded at the next slot instead of waiting for
 // another draw or the 1 Hz idle refresh (typing would otherwise lag seconds).
 static BOOL sourceDirty,encodeDirty;
+// With nobody to see frames (no visible window, no browser stream) a draw is only
+// recorded and ACKed: no copy, no GPU round trip before the ACK. A screenshot, `start`
+// or a window that appears copies the latest drawn scanout then (whenSourceCurrent:
+// inside the next draw while the Guest is drawing, at once on a quiet screen).
+// A draw not copied at once takes its sequence number at once (lazySequence), so
+// frame_status and screen waits see every draw; the copy that includes it reuses it.
+static BOOL lazySequence;static uint64_t drawnGeneration;static gint64 lastDrawMono;
+static NSUInteger deferredDraws,onDemandCopies;
+// Timers that run only while they have work: the flush is one shot at the next
+// capture or encode slot; the screenshot tick runs while a screenshot or shutdown is pending.
+static guint flushSource;static gint64 flushDue;
+#ifdef VEYNODE_NATIVE_DISPLAY
+static guint screenshotSource;
+#endif
 // A browser stream's rate: the viewer's screen refresh it reports with `set_fps`,
 // else 240 Hz, the fastest Mac display. Frames past what the viewer's screen
 // shows would only split the same bitrate thinner.
@@ -90,6 +104,12 @@ static VNFramePacing encodePacing;
 static int generationFD=-1;
 static NSMutableData *input;
 static const NSUInteger maxAU=4*1024*1024;
+#ifdef VEYNODE_SCREENSHOT_TESTING
+static NSUInteger testDrawACKs,testCopiesAtACK;
+#define ACK_DRAW(channel) (testDrawACKs++,testCopiesAtACK=sourceCopies)
+#else
+#define ACK_DRAW(channel) spice_display_channel_gl_draw_done(channel)
+#endif
 static BOOL surfaceLive(void){if(generationFD<0)return NO;struct pollfd p={.fd=generationFD,.events=POLLIN};return poll(&p,1,0)>=0&&!(p.revents&(POLLHUP|POLLERR|POLLNVAL));}
 static void fail(NSString *message){[lock lock];if(!failure)failure=message;[lock unlock];}
 static void captureFail(NSString *message){if(!fatal)fatal=message;if(loop)g_main_loop_quit(loop);}
@@ -239,6 +259,8 @@ static BOOL copyPixels(IOSurfaceRef src,NSUInteger sw,NSUInteger sh,NSUInteger r
 #undef COPY_RETURN
 }
 static BOOL cacheValid(void){return owned&&cachedGeneration==generation&&surfaceLive();}
+// The live generation has a drawn frame: a copy of it exists or can be made now.
+static BOOL frameReady(void){return drawnGeneration==generation&&generationFD>=0&&surfaceLive();}
 static void clearCache(void){cachedGeneration=0;if(owned){
 #ifdef VEYNODE_NATIVE_DISPLAY
  VeynodeDisplayRelease(owned);
@@ -293,20 +315,48 @@ static View view;
 // A guest that redraws a still screen (Windows Basic Display flushes its ramfb at
 // ~27 Hz) would otherwise be encoded 27 times a second as identical frames. The
 // previous source bytes are kept to recognise them; the 1 Hz idle refresh and
-// keyframe requests still encode.
+// keyframe requests still encode. Only rows a draw may have changed are compared:
+// each draw's SPICE damage and, since the orientation of that rectangle against the
+// IOSurface rows is not verified, its vertical mirror (whole rows: they are contiguous).
+// Pending: drawn, not yet in a copy; copied: in `owned`, not yet compared. A new
+// generation, a resize or a zero rectangle is every row. No draw since the last
+// comparison means unchanged without reading a byte (the idle refresh, keyframes).
+typedef struct{size_t top,bottom;} Rows;
+static Rows pendingRows[2],copiedRows[2];static BOOL pendingAll=YES,copiedAll=YES;
+static void addRows(Rows *r,size_t top,size_t bottom){if(top>=bottom)return;if(r->top>=r->bottom){r->top=top;r->bottom=bottom;return;}r->top=MIN(r->top,top);r->bottom=MAX(r->bottom,bottom);}
+static void noteDamage(guint32 x,guint32 y,guint32 w,guint32 h){
+ size_t rows=sourceHeight;if(!w||!h||!rows||y>=rows){pendingAll=YES;return;}
+ size_t bottom=MIN((size_t)y+h,rows);addRows(&pendingRows[0],y,bottom);addRows(&pendingRows[1],rows-bottom,rows-y);
+}
+static void damageCopied(void){copiedAll|=pendingAll;for(int i=0;i<2;i++)addRows(&copiedRows[i],pendingRows[i].top,pendingRows[i].bottom);pendingAll=NO;memset(pendingRows,0,sizeof pendingRows);}
 static uint8_t *previousFrame;static size_t previousSize;
 static BOOL sourceUnchanged(CVPixelBufferRef pixel){
+ size_t row=CVPixelBufferGetBytesPerRow(pixel),rows=CVPixelBufferGetHeight(pixel),size=row*rows;
+ BOOL all=copiedAll||!previousFrame||previousSize!=size;
+ if(!all&&copiedRows[0].top>=copiedRows[0].bottom&&copiedRows[1].top>=copiedRows[1].bottom)return YES;
  if(CVPixelBufferLockBaseAddress(pixel,kCVPixelBufferLock_ReadOnly)!=kCVReturnSuccess)return NO;
- const void *base=CVPixelBufferGetBaseAddress(pixel);size_t size=CVPixelBufferGetBytesPerRow(pixel)*CVPixelBufferGetHeight(pixel);BOOL same=NO;
+ const uint8_t *base=CVPixelBufferGetBaseAddress(pixel);BOOL same=NO;
  if(base&&size){
-  same=previousFrame&&previousSize==size&&!memcmp(previousFrame,base,size);
-  if(!same){if(previousSize!=size){free(previousFrame);previousFrame=malloc(size);previousSize=previousFrame?size:0;}if(previousFrame)memcpy(previousFrame,base,size);}
+  BOOL fresh=!previousFrame||previousSize!=size;
+  if(fresh){free(previousFrame);previousFrame=malloc(size);previousSize=previousFrame?size:0;}
+  if(previousFrame){
+   Rows bands[2]={all?(Rows){0,rows}:copiedRows[0],all?(Rows){0,0}:copiedRows[1]};same=!fresh;
+   // Overlapping bands (a full-frame damage is its own mirror) are compared once.
+   if(bands[1].top<bands[1].bottom&&bands[1].top<bands[0].bottom&&bands[0].top<bands[1].bottom){addRows(&bands[0],bands[1].top,bands[1].bottom);bands[1]=(Rows){0,0};}
+   // Keep the copy in step: only the span from the first to the last differing row is copied.
+   for(int i=0;i<2;i++){size_t top=bands[i].top,bottom=MIN(bands[i].bottom,rows);
+    while(top<bottom&&!memcmp(previousFrame+top*row,base+top*row,row))top++;
+    while(bottom>top&&!memcmp(previousFrame+(bottom-1)*row,base+(bottom-1)*row,row))bottom--;
+    if(top<bottom){same=NO;memcpy(previousFrame+top*row,base+top*row,(bottom-top)*row);}
+   }
+   copiedAll=NO;memset(copiedRows,0,sizeof copiedRows);
+  }
  }
  CVPixelBufferUnlockBaseAddress(pixel,kCVPixelBufferLock_ReadOnly);return same;
 }
 static void encodeLatest(gint64 now,BOOL idle){
  if(!active||!cacheValid())return;
- BOOL same=encoder&&sourceUnchanged(owned); // always refreshes the kept copy
+ BOOL same=sourceUnchanged(owned)&&encoder; // always refreshes the kept copy
  if(same&&!idle&&!forceKeyframe){encodeDirty=NO;unchangedSkips++;return;}
  if(!same){lastChange=now;leaveStill();}
  if(!encoder){
@@ -354,6 +404,7 @@ static void awaitSource(NSString *reason){
  VeynodeDisplayInvalidate();capturePacing.initialized=false;
 #endif
  cachedGeneration=0; // Invalidate publication before draining, retain storage until drain.
+ sourceDirty=lazySequence=NO;pendingAll=copiedAll=YES;
  if(active&&encoder){fail(@"Source generation unavailable; start a fresh encoding epoch after replacement");sessionFailure();}
  clearCache();
 #ifdef VEYNODE_NATIVE_DISPLAY
@@ -384,46 +435,114 @@ static void scanout(SpiceDisplayChannel *channel,GParamSpec *spec,gpointer conte
  generationFD=dup(info->fd);if(generationFD<0){captureFail(@"scanout_fd_failed");return;}fcntl(generationFD,F_SETFD,FD_CLOEXEC);sourceWidth=info->width;sourceHeight=info->height;awaitingSource=NO;lastCapture=0;
  emit(0,@{@"event":@"source-generation",@"source_generation":@(generation),@"width":@(sourceWidth),@"height":@(sourceHeight)});
 }
-// Copy the live scanout into an owned buffer when pacing admits it; a refused
-// update stays dirty for the flush tick. Returns whether a new copy exists.
-static BOOL captureSource(gint64 now){
+// Frames are wanted continuously only while a window shows them or a browser stream encodes them.
+static BOOL captureWanted(void){
+#ifdef VEYNODE_NATIVE_DISPLAY
+ return active||VeynodeDisplayVisibleFPS()>0;
+#else
+ return active;
+#endif
+}
+// Copy the live scanout into an owned buffer when pacing admits it (or at once,
+// onDemand); a refused update stays dirty for the flush. Returns whether a new copy exists.
+static BOOL captureSource(gint64 now,BOOL onDemand){
  if(!surfaceLive()){awaitSource(@"generation_retired_during_draw");return NO;}
 #ifdef VEYNODE_NATIVE_DISPLAY
  unsigned windowFPS=VeynodeDisplayVisibleFPS();BOOL nativeVisible=windowFPS>0;
  // A browser stream gets its own rate even while the window is hidden; both together get the faster.
  unsigned fps=MAX(windowFPS,active?streamFPS:0);captureFPS=fps?fps:VN_BACKGROUND_FPS;
- if(!VNFramePacingAdmit(&capturePacing,now,captureFPS)){capturePacingDrops++;sourceDirty=YES;return NO;}
+ if(!onDemand&&!VNFramePacingAdmit(&capturePacing,now,captureFPS)){capturePacingDrops++;sourceDirty=YES;return NO;}
  CVPixelBufferRef next=VeynodeDisplayAcquire(sourceWidth,sourceHeight);
  // Pool exhaustion drops this copy without blocking ACK; the flush retries.
  if(!next){capturePoolDrops++;sourceDirty=YES;return NO;}
  if(!copyPixels(surface,sourceWidth,sourceHeight,0,0,sourceWidth,sourceHeight,next,VNCopySource)){VeynodeDisplayRelease(next);captureFail(@"source_copy_failed");return NO;}
  if(!surfaceLive()){VeynodeDisplayRelease(next);awaitSource(@"generation_retired_during_copy");return NO;}
- clearCache();owned=next;sourceCopies++;sequence++;cachedGeneration=generation;capturedMono=g_get_monotonic_time();capturedWall=g_get_real_time();lastCapture=now;if(nativeVisible)visibleSourceCopies++;else backgroundSourceCopies++;VeynodeDisplayPublish(owned,generation,sequence,capturedMono);
+ if(!lazySequence)sequence++;lazySequence=NO;
+ clearCache();owned=next;sourceCopies++;cachedGeneration=generation;capturedMono=g_get_monotonic_time();capturedWall=g_get_real_time();lastCapture=now;if(nativeVisible)visibleSourceCopies++;else backgroundSourceCopies++;VeynodeDisplayPublish(owned,generation,sequence,capturedMono);
 #else
- captureFPS=streamFPS;if(lastCapture&&now-lastCapture<encodeInterval()){sourceDirty=YES;return NO;}
+ captureFPS=streamFPS;if(!onDemand&&lastCapture&&now-lastCapture<encodeInterval()){sourceDirty=YES;return NO;}
  cachedGeneration=0;if(!owned)owned=allocatePixel(sourceWidth,sourceHeight);
  if(!owned||!copyPixels(surface,sourceWidth,sourceHeight,0,0,sourceWidth,sourceHeight,owned)){clearCache();captureFail(@"source_copy_failed");return NO;}
  if(!surfaceLive()){awaitSource(@"generation_retired_during_copy");return NO;}
- sourceCopies++;sequence++;cachedGeneration=generation;capturedMono=g_get_monotonic_time();capturedWall=g_get_real_time();lastCapture=now;
+ if(!lazySequence)sequence++;lazySequence=NO;
+ sourceCopies++;cachedGeneration=generation;capturedMono=g_get_monotonic_time();capturedWall=g_get_real_time();lastCapture=now;
 #endif
- sourceDirty=NO;encodeDirty=YES;return YES;
+ if(onDemand)onDemandCopies++;
+ damageCopied();sourceDirty=NO;encodeDirty=YES;return YES;
+}
+// The latest drawn scanout as `owned`, copied now when no copy has it yet.
+static BOOL refreshSource(void){
+ if(frameReady()&&(sourceDirty||!cacheValid()))captureSource(g_get_monotonic_time(),YES);
+ return cacheValid();
+}
+// Requests that need the latest frame (screenshot, `start`, `show_window`) while the
+// newest draw was ACKed uncopied. After that ACK the Guest may already be rendering
+// the next frame into the scanout, so a copy now could be torn. A Guest that drew
+// within drawQuietUS is drawing: the next draw copies before its ACK, as a watched
+// draw does, and completes them. A screen quiet that long has nothing rendering: copy
+// now. The quiet timer (one shot, armed only while requests wait) is the fallback when
+// no draw comes, so a request waits at most drawQuietUS.
+static const gint64 drawQuietUS=50000;
+static NSMutableArray *captureWaiters;static guint captureTimer;
+static void finishCaptureWaiters(void){
+ if(captureTimer){g_source_remove(captureTimer);captureTimer=0;}
+ NSArray *waiting=captureWaiters;captureWaiters=nil;for(void (^done)(void) in waiting)done();
+}
+static gboolean captureQuiet(gpointer data){@autoreleasepool{
+ captureTimer=0;if(!closing&&!fatal)refreshSource();finishCaptureWaiters();return G_SOURCE_REMOVE;
+}}
+static void whenSourceCurrent(void (^done)(void)){
+ gint64 now=g_get_monotonic_time();
+ if(!(frameReady()&&(sourceDirty||!cacheValid()))){done();return;}
+ if(now-lastDrawMono>=drawQuietUS){refreshSource();done();return;}
+ if(!captureWaiters)captureWaiters=[NSMutableArray new];[captureWaiters addObject:[done copy]];
+ if(!captureTimer)captureTimer=g_timeout_add((guint)((lastDrawMono+drawQuietUS-now+999)/1000),captureQuiet,NULL);
 }
 static void encodeIfDue(gint64 now){
  if(!fatal&&active&&cacheValid()&&encodeDirty&&(captureFPS<=streamFPS||VNFramePacingAdmit(&encodePacing,now,streamFPS)))encodeLatest(now,NO);
 }
+static gboolean flush(gpointer data);
+// When the flush has work, the earliest time it can do it, else -1: a refused copy
+// while frames are wanted, or a copy waiting for its encode slot.
+static gint64 flushDeadline(void){
+ if(closing||fatal)return -1;gint64 due=-1;
+ if(sourceDirty&&generationFD>=0&&captureWanted()){
+#ifdef VEYNODE_NATIVE_DISPLAY
+  due=VNFramePacingDue(&capturePacing,captureFPS);
+#else
+  due=lastCapture?lastCapture+encodeInterval():0;
+#endif
+ }
+ if(active&&encodeDirty&&cacheValid()&&captureFPS>streamFPS){gint64 slot=VNFramePacingDue(&encodePacing,streamFPS);due=due<0?slot:MIN(due,slot);}
+ return due;
+}
+static void scheduleFlush(gint64 now){
+ gint64 due=flushDeadline();
+ if(due<0){if(flushSource){g_source_remove(flushSource);flushSource=0;}return;}
+ if(flushSource&&flushDue<=due)return;
+ if(flushSource)g_source_remove(flushSource);
+ guint ms=due>now?(guint)((due-now+999)/1000):0;flushDue=now+(gint64)ms*1000;flushSource=g_timeout_add(ms,flush,NULL);
+}
 static void draw(SpiceDisplayChannel *channel,guint32 x,guint32 y,guint32 w,guint32 h,gpointer context){@autoreleasepool{
- received++;gint64 now=g_get_monotonic_time();
- captureSource(now);
- // Producer ACK is after the source copy, before encoding our owned buffer.
- spice_display_channel_gl_draw_done(channel);
- encodeIfDue(now);
+ received++;gint64 now=g_get_monotonic_time();noteDamage(x,y,w,h);lastDrawMono=now;
+ if(!surfaceLive())awaitSource(@"generation_retired_during_draw");
+ else{
+  // This draw is newer than any number a deferred draw took: a copy of it takes its own.
+  drawnGeneration=generation;lazySequence=NO;BOOL wanted=captureWanted(),waiting=captureWaiters.count>0;
+  if(!((wanted||waiting)&&captureSource(now,waiting))&&generationFD>=0){sequence++;lazySequence=YES;sourceDirty=YES;if(!wanted)deferredDraws++;}
+ }
+ // Producer ACK is after any source copy, before encoding our owned buffer.
+ ACK_DRAW(channel);
+ if(captureWaiters.count&&cacheValid()&&!sourceDirty)finishCaptureWaiters();
+ encodeIfDue(now);scheduleFlush(now);
 }}
 static gboolean flush(gpointer data){@autoreleasepool{
- if(closing||fatal)return G_SOURCE_CONTINUE;
+ flushSource=0;
+ if(closing||fatal)return G_SOURCE_REMOVE;
  gint64 now=g_get_monotonic_time();
- if(sourceDirty&&generationFD>=0&&surfaceLive())captureSource(now);
- encodeIfDue(now);
- return G_SOURCE_CONTINUE;
+ if(sourceDirty&&generationFD>=0&&captureWanted())captureSource(now,NO);
+ encodeIfDue(now);scheduleFlush(now);
+ return G_SOURCE_REMOVE;
 }}
 // Guest audio (Config::audio): SPICE playback PCM becomes kind-3 records
 // (u32 BE rate, u8 channels, s16le PCM) while a broker client listens, and
@@ -539,7 +658,7 @@ static void channelEvent(SpiceChannel *channel,SpiceChannelEvent event,gpointer 
  if(closing)return;
  if(channelLogCount++<32){int type=0,ident=0;g_object_get(channel,"channel-type",&type,"channel-id",&ident,NULL);NSData *log=[NSJSONSerialization dataWithJSONObject:@{@"event":@"channel-event",@"channel_type":@(type),@"channel_id":@(ident),@"event_code":@(event)} options:NSJSONWritingSortedKeys error:nil];fwrite(log.bytes,1,log.length,stderr);fputc('\n',stderr);fflush(stderr);}
  if(event==SPICE_CHANNEL_OPENED){if(SPICE_IS_MAIN_CHANNEL(channel))mainOpen=YES;if(SPICE_IS_DISPLAY_CHANNEL(channel))displayOpen=YES;
-  if(mainOpen&&displayOpen&&!readySent){readySent=YES;emit(0,@{@"event":@"ready",@"protocol":@1,@"capture_connected":@YES,@"frame_available":@(cacheValid())});}}
+  if(mainOpen&&displayOpen&&!readySent){readySent=YES;emit(0,@{@"event":@"ready",@"protocol":@1,@"capture_connected":@YES,@"frame_available":@(frameReady())});}}
  else if(event==SPICE_CHANNEL_CLOSED||event>=SPICE_CHANNEL_ERROR_CONNECT){
 #ifdef VEYNODE_NATIVE_DISPLAY
  VeynodeDisplayInvalidate();
@@ -565,7 +684,7 @@ static void windowCommand(NSString *method,NSString *ident,NSDictionary *frame,N
  if(displayCommandPending){reject(ident,0,@"native_window_busy");return;}displayCommandPending=YES;
  GMainContext *context=g_main_context_ref(g_main_loop_get_context(loop));
  VeynodeDisplayCommand(method,frame,diagnosticID,receiptFields,^(NSDictionary *result,NSString *error){
-  void (^finish)(void)=[^{displayCommandPending=NO;if(!closing&&!fatal){if(error)reject(ident,0,error);else{if([method isEqual:@"show_window"]&&cacheValid())VeynodeDisplayPublish(owned,generation,sequence,capturedMono);if([method isEqual:@"validate_displayed_frame"]){reply(ident,0,result);return;}NSMutableDictionary *status=[result mutableCopy];if(!copyTiming)copyTiming=[VNCopyTiming new];status[@"copy_timing"]=[copyTiming statistics];status[@"screenshot_timing"]=lastScreenshotTiming?:[NSNull null];status[@"source_width"]=@(cacheValid()?sourceWidth:0);status[@"source_height"]=@(cacheValid()?sourceHeight:0);status[@"source_frame_available"]=@(cacheValid());status[@"encoder_width"]=@(encoder?width:0);status[@"encoder_height"]=@(encoder?height:0);status[@"source_draw_events"]=@(received);status[@"source_copies"]=@(sourceCopies);status[@"capture_pacing_drops"]=@(capturePacingDrops);status[@"capture_pool_drops"]=@(capturePoolDrops);status[@"visible_source_copies"]=@(visibleSourceCopies);status[@"background_source_copies"]=@(backgroundSourceCopies);status[@"encoder_output_frames_current_epoch"]=@(encoded);status[@"encoder_idle_frames_current_epoch"]=@(idleFrames);status[@"encoder_unchanged_skips_current_epoch"]=@(unchangedSkips);status[@"encoder_active"]=@(active);status[@"sampled_monotonic_us"]=@(g_get_monotonic_time());reply(ident,0,status);}}} copy];
+  void (^finish)(void)=[^{displayCommandPending=NO;if(!closing&&!fatal){if(error)reject(ident,0,error);else{if([method isEqual:@"show_window"])whenSourceCurrent(^{if(!closing&&!fatal&&cacheValid())VeynodeDisplayPublish(owned,generation,sequence,capturedMono);});if([method isEqual:@"validate_displayed_frame"]){reply(ident,0,result);return;}NSMutableDictionary *status=[result mutableCopy];if(!copyTiming)copyTiming=[VNCopyTiming new];status[@"copy_timing"]=[copyTiming statistics];status[@"screenshot_timing"]=lastScreenshotTiming?:[NSNull null];BOOL ready=frameReady();status[@"source_width"]=@(ready?sourceWidth:0);status[@"source_height"]=@(ready?sourceHeight:0);status[@"source_frame_available"]=@(ready);status[@"encoder_width"]=@(encoder?width:0);status[@"encoder_height"]=@(encoder?height:0);status[@"source_draw_events"]=@(received);status[@"source_copies"]=@(sourceCopies);status[@"capture_pacing_drops"]=@(capturePacingDrops);status[@"capture_pool_drops"]=@(capturePoolDrops);status[@"visible_source_copies"]=@(visibleSourceCopies);status[@"background_source_copies"]=@(backgroundSourceCopies);status[@"on_demand_source_copies"]=@(onDemandCopies);status[@"source_deferred_draws"]=@(deferredDraws);status[@"encoder_output_frames_current_epoch"]=@(encoded);status[@"encoder_idle_frames_current_epoch"]=@(idleFrames);status[@"encoder_unchanged_skips_current_epoch"]=@(unchangedSkips);status[@"encoder_active"]=@(active);status[@"sampled_monotonic_us"]=@(g_get_monotonic_time());reply(ident,0,status);}}} copy];
   // A C trampoline owns the retained block; no stdout emission from AppKit.
   extern gboolean VeynodeConsoleInvoke(gpointer);
   extern void VeynodeConsoleInvokeFree(gpointer);
@@ -580,15 +699,24 @@ gboolean VeynodeConsoleInvoke(gpointer data){void (^block)(void)=(__bridge id)da
 void VeynodeConsoleInvokeFree(gpointer data){CFBridgingRelease(data);}
 #endif
 #ifdef VEYNODE_NATIVE_DISPLAY
-static void beginScreenshot(NSString *ident){
- if(screenshotJob||screenshotWrite){reject(ident,0,@"screenshot_busy");return;}
- if(!cacheValid()||!mainOpen||!displayOpen){emit(0,@{@"id":ident,@"error":@{@"code":@"frame_unavailable",@"message":@"frame_unavailable",@"diagnostic":VNScreenshotFailure(@"cache_invalid_before_copy",nil)}});return;}
+static gboolean screenshotTick(gpointer unused);
+static void armScreenshotTick(void){if(!screenshotSource)screenshotSource=g_timeout_add(10,screenshotTick,NULL);}
+static BOOL screenshotWaiting;
+static void admitScreenshot(NSString *ident){
+ if(!mainOpen||!displayOpen||!cacheValid()){emit(0,@{@"id":ident,@"error":@{@"code":@"frame_unavailable",@"message":@"frame_unavailable",@"diagnostic":VNScreenshotFailure(@"cache_invalid_before_copy",nil)}});return;}
  CVPixelBufferRef pixel=owned;
  if(!VeynodeDisplayRetain(pixel)){reject(ident,0,@"frame_unavailable");return;}
  screenshotID=[ident copy];screenshotMetadata=@{@"source_generation":@(generation),@"source_sequence":@(sequence),@"captured_at_us":@(capturedWall),@"captured_monotonic_us":@(capturedMono),@"width":@(sourceWidth),@"height":@(sourceHeight),@"coordinate_space":@"guest-physical-pixels",@"mime_type":@"image/png"};
  screenshotTiming=[@{@"version":@1,@"timing_clock":@"CLOCK_MONOTONIC",@"source_generation":@(generation),@"source_sequence":@(sequence),@"admitted_monotonic_us":@(nativeClock()*1e6),@"success":@NO} mutableCopy];
  screenshotDeadline=nativeClock()+2.0;screenshotDelivered=NO;
  screenshotJob=[[VNAsyncScreenshot alloc] initWithPixel:pixel metadata:screenshotMetadata requestID:screenshotID release:^{VeynodeDisplayRelease(pixel);}];
+ armScreenshotTick();
+}
+static void beginScreenshot(NSString *ident){
+ if(screenshotJob||screenshotWrite||screenshotWaiting){reject(ident,0,@"screenshot_busy");return;}
+ screenshotWaiting=YES;NSString *request=[ident copy];
+ // A shutdown or teardown while it waited answers for it (see the screenshot tick).
+ whenSourceCurrent(^{screenshotWaiting=NO;if(!closing&&!fatal&&!shutdownID)admitScreenshot(request);});
 }
 static gboolean screenshotTick(gpointer unused){
  if(outputWriter.failed){captureFail(@"stdout_closed_or_stalled");return G_SOURCE_CONTINUE;}
@@ -617,9 +745,10 @@ static gboolean screenshotTick(gpointer unused){
  }
  if(shutdownID){
   if(nativeClock()>=shutdownDeadline){captureFail(@"screenshot_shutdown_deadline");return G_SOURCE_CONTINUE;}
-  if(!screenshotJob&&!shutdownReplied){reply(shutdownID,0,@{@"state":@"stopped"});shutdownReplied=YES;}
+  if(!screenshotJob&&!screenshotWaiting&&!shutdownReplied){reply(shutdownID,0,@{@"state":@"stopped"});shutdownReplied=YES;}
   if(shutdownReplied&&outputWriter.pending==0){closing=YES;g_main_loop_quit(loop);}
  }
+ if(!screenshotJob&&!shutdownID){screenshotSource=0;return G_SOURCE_REMOVE;}
  return G_SOURCE_CONTINUE;
 }
 #endif
@@ -677,7 +806,7 @@ static void command(NSData *line){
  }
  if([method isEqual:@"shutdown"]){closeEncoder();
 #ifdef VEYNODE_NATIVE_DISPLAY
- shutdownID=[ident copy];shutdownDeadline=nativeClock()+2.5;[screenshotJob invalidate];
+ shutdownID=[ident copy];shutdownDeadline=nativeClock()+2.5;[screenshotJob invalidate];armScreenshotTick();
 #else
  reply(ident,0,@{@"state":@"stopped"});closing=YES;g_main_loop_quit(loop);
 #endif
@@ -686,10 +815,11 @@ static void command(NSData *line){
 #ifdef VEYNODE_NATIVE_DISPLAY
  beginScreenshot(ident);
 #else
- NSDictionary *diagnostic=nil;NSDictionary *png=screenshot(&diagnostic);if(png){NSData *body=VNScreenshotResponseData(ident,png);if(body)record(1,0,body);else captureFail(@"json_serialization_failed");}else{NSString *code=cacheValid()?@"screenshot_unavailable_or_too_large":@"frame_unavailable";emit(0,@{@"id":ident,@"error":@{@"code":code,@"message":code,@"diagnostic":diagnostic}});}
+ NSString *request=[ident copy];
+ whenSourceCurrent(^{if(closing||fatal)return;NSDictionary *diagnostic=nil;NSDictionary *png=screenshot(&diagnostic);if(png){NSData *body=VNScreenshotResponseData(request,png);if(body)record(1,0,body);else captureFail(@"json_serialization_failed");}else{NSString *code=cacheValid()?@"screenshot_unavailable_or_too_large":@"frame_unavailable";emit(0,@{@"id":request,@"error":@{@"code":code,@"message":code,@"diagnostic":diagnostic}});}});
 #endif
  return;}
- if([method isEqual:@"frame_status"]){BOOL valid=cacheValid();reply(ident,0,@{@"capture_connected":(mainOpen&&displayOpen&&!fatal)?@YES:@NO,@"frame_available":valid?@YES:@NO,@"source_generation":@(generation),@"source_sequence":@(sequence),@"width":@(valid?sourceWidth:0),@"height":@(valid?sourceHeight:0)});return;}
+ if([method isEqual:@"frame_status"]){BOOL valid=frameReady();reply(ident,0,@{@"capture_connected":(mainOpen&&displayOpen&&!fatal)?@YES:@NO,@"frame_available":valid?@YES:@NO,@"source_generation":@(generation),@"source_sequence":@(sequence),@"width":@(valid?sourceWidth:0),@"height":@(valid?sourceHeight:0)});return;}
  id requested=request[@"epoch"];double number=[requested isKindOfClass:NSNumber.class]?[requested doubleValue]:0;
  if(![requested isKindOfClass:NSNumber.class]||CFGetTypeID((__bridge CFTypeRef)requested)==CFBooleanGetTypeID()||!isfinite(number)||number<1||number>9007199254740991.0||floor(number)!=number){reject(ident,0,@"invalid_epoch");return;}uint64_t e=(uint64_t)number;
  if([method isEqual:@"start"]){
@@ -698,7 +828,10 @@ static void command(NSData *line){
   id level=request[@"level"];if(level&&(![level isKindOfClass:NSNumber.class]||CFGetTypeID((__bridge CFTypeRef)level)==CFBooleanGetTypeID()||![codec isEqual:@"h264"]||([level intValue]!=31&&[level intValue]!=40))){reject(ident,e,@"unsupported_level");return;}
   h264Level=level?[level intValue]:31;
   epoch=lastEpoch=e;codecName=codec;useHEVC=[codec isEqual:@"hevc"];active=YES;streamFPS=maxStreamFPS;encodePacing.initialized=false;forceKeyframe=YES;cropX=cropY=cropWidth=cropHeight=scaleWidth=scaleHeight=0;carriedBitrate=nil;firstPTS=lastEncode=0;encoded=keyframes=idleFrames=unchangedSkips=0;actualH264Profile=nil;actualHEVCProfile=nil;hardwareVerified=NO;failure=nil;
-  reply(ident,e,@{@"state":cacheValid()?@"encoding":@"waiting-frame",@"epoch":@(epoch),@"frame_available":@(cacheValid())});if(cacheValid())encodeLatest(g_get_monotonic_time(),NO);return;
+  BOOL ready=frameReady();
+  reply(ident,e,@{@"state":ready?@"encoding":@"waiting-frame",@"epoch":@(epoch),@"frame_available":@(ready)});
+  // A draw that arrives first encodes through the normal path (firstPTS is then set).
+  whenSourceCurrent(^{if(!fatal&&active&&epoch==e&&!firstPTS&&cacheValid())encodeLatest(g_get_monotonic_time(),NO);});return;
  }
  if(!active||e!=epoch){reject(ident,e,@"stale_or_inactive_epoch");return;}
  if([@[@"rate_status",@"set_bitrate"] containsObject:method]){
@@ -734,19 +867,24 @@ static void command(NSData *line){
   if(!rateUInt(request[@"fps"],1,maxStreamFPS)){reject(ident,e,@"invalid_request");return;}
   streamFPS=[request[@"fps"] unsignedIntValue];reply(ident,e,@{@"fps":@(streamFPS)});return;
  }
- if([method isEqual:@"stop"]){closeEncoder();if(failure){reject(ident,e,@"encoder_drain_failed");failure=nil;return;}reply(ident,e,@{@"state":@"stopped",@"encoded":@(encoded),@"keyframes":@(keyframes),@"idle_frames":@(idleFrames),@"frame_available":@(cacheValid()),@"source_generation":@(generation),@"source_sequence":@(sequence)});return;}
+ if([method isEqual:@"stop"]){closeEncoder();if(failure){reject(ident,e,@"encoder_drain_failed");failure=nil;return;}reply(ident,e,@{@"state":@"stopped",@"encoded":@(encoded),@"keyframes":@(keyframes),@"idle_frames":@(idleFrames),@"frame_available":@(frameReady()),@"source_generation":@(generation),@"source_sequence":@(sequence)});return;}
  if([method isEqual:@"keyframe"]){forceKeyframe=YES;reply(ident,e,@{@"requested":@YES});if(cacheValid()&&g_get_monotonic_time()-lastEncode>=33333)encodeLatest(g_get_monotonic_time(),YES);return;}
  reject(ident,e,@"unsupported_method");
 }
 static gboolean control(GIOChannel *channel,GIOCondition condition,gpointer data){
  char bytes[1024];ssize_t count=read(STDIN_FILENO,bytes,sizeof(bytes));if(count==0){g_main_loop_quit(loop);return G_SOURCE_REMOVE;}if(count<0){if(errno==EINTR||errno==EAGAIN)return G_SOURCE_CONTINUE;captureFail(@"stdin_failed");return G_SOURCE_REMOVE;}
- for(ssize_t i=0;i<count;i++){if(bytes[i]=='\n'){command(input);[input setLength:0];}else{[input appendBytes:bytes+i length:1];if(input.length>4096){captureFail(@"command_line_limit");return G_SOURCE_REMOVE;}}if(fatal||closing)return G_SOURCE_REMOVE;}return G_SOURCE_CONTINUE;
+ for(ssize_t i=0;i<count;i++){if(bytes[i]=='\n'){command(input);[input setLength:0];}else{[input appendBytes:bytes+i length:1];if(input.length>4096){captureFail(@"command_line_limit");return G_SOURCE_REMOVE;}}if(fatal||closing)return G_SOURCE_REMOVE;}scheduleFlush(g_get_monotonic_time());return G_SOURCE_CONTINUE;
 }
 static gboolean tick(gpointer data){@autoreleasepool{
+#ifdef VEYNODE_NATIVE_DISPLAY
+ if(outputWriter.failed){captureFail(@"stdout_closed_or_stalled");return G_SOURCE_CONTINUE;}
+#endif
  if(generationFD>=0&&!surfaceLive()){awaitSource(@"generation_retired");return G_SOURCE_CONTINUE;}
  gint64 now=g_get_monotonic_time();
- if(active&&encoder&&!stillActive&&!stillFailed&&!forceKeyframe&&lastChange&&now-lastChange>=700000&&now-lastStill>=3000000){enterStill(now);return G_SOURCE_CONTINUE;}
- if(active&&cacheValid()&&((forceKeyframe&&now-lastEncode>=33333)||now-lastEncode>=1000000))encodeLatest(now,YES);return G_SOURCE_CONTINUE;
+ if(active&&encoder&&!stillActive&&!stillFailed&&!forceKeyframe&&lastChange&&now-lastChange>=700000&&now-lastStill>=3000000)enterStill(now);
+ else if(active&&cacheValid()&&((forceKeyframe&&now-lastEncode>=33333)||now-lastEncode>=1000000))encodeLatest(now,YES);
+ // A window that became visible (un-minimised, uncovered) gets the draw it missed.
+ scheduleFlush(now);return G_SOURCE_CONTINUE;
 }}
 static int probeCodecs(void){
  hardwareProbe=YES;width=height=64;NSMutableDictionary *result=[NSMutableDictionary new];
@@ -767,6 +905,7 @@ static int probeCodecs(void){
 int main(int argc,char **argv){@autoreleasepool{
 #ifdef VEYNODE_SCREENSHOT_TESTING
  if(argc==2&&!strcmp(argv[1],"--screenshot-pipeline-self-test"))return screenshotPipelineSelfTest();
+ if(argc==2&&!strcmp(argv[1],"--lazy-capture-self-test"))return lazyCaptureSelfTest();
 #endif
  lock=[NSLock new];if(argc==2&&!strcmp(argv[1],"--probe-capabilities")){NSData *json=[NSJSONSerialization dataWithJSONObject:displayCapabilities() options:NSJSONWritingSortedKeys error:nil];fwrite(json.bytes,1,json.length,stdout);fputc('\n',stdout);return 0;}if(argc==2&&!strcmp(argv[1],"--probe-codecs"))return probeCodecs();
  if(argc!=3||strcmp(argv[2],"--persistent")){fprintf(stderr,"Usage: spice-console SOCKET --persistent\n");return 2;}
@@ -775,10 +914,7 @@ int main(int argc,char **argv){@autoreleasepool{
  outputWriter=[[VNRecordWriter alloc] initWithFD:STDOUT_FILENO];if(!outputWriter)return 1;
 #endif
  loop=g_main_loop_new(NULL,FALSE);SpiceSession *session=spice_session_new();g_object_set(session,"unix-path",argv[1],"enable-audio",TRUE,NULL);g_signal_connect(session,"channel-new",G_CALLBACK(newChannel),NULL);
- GIOChannel *channel=g_io_channel_unix_new(STDIN_FILENO);g_io_add_watch(channel,G_IO_IN|G_IO_HUP|G_IO_ERR,control,NULL);g_timeout_add(100,tick,NULL);g_timeout_add(2,flush,NULL);
-#ifdef VEYNODE_NATIVE_DISPLAY
- g_timeout_add(10,screenshotTick,NULL);
-#endif
+ GIOChannel *channel=g_io_channel_unix_new(STDIN_FILENO);g_io_add_watch(channel,G_IO_IN|G_IO_HUP|G_IO_ERR,control,NULL);g_timeout_add(100,tick,NULL);
  if(!spice_session_connect(session))captureFail(@"spice_connect_failed");if(!fatal)g_main_loop_run(loop);
  #ifdef VEYNODE_NATIVE_DISPLAY
  // No success while a CPU task still owns a frame. ImageIO cannot be forcibly
@@ -795,5 +931,5 @@ int main(int argc,char **argv){@autoreleasepool{
  if(![outputWriter drainFor:.6]){if(!fatal)fatal=@"stdout_cleanup_unconfirmed";[outputWriter invalidate];[outputWriter drainFor:.1];if(outputWriter.pending){fputs("stdout_cleanup_unconfirmed\n",stderr);_exit(1);}}
 #endif
  if(generationFD>=0)close(generationFD);if(surface)CFRelease(surface);
- NSData *summary=[NSJSONSerialization dataWithJSONObject:@{@"event":@"capture-stopped",@"error":fatal?:[NSNull null],@"source_copies":@(sourceCopies),@"resize_copies":@(resizeCopies),@"draw_events":@(received),@"cached_frame_released":@YES} options:NSJSONWritingSortedKeys error:nil];fwrite(summary.bytes,1,summary.length,stderr);fputc('\n',stderr);return fatal?1:0;
+ NSData *summary=[NSJSONSerialization dataWithJSONObject:@{@"event":@"capture-stopped",@"error":fatal?:[NSNull null],@"source_copies":@(sourceCopies),@"on_demand_source_copies":@(onDemandCopies),@"deferred_draws":@(deferredDraws),@"resize_copies":@(resizeCopies),@"draw_events":@(received),@"cached_frame_released":@YES} options:NSJSONWritingSortedKeys error:nil];fwrite(summary.bytes,1,summary.length,stderr);fputc('\n',stderr);return fatal?1:0;
 }}

@@ -30,4 +30,13 @@ static inline bool VNFramePacingAdmit(VNFramePacing *p,int64_t now,unsigned fps)
     if(nextOrdinal<=p->ordinal)nextOrdinal=p->ordinal+1;
     p->ordinal=nextOrdinal;p->next=p->anchor+(int64_t)(nextOrdinal*1000000/fps);return true;
 }
+// The earliest time Admit accepts a frame at this rate: 0 when the cadence would
+// (re)start at once. A caller with a refused frame sleeps until then instead of polling.
+static inline int64_t VNFramePacingDue(const VNFramePacing *p,unsigned fps){
+    if(fps<1)fps=1;
+    if(fps>VN_VISIBLE_FPS)fps=VN_VISIBLE_FPS;
+    if(!p->initialized||p->fps!=fps)return 0;
+    int64_t early=1000000/fps/4;if(early>3000)early=3000;
+    return p->next-early;
+}
 #endif

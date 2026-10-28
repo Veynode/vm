@@ -109,6 +109,30 @@ this view; it does not change Guest resolution. Existing raw-row orientation is
 preserved; actual window orientation still requires Guest-grounded visual
 validation.
 
+Frames are copied at draw time only while someone sees them: a visible window or
+an active browser stream. Otherwise a draw is only recorded (its damage, the
+drawn generation and the next `source_sequence`) and acknowledged at once, with
+no GPU command before the ACK. A `screenshot`, a `start` or `show_window` then
+needs the latest drawn frame (`on_demand_source_copies`). After an ACK the Guest
+may already be rendering the next frame into the scanout, so a copy taken while
+it draws could be torn: if a draw came within the last 50 ms, the request waits
+and the next draw copies before its ACK, as a watched draw does; a screen quiet
+for 50 ms has nothing rendering and is copied at once, and a one-shot 50 ms timer
+(armed only while a request waits) copies if no further draw comes. A screenshot
+therefore waits at most 50 ms more and is never older than the last draw; one
+screenshot is in flight at a time, including while it waits. A window that
+becomes visible (un-minimized, uncovered; seen by the 100 ms tick) gets its
+missed frame through the flush, which copies between draws as it always has; a
+torn frame there is replaced by the next draw. `frame_status.frame_available` and
+`window_status.source_frame_available` mean the live generation has a drawn frame
+(copied or copyable now), and `source_sequence` advances on every draw, copied or
+not; an on-demand copy of deferred draws keeps the last of their numbers, and a
+copy made inside a draw takes a new one.
+The flush is a one-shot timer at the next capture or encode slot, armed only
+while a refused frame waits for a viewer's slot; the 10 ms screenshot tick runs
+only while a screenshot or shutdown is pending. An idle console with nothing
+visible wakes for its 100 ms liveness tick and the draws themselves.
+
 A lock-protected three-slot CVPixelBuffer pool provides explicit leases for the
 capture cache, latest display publication and GPU in-flight access. A slot is
 never reused or resized until all leases are released. If no slot is available,
@@ -185,7 +209,9 @@ The AppKit main thread publishes visible state under the existing lock. A window
 must be open, visible, not miniaturized, and have the public visible occlusion
 flag. While visible, source draw admission uses a rational deadline cadence at the
 window's screen refresh (`NSScreen.maximumFramesPerSecond`, read again when the
-window changes screen, at most 240 Hz); otherwise it uses 30 Hz. A draw may claim
+window changes screen, at most 240 Hz); with only a browser stream it uses the
+stream's rate, and with neither no copy is made at draw time (see
+[ownership](#ownership-and-display-path)). A draw may claim
 its slot a quarter slot (at most 3 ms) early. Closing clears visibility synchronously before the ACK.
 Generation replacement resets pacing. Delayed events skip missed slots without a
 catch-up queue. Source event jitter, GPU copy/encode cost and draw availability
@@ -200,7 +226,15 @@ Remote encoding has its own rate. A stream starts at 240 fps; the viewer's
 and resets at the next `start`. Capture runs at the faster of the visible window
 and the stream; when it runs faster than the stream, the encode gate paces on its
 own grid, otherwise every capture is encoded. A copy identical to the previous
-frame is not encoded and counts in `encoder_unchanged_skips_current_epoch`.
+frame is not encoded and counts in `encoder_unchanged_skips_current_epoch`. The
+comparison reads only the rows the draws since the last one damaged (SPICE's
+draw rectangle, plus its vertical mirror while the rectangle's orientation
+against the IOSurface rows is unverified), copies only the changed span, and
+reads nothing when no draw came in between (the idle refresh, keyframes). A new
+generation, a resize or an empty rectangle compares every row, as does a guest
+that damages the whole frame each flush (Windows ramfb), the case it exists for.
+A guest that changes rows outside its reported damage is caught by the one-second
+idle refresh, which encodes regardless.
 Encoder properties and the one-second idle refresh are unchanged.
 
 Additional capabilities (all limits/preferences, not observed performance):
@@ -221,7 +255,9 @@ Additional capabilities (all limits/preferences, not observed performance):
 
 `window_status` adds `capture_current_limit_fps`, `capture_native_visible`,
 `source_draw_events`, `source_copies`, `capture_pacing_drops`, `capture_pool_drops`,
-`visible_source_copies`, `background_source_copies`, `sampled_monotonic_us`,
+`visible_source_copies`, `background_source_copies` (on-demand copies with no
+visible window count here), `on_demand_source_copies`, `source_deferred_draws`
+(draws acknowledged without a copy because nobody watched), `sampled_monotonic_us`,
 `encoder_active`, `encoder_output_frames_current_epoch`, and
 `encoder_idle_frames_current_epoch`, `encoder_unchanged_skips_current_epoch`. Source counters are process-cumulative;
 encoder counts reset at an encoding epoch start and retain their last values
@@ -297,8 +333,8 @@ Window status now reports:
   zero when the display has no frame (including closed).
 - `viewport_width_pixels`, `viewport_height_pixels`: aspect-fit viewport inside
   the drawable; black letterboxing does not count as displayed Guest pixels.
-- `source_width`, `source_height`, `source_frame_available`: independent valid
-  capture cache, available even with the window closed.
+- `source_width`, `source_height`, `source_frame_available`: the live generation
+  has a drawn frame (copied, or copied on demand), even with the window closed.
 - `encoder_width`, `encoder_height`: actual configured active encoder dimensions,
   zero before encoder creation / after close.
 

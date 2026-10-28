@@ -30,8 +30,9 @@ static void cancellationAndException(void){
  }
  [VNAsyncScreenshot setTestBarrier:nil];puts("PASS cancellation and actual exception settle only after lease release; no private exception text");
 }
+// Incompressible 2560x1600 RGB is about 12 MB of PNG, past the 8 MiB bound (decision 0024).
 static void boundedPNG(void){
- VNFramePool *pool=[VNFramePool new];CVPixelBufferRef p=[pool acquireWidth:1280 height:800];CHECK(p);CHECK(CVPixelBufferLockBaseAddress(p,0)==0);uint8_t *bytes=CVPixelBufferGetBaseAddress(p);uint32_t state=1234567;for(size_t i=0;i<CVPixelBufferGetBytesPerRow(p)*800;i++){state^=state<<13;state^=state>>17;state^=state<<5;bytes[i]=(uint8_t)state;}CVPixelBufferUnlockBaseAddress(p,0);
+ VNFramePool *pool=[VNFramePool new];CVPixelBufferRef p=[pool acquireWidth:2560 height:1600];CHECK(p);CHECK(CVPixelBufferLockBaseAddress(p,0)==0);uint8_t *bytes=CVPixelBufferGetBaseAddress(p);uint32_t state=1234567;for(size_t i=0;i<CVPixelBufferGetBytesPerRow(p)*1600;i++){state^=state<<13;state^=state>>17;state^=state<<5;bytes[i]=(uint8_t)state;}CVPixelBufferUnlockBaseAddress(p,0);
  VNAsyncScreenshot *job=[[VNAsyncScreenshot alloc]initWithPixel:p metadata:meta() requestID:@"limit" release:^{[pool releasePixel:p];}];CHECK([job waitFor:4]);NSDictionary *r=job.resultIfFinished;CHECK([r[@"error"] isEqual:@"encoded_size_limit"]);CHECK([r[@"body"] length]==0);CHECK(r[@"diagnostic"][@"encoded_bytes"]==NSNull.null);CHECK([pool.statistics[@"leases"] unsignedIntegerValue]==0);puts("PASS actual incompressible PNG bounded sink overflow, no invented final length");
 }
 int main(void){@autoreleasepool{actualPixelsAndLeases();cancellationAndException();boundedPNG();}return 0;}
