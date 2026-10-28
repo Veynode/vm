@@ -360,7 +360,9 @@ impl DiskGuard {
         Ok(())
     }
     /// `device` is the guest-facing `-device` for drive `veynode-disk`
-    /// (see `qemu_uefi::disk_device`).
+    /// (see `qemu_uefi::disk_device`). When it names the disk iothread, the
+    /// iothread object is created here too. The writable disk passes guest
+    /// discards down (on macOS file-posix punches holes with F_PUNCHHOLE).
     pub fn configure_command(&self, command: &mut Command, device: &str) -> Result<()> {
         self.install_inheritance(command)?;
         command.args([
@@ -379,8 +381,15 @@ impl DiskGuard {
                 self.lock_opaque()
             ),
         ]);
-        command.arg("-blockdev").arg(serde_json::to_string(&json!({"driver":"file","node-name":"veynode-disk-file","filename":"/dev/fdset/1","locking":"on","cache":{"direct":false,"no-flush":false}}))?);
-        command.arg("-blockdev").arg(serde_json::to_string(&json!({"driver":"raw","node-name":"veynode-disk","file":"veynode-disk-file","read-only":false}))?);
+        let iothread = crate::qemu_uefi::DISK_IOTHREAD;
+        if device
+            .split(',')
+            .any(|p| p.strip_prefix("iothread=") == Some(iothread))
+        {
+            command.args(["-object", &format!("iothread,id={iothread}")]);
+        }
+        command.arg("-blockdev").arg(serde_json::to_string(&json!({"driver":"file","node-name":"veynode-disk-file","filename":"/dev/fdset/1","locking":"on","cache":{"direct":false,"no-flush":false},"discard":"unmap"}))?);
+        command.arg("-blockdev").arg(serde_json::to_string(&json!({"driver":"raw","node-name":"veynode-disk","file":"veynode-disk-file","read-only":false,"discard":"unmap"}))?);
         command.args(["-device", device]);
         Ok(())
     }
@@ -695,12 +704,9 @@ mod tests {
         let f = Fixture::new();
         let guard = f.open().unwrap();
         let mut c = Command::new("qemu");
-        guard
-            .configure_command(
-                &mut c,
-                "virtio-blk-pci,drive=veynode-disk,id=veynode-disk-device",
-            )
-            .unwrap();
+        let device =
+            "virtio-blk-pci,drive=veynode-disk,iothread=veynode-disk-io,id=veynode-disk-device";
+        guard.configure_command(&mut c, device).unwrap();
         let args: Vec<_> = c
             .get_args()
             .map(|x| x.to_str().unwrap().to_owned())
@@ -711,9 +717,28 @@ mod tests {
             .filter(|w| w[0] == "-blockdev")
             .map(|w| serde_json::from_str(&w[1]).unwrap())
             .collect();
+        assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0]["filename"], "/dev/fdset/1");
         assert_eq!(blocks[0]["locking"], "on");
+        assert_eq!(blocks[0]["discard"], "unmap");
         assert_eq!(blocks[1]["driver"], "raw");
+        assert_eq!(blocks[1]["file"], "veynode-disk-file");
+        assert_eq!(blocks[1]["discard"], "unmap");
+        assert!(blocks[1].get("detect-zeroes").is_none());
+        // The iothread exists before the device that names it.
+        let object = args.iter().position(|a| a == "-object").unwrap();
+        assert_eq!(args[object + 1], "iothread,id=veynode-disk-io");
+        assert_eq!(args[args.len() - 2..], ["-device", device]);
+        assert!(object < args.len() - 2);
+        // NVMe has no iothread property in QEMU 10.0: no object is created.
+        let mut nvme = Command::new("qemu");
+        guard
+            .configure_command(
+                &mut nvme,
+                "nvme,drive=veynode-disk,serial=veynode-disk,id=veynode-disk-device",
+            )
+            .unwrap();
+        assert!(!nvme.get_args().any(|a| a == "-object"));
         let good = json!([{"fdset-id":1,"fds":[{"fd":31,"opaque":guard.disk_opaque()}]},{"fdset-id":2,"fds":[{"fd":32,"opaque":guard.lock_opaque()}]}]);
         guard.verify_fdsets(&good).unwrap();
         for bad in [json!([]), json!({}), json!([good[0], good[0], good[1]])] {
@@ -831,7 +856,7 @@ else:
         guard
             .configure_command(
                 &mut template,
-                "virtio-blk-pci,drive=veynode-disk,id=veynode-disk-device",
+                "virtio-blk-pci,drive=veynode-disk,iothread=veynode-disk-io,id=veynode-disk-device",
             )
             .unwrap();
         let args: Vec<_> = template.get_args().map(|x| x.to_owned()).collect();
@@ -855,7 +880,8 @@ else:
             .arg(format!("unix:{},server=on,wait=off", socket.display()))
             // machine none has no PCI bus; the fixed virtio-blk device is tested
             // separately by actual VM acceptance. This tests the identical raw
-            // file nodes and inherited lock set in the actual QEMU implementation.
+            // file nodes, disk iothread and inherited lock set in the actual
+            // QEMU implementation.
             .args(&args[..args.len() - 2])
             .stdin(Stdio::null())
             .stdout(Stdio::null())

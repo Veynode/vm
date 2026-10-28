@@ -258,10 +258,17 @@ impl DiskBus {
     }
 }
 
-/// `-device` for the primary disk (drive `veynode-disk`).
+/// The iothread the writable virtio-blk disk runs on, off the main loop
+/// (`qemu_disk::DiskGuard::configure_command` creates it).
+pub const DISK_IOTHREAD: &str = "veynode-disk-io";
+
+/// `-device` for the primary disk (drive `veynode-disk`). QEMU 10.0's `nvme`
+/// has no `iothread` property, so it stays on the main loop.
 pub fn disk_device(config: &Config) -> &'static str {
     match config.qemu_disk_bus {
-        DiskBus::Virtio => "virtio-blk-pci,drive=veynode-disk,id=veynode-disk-device",
+        DiskBus::Virtio => {
+            "virtio-blk-pci,drive=veynode-disk,iothread=veynode-disk-io,id=veynode-disk-device"
+        }
         DiskBus::Nvme => "nvme,drive=veynode-disk,serial=veynode-disk,id=veynode-disk-device",
     }
 }
@@ -484,6 +491,7 @@ mod tests {
         let nvme = config(&root, json!({"guest":"windows","qemu_disk_bus":"nvme"}));
         nvme.validate().unwrap();
         assert!(disk_device(&nvme).starts_with("nvme,drive=veynode-disk,"));
+        assert!(!disk_device(&nvme).contains("iothread"));
         assert!(config(
             &root,
             json!({"backend":"apple-virtualization","qemu_disk_bus":"nvme"})
@@ -515,7 +523,11 @@ mod tests {
         .validate()
         .is_err());
         let linux = config(&root, json!({}));
-        assert!(disk_device(&linux).starts_with("virtio-blk-pci,"));
+        assert_eq!(
+            disk_device(&linux),
+            "virtio-blk-pci,drive=veynode-disk,iothread=veynode-disk-io,id=veynode-disk-device"
+        );
+        assert!(disk_device(&linux).contains(&format!(",iothread={DISK_IOTHREAD},")));
         assert_eq!(
             extra_disk_devices(&linux, 0),
             [
