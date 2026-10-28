@@ -48,13 +48,18 @@ use crate::{desktop_input, home};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::{
+    collections::HashSet,
     io::{BufRead, BufReader, Read, Write},
-    os::{fd::AsRawFd, unix::fs::DirBuilderExt, unix::net::UnixStream},
+    net::Shutdown,
+    os::{
+        fd::AsRawFd,
+        unix::{fs::DirBuilderExt, net::UnixStream, process::CommandExt},
+    },
     path::PathBuf,
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
+        mpsc, Arc, Condvar, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -102,6 +107,100 @@ struct Session {
     /// `linux`, `windows` or `macos`, for the browser's shortcut mapping.
     guest: String,
     link: Option<AudioLink>,
+    /// A QEMU VM's one encoder session, released when the session is dropped.
+    _gate: Option<EncoderGate>,
+}
+
+/// The QEMU VMs whose encoder session is running. The console broker takes
+/// one encoder at a time, so a viewer that reconnects waits here until the
+/// previous session has stopped its encoder instead of being refused as busy.
+static ENCODING: (Mutex<Option<HashSet<String>>>, Condvar) = (Mutex::new(None), Condvar::new());
+
+struct EncoderGate(String);
+
+impl EncoderGate {
+    /// The VM's gate, or `None` once `wait` passes with another session still
+    /// holding it (a live viewer of another client: the broker then refuses).
+    fn enter(vm: &str, wait: Duration) -> Option<Self> {
+        let deadline = Instant::now() + wait;
+        let mut running = ENCODING.0.lock().unwrap();
+        while running.get_or_insert_with(HashSet::new).contains(vm) {
+            let left = deadline.checked_duration_since(Instant::now())?;
+            running = ENCODING.1.wait_timeout(running, left).unwrap().0;
+        }
+        running
+            .get_or_insert_with(HashSet::new)
+            .insert(vm.to_owned());
+        Some(Self(vm.to_owned()))
+    }
+}
+
+impl Drop for EncoderGate {
+    fn drop(&mut self) {
+        if let Some(running) = ENCODING.0.lock().unwrap().as_mut() {
+            running.remove(&self.0);
+        }
+        ENCODING.1.notify_all();
+    }
+}
+
+/// A socket pair whose second end `command`'s child gets as `flag FD`. The
+/// end stays close-on-exec here and is cleared only in that child, so a spawn
+/// on another daemon thread can never inherit it.
+fn encoder_channel(command: &mut Command, flag: &str) -> Result<(UnixStream, UnixStream)> {
+    let (ours, theirs) = UnixStream::pair()?;
+    let fd = theirs.as_raw_fd();
+    command.args([flag, &fd.to_string()]);
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok((ours, theirs))
+}
+
+/// The session's own connection to the QEMU console broker: requests go
+/// through `link`, a thread turns its records into events. Dropping it shuts
+/// the connection, which ends that thread and frees the broker's slot at once
+/// (the broker serves 8 connections and drops an idle one only after 300 s).
+struct BrokerLink {
+    link: Arc<Mutex<UnixStream>>,
+    socket: UnixStream,
+}
+
+impl BrokerLink {
+    fn start(link: UnixStream, hearing: Arc<AtomicBool>, out: Out) -> Result<Self> {
+        let socket = link.try_clone()?;
+        let reader = link.try_clone()?;
+        thread::spawn(move || pump_audio(reader, true, hearing, out));
+        let link = Arc::new(Mutex::new(link));
+        // The broker ends a connection that sends nothing for 300 s (a muted microphone).
+        let keepalive = Arc::downgrade(&link);
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(60));
+            let Some(link) = keepalive.upgrade() else {
+                return;
+            };
+            let line = b"{\"request_id\":\"keepalive\",\"method\":\"status\"}\n";
+            if link.lock().unwrap().write_all(line).is_err() {
+                return;
+            }
+        });
+        Ok(Self { link, socket })
+    }
+
+    fn send(&self, line: &[u8]) -> std::io::Result<()> {
+        self.link.lock().unwrap().write_all(line)
+    }
+}
+
+impl Drop for BrokerLink {
+    fn drop(&mut self) {
+        let _ = self.socket.shutdown(Shutdown::Both);
+    }
 }
 
 /// Where Guest audio comes from and the microphone goes.
@@ -453,20 +552,17 @@ impl Session {
         let mut command;
         let mut rate = None;
         let mut audio = None;
+        let mut gate = None;
         let session_backend = match (backend, guest) {
             ("qemu-hvf", _) => {
                 let console = status["runtime"]["console_socket"]
                     .as_str()
                     .context("this QEMU VM has no persistent console; register the console broker and restart it")?;
+                // A replaced viewer's session stops its encoder within about 3 s.
+                gate = EncoderGate::enter(&vm, Duration::from_secs(4));
                 command = Command::new(sibling("vm-console-stream")?);
                 command.args([console, "--codec", codec]);
-                let (controller, encoder_end) = UnixStream::pair()?;
-                // std opens descriptors close-on-exec; the encoder's end must survive the exec.
-                if unsafe { libc::fcntl(encoder_end.as_raw_fd(), libc::F_SETFD, 0) } != 0 {
-                    return Err(std::io::Error::last_os_error().into());
-                }
-                command.args(["--rate-control-fd", &encoder_end.as_raw_fd().to_string()]);
-                rate = Some((controller, encoder_end));
+                rate = Some(encoder_channel(&mut command, "--rate-control-fd")?);
                 // Linux Guests share the clipboard through the broker too.
                 if has_audio || guest == "linux" {
                     audio = Some((AudioLink::Broker(UnixStream::connect(console)?), None));
@@ -514,11 +610,7 @@ impl Session {
                     command.arg("--tracks");
                 }
                 if has_audio {
-                    let (relay_end, encoder_end) = UnixStream::pair()?;
-                    if unsafe { libc::fcntl(encoder_end.as_raw_fd(), libc::F_SETFD, 0) } != 0 {
-                        return Err(std::io::Error::last_os_error().into());
-                    }
-                    command.args(["--audio-fd", &encoder_end.as_raw_fd().to_string()]);
+                    let (relay_end, encoder_end) = encoder_channel(&mut command, "--audio-fd")?;
                     audio = Some((AudioLink::Encoder(relay_end), Some(encoder_end)));
                 }
                 Backend::Apple { bridge_dir }
@@ -553,6 +645,7 @@ impl Session {
                     guest: guest.to_owned(),
                     // The encoder's end closes here, in the parent, once the child holds it.
                     link: audio.map(|(link, _encoder_end)| link),
+                    _gate: gate,
                 })
             }
             Err(error) => {
@@ -616,9 +709,11 @@ fn pump_video(mut from: impl Read, out: Out, tracks: bool) -> Result<()> {
     }
 }
 
-/// Encoder diagnostics are JSON lines; pass them through as events.
-fn pump_diagnostics(from: impl Read, out: Out) {
+/// Encoder diagnostics are JSON lines; pass them through as events. `last`
+/// keeps the latest line, the reason an encoder that fails prints last.
+fn pump_diagnostics(from: impl Read, out: Out, last: &Mutex<Option<String>>) {
     for line in BufReader::new(from).lines().map_while(Result::ok) {
+        *last.lock().unwrap() = Some(line.chars().take(400).collect());
         let value = serde_json::from_str::<Value>(&line)
             .unwrap_or_else(|_| json!({"text":line.chars().take(400).collect::<String>()}));
         // The guest agent's clipboard events reach the encoder as guest diagnostics.
@@ -742,26 +837,10 @@ fn run(name: &str, codec: &str, tracks: bool, io: &StreamIo) -> Result<i32> {
     )?;
     // The broker connection takes requests from the input thread; the encoder's audio socket only reads.
     let hearing = Arc::new(AtomicBool::new(false));
+    // Dropped on every way out of this function, which closes the broker connection.
     let broker = match session.link.take() {
         Some(AudioLink::Broker(link)) => {
-            let reader = link.try_clone()?;
-            let audio_out = out.clone();
-            let hearing = hearing.clone();
-            thread::spawn(move || pump_audio(reader, true, hearing, audio_out));
-            let link = Arc::new(Mutex::new(link));
-            // The broker ends a connection that sends nothing for 300 s (a muted microphone).
-            let keepalive = Arc::downgrade(&link);
-            thread::spawn(move || loop {
-                thread::sleep(Duration::from_secs(60));
-                let Some(link) = keepalive.upgrade() else {
-                    return;
-                };
-                let line = b"{\"request_id\":\"keepalive\",\"method\":\"status\"}\n";
-                if link.lock().unwrap().write_all(line).is_err() {
-                    return;
-                }
-            });
-            Some(link)
+            Some(BrokerLink::start(link, hearing.clone(), out.clone())?)
         }
         Some(AudioLink::Encoder(link)) => {
             let audio_out = out.clone();
@@ -790,7 +869,9 @@ fn run(name: &str, codec: &str, tracks: bool, io: &StreamIo) -> Result<i32> {
     };
     let video_thread = thread::spawn(move || pump_video(video, video_out, multi_track));
     let diag_out = out.clone();
-    thread::spawn(move || pump_diagnostics(diagnostics, diag_out));
+    let last_diagnostic = Arc::new(Mutex::new(None));
+    let last = last_diagnostic.clone();
+    let diag_thread = thread::spawn(move || pump_diagnostics(diagnostics, diag_out, &last));
 
     // Browser input arrives as control messages; the encoder ends on its own
     // on failure.
@@ -834,7 +915,7 @@ fn run(name: &str, codec: &str, tracks: bool, io: &StreamIo) -> Result<i32> {
                     let mut line = serde_json::to_vec(&line).unwrap_or_default();
                     line.push(b'\n');
                     let _ = match &broker {
-                        Some(broker) => broker.lock().unwrap().write_all(&line),
+                        Some(broker) => broker.send(&line),
                         None => control.lock().unwrap().write_all(&line),
                     };
                 }
@@ -845,7 +926,7 @@ fn run(name: &str, codec: &str, tracks: bool, io: &StreamIo) -> Result<i32> {
                     (Ok(line), Some(broker)) => {
                         let mut bytes = serde_json::to_vec(&line).unwrap_or_default();
                         bytes.push(b'\n');
-                        let _ = broker.lock().unwrap().write_all(&bytes);
+                        let _ = broker.send(&bytes);
                         continue;
                     }
                     (Ok(_), None) => "this desktop has no Guest pointer or monitor link".to_owned(),
@@ -895,7 +976,7 @@ fn run(name: &str, codec: &str, tracks: bool, io: &StreamIo) -> Result<i32> {
                             let mut line = serde_json::to_vec(&line).unwrap_or_default();
                             line.push(b'\n');
                             let _ = match &broker {
-                                Some(broker) => broker.lock().unwrap().write_all(&line),
+                                Some(broker) => broker.send(&line),
                                 None => control.lock().unwrap().write_all(&line),
                             };
                         }
@@ -963,10 +1044,18 @@ fn run(name: &str, codec: &str, tracks: bool, io: &StreamIo) -> Result<i32> {
     }
     let result = video_thread.join().unwrap();
     let status = session.child.wait()?;
-    let message = match result {
+    // Its stderr ends with it; give the last line a moment to arrive.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !diag_thread.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let mut message = match result {
         Err(error) => format!("{error:#}"),
         Ok(()) => format!("encoder exited ({status})"),
     };
+    if let Some(last) = last_diagnostic.lock().unwrap().take() {
+        message = format!("{message}: {last}");
+    }
     event(&out, json!({"event":"error","message":message}))?;
     session.stop(&input);
     Ok(1)
@@ -1330,5 +1419,71 @@ mod tests {
         for qemu_bad in ["@1 keyframe", "track add 1"] {
             assert_eq!(encoder_line(qemu_bad, true), None, "{qemu_bad}");
         }
+    }
+
+    #[test]
+    fn an_ended_session_holds_no_broker_connection() {
+        let (ours, broker) = UnixStream::pair().unwrap();
+        let out: Out = Arc::new(Mutex::new(Box::new(std::io::sink())));
+        let link = BrokerLink::start(ours, Arc::new(AtomicBool::new(true)), out).unwrap();
+        link.send(b"{\"request_id\":\"cursor\",\"method\":\"cursor_watch\"}\n")
+            .unwrap();
+        drop(link);
+        // The audio reader still waits on the connection; only its shutdown
+        // lets the broker see the end and free the slot.
+        broker
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut seen = String::new();
+        (&broker)
+            .read_to_string(&mut seen)
+            .expect("the broker sees the connection end");
+        assert_eq!(
+            seen,
+            "{\"request_id\":\"cursor\",\"method\":\"cursor_watch\"}\n"
+        );
+    }
+
+    #[test]
+    fn an_encoder_channel_reaches_only_its_own_child() {
+        // `sh -c SCRIPT sh FLAG FD`: the script checks the descriptor in `$2`.
+        let probe = || {
+            let mut sh = Command::new("/bin/sh");
+            sh.args(["-c", "[ -e /dev/fd/$2 ]", "sh"]);
+            sh
+        };
+        let mut encoder = probe();
+        let (_ours, theirs) = encoder_channel(&mut encoder, "--rate-control-fd").unwrap();
+        let fd = theirs.as_raw_fd();
+        // Close-on-exec here until the encoder's own exec, so a spawn from
+        // any other daemon thread goes without it.
+        assert_ne!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        let other = probe().args(["--other", &fd.to_string()]).status().unwrap();
+        assert!(
+            !other.success(),
+            "an unrelated child inherited the encoder's end"
+        );
+        assert!(
+            encoder.status().unwrap().success(),
+            "the encoder lacks its end"
+        );
+    }
+
+    #[test]
+    fn a_reconnecting_viewer_waits_for_the_previous_encoder() {
+        let vm = format!("gate-{}", random_hex(4));
+        let first = EncoderGate::enter(&vm, Duration::ZERO).unwrap();
+        assert!(EncoderGate::enter(&vm, Duration::from_millis(50)).is_none());
+        let waiter = {
+            let vm = vm.clone();
+            thread::spawn(move || EncoderGate::enter(&vm, Duration::from_secs(5)).is_some())
+        };
+        thread::sleep(Duration::from_millis(100));
+        drop(first);
+        assert!(waiter.join().unwrap());
+        assert!(EncoderGate::enter(&format!("{vm}-other"), Duration::ZERO).is_some());
     }
 }
