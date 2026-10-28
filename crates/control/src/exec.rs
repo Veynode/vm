@@ -214,6 +214,14 @@ pub(crate) fn advertised_async_timeout(info: &Value, qemu_exec: bool) -> u64 {
             maximum.min(ASYNC_EXEC_MAX_TIMEOUT_MS)
         })
 }
+/// The pause after the `polls`-th `exec_poll` of a synchronous command that is
+/// still running: 2, 4, 8, 16, 32 ms, then every 50 ms. A short command is
+/// answered a few milliseconds after it ends; a long one costs no more polls
+/// than a steady 50 ms. There is no server-side wait to block on: each poll
+/// is answered by the Guest.
+pub(crate) fn exec_poll_delay(polls: u32) -> Duration {
+    Duration::from_millis((2u64 << polls.min(5)).min(50))
+}
 pub(crate) fn synchronous_exec(dir: &Path, arguments: Value, peer: &UnixStream) -> Result<Value> {
     // The shared asynchronous start route has a longer host ceiling. Do not
     // inherit that ceiling into the synchronous API or its 35-second waiter.
@@ -228,6 +236,7 @@ pub(crate) fn synchronous_exec(dir: &Path, arguments: Value, peer: &UnixStream) 
         .context("guest returned no job identity")?;
     let job = json!({"id":arguments["id"],"job_id":job_id});
     let deadline = std::time::Instant::now() + Duration::from_secs(35);
+    let mut polls = 0;
     let result = (|| loop {
         if peer_disconnected(&[peer.as_raw_fd()]) {
             bail!("command client disconnected")
@@ -239,7 +248,8 @@ pub(crate) fn synchronous_exec(dir: &Path, arguments: Value, peer: &UnixStream) 
         if let Some(result) = completed_exec_result(&reply)? {
             return Ok(result);
         }
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(exec_poll_delay(polls));
+        polls += 1;
     })();
     if let Err(error) = result {
         return match call(dir, "exec_cancel", job) {
@@ -252,4 +262,18 @@ pub(crate) fn synchronous_exec(dir: &Path, arguments: Value, peer: &UnixStream) 
         };
     }
     result
+}
+
+#[cfg(test)]
+mod poll_tests {
+    use super::*;
+
+    #[test]
+    fn synchronous_polls_start_fast_and_settle_at_50_ms() {
+        let delays: Vec<u64> = (0..8)
+            .map(|n| exec_poll_delay(n).as_millis() as u64)
+            .collect();
+        assert_eq!(delays, [2, 4, 8, 16, 32, 50, 50, 50]);
+        assert_eq!(exec_poll_delay(u32::MAX), Duration::from_millis(50));
+    }
 }
