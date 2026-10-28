@@ -31,6 +31,15 @@
   }
 }
 
+/* The desktop window in fullscreen: the whole screen, toolbar kept (core's computer window). */
+.console-window:fullscreen {
+  width: 100vw !important;
+  height: 100dvh !important;
+  max-width: none !important;
+  max-height: none !important;
+  border-radius: 0 !important;
+}
+
 /* Phone page motion and swipe back, copied from core packages/console/src/styles/base.css
    (219ab4f56): the styles `useSwipeBack` (vendor/veynode-ui/boardui/overlays/swipe-back.tsx)
    and `pageTransition` (vendor/veynode-console/lib/page-transition.ts) draw with. */
@@ -118,4 +127,122 @@ html[data-page-motion="pop"]::view-transition-new(root) {
     transform: translateX(-25%);
     filter: brightness(0.84);
   }
+}
+
+/* The desktop dock's panel (desktop-dock.tsx), copied from core
+   packages/console/src/styles/working-menu.css: BoardUI's menu opening (in
+   140ms from the trigger, up 4px and from .97; out in 100ms, fading only), and
+   the shared panel that moves and resizes to the next button's contents while
+   they cross-fade. */
+.board-menu-motion {
+  transform-origin: var(--trigger-anchor-point, 50% 50%);
+}
+.board-menu-motion[data-entering] {
+  animation: menu-open 140ms cubic-bezier(0.2, 0, 0, 1) both;
+}
+.board-menu-motion[data-exiting] {
+  animation: menu-close 100ms cubic-bezier(0.4, 0, 1, 1) both;
+  pointer-events: none;
+}
+@keyframes menu-open {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes menu-close {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+/* `shadow-float` without its inset top highlight: the panel hangs right under
+   the window's toolbar, where that highlight stacks on the 1px ring into a
+   brighter, doubled top edge. Same ring and shadow, one 1px on every side. */
+.dock-panel {
+  box-shadow:
+    0 0 0 1px rgb(15 18 25 / 0.06),
+    0 1px 2px rgb(15 18 25 / 0.06),
+    0 10px 24px -10px rgb(15 18 25 / 0.22);
+}
+.dark .dock-panel {
+  box-shadow:
+    0 0 0 1px rgb(255 255 255 / 0.08),
+    0 10px 28px -8px rgb(0 0 0 / 0.65);
+}
+.dock-panel[data-morph] {
+  transition-property: left, top, width, height;
+  transition-duration: 200ms;
+  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+}
+.dock-panel-slot {
+  transition: opacity 200ms ease-out;
+}
+.dock-panel-slot:not([data-current]) {
+  opacity: 0;
+  pointer-events: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .board-menu-motion[data-entering],
+  .board-menu-motion[data-exiting],
+  .dock-panel[data-morph],
+  .dock-panel-slot {
+    animation: none;
+    transition: none;
+  }
+}
+
+/* The volume: core's Slider (a 4px ink-3 track, the accent fill up to the
+   value, a 16px ink thumb) on a range input. `--fill` is the value. */
+.volume-slider {
+  appearance: none;
+  display: block;
+  width: 100%;
+  height: 16px;
+  background: transparent;
+  cursor: pointer;
+  outline: none;
+}
+.volume-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 9999px;
+  background: linear-gradient(to right, var(--color-accent-500) var(--fill, 0%), var(--color-ink-3) var(--fill, 0%));
+}
+.volume-slider::-moz-range-track {
+  height: 4px;
+  border-radius: 9999px;
+  background: var(--color-ink-3);
+}
+.volume-slider::-moz-range-progress {
+  height: 4px;
+  border-radius: 9999px;
+  background: var(--color-accent-500);
+}
+.volume-slider::-webkit-slider-thumb {
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  margin-top: -6px;
+  border: 0;
+  border-radius: 9999px;
+  background: var(--color-ink);
+}
+.volume-slider::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border: 0;
+  border-radius: 9999px;
+  background: var(--color-ink);
+}
+.volume-slider:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 2px var(--color-focus);
+}
+.volume-slider:focus-visible::-moz-range-thumb {
+  box-shadow: 0 0 0 2px var(--color-focus);
 }

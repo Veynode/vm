@@ -1,24 +1,28 @@
-// Browser desktop relay: one WebSocket per viewer, bridged to a
-// `veynodevm desktop --stream` child. Encoded access units go out as binary
-// messages (u64 pts_us, u8 keyframe, Annex B) as soon as they arrive; input
-// comes back as JSON text. Minimal RFC 6455 server, no dependency: text and
+// Browser desktop relay: one WebSocket per viewer, bridged to the daemon's
+// `desktop.stream` (docs/api.md). Encoded access units go out as binary
+// messages (u64 pts_us, u8 keyframe, Annex B) as soon as they arrive; Guest
+// audio (record kind 20) as binary messages marked by a first byte 0xFF, which
+// a timestamp's high byte never is (0xFF, u32 rate, u8 channels, s16le PCM);
+// input, audio requests, microphone frames and clipboard text come back as JSON text. Minimal RFC 6455 server, no dependency: text and
 // binary frames, ping/pong and close; no extensions or fragmentation on send.
-import { spawn } from 'node:child_process'
+import { stream } from './daemon.mjs'
 import { createHash } from 'node:crypto'
 
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
-const MAX_MESSAGE = 64 * 1024
+// A clipboard message carries up to 200 KiB of text, JSON-escaped.
+const MAX_MESSAGE = 2 * 1024 * 1024
 // A viewer that falls this far behind drops delta frames until a keyframe:
 // latency stays bounded instead of queueing seconds of video.
 const MAX_BUFFERED = 2 * 1024 * 1024
 const NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/
+const AUDIO_MARK = Buffer.from([0xff])
 // The encoders start at 8 Mbps, which busy motion (a window drag on a macOS guest) uses in
 // full. A viewer that keeps up (nothing queued behind its socket, no added delay) is stepped up
 // one level every 5 s; any queue sends a stepped-up viewer back to 8 Mbps and doubles the wait
 // before the next try, and a viewer that is still queueing at 8 Mbps is stepped down (at most
 // every 1 s) until its link keeps up: a 6 Mbps link held 8 Mbps at 0.2-1.2 s of delay.
-const BITRATE_STEPS = [2_000_000, 4_000_000, 6_000_000, 8_000_000, 12_000_000, 16_000_000, 24_000_000]
-const BASE_LEVEL = 3
+const BITRATE_STEPS = [1_000_000, 2_000_000, 4_000_000, 6_000_000, 8_000_000, 12_000_000, 16_000_000, 24_000_000]
+const BASE_LEVEL = 4
 const BITRATE_QUIET_MS = 5000
 const BITRATE_DOWN_MS = 1000
 const BITRATE_HOLD_MAX_MS = 60_000
@@ -30,6 +34,8 @@ const PRESSURE_DELAY_MS = 40
 const PING_EVERY_MS = 250
 const JITTER_MS = 150
 const DEEP_DELAY_MS = 250
+// A step down is waited out while the delay is still falling by this much since the last change: the backlog is draining.
+const DRAIN_MS = 30
 const PING_WINDOW = 40
 
 /** Round trips of WebSocket pings; the added delay is the newest one (or the oldest unanswered one) over the recent minimum. */
@@ -82,6 +88,7 @@ export class BitrateGovernor {
     this.pressured = now
     this.climbed = -Infinity
     this.hold = BITRATE_QUIET_MS
+    this.delayAtChange = 0
   }
 
   /** Call per forwarded frame with `socket.writableLength` and the link's added delay in ms; the new target in bits/s, or null. */
@@ -90,9 +97,10 @@ export class BitrateGovernor {
       this.pressured = now
       if (now - this.climbed < 2 * BITRATE_QUIET_MS) this.hold = Math.min(this.hold * 2, BITRATE_HOLD_MAX_MS)
       if (this.level > BASE_LEVEL) this.level = BASE_LEVEL
-      else if (this.level > 0 && now - this.changed >= BITRATE_DOWN_MS) this.level -= delay > DEEP_DELAY_MS && this.level > 1 ? 2 : 1
+      else if (this.level > 0 && now - this.changed >= BITRATE_DOWN_MS && delay >= this.delayAtChange - DRAIN_MS) this.level -= delay > DEEP_DELAY_MS && this.level > 1 ? 2 : 1
       else return null
       this.changed = now
+      this.delayAtChange = delay
       return BITRATE_STEPS[this.level]
     }
     if (this.level === BITRATE_STEPS.length - 1 || now - this.pressured < this.hold || now - this.changed < BITRATE_QUIET_MS) return null
@@ -197,7 +205,7 @@ export class RecordReader {
  * Handle `GET /desktop/ws?id=NAME&codec=hevc|h264` after admission.
  * `origins` are the exact page origins allowed to open the socket.
  */
-export function upgradeDesktop(req, socket, { cli, origins }) {
+export function upgradeDesktop(req, socket, { origins, daemon }) {
   const url = new URL(req.url, 'http://127.0.0.1')
   const name = url.searchParams.get('id') ?? ''
   const codec = url.searchParams.get('codec') ?? 'hevc'
@@ -215,7 +223,7 @@ export function upgradeDesktop(req, socket, { cli, origins }) {
       `sec-websocket-accept: ${acceptKey(key)}\r\n\r\n`,
   )
   socket.setNoDelay(true)
-  const child = spawn(cli, ['desktop', '--stream', '--codec', codec, name], { stdio: ['pipe', 'pipe', 'inherit'] })
+  const relay = stream('desktop.stream', { name, codec }, daemon)
   const records = new RecordReader()
   const frames = new FrameReader()
   let waitingForKey = false
@@ -229,11 +237,11 @@ export function upgradeDesktop(req, socket, { cli, origins }) {
     if (closed) return
     closed = true
     clearInterval(pings)
-    child.stdin.end()
-    setTimeout(() => child.kill('SIGTERM'), 5000).unref()
+    // The daemon stops the encoder and releases held keys.
+    relay.cancel()
     if (!socket.destroyed) socket.end(frame(0x8, Buffer.alloc(0)))
   }
-  child.stdout.on('data', (chunk) => {
+  relay.on('stdout', (chunk) => {
     let list
     try {
       list = records.push(chunk)
@@ -243,6 +251,11 @@ export function upgradeDesktop(req, socket, { cli, origins }) {
     }
     for (const { kind, payload } of list) {
       if (socket.destroyed) return
+      if (kind === 20) {
+        // Late audio is worse than none; it never waits behind a video backlog.
+        if (socket.writableLength <= MAX_BUFFERED) socket.write(frame(0x2, Buffer.concat([AUDIO_MARK, payload])))
+        continue
+      }
       if (kind === 1) {
         socket.write(frame(0x1, payload))
         try {
@@ -251,10 +264,10 @@ export function upgradeDesktop(req, socket, { cli, origins }) {
         continue
       }
       const target = governor?.observe(Date.now(), socket.writableLength, link.delay(Date.now()))
-      if (target) child.stdin.write(JSON.stringify({ encoder: `bitrate ${target}` }) + '\n')
+      if (target) relay.control({ encoder: `bitrate ${target}` })
       const keyframe = payload[8] === 1
       if (socket.writableLength > MAX_BUFFERED) {
-        if (!waitingForKey) child.stdin.write('{"keyframe":true}\n')
+        if (!waitingForKey) relay.control({ keyframe: true })
         waitingForKey = true
         continue
       }
@@ -263,7 +276,11 @@ export function upgradeDesktop(req, socket, { cli, origins }) {
       socket.write(frame(0x2, payload))
     }
   })
-  child.on('exit', close)
+  relay.on('error', (error) => {
+    if (!closed && !socket.destroyed) socket.write(frame(0x1, Buffer.from(JSON.stringify({ event: 'error', message: error.message }))))
+    close()
+  })
+  relay.on('end', close)
   socket.on('data', (chunk) => {
     let messages
     try {
@@ -276,9 +293,13 @@ export function upgradeDesktop(req, socket, { cli, origins }) {
       if (opcode === 0x9) socket.write(frame(0xa, payload))
       if (opcode === 0xa) link.pong(Date.now(), payload)
       if (opcode !== 0x1) continue
-      const text = payload.toString('utf8')
-      if (text.includes('\n')) continue
-      child.stdin.write(text + '\n')
+      let message
+      try {
+        message = JSON.parse(payload.toString('utf8'))
+      } catch {
+        continue
+      }
+      relay.control(message)
     }
   })
   socket.on('close', close)

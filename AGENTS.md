@@ -10,13 +10,15 @@ VeynodeVM is a Docker-like runtime for Apple Silicon Macs: each container is a m
 
 | Area | Path | Read | Check |
 |---|---|---|---|
-| `veynodevm` CLI: run, exec, engine, machine, desktop, macOS containers | `crates/cli` | README "Quick start" | `check-changed.py` |
-| Control daemon, MCP, jobs, files, QEMU worker (`bin/vm-qemu.rs`), images | `crates/control` | the matching section of [crates/control/README.md](crates/control/README.md) | `check-changed.py` |
+| `veynodevm` CLI (an API 1 client: flags, output, terminal, launchd) | `crates/cli` | README "Quick start" | `check-changed.py` |
+| MCP HTTPS endpoint (`vm-mcp-http`), tool groups, cua-driver scopes, resource URIs | `crates/mcp` | the "HTTPS endpoint" section of [crates/control/README.md](crates/control/README.md) | `check-changed.py` |
+| Local API 1: wire, codes, frames, client | `crates/api` | [docs/api.md](docs/api.md), [decision 0028](docs/decisions/0028-core-split-and-api-1.md) | `check-changed.py` |
+| Control daemon, its services (`src/services/`: machines, containers, images, engine, sessions, desktop relay), MCP, QEMU worker (`bin/vm-qemu.rs`) | `crates/control` | the matching section of [crates/control/README.md](crates/control/README.md) | `check-changed.py` |
 | OCI registry, blob store, layers, Tart images | `crates/oci` | — | `check-changed.py` |
 | Console broker, WebRTC, H.264/HEVC | `crates/media-local`, `browser/` | [crates/media-local/README.md](crates/media-local/README.md) | `check-changed.py` |
 | Pairing and signed sessions | `crates/session-auth` | [crates/session-auth/README.md](crates/session-auth/README.md) | `check-changed.py` |
 | Linux guest agent (PID 1 in micro-VMs) | `guest/veynode-agent` | [guest/veynode-agent/README.md](guest/veynode-agent/README.md) | `check-changed.py` |
-| Web UI (TanStack Start, xterm.js, WebCodecs desktop) | `web/` | [docs/design/DESIGN.md](docs/design/DESIGN.md) (core's design system), then the file it names | `check-changed.py` |
+| Web UI (TanStack Start, xterm.js, WebCodecs desktop; `web/daemon.mjs` speaks API 1) | `web/` | [docs/design/DESIGN.md](docs/design/DESIGN.md) (core's design system), then the file it names | `check-changed.py` |
 | Apple Virtualization worker, native tools | `native/worker`, `native/tools` | [native/README.md](native/README.md) | `check-changed.py` (builds to a temp dir) |
 | QEMU native console (needs the UTM runtime) | `native/console` | README "Build and check" | `native/console/test.sh` on a staged app |
 | Kernel, initramfs, official images | `guest/kernel`, `guest/images` | [guest/images/README.md](guest/images/README.md) | live only |

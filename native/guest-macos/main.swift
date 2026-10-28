@@ -127,7 +127,7 @@ func command(_ argv:[String],timeoutMS:Int) throws -> [String:Any] {
     let exitCode=(processStatus & 0x7f)==0 ? Int((processStatus>>8)&0xff):-1
     return ["exit_code":exitCode,"stdout":String(decoding:outputs[0],as:UTF8.self),"stderr":String(decoding:outputs[1],as:UTF8.self),"stdout_truncated":truncated[0],"stderr_truncated":truncated[1],"timed_out":timedOut,"duration_ms":Int((DispatchTime.now().uptimeNanoseconds-start)/1_000_000)]
 }
-func handle(_ request:[String:Any],allowExec:Bool,allowObserve:Bool=false,allowInput:Bool=false,
+func handle(_ request:[String:Any],allowExec:Bool,allowObserve:Bool=false,allowInput:Bool=false,allowAudio:Bool=false,
             consoleRead:()->ConsoleIdentityObservation={GuestConsoleIdentityReader.observe()},
             graphicsRead:()->[String:Any]={readGuestGraphicsFields()}) -> [String:Any] {
     let id=request["id"] as? String ?? ""
@@ -143,7 +143,7 @@ func handle(_ request:[String:Any],allowExec:Bool,allowObserve:Bool=false,allowI
         if !console.identityEligible {guestInput.invalidate()}
         let fields=consoleInfoFields(console,observation:observationPolicy(allowObserve),input:inputPolicy(allowInput))
         let observation=fields["observation"] as! [String:Any],input=fields["input_policy"] as! [String:Any]
-        var info:[String:Any]=["protocol_version":1,"os":"darwin","arch":"arm64","os_release":ProcessInfo.processInfo.operatingSystemVersionString,"kernel":systemString("kern.osrelease"),"machine":systemString("hw.model"),"uid":getuid(),"username":NSUserName(),"transport":"vsock-host-only","capabilities":["exec":allowExec,"async_exec":false,"shutdown":false,"desktop":input["available"] as! Bool,"input":input["available"] as! Bool,"screenshot":observation["screenshot_available"] as! Bool,"files":false],"max_output_bytes_per_stream":maxOutput,"max_timeout_ms":30000]
+        var info:[String:Any]=["protocol_version":1,"os":"darwin","arch":"arm64","os_release":ProcessInfo.processInfo.operatingSystemVersionString,"kernel":systemString("kern.osrelease"),"machine":systemString("hw.model"),"uid":getuid(),"username":NSUserName(),"transport":"vsock-host-only","capabilities":["exec":allowExec,"async_exec":false,"shutdown":false,"desktop":input["available"] as! Bool,"input":input["available"] as! Bool,"screenshot":observation["screenshot_available"] as! Bool,"audio":allowAudio && observation["screenshot_available"] as! Bool,"files":false],"max_output_bytes_per_stream":maxOutput,"max_timeout_ms":30000]
         info.merge(graphicsRead()){_,new in new}
         let windows=windowObservationPolicy(allowObserve,console:console)
         info["window_policy"]=windows
@@ -176,7 +176,7 @@ func handle(_ request:[String:Any],allowExec:Bool,allowObserve:Bool=false,allowI
     default:return errorReply(id,"unsupported","unsupported guest method")
     }
 }
-func serve(_ fd:Int32,allowExec:Bool,allowObserve:Bool,allowInput:Bool) {
+func serve(_ fd:Int32,allowExec:Bool,allowObserve:Bool,allowInput:Bool,allowAudio:Bool) {
     defer {close(fd)}
     _ = fcntl(fd,F_SETFL,fcntl(fd,F_GETFL)|O_NONBLOCK)
     var noSignal:Int32=1;_ = setsockopt(fd,SOL_SOCKET,SO_NOSIGPIPE,&noSignal,socklen_t(MemoryLayout<Int32>.size))
@@ -198,7 +198,7 @@ func serve(_ fd:Int32,allowExec:Bool,allowObserve:Bool,allowInput:Bool) {
     let reply:[String:Any]
     var failedWriteCleanup:[String:Any]?
     if complete,let value=try? JSONSerialization.jsonObject(with:data) as? [String:Any] {
-        reply=handle(value,allowExec:allowExec,allowObserve:allowObserve,allowInput:allowInput)
+        reply=handle(value,allowExec:allowExec,allowObserve:allowObserve,allowInput:allowInput,allowAudio:allowAudio)
         if value["method"] as? String=="input_step" {failedWriteCleanup=value["arguments"] as? [String:Any]}
     }
     else {reply=errorReply("","invalid_request","expected newline JSON within 64 KiB")}
@@ -221,7 +221,7 @@ func serve(_ fd:Int32,allowExec:Bool,allowObserve:Bool,allowInput:Bool) {
         written = offset==bytes.count
     }
 }
-func run(allowExec:Bool,allowObserve:Bool,allowInput:Bool) throws {
+func run(allowExec:Bool,allowObserve:Bool,allowInput:Bool,allowAudio:Bool) throws {
     guard getuid() != 0 else {throw AgentError(message:"Run this service as the intended Guest user, not root")}
     let listener=socket(AF_VSOCK,SOCK_STREAM,0)
     guard listener>=0 else {throw AgentError(message:"AF_VSOCK unavailable: \(String(cString:strerror(errno)))")}
@@ -230,7 +230,7 @@ func run(allowExec:Bool,allowObserve:Bool,allowInput:Bool) throws {
     var address=sockaddr_vm();address.svm_len=UInt8(MemoryLayout<sockaddr_vm>.size);address.svm_family=sa_family_t(AF_VSOCK);address.svm_port=5000;address.svm_cid=UInt32.max
     let status=withUnsafePointer(to:&address){$0.withMemoryRebound(to:sockaddr.self,capacity:1){Darwin.bind(listener,$0,socklen_t(MemoryLayout<sockaddr_vm>.size))}}
     guard status==0,listen(listener,16)==0 else {throw AgentError(message:"VSOCK listen failed: \(String(cString:strerror(errno)))")}
-    FileHandle.standardError.write(Data("veynode macOS guest agent protocol=1 port=5000 hostCID=2 uid=\(getuid()) exec=\(allowExec) observe=\(allowObserve)\n".utf8))
+    FileHandle.standardError.write(Data("veynode macOS guest agent protocol=1 port=5000 hostCID=2 uid=\(getuid()) exec=\(allowExec) observe=\(allowObserve) audio=\(allowAudio)\n".utf8))
     let capacity=DispatchSemaphore(value:16)
     while true {
         var peer=sockaddr_vm(),length=socklen_t(MemoryLayout<sockaddr_vm>.size)
@@ -238,7 +238,7 @@ func run(allowExec:Bool,allowObserve:Bool,allowInput:Bool) throws {
         if fd<0 {if errno==EINTR{continue};throw AgentError(message:"VSOCK accept failed")}
         _ = fcntl(fd,F_SETFD,FD_CLOEXEC)
         guard length==MemoryLayout<sockaddr_vm>.size,peer.svm_family==AF_VSOCK,peer.svm_cid==2,capacity.wait(timeout:.now()) == .success else {close(fd);continue}
-        DispatchQueue.global(qos:.userInitiated).async {serve(fd,allowExec:allowExec,allowObserve:allowObserve,allowInput:allowInput);capacity.signal()}
+        DispatchQueue.global(qos:.userInitiated).async {serve(fd,allowExec:allowExec,allowObserve:allowObserve,allowInput:allowInput,allowAudio:allowAudio);capacity.signal()}
     }
 }
 func selfTest() {
@@ -280,8 +280,9 @@ let arguments=Set(rawArguments)
 if arguments==["--graphics-self-test"] {graphicsSelfTest();exit(0)}
 if arguments==["--windows-self-test"] {windowsSelfTest();exit(0)}
 if arguments==["--files-self-test"] {filesSelfTest();exit(0)}
-if arguments==["--self-test"] {selfTest();captureSelfTest();inputSelfTest();consoleIntegrationSelfTest();graphicsSelfTest();windowsSelfTest();filesSelfTest();exit(0)}
-guard rawArguments.count==arguments.count, arguments.contains("--allow-files")==((filesRoot) != nil),arguments.isSubset(of:["--allow-execute","--allow-observe","--allow-input","--allow-files"]), !arguments.contains("--allow-input") || arguments.contains("--allow-observe") else {fputs("Usage: macos-guest-agent [--allow-execute] [--allow-observe [--allow-input]] [--allow-files --files-root ABSOLUTE_PRIVATE_DIRECTORY] | --self-test\n",stderr);exit(2)}
+if arguments==["--audio-self-test"] {audioSelfTest();exit(0)}
+if arguments==["--self-test"] {selfTest();captureSelfTest();audioSelfTest();inputSelfTest();consoleIntegrationSelfTest();graphicsSelfTest();windowsSelfTest();filesSelfTest();exit(0)}
+guard rawArguments.count==arguments.count, arguments.contains("--allow-files")==((filesRoot) != nil),arguments.isSubset(of:["--allow-execute","--allow-observe","--allow-input","--allow-audio","--allow-files"]), !arguments.contains("--allow-input") || arguments.contains("--allow-observe"), !arguments.contains("--allow-audio") || arguments.contains("--allow-observe") else {fputs("Usage: macos-guest-agent [--allow-execute] [--allow-observe [--allow-input] [--allow-audio]] [--allow-files --files-root ABSOLUTE_PRIVATE_DIRECTORY] | --self-test\n",stderr);exit(2)}
 signal(SIGPIPE,SIG_IGN)
 if let root=filesRoot {
     do {guestFiles=try GuestFileBridge(binary:URL(fileURLWithPath:CommandLine.arguments[0]).standardizedFileURL.path,root:root)}
@@ -292,8 +293,13 @@ let inputTimer=DispatchSource.makeTimerSource(queue:.global(qos:.userInitiated))
 if arguments.contains("--allow-input") {inputTimer.schedule(deadline:.now(),repeating:.milliseconds(100));inputTimer.setEventHandler{guestInput.tick()};inputTimer.resume()}
 var terminationSources:[DispatchSourceSignal]=[]
 for number in [SIGINT,SIGTERM] {signal(number,SIG_IGN);let source=DispatchSource.makeSignalSource(signal:number,queue:.global(qos:.userInitiated));source.setEventHandler{let inputClean=guestInput.shutdown();let filesClean=guestFiles?.stop() ?? true;exit(inputClean && filesClean ? 0:1)};source.resume();terminationSources.append(source)}
+if arguments.contains("--allow-audio") {
+    Thread.detachNewThread {
+        do {try runAudio()} catch {fputs(error.localizedDescription+"\n",stderr);exit(1)}
+    }
+}
 DispatchQueue.global(qos:.userInitiated).async {
-    do {try run(allowExec:arguments.contains("--allow-execute"),allowObserve:arguments.contains("--allow-observe"),allowInput:arguments.contains("--allow-input"))}
+    do {try run(allowExec:arguments.contains("--allow-execute"),allowObserve:arguments.contains("--allow-observe"),allowInput:arguments.contains("--allow-input"),allowAudio:arguments.contains("--allow-audio"))}
     catch {_ = guestInput.shutdown();_ = guestFiles?.stop();fputs(error.localizedDescription+"\n",stderr);exit(1)}
 }
 dispatchMain()

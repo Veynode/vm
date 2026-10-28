@@ -75,6 +75,10 @@ impl Output {
             let _ = self.socket.shutdown(std::net::Shutdown::Both);
         }
     }
+    /// Audio is best effort: a full queue drops the record, it does not close the client.
+    fn offer(&self, record: Record) {
+        let _ = self.tx.try_send(record);
+    }
 }
 fn native_write(
     input: &mut (impl Write + std::os::fd::AsRawFd),
@@ -83,7 +87,16 @@ fn native_write(
 ) -> Result<()> {
     let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');
-    if bytes.len() > 1024 {
+    // A microphone frame or a clipboard part carries base64; the native line limit is 4096.
+    let bound = if matches!(
+        value["method"].as_str(),
+        Some("audio_in" | "clipboard_chunk")
+    ) {
+        4096
+    } else {
+        1024
+    };
+    if bytes.len() > bound {
         bail!("native command exceeds bound")
     }
     let until = Instant::now() + Duration::from_millis(500);
@@ -147,6 +160,10 @@ struct Native {
     alive: AtomicBool,
     ready: (Mutex<bool>, Condvar),
     owner: Mutex<Option<Owner>>,
+    /// The client hearing Guest audio and feeding its microphone: the newest `audio_start`.
+    audio: Mutex<Option<(u64, Output)>>,
+    /// Clients told of the Guest's clipboard (`clipboard_watch`).
+    clipboard: Mutex<BTreeMap<u64, Output>>,
     next_epoch: AtomicU64,
     snapshot: Mutex<()>,
     capabilities: Value,
@@ -155,6 +172,12 @@ fn receive_native(receive: &Native, pipe: &mut impl Read) -> Result<()> {
     let result = (|| {
         loop {
             let record = read_record(pipe)?;
+            if record.kind == 3 {
+                if let Some((_, output)) = receive.audio.lock().unwrap().as_ref() {
+                    output.offer(record);
+                }
+                continue;
+            }
             if record.kind == 2 {
                 let mut owner = receive.owner.lock().unwrap();
                 if let Some(owner) = owner.as_mut().filter(|o| o.epoch == record.epoch) {
@@ -163,6 +186,15 @@ fn receive_native(receive: &Native, pipe: &mut impl Read) -> Result<()> {
                 continue;
             }
             let value = record.value()?;
+            if value["event"] == "clipboard" && value.get("id").is_none() {
+                if record.epoch != 0 {
+                    bail!("native clipboard event has an epoch")
+                }
+                for output in receive.clipboard.lock().unwrap().values() {
+                    output.offer(record.clone());
+                }
+                continue;
+            }
             if let Some(id) = value["id"].as_str() {
                 if let Some((epoch, tx)) = receive.pending.lock().unwrap().remove(id) {
                     if epoch != record.epoch {
@@ -432,6 +464,70 @@ impl Native {
             }
         }
     }
+    fn audio_start(&self, client: u64, output: Output) -> Result<Value> {
+        let previous = self.audio.lock().unwrap().replace((client, output));
+        let result = self.call(json!({"method":"audio_start"}));
+        if result.is_err() {
+            *self.audio.lock().unwrap() = previous;
+        }
+        result
+    }
+    fn audio_stop(&self, client: u64) -> Result<Value> {
+        let mut audio = self.audio.lock().unwrap();
+        if audio.as_ref().is_none_or(|(owner, _)| *owner != client) {
+            return Ok(json!({"listening":false}));
+        }
+        *audio = None;
+        drop(audio);
+        self.call(json!({"method":"audio_stop"}))
+    }
+    /// One microphone frame from the audio client; anyone else's is ignored.
+    fn audio_in(&self, client: u64, pcm: &str) -> Result<()> {
+        if pcm.is_empty()
+            || pcm.len() > 2560
+            || !pcm
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+        {
+            bail!("invalid microphone frame")
+        }
+        if self
+            .audio
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|(owner, _)| *owner != client)
+        {
+            return Ok(());
+        }
+        if !self.alive.load(Ordering::Acquire) {
+            bail!("capture process unavailable")
+        }
+        let mut input = self.input.lock().unwrap();
+        native_write(&mut *input, &json!({"method":"audio_in","pcm":pcm}), None)
+            .inspect_err(|_| self.alive.store(false, Ordering::Release))
+    }
+    /// Fire-and-forget clipboard commands: a text part, or a request for the Guest's text. Either
+    /// answers only as a `clipboard` event to the watchers.
+    fn clipboard_send(&self, command: Value) -> Result<()> {
+        if !self.alive.load(Ordering::Acquire) {
+            bail!("capture process unavailable")
+        }
+        let mut input = self.input.lock().unwrap();
+        native_write(&mut *input, &command, None)
+            .inspect_err(|_| self.alive.store(false, Ordering::Release))
+    }
+    fn clipboard_chunk(&self, data: &str, last: bool) -> Result<()> {
+        if data.len() > 2400
+            || !data.len().is_multiple_of(4)
+            || !data
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+        {
+            bail!("invalid clipboard part")
+        }
+        self.clipboard_send(json!({"method":"clipboard_chunk","data":data,"last":last}))
+    }
     fn close(&self, client: u64) -> Result<Value> {
         let epoch = {
             let mut owner = self.owner.lock().unwrap();
@@ -528,7 +624,7 @@ impl Native {
         };
         self.call(json!({"method":"keyframe","epoch":epoch}))
     }
-    /// `set_scale` or `set_crop`, passed through to the helper, which validates the geometry.
+    /// `set_scale`, `set_crop` or `set_fps`, passed through to the helper, which validates the values.
     fn view(&self, client: u64, mut command: Value) -> Result<Value> {
         let epoch = {
             let owner = self.owner.lock().unwrap();
@@ -570,12 +666,19 @@ struct Request {
     y: Option<u64>,
     width: Option<u64>,
     height: Option<u64>,
+    // set_fps only: the viewer's screen refresh, 1..240; the helper holds the stream to it.
+    fps: Option<u64>,
     // The scaled-JPEG screenshot form. Only named here so that the request is not refused as unknown; the values
     // are read from the request line by `Scaled::parse`, which refuses a partial or out-of-range set.
     format: Option<Value>,
     max_width: Option<Value>,
     max_height: Option<Value>,
     quality: Option<Value>,
+    // audio_in only: 20 ms of 48 kHz mono s16le PCM, base64.
+    pcm: Option<String>,
+    // clipboard_chunk only: up to 2400 base64 characters of UTF-8 text, and whether it ends the text.
+    data: Option<String>,
+    last: Option<bool>,
 }
 fn helper_display_rejection(
     method: &Value,
@@ -836,8 +939,38 @@ fn connection(stream: UnixStream, native: Arc<Native>, client: u64) -> Result<()
             {
                 bail!("unexpected view fields")
             }
+            if request.fps.is_some() != (request.method == "set_fps") {
+                bail!("unexpected fps fields")
+            }
             if request.diagnostic_id.is_some() && request.method != "validate_displayed_frame" {
                 bail!("unexpected native diagnostic identity")
+            }
+            if request.pcm.is_some() != (request.method == "audio_in") {
+                bail!("unexpected microphone fields")
+            }
+            if (request.data.is_some() || request.last.is_some())
+                != (request.method == "clipboard_chunk")
+            {
+                bail!("unexpected clipboard fields")
+            }
+            // Microphone frames and clipboard commands get no reply, so they never take an output slot.
+            match request.method.as_str() {
+                "audio_in" => {
+                    native.audio_in(client, request.pcm.as_deref().unwrap_or_default())?;
+                    continue;
+                }
+                "clipboard_chunk" => {
+                    native.clipboard_chunk(
+                        request.data.as_deref().context("missing data")?,
+                        request.last.context("missing last")?,
+                    )?;
+                    continue;
+                }
+                "clipboard_get" => {
+                    native.clipboard_send(json!({"method":"clipboard_get"}))?;
+                    continue;
+                }
+                _ => {}
             }
             let result = match request.method.as_str() {
                 "rate_status" | "set_bitrate" => native.rate(client, &request),
@@ -852,6 +985,20 @@ fn connection(stream: UnixStream, native: Arc<Native>, client: u64) -> Result<()
                     request.level,
                 ),
                 "stop" => native.close(client),
+                "audio_start" => native.audio_start(client, output.clone()),
+                "audio_stop" => native.audio_stop(client),
+                "clipboard_watch" => {
+                    native
+                        .clipboard
+                        .lock()
+                        .unwrap()
+                        .insert(client, output.clone());
+                    Ok(json!({"watching":true}))
+                }
+                "clipboard_unwatch" => {
+                    native.clipboard.lock().unwrap().remove(&client);
+                    Ok(json!({"watching":false}))
+                }
                 "keyframe" => native.keyframe(client),
                 "set_scale" => native.view(
                     client,
@@ -860,6 +1007,10 @@ fn connection(stream: UnixStream, native: Arc<Native>, client: u64) -> Result<()
                 "set_crop" => native.view(
                     client,
                     json!({"method":"set_crop","x":request.x.context("missing x")?,"y":request.y.context("missing y")?,"width":request.width.context("missing width")?,"height":request.height.context("missing height")?}),
+                ),
+                "set_fps" => native.view(
+                    client,
+                    json!({"method":"set_fps","fps":request.fps.context("missing fps")?}),
                 ),
                 "show_window" | "close_window" | "window_status" => {
                     if !vm_control::backend::window_supported(&native.capabilities) {
@@ -965,6 +1116,8 @@ fn connection(stream: UnixStream, native: Arc<Native>, client: u64) -> Result<()
         Ok(())
     })();
     let _ = native.close(client);
+    let _ = native.audio_stop(client);
+    native.clipboard.lock().unwrap().remove(&client);
     let _ = shared.shutdown(std::net::Shutdown::Both);
     drop(output);
     let _ = writer.join();
@@ -1081,6 +1234,8 @@ fn run() -> Result<()> {
         alive: AtomicBool::new(true),
         ready: (Mutex::new(false), Condvar::new()),
         owner: Mutex::new(None),
+        audio: Mutex::new(None),
+        clipboard: Mutex::new(BTreeMap::new()),
         next_epoch: AtomicU64::new(1),
         snapshot: Mutex::new(()),
         capabilities,
@@ -1289,6 +1444,8 @@ mod frame_diagnostic_id_tests {
                 alive: AtomicBool::new(true),
                 ready: (Mutex::new(true), Condvar::new()),
                 owner: Mutex::new(None),
+                audio: Mutex::new(None),
+                clipboard: Mutex::new(BTreeMap::new()),
                 next_epoch: AtomicU64::new(1),
                 snapshot: Mutex::new(()),
                 capabilities: json!({"native_window":true,"native_window_protocol":1,"display_only":true,"input_enabled":false}),
@@ -1399,6 +1556,8 @@ mod frame_diagnostic_id_tests {
                 alive: AtomicBool::new(true),
                 ready: (Mutex::new(true), Condvar::new()),
                 owner: Mutex::new(None),
+                audio: Mutex::new(None),
+                clipboard: Mutex::new(BTreeMap::new()),
                 next_epoch: AtomicU64::new(1),
                 snapshot: Mutex::new(()),
                 capabilities: json!({}),
@@ -1485,6 +1644,8 @@ mod frame_diagnostic_id_tests {
                 alive: AtomicBool::new(true),
                 ready: (Mutex::new(true), Condvar::new()),
                 owner: Mutex::new(None),
+                audio: Mutex::new(None),
+                clipboard: Mutex::new(BTreeMap::new()),
                 next_epoch: AtomicU64::new(1),
                 snapshot: Mutex::new(()),
                 capabilities: json!({}),
@@ -1601,6 +1762,8 @@ mod screenshot_forward_tests {
                 native_ended: true,
                 early: Vec::new(),
             })),
+            audio: Mutex::new(None),
+            clipboard: Mutex::new(BTreeMap::new()),
             next_epoch: AtomicU64::new(1),
             snapshot: Mutex::new(()),
             capabilities: json!({}),
@@ -1979,6 +2142,8 @@ mod screenshot_forward_tests {
             alive: AtomicBool::new(true),
             ready: (Mutex::new(true), Condvar::new()),
             owner: Mutex::new(None),
+            audio: Mutex::new(None),
+            clipboard: Mutex::new(BTreeMap::new()),
             next_epoch: AtomicU64::new(1),
             snapshot: Mutex::new(()),
             capabilities: json!({}),
@@ -2165,6 +2330,8 @@ mod screenshot_deadline_tests {
             alive: AtomicBool::new(true),
             ready: (Mutex::new(true), Condvar::new()),
             owner: Mutex::new(None),
+            audio: Mutex::new(None),
+            clipboard: Mutex::new(BTreeMap::new()),
             next_epoch: AtomicU64::new(1),
             snapshot: Mutex::new(()),
             capabilities: json!({}),

@@ -1,0 +1,14 @@
+{
+  "frames": [
+    {"name": "stdout bytes", "channel": 1, "payload": "68690a", "wire": "01000000036869 0a"},
+    {"name": "end of input", "channel": 0, "payload": "", "wire": "0000000000"},
+    {"name": "progress event", "channel": 3, "payload": "7b2270726f6772657373223a22436c6f6e696e67227d", "wire": "03000000167b2270726f6772657373223a22436c6f6e696e67227d"},
+    {"name": "kill signal", "channel": 5, "payload": "7b227369676e616c223a224b494c4c227d", "wire": "05000000117b227369676e616c223a224b494c4c227d"}
+  ],
+  "lines": [
+    {"name": "hello request", "value": {"method": "hello", "arguments": {"api": 1, "client": "veynode-core/1"}}},
+    {"name": "stream start", "value": {"result": {"stream": true}}},
+    {"name": "refusal", "value": {"error": "no machine dev", "code": "not_found"}},
+    {"name": "version refusal", "value": {"error": "send hello with api 1", "code": "version"}}
+  ]
+}

@@ -5,6 +5,20 @@ With `--desktop-stream` (set by container-init for Apple Virtualization
 desktop containers) a second listener on port 5001, also host CID 2 only,
 serves the browser desktop: DRM scanout tiles out, uinput keyboard and tablet
 events in (protocol in `desktop_linux.go`, design in `docs/browser-desktop.md`).
+It also carries the desktop's sound and clipboard. `{"audio":true}` starts
+recording the image's PipeWire sink `veynodevm-speakers` (`pw-cat`, as the
+session user) as record kind 4: `u32 rate, u8 channels, s16le PCM`, 20 ms of
+48 kHz stereo each. `{"mic":"BASE64"}` plays up to 20 ms of 48 kHz mono into
+`veynodevm-microphone-feed`, the sink of the PipeWire loopback whose source,
+`veynodevm-microphone`, applications record; 100 ms after the last frame the
+agent plays 60 ms of silence, so the loopback's last buffer does not reach the
+next recording. An image without PipeWire answers
+`{"event":"audio_unavailable"}` once. `{"clipboard":"TEXT"}` makes the agent
+the X11 `CLIPBOARD` owner (`clipboard_x11.go`; UTF8_STRING, TEXT and STRING,
+200 KiB). `{"clipboard_watch":true}` reports other clients' copies through
+XFixes, and `{"clipboard_get":true}` the current text, each as
+`{"event":"clipboard","text"|"error"}` (INCR transfers are read; ours are
+not echoed).
 The same flag enables MCP observation and input on port 5000 (`observe.go`):
 `screenshot` (PNG of the scanout, JPEG when over 700 KiB), `screen_wait`
 (64x64 tile hashes; changed regions), and frame-bound `input_step` and

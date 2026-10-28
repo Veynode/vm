@@ -1,9 +1,8 @@
-// Web UI terminal relay: one WebSocket per terminal, bridged to a
-// `veynodevm __terminal NAME ROWS COLS` child (an interactive shell in the
-// container). Terminal output goes out as binary messages, events
+// Web UI terminal relay: one WebSocket per terminal, bridged to the daemon's
+// `terminal.open` (an interactive shell in the container or machine). Terminal output goes out as binary messages, events
 // (ready, exit, error) as JSON text; the page sends JSON text messages
 // `{"input":"..."}` and `{"resize":{"rows":R,"cols":C}}`.
-import { spawn } from 'node:child_process'
+import { stream } from './daemon.mjs'
 import { FrameReader, RecordReader, acceptKey, frame } from './desktop.mjs'
 
 const NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/
@@ -14,7 +13,7 @@ function dimension(value, fallback) {
 }
 
 /** Handle `GET /terminal/ws?id=NAME&rows=R&cols=C` after admission. */
-export function upgradeTerminal(req, socket, { cli, origins }) {
+export function upgradeTerminal(req, socket, { origins, daemon }) {
   const url = new URL(req.url, 'http://127.0.0.1')
   const name = url.searchParams.get('id') ?? ''
   const key = req.headers['sec-websocket-key']
@@ -33,18 +32,18 @@ export function upgradeTerminal(req, socket, { cli, origins }) {
       `sec-websocket-accept: ${acceptKey(key)}\r\n\r\n`,
   )
   socket.setNoDelay(true)
-  const child = spawn(cli, ['__terminal', name, String(rows), String(cols)], { stdio: ['pipe', 'pipe', 'inherit'] })
+  const session = stream('terminal.open', { name, rows, cols }, daemon)
   const records = new RecordReader()
   const frames = new FrameReader()
   let closed = false
   const close = () => {
     if (closed) return
     closed = true
-    child.stdin.end()
-    setTimeout(() => child.kill('SIGTERM'), 5000).unref()
+    // The daemon hangs the session up.
+    session.cancel()
     if (!socket.destroyed) socket.end(frame(0x8, Buffer.alloc(0)))
   }
-  child.stdout.on('data', (chunk) => {
+  session.on('stdout', (chunk) => {
     let list
     try {
       list = records.push(chunk)
@@ -57,8 +56,11 @@ export function upgradeTerminal(req, socket, { cli, origins }) {
       socket.write(frame(kind === 1 ? 0x1 : 0x2, payload))
     }
   })
-  child.stdin.on('error', close)
-  child.on('exit', close)
+  session.on('error', (error) => {
+    if (!closed && !socket.destroyed) socket.write(frame(0x1, Buffer.from(JSON.stringify({ event: 'error', message: error.message }))))
+    close()
+  })
+  session.on('end', close)
   socket.on('data', (chunk) => {
     let messages
     try {
@@ -70,14 +72,13 @@ export function upgradeTerminal(req, socket, { cli, origins }) {
       if (opcode === 0x8) return close()
       if (opcode === 0x9) socket.write(frame(0xa, payload))
       if (opcode !== 0x1) continue
-      // JSON.stringify escapes newlines, so each message stays one line.
       let message
       try {
         message = JSON.parse(payload.toString('utf8'))
       } catch {
         continue
       }
-      child.stdin.write(JSON.stringify(message) + '\n')
+      session.control(message)
     }
   })
   socket.on('close', close)

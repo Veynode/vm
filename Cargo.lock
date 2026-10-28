@@ -3087,12 +3087,41 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "libc",
- "rustls",
  "serde",
  "serde_json",
  "tempfile",
- "veynodevm-oci",
- "vm-control",
+ "veynodevm-api",
+]
+
+[[package]]
+name = "veynodevm-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "veynodevm-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "axum-server",
+ "base64 0.22.1",
+ "futures-util",
+ "libc",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tower-http",
+ "veynodevm-api",
 ]
 
 [[package]]
@@ -3117,20 +3146,18 @@ name = "vm-control"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "axum",
- "axum-server",
  "base64 0.22.1",
  "flate2",
- "futures-util",
  "libc",
  "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "subtle",
  "tempfile",
  "tokio",
- "tower-http",
+ "veynodevm-api",
+ "veynodevm-mcp",
+ "veynodevm-oci",
 ]
 
 [[package]]
@@ -3180,6 +3207,7 @@ dependencies = [
  "tokio",
  "tower",
  "uuid",
+ "veynodevm-api",
  "vm-control",
  "vm-remote-proto",
  "vm-session-auth",

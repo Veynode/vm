@@ -17,6 +17,7 @@ RUN apt-get update \
       xserver-xorg-core xserver-xorg-input-libinput xwayland x11-xserver-utils x11-apps netpbm \
       libgl1-mesa-dri libegl-mesa0 libgbm1 mesa-vulkan-drivers mesa-utils \
       network-manager iproute2 iputils-ping ca-certificates sudo locales less \
+      pipewire pipewire-bin pipewire-pulse pipewire-alsa wireplumber spice-vdagent \
  && rm -rf /var/lib/apt/lists/*
 COPY rootfs/ /
 # Autologin needs no password; "ubuntu" unlocks sudo and the lock screen.

@@ -126,7 +126,7 @@ Report pass@k, steps, tokens and wall time beside cua's published numbers, and s
 
 ## Gaps found on main that this plan closes
 
-- **QEMU desktops:** desktop and a11y tools are refused by the daemon (`lib.rs:2684`), and QEMU has only the serial transport. Fixed by the driver port.
+- **QEMU desktops:** desktop and a11y tools are refused by the daemon (`crates/control/src/manager.rs`), and QEMU has only the serial transport. Fixed by the driver port.
 - **Windows:** no screenshots or input. Check the console-broker path, then add the driver.
 - **Clipboard:** none anywhere. Fixed by the driver's clipboard tools, under the new `clipboard` scope.
 - **Resolution:** fixed everywhere. Add `set_resolution` (VZ display reconfiguration; QEMU virtio-gpu EDID plus SPICE resize).

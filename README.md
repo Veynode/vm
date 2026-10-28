@@ -105,23 +105,25 @@ The script writes an `Autounattend.xml` seed (Windows 11 Pro with the generic, n
 
 | Area | Path | State |
 |---|---|---|
-| `veynodevm` CLI (run, ps, logs, exec, build, engine, desktop, ui, mcp) | `crates/cli` | implemented |
+| `veynodevm` CLI (run, ps, logs, exec, build, engine, desktop, ui, mcp): a client of local API 1 | `crates/cli` | implemented |
+| Local API 1 (the daemon's socket: envelope, codes, frames, client) | `crates/api`, [docs/api.md](docs/api.md) | implemented |
 | OCI registry client, blob store, layer flattening, squashfs roots | `crates/oci` | implemented |
 | Pinned kernel, initramfs, agent as container init | `guest/kernel`, `guest/veynode-agent` | implemented |
-| Shared engine VM (dockerd, docker context, dynamic port publishing, `--share`) | `crates/cli/src/engine.rs` | implemented; Venus GPU via CDI verified |
+| Shared engine VM (dockerd, docker context, dynamic port publishing, `--share`) | `crates/control/src/services/engine.rs`, `crates/cli/src/engine.rs` (docker side) | implemented; Venus GPU via CDI verified |
 | Web management UI | `web/` (TanStack Start; shadcn/ui on Base UI in Veynode Soft, vendored from core: [SOURCE.md](web/src/vendor/veynode-ui/SOURCE.md)) | implemented, including the WebCodecs browser desktop and an xterm.js terminal |
 | Official desktop and GPU images | `guest/images` | alpine-desktop verified on VZ and virgl; ubuntu-gpu verified on virgl and Venus; ubuntu-desktop verified with Venus vkcube, Zink OpenGL and SuperTuxKart on XFCE |
-| Control daemon, MCP (stdio + HTTPS), jobs, files | `crates/control` | implemented |
+| Control daemon (the core: every record, API 1 services, the MCP server), jobs, files | `crates/control` | implemented |
+| MCP HTTPS endpoint (`vm-mcp-http`) and the MCP protocol tables | `crates/mcp` | implemented |
 | QEMU/HVF worker with virgl / Venus GPU profiles | `crates/control/src/bin/vm-qemu.rs`, `qemu_graphics.rs` | implemented (Venus experimental) |
 | Apple Virtualization worker | `native/worker` | implemented (2D display, no GPU) |
-| Full-distribution machines (UEFI boot from ISO/disk, unattended installers) | `crates/cli/src/machine.rs`, `crates/control/src/qemu_uefi.rs`, `native/worker`, `scripts/install-distro.py` | implemented; Ubuntu 24.04 and Fedora 44 verified on QEMU |
+| Full-distribution machines (UEFI boot from ISO/disk, unattended installers) | `crates/control/src/services/machines.rs`, `crates/control/src/qemu_uefi.rs`, `native/worker`, `scripts/install-distro.py` | implemented; Ubuntu 24.04 and Fedora 44 verified on QEMU |
 | APFS base images and writable clones | `crates/control/src/bin/vm-image.rs` | implemented |
 | Console broker, hardware H.264/HEVC WebRTC | `crates/media-local`, `browser/` | localhost implemented, not yet in the web UI |
 | Device pairing and signed sessions | `crates/session-auth` | localhost implemented |
 | Native desktop console (AppKit/Metal) | `native/console`, `native/tools/spice-console.m` | implemented |
 | GPU runtime fetch/build (UTM QEMU, virglrenderer, SPICE) | `runtime/` | development only |
-| macOS containers (Tart OCI images, SSH exec/cp, Screen Sharing MCP) | `crates/oci/src/tart.rs`, `crates/cli/src/macos.rs`, `native/worker/ScreenSharing.swift` | implemented; Metal at game load verified on Tahoe 26.6 (99% of host offscreen, 60 fps on screen); OpenGL is software-only; `native/guest-metal-fix` works around a paravirtual `baseVertex` bug that breaks MoltenVK games |
-| Windows 11 ARM64 machines (QEMU/HVF, unattended install from the user's ISO) | `crates/cli/src/machine.rs`, `crates/control/src/qemu_uefi.rs`, `scripts/install-distro.py` | implemented; see known issues for what is verified |
+| macOS containers (Tart OCI images, SSH exec/cp, Screen Sharing MCP) | `crates/oci/src/tart.rs`, `crates/control/src/services/macos.rs`, `native/worker/ScreenSharing.swift` | implemented; Metal at game load verified on Tahoe 26.6 (99% of host offscreen, 60 fps on screen); OpenGL is software-only; `native/guest-metal-fix` works around a paravirtual `baseVertex` bug that breaks MoltenVK games |
+| Windows 11 ARM64 machines (QEMU/HVF, unattended install from the user's ISO) | `crates/control/src/services/machines.rs`, `crates/control/src/qemu_uefi.rs`, `scripts/install-distro.py` | implemented; see known issues for what is verified |
 | Signed-in macOS Guest service | `native/guest-macos`, `native/guest-launcher` | reserved, not on main path |
 
 Experiments, benchmarks and validation evidence from the earlier phase are in [`archive/`](archive/README.md).
@@ -133,6 +135,15 @@ Host: Apple Silicon, macOS 14+ (Venus requires macOS 26+). Install the Swift com
 ```sh
 ./scripts/check.sh            # native build, cargo fmt/build/test/clippy, go, python, browser and web tests
 ./scripts/check.sh --real     # also builds the kernel and boots real containers (and the engine if docker is installed)
+```
+
+A release directory for the standalone product and for Veynode core's plugin (nothing is built, notarized or
+published; the QEMU/GPU runtime is left out):
+
+```sh
+cargo build --release -p veynodevm -p vm-control -p veynodevm-mcp -p vm-media-local
+python3 scripts/package-release.py --output /tmp/VeynodeVM --web [--sign "Developer ID Application: …"]
+/tmp/VeynodeVM/install.py && /tmp/VeynodeVM/bin/veynodevm daemon start
 ```
 
 Day to day, `scripts/check-changed.py` runs only the checks that the files changed against `main` need (`--quick` while editing, `--dry-run` to see the plan); see [AGENTS.md](AGENTS.md#verification).

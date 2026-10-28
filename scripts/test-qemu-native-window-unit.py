@@ -23,7 +23,7 @@ class Tests(unittest.TestCase):
         caps={'capture_limit_fps':60,'native_window_capture_limit_fps':60,'background_capture_limit_fps':30,
               'encoder_limit_fps':30,'idle_encode_interval_ms':1000,'display_refresh_preference_hz':60,'capture_current_limit_fps':30}
         module.pacing_limits(caps)
-        for field,value in [('encoder_limit_fps',True),('encoder_limit_fps',30.0),('encoder_limit_fps',60),('capture_current_limit_fps',45)]:
+        for field,value in [('encoder_limit_fps',True),('encoder_limit_fps',30.0),('encoder_limit_fps',120),('capture_current_limit_fps',61),('capture_current_limit_fps',0)]:
             with self.assertRaises(AssertionError):module.pacing_limits(caps|{field:value})
         del caps['idle_encode_interval_ms']
         with self.assertRaises(AssertionError):module.pacing_limits(caps)

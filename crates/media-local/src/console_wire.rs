@@ -7,13 +7,27 @@ pub const MAX_BODY: usize = 4 * 1024 * 1024;
 /// Bound for a JSON record (kind 1). A screenshot reply is base64 PNG: up to 8 MiB of PNG is about 10.7 MiB, so 12 MiB, the
 /// same pair as `vm_control::MAX_SCREENSHOT_BYTES`/`MAX_SCREENSHOT_RESPONSE` and the native `RecordWriter`.
 pub const MAX_JSON_BODY: usize = 12 * 1024 * 1024;
+/// Bound for a Guest audio record (kind 3): `u32 BE rate, u8 channels, s16le PCM`.
+pub const MAX_AUDIO_BODY: usize = 64 * 1024 + 5;
 /// The body bound for a record kind; unknown kinds are not valid records.
 pub fn body_limit(kind: u8) -> Option<usize> {
     match kind {
         1 => Some(MAX_JSON_BODY),
         2 => Some(MAX_BODY),
+        3 => Some(MAX_AUDIO_BODY),
         _ => None,
     }
+}
+/// The sample rate and channel count of a well-formed audio record body.
+pub fn audio_format(body: &[u8]) -> Option<(u32, u8)> {
+    let rate = u32::from_be_bytes(body.get(..4)?.try_into().ok()?);
+    let channels = *body.get(4)?;
+    let pcm = body.len() - 5;
+    ((8_000..=96_000).contains(&rate)
+        && (1..=2).contains(&channels)
+        && pcm > 0
+        && pcm.is_multiple_of(2 * channels as usize))
+    .then_some((rate, channels))
 }
 #[derive(Clone, Debug)]
 pub struct Record {
@@ -51,6 +65,9 @@ pub fn read_record(reader: &mut impl Read) -> Result<Record> {
     if header[4] == 2 && (epoch == 0 || size <= 9 || body[8] > 1) {
         bail!("invalid console AU")
     }
+    if header[4] == 3 && (epoch != 0 || audio_format(&body).is_none()) {
+        bail!("invalid console audio")
+    }
     Ok(Record {
         kind: header[4],
         epoch,
@@ -82,6 +99,7 @@ mod tests {
             ((MAX_JSON_BODY + 1) as u32, 1),
             ((MAX_BODY + 1) as u32, 2),
             (1, 3),
+            (1, 4),
         ] {
             let mut h = [0; 13];
             h[..4].copy_from_slice(&len.to_be_bytes());
@@ -118,6 +136,32 @@ mod tests {
         assert!(write_record(&mut Vec::new(), &access_unit).is_err());
         assert_eq!(body_limit(1), Some(MAX_JSON_BODY));
         assert_eq!(body_limit(2), Some(MAX_BODY));
-        assert_eq!(body_limit(3), None);
+        assert_eq!(body_limit(4), None);
+    }
+    #[test]
+    fn audio_records_carry_a_bounded_well_formed_format() {
+        let mut body = 48_000u32.to_be_bytes().to_vec();
+        body.push(2);
+        body.extend_from_slice(&[0; 3840]);
+        assert_eq!(audio_format(&body), Some((48_000, 2)));
+        let record = Record {
+            kind: 3,
+            epoch: 0,
+            body: body.clone(),
+        };
+        let mut bytes = Vec::new();
+        write_record(&mut bytes, &record).unwrap();
+        assert_eq!(read_record(&mut bytes.as_slice()).unwrap().body, body);
+        // Epoch-scoped, odd-sized, three-channel or out-of-range audio is refused.
+        bytes[12] = 1;
+        assert!(read_record(&mut bytes.as_slice()).is_err());
+        for bad in [
+            [&48_000u32.to_be_bytes()[..], &[2, 0, 0, 0]].concat(),
+            [&48_000u32.to_be_bytes()[..], &[3, 0, 0, 0, 0, 0, 0]].concat(),
+            [&4_000u32.to_be_bytes()[..], &[1, 0, 0]].concat(),
+            [&48_000u32.to_be_bytes()[..], &[1]].concat(),
+        ] {
+            assert_eq!(audio_format(&bad), None);
+        }
     }
 }

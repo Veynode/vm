@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Adversarial protocol fixture ONLY: no SPICE, VM, GPU or real codec work."""
+import base64
 import json
 import os
 import struct
@@ -37,11 +38,26 @@ def record(kind, epoch, body):
 def au(epoch):
     return record(2, epoch, struct.pack(">QB", 1000, 1) + b"\x00\x00\x00\x01\x65test")
 
+clipboard, clipboard_parts = "", b""
 log({"event": "spawn", "pid": os.getpid()})
 os.write(1, record(1, 0, {"event": "ready", "protocol": 1, "capture_connected": True}))
 for line in sys.stdin:
     request = json.loads(line)
     log(request)
+    if request["method"] == "audio_in":
+        assert set(request) == {"method", "pcm"}
+        continue
+    # The Guest clipboard: parts build the text a later clipboard_get reports as an event.
+    if request["method"] == "clipboard_chunk":
+        assert set(request) == {"method", "data", "last"}
+        clipboard_parts += base64.b64decode(request["data"])
+        if request["last"]:
+            clipboard, clipboard_parts = clipboard_parts.decode(), b""
+        continue
+    if request["method"] == "clipboard_get":
+        assert set(request) == {"method"}
+        os.write(1, record(1, 0, {"event": "clipboard", "text": clipboard}))
+        continue
     ident, method = request["id"], request["method"]
     epoch = request.get("epoch", 0)
     if method in {"show_window", "close_window", "window_status"}:
@@ -64,6 +80,11 @@ for line in sys.stdin:
         elif mode == "session-error" and starts == 1:
             active = None
             os.write(1, ack + record(1, epoch, {"event": "session-error", "epoch": epoch, "error": "injected encoder failure"}))
+        elif mode == "source-replaced" and starts == 1:
+            # What spice-console sends when the guest changes resolution.
+            active = None
+            os.write(1, ack + au(epoch) + record(1, epoch, {"event": "session-error", "epoch": epoch, "error": {"code": "encoder_failed",
+                      "message": "Source generation unavailable; start a fresh encoding epoch after replacement"}}))
         elif mode == "mismatched-session-error":
             os.write(1, ack + record(1, epoch, {"event": "session-error", "epoch": epoch + 1, "error": "wrong session; encoder remains active"}))
         else:
@@ -112,6 +133,13 @@ for line in sys.stdin:
             os.write(1, record(1, epoch, {"id": ident, "error": "stale_or_inactive_epoch"}))
         else:
             os.write(1, record(1, epoch, {"id": ident, "result": {"requested": True}}))
+    elif method in {"audio_start", "audio_stop"}:
+        assert set(request) == {"id", "method"}
+        listening = method == "audio_start"
+        out = record(1, 0, {"id": ident, "result": {"listening": listening, "playback": True, "record": True}})
+        if listening:
+            out += record(3, 0, struct.pack(">IB", 48000, 2) + b"\x01\x00\x02\x00")
+        os.write(1, out)
     elif method == "shutdown":
         active = None
         os.write(1, record(1, 0, {"id": ident, "result": {"state": "stopped"}}))

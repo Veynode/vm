@@ -71,6 +71,7 @@ struct Config: Decodable {
     var mac_address: String?
     var screen_sharing_login: String?
     var machine_identifier_file: String?
+    var audio: Bool?
 }
 struct ExtraDisk: Decodable { let path: String; let read_only: Bool }
 struct Share: Decodable { let tag: String; let path: String; var read_only: Bool? }
@@ -377,6 +378,14 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
             c.graphicsDevices = [graphics]
             c.keyboards = [VZMacKeyboardConfiguration()]
             c.pointingDevices = [VZMacTrackpadConfiguration()]
+            if config.audio == true {
+                // A sound card with no host sink: the Guest has an output to play into, and its
+                // service records that with ScreenCaptureKit for the viewer (MacDesktopStream),
+                // instead of Apple Virtualization playing it on the Mac's speakers.
+                let sound = VZVirtioSoundDeviceConfiguration()
+                sound.streams = [VZVirtioSoundDeviceOutputStreamConfiguration()]
+                c.audioDevices = [sound]
+            }
         } else { throw NativeError(message:"Unsupported guest: \(config.guest)") }
         let network = VZVirtioNetworkDeviceConfiguration()
         if let context = linuxSnapshot { network.macAddress = context.macAddress }
@@ -584,7 +593,21 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
                 setsockopt(descriptor, SOL_SOCKET, SO_SNDBUF, &buffer, socklen_t(MemoryLayout<Int32>.size))
                 setsockopt(descriptor, SOL_SOCKET, SO_RCVBUF, &buffer, socklen_t(MemoryLayout<Int32>.size))
             }
-            MacDesktopStream.start(fd:pair[1], connect:{ try sharing.connect() })
+            MacDesktopStream.start(fd:pair[1], connect:{ try sharing.connect() }, audio:self.config.audio == true ? { completion in
+                // The Guest service's audio port (native/guest-macos/audio.swift).
+                DispatchQueue.main.async {
+                    guard self.vm.state == .running, let socket = self.vm.socketDevices.first as? VZVirtioSocketDevice else {
+                        completion(.failure(NativeError(message:"the macOS Guest is not running"))); return
+                    }
+                    socket.connect(toPort:5002) { result in
+                        completion(result.flatMap { connection in
+                            let descriptor = dup(connection.fileDescriptor)
+                            guard descriptor >= 0 else { connection.close(); return .failure(NativeError(message:"Cannot retain the Guest audio descriptor")) }
+                            return .success((fd:descriptor, release:{ DispatchQueue.main.async { connection.close() } }))
+                        })
+                    }
+                }
+            } : nil)
             completion(.success(GuestStreamEndpoint(fd:pair[0])))
         }
     }

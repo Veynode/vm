@@ -26,7 +26,7 @@ use vm_remote_proto::tunnel::{RouteOpen, MAX_MESSAGE};
 use vm_session_auth::store::{Registry, Store};
 use vm_session_auth::SessionGate;
 
-const USAGE: &str = "usage: vm-media-local remote --config GATEWAY_TOML --auth-state DIR --auth-namespace NAME [--veynodevm PATH]";
+const USAGE: &str = "usage: vm-media-local remote --config GATEWAY_TOML --auth-state DIR --auth-namespace NAME [--state-dir DIR]";
 /// How often the pairing registry is re-read for revocations.
 const RELOAD: Duration = Duration::from_millis(250);
 const RECONNECT_MIN: Duration = Duration::from_secs(1);
@@ -150,11 +150,12 @@ struct Args {
     config: PathBuf,
     state: PathBuf,
     namespace: String,
-    veynodevm: Option<PathBuf>,
+    /// The daemon's state directory, for a home other than `VEYNODEVM_HOME`'s.
+    state_dir: Option<PathBuf>,
 }
 
 fn parse_args(args: &[String]) -> Result<Args> {
-    let (mut config, mut state, mut namespace, mut veynodevm) = (None, None, None, None);
+    let (mut config, mut state, mut namespace, mut state_dir) = (None, None, None, None);
     let mut i = 0;
     while i < args.len() {
         let value = args.get(i + 1).context(USAGE)?.clone();
@@ -162,7 +163,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
             "--config" => &mut config,
             "--auth-state" => &mut state,
             "--auth-namespace" => &mut namespace,
-            "--veynodevm" => &mut veynodevm,
+            "--state-dir" => &mut state_dir,
             other => bail!("unknown option {other}\n{USAGE}"),
         };
         anyhow::ensure!(slot.is_none(), "duplicate option {}", args[i]);
@@ -173,7 +174,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
         config: config.context(USAGE)?.into(),
         state: state.context(USAGE)?.into(),
         namespace: namespace.context(USAGE)?,
-        veynodevm: veynodevm.map(PathBuf::from),
+        state_dir: state_dir.map(PathBuf::from),
     })
 }
 
@@ -198,18 +199,16 @@ pub async fn run(args: &[String]) -> Result<()> {
         &registry.grants.values().cloned().collect::<Vec<_>>(),
         &registry.versions,
     )?;
-    let program = match args.veynodevm {
-        Some(p) => p,
-        None => std::env::current_exe()?
-            .parent()
-            .context("executable directory")?
-            .join("veynodevm"),
+    let name = concat!("vm-media-local/", env!("CARGO_PKG_VERSION"));
+    let client = match args.state_dir {
+        Some(dir) => veynodevm_api::Client::at_socket(dir.join("control.sock"), name),
+        None => veynodevm_api::Client::from_env(name)?,
     };
     let remote = Remote::new(
         gate,
         identity,
         config,
-        Arc::new(hub::DesktopProcess { program }),
+        Arc::new(hub::DesktopStream { client }),
     );
     tokio::spawn(reload_loop(
         remote.clone(),

@@ -1,11 +1,9 @@
 // Server-only: image pulls that outlive one request, so the browser can poll
-// their progress. `veynodevm pull` prints its progress on stderr only without
-// --json, so this runs it plain; its last stderr line is the error when it
-// fails. One pull per reference at a time; finished pulls stay until the next
-// pull of that reference.
-import { spawn } from 'node:child_process'
+// their progress: the daemon's `image.pull` stream, whose `progress` events
+// are the lines kept here. One pull per reference at a time; finished pulls
+// stay until the next pull of that reference.
+import { stream } from '../../daemon.mjs'
 
-const CLI = process.env.VEYNODEVM_CLI || 'veynodevm'
 const KEEP = 40
 
 export interface PullState {
@@ -31,8 +29,7 @@ export function startPull(reference: string): PullState {
   if (current?.state === 'pulling') return current
   const pull: PullState = { reference, state: 'pulling', lines: [], started_at: Date.now() / 1000 }
   pulls.set(reference, pull)
-  const child = spawn(CLI, ['pull', reference], { stdio: ['ignore', 'ignore', 'pipe'], env: process.env })
-  let partial = ''
+  const pulling = stream('image.pull', { reference })
   const line = (text: string) => {
     const trimmed = text.trim()
     if (!trimmed) return
@@ -46,25 +43,15 @@ export function startPull(reference: string): PullState {
     const plan = /^macOS image: (\d+) disk chunks/.exec(trimmed)
     if (plan) pull.total = Number(plan[1])
   }
-  child.stderr.setEncoding('utf8')
-  child.stderr.on('data', (data: string) => {
-    const parts = (partial + data).split('\n')
-    partial = parts.pop() ?? ''
-    parts.forEach(line)
+  pulling.on('event', (event: { progress?: string }) => {
+    if (typeof event.progress === 'string') event.progress.split('\n').forEach(line)
   })
-  child.on('error', (error) => {
+  pulling.on('error', (error: Error) => {
     pull.state = 'failed'
     pull.error = error.message
   })
-  child.on('close', (code) => {
-    line(partial)
-    if (pull.state !== 'pulling') return
-    if (code === 0) pull.state = 'done'
-    else {
-      pull.state = 'failed'
-      const last = pull.lines.at(-1) ?? `veynodevm pull exited with ${code}`
-      pull.error = last.replace(/^veynodevm: /, '')
-    }
+  pulling.on('end', () => {
+    pull.state = 'done'
   })
   return pull
 }

@@ -152,7 +152,7 @@ function Detail() {
             control={
               <Input
                 size="small"
-                className="font-mono"
+                className="w-96 font-mono"
                 placeholder={up ? 'cat /etc/os-release' : 'Not running'}
                 value={command}
                 disabled={!up}

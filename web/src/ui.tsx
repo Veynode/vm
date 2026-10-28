@@ -89,10 +89,23 @@ export function PageActions({ children }: { children: ReactNode }) {
 /** A state's tone; `fact` is a word that is no state (a kind, a count). */
 export type Tone = StateTone | 'fact'
 
+/** A field's one-line limit or default, under it (`warn` when it is exceeded). */
+export function Hint({ children, warn }: { children: ReactNode; warn?: boolean }) {
+  return <p className={`text-caption-1-regular ${warn ? 'text-state-failed-ink' : 'text-ink-2'}`}>{children}</p>
+}
+
+/** GiB from a stepper as the CLI's `--memory` (whole MiB). */
+export const gibToMemory = (gib: string) => (gib.trim() ? `${Math.round(Number(gib) * 1024)}m` : undefined)
+
+/** A state that is a failure: crashed, failed, or exited with a nonzero status. */
+export function failed(state: string, status: string) {
+  return state === 'crashed' || status.startsWith('Failed') || /Exited \((?!0\))/.test(status)
+}
+
 /** A container's or the engine's state as one `StateTag`. */
 export function StatusTag({ state, status }: { state: string; status: string }) {
   const up = !['stopped', 'crashed', 'missing', 'unknown', 'absent'].includes(state)
-  const bad = state === 'crashed' || status.startsWith('Failed') || /Exited \((?!0\))/.test(status)
+  const bad = failed(state, status)
   const busy = /^(starting|creating|stopping|booting|pulling)/i.test(state)
   const tone: StateTone = bad ? 'failed' : busy ? 'working' : up ? 'done' : 'neutral'
   return (
@@ -321,10 +334,14 @@ export function age(seconds: number) {
   return `${Math.floor(d / 86400)}d ago`
 }
 
+/** An image reference as Docker shows it: without `docker.io/library/` or `docker.io/`. */
+export const shortRef = (reference: string) => reference.replace(/^docker\.io\/(library\/)?/, '')
+
+/** Bytes in the binary units memory and disk sizes use (GiB, MiB, KiB). */
 export function size(bytes: number) {
-  if (bytes >= 1 << 30) return `${(bytes / (1 << 30)).toFixed(2)} GB`
-  if (bytes >= 1 << 20) return `${(bytes / (1 << 20)).toFixed(1)} MB`
-  return `${(bytes / 1024).toFixed(1)} kB`
+  if (bytes >= 1 << 30) return `${(bytes / (1 << 30)).toFixed(1)} GiB`
+  if (bytes >= 1 << 20) return `${(bytes / (1 << 20)).toFixed(1)} MiB`
+  return `${(bytes / 1024).toFixed(1)} KiB`
 }
 
 /** Split a command line into argv, honouring single and double quotes. */

@@ -10,11 +10,16 @@ package main
 // host -> guest: JSON lines of at most 4 KiB. {"method":"start"} first, then
 //   {"input":[{"t":"abs","x":0..32767,"y":0..32767} |
 //             {"t":"key","code":evdev,"down":bool} | {"t":"wheel","dx","dy"}]}
+//   {"audio":bool} and {"mic":"<base64>"}: Guest audio (desktop_audio_linux.go)
+//   {"clipboard":"text"}, {"clipboard_watch":bool}, {"clipboard_get":true}:
+//   the desktop's clipboard (clipboard_x11.go), answered by
+//   {"event":"clipboard","text"} or {"event":"clipboard","error"}
 // guest -> host: records of u32 big-endian length, u8 kind, body:
 //   1 JSON event: {"event":"mode","width","height","format":"bgrx"}
 //                 or {"event":"error","message"}
 //   2 rectangle:  u16 BE x, y, w, h then w*h*4 bytes, rows packed
 //   3 frame end:  u64 BE guest monotonic microseconds
+//   4 audio:      u32 BE rate, u8 channels, s16le PCM
 
 import (
 	"bufio"
@@ -33,7 +38,8 @@ const (
 	desktopPort    = 5001
 	desktopPoll    = 8 * time.Millisecond
 	desktopMaxSide = 4096
-	desktopMaxLine = 4096
+	// A clipboard line carries up to 200 KiB of text, JSON-escaped.
+	desktopMaxLine = 2 << 20
 )
 
 // DRM UAPI (include/uapi/drm/drm.h, drm_mode.h); fixed Linux ABI.
@@ -345,12 +351,23 @@ func listenDesktop() error {
 	}
 }
 
+// desktopWriter is shared by the frame loop and the audio relay; each record
+// and flush is whole under mu.
 type desktopWriter struct {
+	mu   sync.Mutex
 	conn *os.File
 	out  *bufio.Writer
 }
 
+func (w *desktopWriter) flush() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.out.Flush()
+}
+
 func (w *desktopWriter) record(kind byte, head []byte, body []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	var prefix [5]byte
 	binary.BigEndian.PutUint32(prefix[:], uint32(1+len(head)+len(body)))
 	prefix[4] = kind
@@ -368,13 +385,13 @@ func (w *desktopWriter) event(value map[string]any) error {
 	if err := w.record(1, nil, body); err != nil {
 		return err
 	}
-	return w.out.Flush()
+	return w.flush()
 }
 
 func serveDesktop(conn *os.File) {
 	w := &desktopWriter{conn: conn, out: bufio.NewWriterSize(conn, 1<<20)}
 	lines := bufio.NewScanner(conn)
-	lines.Buffer(make([]byte, desktopMaxLine), desktopMaxLine)
+	lines.Buffer(make([]byte, 64<<10), desktopMaxLine)
 	fail := func(err error) { _ = w.event(map[string]any{"event": "error", "message": err.Error()}) }
 	var start struct {
 		Method string `json:"method"`
@@ -396,15 +413,37 @@ func serveDesktop(conn *os.File) {
 		// Video still works; every input batch reports the reason.
 		fmt.Fprintln(os.Stderr, "desktop input unavailable:", inputErr)
 	}
+	audio := &desktopAudio{}
+	defer audio.stop()
+	clipboard := &desktopClipboard{}
+	defer clipboard.close()
 	done := make(chan struct{})
 	reports := make(chan error, 1)
 	go func() {
 		defer close(done)
 		for lines.Scan() {
 			var message struct {
-				Input []desktopEvent `json:"input"`
+				Input          []desktopEvent `json:"input"`
+				Audio          *bool          `json:"audio"`
+				Mic            []byte         `json:"mic"`
+				Clipboard      *string        `json:"clipboard"`
+				ClipboardWatch *bool          `json:"clipboard_watch"`
+				ClipboardGet   bool           `json:"clipboard_get"`
 			}
 			err := json.Unmarshal(lines.Bytes(), &message)
+			if err == nil && (message.Clipboard != nil || message.ClipboardWatch != nil || message.ClipboardGet) {
+				clipboard.apply(w, message.Clipboard, message.ClipboardWatch, message.ClipboardGet)
+				continue
+			}
+			if err == nil && (message.Audio != nil || message.Mic != nil) {
+				if message.Audio != nil {
+					audio.listen(w, *message.Audio)
+				}
+				if message.Mic != nil {
+					audio.microphone(w, message.Mic)
+				}
+				continue
+			}
 			if err == nil && input == nil {
 				err = inputErr
 			}
@@ -469,7 +508,7 @@ func serveDesktop(conn *os.File) {
 			frames++
 			binary.BigEndian.PutUint64(head[:], uint64(time.Since(desktopEpoch).Microseconds()))
 			if err = w.record(3, head[:], nil); err == nil {
-				err = w.out.Flush()
+				err = w.flush()
 			}
 		}
 		if err != nil {

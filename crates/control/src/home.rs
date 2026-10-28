@@ -14,15 +14,7 @@ use std::{
 pub const RUNTIME_FILE: &str = "runtime.json";
 
 pub fn root() -> Result<PathBuf> {
-    if let Some(dir) = std::env::var_os("VEYNODEVM_HOME") {
-        let dir = PathBuf::from(dir);
-        if !dir.is_absolute() {
-            bail!("VEYNODEVM_HOME must be absolute")
-        }
-        return Ok(dir);
-    }
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join("Library/Application Support/VeynodeVM"))
+    veynodevm_api::home()
 }
 
 /// Create (or verify) a private directory owned by this user.

@@ -49,7 +49,7 @@ Replies use the existing length / kind / epoch envelope: JSON kind `1`, epoch
 `0`, `{ "id": "w2", "result": { ... } }` or
 `{ "id": "w2", "error": { "code": "...", "message": "..." } }`.
 Capabilities include `native_window`, `native_window_protocol: 1`,
-`display_only: true`, `input_enabled: false`, the 60 fps visible / 30 fps background source limits, a separate fixed 30 fps
+`display_only: true`, `input_enabled: false`, the 240 fps visible / 30 fps background source limits, a separate fixed 30 fps
 encoder limit, three owned slots and one in-flight display GPU command. `ready` is unchanged.
 Window replies also include `window_open`, `window_visible`, frame availability,
 source generation/sequence, submission/completion/failure counters and pool
@@ -67,9 +67,36 @@ the broker must retain its bounded timeout and treat missing ACK as uncertain.
 No window request changes an encoding epoch or native input state.
 
 The content view does not accept or forward keys, mouse buttons, wheel,
-clipboard or accessibility operations. The title and a line above the picture say “View Only” only when there is no native input path; input that simply follows focus is not announced. Native
+or accessibility operations except through the input path below; the
+clipboard follows the title bar's controls ([sound and clipboard](#sound-and-clipboard)). The title and a line above the picture say “View Only” only when there is no native input path; input that simply follows focus is not announced. Native
 window chrome, move, resize and minimize still work. A future input path must
 be authorized through the controller; this target does not bypass it.
+
+## Sound and clipboard
+
+`Media.m` puts three controls in the window's title bar. A VM with `audio`
+plays through AVAudioEngine (60 ms buffer) while the window is open and not
+minimized. The speaker button mutes it; the setting is kept across launches.
+The microphone button is off at every launch. It asks for macOS microphone
+access (`NSMicrophoneUsageDescription` in the bundle), shows red while the Guest
+hears this Mac, and turns off with the window. Its 48 kHz mono frames enter
+SPICE record on the GLib thread.
+
+The clipboard button's menu has **Sync Clipboard** (on by default). With it, a
+Guest copy (the Guest's `spice-vdagent`) is put on the Mac pasteboard, and a Mac
+copy goes to the Guest when the window becomes key. **Send Mac Clipboard to
+Desktop** and **Copy Desktop Clipboard** work either way. Text only, 200 KiB.
+Unlike the browser, ⌘ shortcuts are not mapped to Ctrl here: inside the Guest
+use its own Ctrl+C/V.
+
+Evidence: compiled, and `test.sh` passes with stubs for these hooks. The SPICE
+side these controls share with the browser (playback, record and the
+`spice-vdagent` clipboard in `spice-console`) passed live through the console
+broker ([evidence](../../docs/browser-desktop.md#sound-and-clipboard)). The
+window's own half has not been checked live: no AVAudioEngine playback,
+microphone permission prompt or pasteboard round trip yet. The microphone permission belongs to whichever
+process macOS treats as responsible for the console, which has not been
+observed.
 
 ## Ownership and display path
 
@@ -156,30 +183,36 @@ has only build / offline tests at this checkpoint, not a VM performance result.
 
 The AppKit main thread publishes visible state under the existing lock. A window
 must be open, visible, not miniaturized, and have the public visible occlusion
-flag. While visible, source draw admission uses a 60 Hz rational deadline cadence;
-otherwise it uses 30 Hz. Closing clears visibility synchronously before the ACK.
+flag. While visible, source draw admission uses a rational deadline cadence at the
+window's screen refresh (`NSScreen.maximumFramesPerSecond`, read again when the
+window changes screen, at most 240 Hz); otherwise it uses 30 Hz. A draw may claim
+its slot a quarter slot (at most 3 ms) early. Closing clears visibility synchronously before the ACK.
 Generation replacement resets pacing. Delayed events skip missed slots without a
 catch-up queue. Source event jitter, GPU copy/encode cost and draw availability
-can lower the actual rate; changing the bound does not prove achieved 60 fps.
-The renderer's refresh preference is also 60 Hz and still submits at most one GPU
+can lower the actual rate; the bound is not an achieved rate (measured: about
+122 fps; see [browser desktop](../../docs/browser-desktop.md#why-1280x800-at-60-fps-and-why-apple-virtualization-is-not-capped)).
+The renderer's `MTKView` asks for the same screen rate and still submits at most one GPU
 command at a time, skipping unchanged sequence/size. The owned slot limit stays
 three.
 
-Remote encoding is deliberately independent. The current `start` protocol has
-no fps field and retains its existing fixed 30 fps gate, encoder properties and
-one-second idle refresh. Visible-source admission does not increase encoded
-frames or static repeats. This change does not advertise remote 60 fps support.
+Remote encoding has its own rate. A stream starts at 240 fps; the viewer's
+`set_fps` request (`fps`, 1..240, from the browser's measured refresh) lowers it
+and resets at the next `start`. Capture runs at the faster of the visible window
+and the stream; when it runs faster than the stream, the encode gate paces on its
+own grid, otherwise every capture is encoded. A copy identical to the previous
+frame is not encoded and counts in `encoder_unchanged_skips_current_epoch`.
+Encoder properties and the one-second idle refresh are unchanged.
 
 Additional capabilities (all limits/preferences, not observed performance):
 
 ```json
 {
-  "capture_limit_fps": 60,
-  "native_window_capture_limit_fps": 60,
+  "capture_limit_fps": 240,
+  "native_window_capture_limit_fps": 240,
   "background_capture_limit_fps": 30,
-  "encoder_limit_fps": 60,
+  "encoder_limit_fps": 240,
   "idle_encode_interval_ms": 1000,
-  "display_refresh_preference_hz": 60,
+  "display_refresh_preference_hz": 240,
   "presented_time_sample_limit": 120,
   "presented_time_source": "CAMetalDrawable.addPresentedHandler/presentedTime",
   "physical_presentation_measurement": "unavailable"
@@ -190,7 +223,7 @@ Additional capabilities (all limits/preferences, not observed performance):
 `source_draw_events`, `source_copies`, `capture_pacing_drops`, `capture_pool_drops`,
 `visible_source_copies`, `background_source_copies`, `sampled_monotonic_us`,
 `encoder_active`, `encoder_output_frames_current_epoch`, and
-`encoder_idle_frames_current_epoch`. Source counters are process-cumulative;
+`encoder_idle_frames_current_epoch`, `encoder_unchanged_skips_current_epoch`. Source counters are process-cumulative;
 encoder counts reset at an encoding epoch start and retain their last values
 after stop. Existing `display_gpu_inflight` remains a JSON **boolean**, with
 `display_gpu_inflight_limit: 1` the separate numeric limit.
@@ -202,7 +235,10 @@ includes `metal_presented_time_seconds`, `source_generation`, `source_sequence`,
 `presented_callback_count`, `presented_time_valid_count`,
 `presented_time_invalid_count`, and `presented_time_evicted_count` are cumulative.
 Only finite, positive, strictly increasing times enter the ring. Zero, duplicate,
-nonfinite or out-of-order values increase the invalid count. Blank clearing
+nonfinite or out-of-order values increase the invalid count. On macOS 27 every
+`presentedTime` of a visible window is 0 (all callbacks counted invalid), so the
+displayed-frame record that admits input takes `CACurrentMediaTime()` at the
+callback instead; the ring keeps only real values. Blank clearing
 frames are distinguishable by `source_frame_available: false`. Historical samples
 from a closed window retain their epoch. GPU completed/submitted counters remain
 separate. `physical_presentations` is null: this probe is not a photon detector,
@@ -222,7 +258,8 @@ Public API evidence reviewed on 2026-10-09:
 - [Apple addPresentedHandler](https://developer.apple.com/documentation/metal/mtldrawable/addpresentedhandler(_:))
   is the public callback API, also declared in the SDK above.
 
-Offline tests cover 600 rational 60 Hz admissions without integer rounding drift,
+Offline tests cover every draw of a 60 Hz source admitted, a 1 kHz source held to 240 or 120 without integer rounding drift,
+a busy source at 120,
 30 Hz background admission on that source, same-timestamp/late-event catch-up
 rejection, visibility policy transitions, and bounded timestamp filtering with
 synthetic values. Those values are explicitly **not** evidence of actual

@@ -175,7 +175,7 @@ pub fn validate_pacing_capabilities(value: &Value) -> Result<()> {
         Ok(n)
     };
     if value.get("capture_limit_fps").is_some() {
-        cap("capture_limit_fps", 60)?;
+        cap("capture_limit_fps", 240)?;
     }
     let extended = [
         "native_window_capture_limit_fps",
@@ -185,10 +185,10 @@ pub fn validate_pacing_capabilities(value: &Value) -> Result<()> {
         "display_refresh_preference_hz",
     ];
     if extended.iter().any(|key| value.get(key).is_some()) {
-        let capture = cap("capture_limit_fps", 60)?;
-        let window = cap("native_window_capture_limit_fps", 60)?;
-        let background = cap("background_capture_limit_fps", 60)?;
-        let encoder = cap("encoder_limit_fps", 60)?;
+        let capture = cap("capture_limit_fps", 240)?;
+        let window = cap("native_window_capture_limit_fps", 240)?;
+        let background = cap("background_capture_limit_fps", 240)?;
+        let encoder = cap("encoder_limit_fps", 240)?;
         cap("idle_encode_interval_ms", 10000)?;
         cap("display_refresh_preference_hz", 240)?;
         // A browser stream captures at the window cadence even while the
@@ -200,8 +200,9 @@ pub fn validate_pacing_capabilities(value: &Value) -> Result<()> {
             let current = current
                 .as_u64()
                 .context("current capture limit must be an unsigned integer")?;
-            if current != background && current != window {
-                bail!("current capture limit does not match a configured state")
+            // Visible, the window's screen refresh (at most the window limit); else the background rate.
+            if current == 0 || current > window {
+                bail!("current capture limit outside the configured limits")
             }
         }
     } else if value.get("capture_current_limit_fps").is_some() {
@@ -407,11 +408,20 @@ mod window_tests {
         let mut streaming = caps.clone();
         streaming["encoder_limit_fps"] = json!(60);
         assert!(validate_pacing_capabilities(&streaming).is_ok());
+        let uncapped = json!({"capture_limit_fps":240,"native_window_capture_limit_fps":240,"background_capture_limit_fps":30,"encoder_limit_fps":240,"idle_encode_interval_ms":1000,"display_refresh_preference_hz":240,"capture_current_limit_fps":240});
+        assert!(validate_pacing_capabilities(&uncapped).is_ok());
+        let mut promotion = uncapped.clone();
+        promotion["capture_current_limit_fps"] = json!(120);
+        assert!(validate_pacing_capabilities(&promotion).is_ok());
+        let mut over = uncapped.clone();
+        over["capture_limit_fps"] = json!(241);
+        assert!(validate_pacing_capabilities(&over).is_err());
         for (field, value) in [
             ("encoder_limit_fps", json!(true)),
             ("encoder_limit_fps", json!(30.0)),
             ("encoder_limit_fps", json!(120)),
-            ("capture_current_limit_fps", json!(45)),
+            ("capture_current_limit_fps", json!(0)),
+            ("capture_current_limit_fps", json!(61)),
             ("background_capture_limit_fps", json!(0)),
             ("capture_limit_fps", json!(30)),
         ] {

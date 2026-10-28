@@ -7,72 +7,54 @@
 //! on host loopback, and a `veynodevm` docker context points at it, so the
 //! stock docker CLI and compose work unchanged. Directories given with
 //! `--share` are mounted at the same path, so host bind mounts under them work.
-use crate::container::{self, RunOptions};
+//
+//! The engine itself is the daemon's (`engine.*`); this is the docker side.
+use crate::{api_call, api_stream};
 use anyhow::{bail, Context, Result};
+use serde_json::{json, Value};
 use std::{
     path::PathBuf,
     process::Command,
     time::{Duration, Instant},
 };
-use vm_control::home;
 
 pub const NAME: &str = "veynodevm-engine";
-pub const IMAGE: &str = "docker:28-dind";
 pub const CONTEXT: &str = "veynodevm";
-const DEFAULT_PORT: u16 = 2376;
-
-fn certs() -> Result<PathBuf> {
-    let dir = home::private_dir(&home::root()?.join("engine"))?;
-    Ok(dir.join("certs"))
-}
-
-fn port(c: &container::Container) -> u16 {
-    c.ports.first().map(|p| p.host_port).unwrap_or(DEFAULT_PORT)
-}
 
 fn docker_cli() -> Option<PathBuf> {
-    veynodevm_oci::store::which("docker")
+    crate::home::which("docker")
 }
 
 /// Environment for the docker CLI to reach the engine directly.
 pub fn env() -> Result<Vec<(String, String)>> {
-    let c = container::find(NAME).context("engine not created; run veynodevm engine start")?;
-    Ok(vec![
-        (
-            "DOCKER_HOST".into(),
-            format!("tcp://127.0.0.1:{}", port(&c)),
-        ),
-        ("DOCKER_TLS_VERIFY".into(), "1".into()),
-        (
-            "DOCKER_CERT_PATH".into(),
-            certs()?.to_string_lossy().into_owned(),
-        ),
-    ])
+    Ok(env_of(&api_call("engine.status", json!({}))?))
 }
 
-fn wait_ready(c: &container::Container, timeout: Duration) -> Result<()> {
+fn env_of(status: &Value) -> Vec<(String, String)> {
+    status["env"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_owned()))
+        .collect()
+}
+
+/// The daemon waits for dind's certificates and endpoint; this waits for
+/// dockerd to answer the docker CLI on it.
+fn wait_docker(status: &Value, timeout: Duration) -> Result<()> {
+    let Some(docker) = docker_cli() else {
+        return Ok(());
+    };
     let deadline = Instant::now() + timeout;
-    let cert = certs()?.join("cert.pem");
     loop {
-        let console = container::read_console(c);
-        if let Some(code) = console.exit {
-            bail!("engine exited with status {code}; see veynodevm logs {NAME}")
-        }
-        if cert.exists() && std::net::TcpStream::connect(("127.0.0.1", port(c))).is_ok() {
-            match docker_cli() {
-                None => return Ok(()),
-                Some(docker) => {
-                    let ok = Command::new(docker)
-                        .args(["version", "--format", "{{.Server.Version}}"])
-                        .envs(env()?)
-                        .output()
-                        .map(|o| o.status.success())
-                        .unwrap_or(false);
-                    if ok {
-                        return Ok(());
-                    }
-                }
-            }
+        let ok = Command::new(&docker)
+            .args(["version", "--format", "{{.Server.Version}}"])
+            .envs(env_of(status))
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            return Ok(());
         }
         if Instant::now() > deadline {
             bail!("engine did not become ready in time; see veynodevm logs {NAME}")
@@ -83,14 +65,14 @@ fn wait_ready(c: &container::Container, timeout: Duration) -> Result<()> {
 
 /// Create or refresh the `veynodevm` docker context (additive; never switches
 /// the current context).
-fn ensure_context(c: &container::Container) -> Result<Option<String>> {
+fn ensure_context(status: &Value) -> Result<Option<String>> {
     let Some(docker) = docker_cli() else {
         return Ok(None);
     };
-    let certs = certs()?;
+    let certs = PathBuf::from(status["certs"].as_str().unwrap_or_default());
     let endpoint = format!(
         "host=tcp://127.0.0.1:{},ca={},cert={},key={}",
-        port(c),
+        status["port"],
         certs.join("ca.pem").display(),
         certs.join("cert.pem").display(),
         certs.join("key.pem").display()
@@ -157,85 +139,38 @@ fn start(rest: &[String]) -> Result<i32> {
         .iter()
         .map(|dir| shared_dir(dir))
         .collect::<Result<Vec<_>>>()?;
-    let c = match container::find(NAME) {
-        Ok(c) => {
-            let (state, _) = container::status_text(&c);
-            if !shares.is_empty() || p.value("gpus").is_some() {
-                bail!("--share and --gpus apply when the engine is created; run `veynodevm rm -f {NAME}` first (its images and containers are discarded)")
-            }
-            if matches!(state.as_str(), "stopped" | "crashed" | "missing") {
-                container::start(&c)?;
-            }
-            c
-        }
-        Err(_) => {
-            let certs = certs()?;
-            std::fs::create_dir_all(&certs)?;
-            let port: u16 = p
-                .value("port")
-                .map(str::parse)
-                .transpose()
-                .context("invalid --port")?
-                .unwrap_or(DEFAULT_PORT);
-            // Inside the engine VM, inbound segments above ~1300 bytes were
-            // observed to be lost on Apple NAT while plain containers were
-            // unaffected (docs/known-issues.md); 1280 is the safe default.
-            let mtu: u16 = p
-                .value("mtu")
-                .map(str::parse)
-                .transpose()
-                .context("invalid --mtu")?
-                .unwrap_or(1280);
-            eprintln!(
-                "creating shared engine ({})",
-                p.value("image").unwrap_or(IMAGE)
-            );
-            container::create_and_start(&RunOptions {
-                image: p.value("image").unwrap_or(IMAGE).into(),
-                name: Some(NAME.into()),
-                detach: true,
-                ports: vec![format!("127.0.0.1:{port}:2376")],
-                // Shared host directories keep their path, so `docker run -v`
-                // and compose bind mounts under them resolve inside the VM.
-                volumes: std::iter::once(format!("{}:/certs/client", certs.display()))
-                    .chain(shares.iter().map(|d| format!("{0}:{0}", d.display())))
-                    .collect(),
-                cpus: Some(
-                    p.value("cpus")
-                        .map(str::parse)
-                        .transpose()
-                        .context("invalid --cpus")?
-                        .unwrap_or(4),
-                ),
-                memory_mib: Some(
-                    p.value("memory")
-                        .map(crate::args::memory_mib)
-                        .transpose()?
-                        .unwrap_or(4096),
-                ),
-                disk_gib: Some(
-                    p.value("disk-size")
-                        .map(|d| d.trim_end_matches(['g', 'G']).parse())
-                        .transpose()
-                        .context("invalid --disk-size")?
-                        .unwrap_or(64),
-                ),
-                gpus: p.value("gpus").map(str::to_owned),
-                engine: true,
-                dns: p.values("dns").to_vec(),
-                mtu: Some(mtu),
-                // dind passes leading flags to dockerd; inner bridges match the VM.
-                command: vec![format!("--mtu={mtu}")],
-                ..Default::default()
-            })?
-        }
+    let number = |flag: &str| -> Result<Option<u64>> {
+        p.value(flag)
+            .map(str::parse)
+            .transpose()
+            .with_context(|| format!("invalid --{flag}"))
     };
-    wait_ready(&c, Duration::from_secs(180))?;
-    match ensure_context(&c)? {
+    let mut args = json!({
+        "shares": shares,
+        "gpus": p.value("gpus"),
+        "cpus": number("cpus")?,
+        "memoryMiB": p.value("memory").map(crate::args::memory_mib).transpose()?,
+        "diskGiB": p
+            .value("disk-size")
+            .map(|d| d.trim_end_matches(['g', 'G']).parse::<u64>())
+            .transpose()
+            .context("invalid --disk-size")?,
+        "port": number("port")?,
+        "image": p.value("image"),
+        "dns": p.values("dns"),
+        "mtu": number("mtu")?,
+    });
+    // Unset options take the daemon's defaults.
+    if let Some(args) = args.as_object_mut() {
+        args.retain(|_, v| !v.is_null());
+    }
+    let status = api_stream("engine.start", args, false)?;
+    wait_docker(&status, Duration::from_secs(180))?;
+    match ensure_context(&status)? {
         Some(context) => println!("engine ready: docker --context {context} ps"),
         None => println!(
-            "engine ready at tcp://127.0.0.1:{} (docker CLI not found; see veynodevm engine env)",
-            port(&c)
+            "engine ready at {} (docker CLI not found; see veynodevm engine env)",
+            status["endpoint"].as_str().unwrap_or_default()
         ),
     }
     Ok(0)
@@ -247,12 +182,12 @@ pub fn command(rest: &[String], json_output: bool) -> Result<i32> {
     match action {
         "start" => start(tail),
         "stop" => {
-            container::stop(&container::find(NAME)?, Duration::from_secs(20))?;
+            api_call("engine.stop", json!({}))?;
             println!("engine stopped");
             Ok(0)
         }
         "rm" => {
-            container::remove(&container::find(NAME)?, tail.iter().any(|a| a == "-f"))?;
+            api_call("engine.rm", json!({"force":tail.iter().any(|a| a == "-f")}))?;
             println!(
                 "engine removed (images and containers inside it are gone; certificates kept)"
             );
@@ -265,23 +200,26 @@ pub fn command(rest: &[String], json_output: bool) -> Result<i32> {
             Ok(0)
         }
         "status" => {
-            let Ok(c) = container::find(NAME) else {
-                println!("engine not created (veynodevm engine start)");
-                return Ok(1);
+            let status = match api_call("engine.status", json!({})) {
+                Ok(status) => status,
+                Err(e) if veynodevm_api::code_of(&e) == veynodevm_api::ErrorCode::NotFound => {
+                    println!("engine not created (veynodevm engine start)");
+                    return Ok(1);
+                }
+                Err(e) => return Err(e),
             };
-            let (state, status) = container::status_text(&c);
-            let console = container::read_console(&c);
             if json_output {
                 println!(
                     "{}",
-                    serde_json::json!({"state":state,"status":status,"endpoint":format!("tcp://127.0.0.1:{}",port(&c)),"context":CONTEXT,"gpu":console.gpu,"backend":c.backend})
+                    json!({"state":status["state"],"status":status["status"],"endpoint":status["endpoint"],"context":CONTEXT,"gpu":status["gpu"],"backend":status["backend"]})
                 );
             } else {
                 println!(
-                    "{status}  endpoint tcp://127.0.0.1:{}  backend {}  gpu {}",
-                    port(&c),
-                    c.backend,
-                    console.gpu.unwrap_or_else(|| "none".into())
+                    "{}  endpoint {}  backend {}  gpu {}",
+                    status["status"].as_str().unwrap_or_default(),
+                    status["endpoint"].as_str().unwrap_or_default(),
+                    status["backend"].as_str().unwrap_or_default(),
+                    status["gpu"].as_str().unwrap_or("none")
                 );
             }
             Ok(0)
@@ -379,10 +317,8 @@ pub fn build(rest: &[String]) -> Result<i32> {
     {
         bail!("docker build failed")
     }
-    let store = veynodevm_oci::Store::open(&home::images_dir()?)?;
-    let archive = home::images_dir()?
-        .join("tmp")
-        .join(format!("build-{}.tar", crate::random_hex(8)));
+    let dir = tempdir()?;
+    let archive = dir.join("image.tar");
     let saved = Command::new(&docker)
         .args(["save", "-o"])
         .arg(&archive)
@@ -390,16 +326,27 @@ pub fn build(rest: &[String]) -> Result<i32> {
         .envs(env)
         .status()?;
     let loaded = if saved.success() {
-        store.load(&archive)
+        api_stream("image.load", json!({"path":archive,"rootfs":true}), false)
     } else {
         Err(anyhow::anyhow!("docker save failed"))
     };
-    let _ = std::fs::remove_file(&archive);
-    for image in loaded? {
-        let root = store.rootfs(&image, &mut |m| eprintln!("{m}"))?;
-        println!("Loaded image: {} ({})", image.reference, root.display());
+    let _ = std::fs::remove_dir_all(&dir);
+    for image in loaded?.as_array().into_iter().flatten() {
+        println!(
+            "Loaded image: {} ({})",
+            image["reference"].as_str().unwrap_or_default(),
+            image["rootfs"].as_str().unwrap_or_default()
+        );
     }
     Ok(0)
+}
+
+/// A private directory for the build's archive, which the daemon reads.
+fn tempdir() -> Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = std::env::temp_dir().join(format!("veynodevm-build-{}", crate::random_hex(8)));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    Ok(dir)
 }
 
 #[cfg(test)]

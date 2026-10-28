@@ -6,11 +6,16 @@
 // track is its own compression session over the same canvas, with its own
 // crop, output size and bitrate.
 //
-// Usage: vz-desktop-stream PRIVATE_UNIX_SOCKET --codec hevc|h264 [--tracks]
+// Usage: vz-desktop-stream PRIVATE_UNIX_SOCKET --codec hevc|h264 [--tracks] [--audio-fd N]
 // stdout: u32 BE size, u64 BE pts_us, u8 keyframe, [u8 track with --tracks,] Annex B access unit
+// --audio-fd: a stream socket that gets the guest's audio, each record u32 BE
+// size, then u32 BE rate, u8 channels, s16le PCM. Audio is best effort: a
+// writer thread sends it, and records past a short backlog are dropped.
 // stdin, one command per line:
 //   stop
-//   {"input":[...]}             forwarded to the guest
+//   {"input":[...]}             forwarded to the guest, as are
+//   {"audio":bool}, {"mic":"<base64>"}  (guest/veynode-agent/desktop_audio_linux.go;
+//                               a macOS Guest: native/worker/ScreenSharing.swift)
 //   [@T ]keyframe
 //   [@T ]bitrate N              bits/s, clamped to 250000..40000000
 //   [@T ]crop X Y W H           source pixels, clamped to the source, W/H made even;
@@ -18,6 +23,8 @@
 //   [@T ]scale W H              even output size, at least 0.4x the view per side;
 //                               never larger than the crop; "scale 0 0" is the view size
 //   track add T | track remove T
+//   fps N                       at most N guest frames a second (1..240, the
+//                               viewer's screen refresh; default 240), every track
 // T is 0..7 and defaults to 0. Track 0 always exists; other tracks need --tracks.
 // stderr: JSON diagnostics. "view" gives each track's source rectangle and
 // output size; "rate" answers bitrate and reports a refused command.
@@ -32,8 +39,10 @@
 #include <signal.h>
 #include <errno.h>
 #include <time.h>
+#include <limits.h>
+#include "../console/FramePacing.h"
 
-static const size_t maxAU = 4 * 1024 * 1024, maxSide = 4096, tile = 64, maxLine = 4096;
+static const size_t maxAU = 4 * 1024 * 1024, maxSide = 4096, tile = 64, maxLine = 2 * 1024 * 1024; // a JSON line may carry 200 KiB of clipboard text
 enum { maxTracks = 8 };
 static const size_t maxRecord = 1 + 8 + maxSide * tile * 4;
 // Same bounds as crates/media-local/src/rate_control.rs MIN_BPS/MAX_BPS.
@@ -57,6 +66,14 @@ static int64_t lastStill;
 static size_t sourceWidth, sourceHeight;
 static uint8_t *canvas;
 static int64_t epoch, lastChange;
+// A guest frame that ends before its slot at fps a second waits for it.
+static const uint64_t maxFPS = VN_VISIBLE_FPS;
+static uint64_t streamFPS = maxFPS;
+static VNFramePacing framePacing;
+// deferred: a finished guest frame waits for its slot. inFrame: rectangles of the next frame are
+// arriving, so the canvas is mid-frame and the next frame end encodes instead.
+static BOOL deferred, inFrame;
+static void frameDue(void);
 static NSLock *outputLock;
 
 static int64_t nowUs(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (int64_t)t.tv_sec * 1000000 + t.tv_nsec / 1000; }
@@ -370,6 +387,11 @@ static BOOL hasPrefix(const uint8_t *bytes, size_t length, const char *word) {
 // NO for a malformed line; a well-formed but refused one is reported and kept going.
 static BOOL trackCommand(const uint8_t *bytes, size_t line) {
     uint64_t fields[4];
+    if (hasPrefix(bytes, line, "fps ") && parseFields(bytes + 4, line - 4, fields, 1)) {
+        if (fields[0] < 1 || fields[0] > maxFPS) refuse(0, @"fps", @"outside 1..240");
+        else streamFPS = fields[0];
+        return YES;
+    }
     if (hasPrefix(bytes, line, "track add ") && parseFields(bytes + 10, line - 10, fields, 1) && fields[0] < maxTracks) { addTrack((size_t)fields[0]); return YES; }
     if (hasPrefix(bytes, line, "track remove ") && parseFields(bytes + 13, line - 13, fields, 1) && fields[0] < maxTracks) {
         if (fields[0] == 0 || !tracks[fields[0]].used) refuse((size_t)fields[0], @"track", @"track 0 stays and others must exist");
@@ -407,8 +429,32 @@ static int connectPrivate(const char *path) {
     return -1;
 }
 
+static _Atomic int audioFD = -1;
+static const size_t maxAudio = 5 + 64 * 1024;
+static dispatch_queue_t audioQueue;
+static _Atomic int audioBacklog;
+static void forwardAudio(const uint8_t *body, size_t length) {
+    if (audioFD < 0 || audioBacklog >= 8) return;
+    NSMutableData *record = [NSMutableData dataWithLength:4];
+    uint32_t size = CFSwapInt32HostToBig((uint32_t)length);
+    memcpy(record.mutableBytes, &size, 4);
+    [record appendBytes:body length:length];
+    audioBacklog++;
+    dispatch_async(audioQueue, ^{
+        // A failed write ends the audio, never the video.
+        if (audioFD >= 0 && !writeAll(audioFD, record.bytes, record.length)) { close(audioFD); audioFD = -1; }
+        audioBacklog--;
+    });
+}
+
 static BOOL handleRecord(const uint8_t *body, size_t length) {
     uint8_t kind = body[0]; body++; length--;
+    if (kind == 4) {
+        uint8_t channels = length > 4 ? body[4] : 0;
+        if (length < 6 || length > maxAudio || channels < 1 || channels > 2 || (length - 5) % (2 * channels)) { fail(@"guest audio outside bound"); return NO; }
+        forwardAudio(body, length);
+        return YES;
+    }
     if (kind == 1) {
         NSDictionary *event = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:body length:length] options:0 error:NULL];
         if (![event isKindOfClass:NSDictionary.class]) { fail(@"malformed guest event"); return NO; }
@@ -445,30 +491,44 @@ static BOOL handleRecord(const uint8_t *body, size_t length) {
             if (x >= sourceWidth) break;
             memcpy(canvas + ((y + row) * sourceWidth + x) * 4, rows + row * w * 4, MIN(w, sourceWidth - x) * 4);
         }
-        dirty = YES; lastChange = nowUs();
+        dirty = YES; inFrame = YES; lastChange = nowUs();
         return YES;
     }
     if (kind == 3) {
-        if (dirty) {
-            for (size_t i = 0; i < maxTracks; i++) leaveStill(&tracks[i]);
-            encode(maxTracks); settled = NO;
-        }
+        inFrame = NO;
+        if (dirty) frameDue();
         return YES;
     }
     fail(@"unknown guest record");
     return NO;
 }
 
+// Encode the guest's latest frame if its slot has come; else it stays dirty for the poll timeout.
+static void frameDue(void) {
+    deferred = !VNFramePacingAdmit(&framePacing, nowUs(), (unsigned)streamFPS);
+    if (deferred) return;
+    for (size_t i = 0; i < maxTracks; i++) leaveStill(&tracks[i]);
+    encode(maxTracks); settled = NO;
+}
+
 int main(int argc, char **argv) {
     @autoreleasepool {
-        if ((argc != 4 && argc != 5) || strcmp(argv[2], "--codec") || (strcmp(argv[3], "hevc") && strcmp(argv[3], "h264"))
-            || (argc == 5 && strcmp(argv[4], "--tracks"))) {
-            fprintf(stderr, "Usage: vz-desktop-stream PRIVATE_UNIX_SOCKET --codec hevc|h264 [--tracks]\n");
+        BOOL usage = argc < 4 || strcmp(argv[2], "--codec") || (strcmp(argv[3], "hevc") && strcmp(argv[3], "h264"));
+        for (int i = 4; !usage && i < argc; i++) {
+            if (!strcmp(argv[i], "--tracks") && !multiTrack) multiTrack = YES;
+            else if (!strcmp(argv[i], "--audio-fd") && audioFD < 0 && i + 1 < argc) {
+                char *end; long fd = strtol(argv[++i], &end, 10);
+                if (*end || fd < 3 || fd > INT_MAX || fcntl((int)fd, F_GETFD) < 0) usage = YES;
+                else audioFD = (int)fd;
+            } else usage = YES;
+        }
+        if (usage) {
+            fprintf(stderr, "Usage: vz-desktop-stream PRIVATE_UNIX_SOCKET --codec hevc|h264 [--tracks] [--audio-fd N]\n");
             return 2;
         }
         signal(SIGPIPE, SIG_IGN);
+        audioQueue = dispatch_queue_create("audio", DISPATCH_QUEUE_SERIAL);
         useHEVC = !strcmp(argv[3], "hevc");
-        multiTrack = argc == 5;
         tracks[0] = (Track){.used = YES, .bitrate = defaultBitrate};
         outputLock = [NSLock new];
         epoch = nowUs();
@@ -483,7 +543,11 @@ int main(int argc, char **argv) {
             // A still screen gets one more encode after it settles: the first encode of a change is
             // speed-first and can be soft, so a full-quality keyframe (at most every 3 s), else a refinement.
             int timeout = -1;
-            if (!settled && canvas) {
+            if (deferred && !inFrame && canvas) {
+                frameDue();
+                if (deferred) timeout = (int)MAX(1, (framePacing.next - nowUs()) / 1000 + 1);
+            }
+            if (!settled && canvas && !deferred) {
                 int64_t wait = 300000 - (nowUs() - lastChange);
                 if (wait <= 0) {
                     int64_t now = nowUs();
@@ -508,7 +572,7 @@ int main(int argc, char **argv) {
                 for (;;) {
                     const uint8_t *bytes = commands.bytes;
                     const uint8_t *newline = memchr(bytes, '\n', commands.length);
-                    if (!newline) { if (commands.length > maxLine) { fail(@"stdin line exceeds 4 KiB"); } break; }
+                    if (!newline) { if (commands.length > maxLine) { fail(@"stdin line exceeds 2 MiB"); } break; }
                     size_t line = (size_t)(newline - bytes);
                     if (line == 4 && !memcmp(bytes, "stop", 4)) { stopping = YES; break; }
                     if (line > 1 && line <= maxLine && bytes[0] == '{') { if (!writeAll(guest, bytes, line + 1)) fail(@"guest bridge closed"); }

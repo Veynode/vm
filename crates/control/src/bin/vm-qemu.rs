@@ -1565,8 +1565,10 @@ fn run() -> Result<bool> {
         .arg("-qmp")
         .arg(format!("unix:{},server=on,wait=off", qmp_path.display()))
         .arg("-spice")
+        // agent-mouse=off: a Guest spice-vdagent shares only the clipboard; pointer input
+        // keeps going through the SPICE inputs channel.
         .arg(format!(
-            "unix=on,addr={},disable-ticketing=on,gl={}",
+            "unix=on,addr={},disable-ticketing=on,agent-mouse=off,gl={}",
             spice_path.display(),
             if config.qemu_graphics_profile.requires_gl() {
                 "es"
@@ -1642,6 +1644,13 @@ fn run() -> Result<bool> {
                 "-device",
                 "virtserialport,bus=veynode-serial.0,chardev=veynode-driver,name=veynode.driver",
             ]);
+        // The SPICE agent's port: a Guest spice-vdagent shares the clipboard with the viewers.
+        command.args([
+            "-chardev",
+            "spicevmc,id=veynode-vdagent,name=vdagent",
+            "-device",
+            "virtserialport,bus=veynode-serial.0,chardev=veynode-vdagent,name=com.redhat.spice.0",
+        ]);
     }
     if let Some(spice_library) = options.get("--spice-library") {
         command.env("VEYNODE_SPICE_LIBRARY", spice_library);
@@ -1650,6 +1659,7 @@ fn run() -> Result<bool> {
         disk.configure_command(&mut command, vm_control::qemu_uefi::disk_device(&config))?;
     }
     command.args(vm_control::qemu_extras::arguments(&config)?);
+    command.args(vm_control::qemu_audio::arguments(&config));
     let mut child = QemuChild(
         command.spawn().context("starting QEMU/HVF runtime")?,
         guardian,

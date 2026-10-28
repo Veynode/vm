@@ -21,8 +21,8 @@ buffer), and input on the same socket. WebRTC (`crates/media-local`,
 
 ```
 browser canvas ── WebSocket (/desktop/ws, exact Origin) ────────── web/desktop.mjs
-                                                                      │ stdin/stdout pipes
-                                                     veynodevm desktop --stream [--codec hevc|h264] NAME
+                                                                      │ API 1 stream (control.sock)
+                                                     daemon: desktop.stream {name, codec}
                                            QEMU ─┤                                   ├─ Apple VZ
               vm-console-stream ← console broker ← SPICE          vz-desktop-stream ← worker bridge ← vsock 5001
               (spice-console VideoToolbox)                         (VideoToolbox)       ← guest agent: DRM scanout, uinput
@@ -31,9 +31,10 @@ browser canvas ── WebSocket (/desktop/ws, exact Origin) ──────�
 - `web/desktop.mjs`: a dependency-free RFC 6455 server. Access units go out as
   binary messages the moment they arrive. A viewer more than 2 MiB behind
   drops delta frames and asks for a keyframe, so backlog never becomes lag.
-- `veynodevm desktop --stream` (`crates/cli/src/desktop_stream.rs`): stdout
-  records are `u32 BE length, u8 kind, payload` (kind 1 JSON event, kind 2
-  `u64 pts_us, u8 keyframe, Annex B`); stdin takes `{"events":[...]}` and
+- `desktop.stream` (`crates/control/src/services/desktop_stream.rs`, also on
+  pipes as `veynodevm desktop --stream`): its `stdout` channel carries
+  records `u32 BE length, u8 kind, payload` (kind 1 JSON event, kind 2
+  `u64 pts_us, u8 keyframe, Annex B`); its `control` channel (the CLI's stdin lines) takes `{"events":[...]}` and
   `{"keyframe":true}` lines. Held keys and buttons are released when the
   viewer goes away.
 - Input events (`crates/control/src/desktop_input.rs`): `move` (source
@@ -224,7 +225,7 @@ so the encoder uses a higher target to lower its quantizer even where 8 Mbps was
 Through the real relay over a 30 s drag the target stepped 12, 16, 24 Mbps at 5 s intervals and
 the stream went from 4.0 to 10.2 Mbps at 57 fps; with the viewer's socket paused for 12 s the
 relay sent 8 Mbps and later climbed to 12 again. QEMU desktops (Linux, Windows) are governed too:
-the relay's `bitrate` line goes through `veynodevm desktop --stream`, which owns the controller end
+the relay's `bitrate` line goes through `desktop.stream`, which owns the controller end
 of `vm-console-stream`'s private rate channel (`--rate-control-fd`: `rate_status`, then `set_bitrate`
 with the next sequence, one request at a time, the encoder's read-back checked, one status refresh
 after a stale refusal). Live on the QEMU GNOME desktop, toggling the overview every 0.46 s, the
@@ -285,12 +286,14 @@ Idle before the key costs little: median 43.5 ms after 0.8 s and 48.8 ms after
 12 ms is the host's cores waking, not the stream. A latency-critical activity
 plus user-interactive QoS in `spice-console` did not change it (53.8 / 46.1 ms
 at 4 s) and was reverted. Animations off in GNOME did not change it either. Frame rate with a continuously redrawing guest app (glxgears on GNOME, guest
-display 75 Hz): 60.0 fps and a 16.7 ms median gap for both HEVC and H.264. The
-capture side already sits on a 60 Hz slot grid; the encode gate used to demand
-a full 16.667 ms since the last frame and could only fire on a 4 ms timer, so a
-copy admitted a fraction early waited a tick and the stream averaged 54 fps.
-`encodeSlack` (3 ms) and a 2 ms flush timer fixed that without changing key
-latency (median 37 ms). On Apple Virtualization (XFCE `ubuntu-desktop`, no GPU) the same measures give
+display 75 Hz): 60.0 fps and a 16.7 ms median gap for both HEVC and H.264,
+then the helper's ceiling; it is now 240 Hz (see
+[below](#why-1280x800-at-60-fps-and-why-apple-virtualization-is-not-capped)).
+The capture side sits on a slot grid; the encode gate used to demand a full
+slot since the last frame and could only fire on a 4 ms timer, so a copy
+admitted a fraction early waited a tick and the stream averaged 54 of 60 fps.
+`encodeSlack` and a 2 ms flush timer fixed that without changing key latency
+(median 37 ms). On Apple Virtualization (XFCE `ubuntu-desktop`, no GPU) the same measures give
 17.9 ms median key (typing in a terminal) to first frame, 125 fps encoded for a
 continuously redrawing app (one encode per guest frame, 8 ms scanout poll), and
 static SSIM 0.997 (HEVC) / 0.998 (H.264) once tagged. A viewer started by a
@@ -466,22 +469,244 @@ beyond what MCP screenshots already use (Screen Sharing on, the login file).
   0.992 / PSNR 46.4 dB against the guest framebuffer, key-to-pixel median
   36.9 ms. A bigger size gives more desktop area, not sharper text, since the
   guest does not scale its UI.
-- Apple Virtualization encodes once per guest frame (about 125 fps under
-  animation, 17 % of one core for the encoder). The browser shows at most its
-  display rate, but a 120 Hz display does use the extra frames and the cost is
-  small, so it is not rate-limited. QEMU's stream stays on the 60 Hz capture
-  grid (the guest display there refreshes at 75 Hz).
-  Tried 2026-10-27: lowering the helper's encode interval from 16.7 ms to
-  13.3 ms (75 Hz) changed nothing (glxgears, 60.0 fps, 16.9
-  ms median gap), so the limit is the cadence of the display updates QEMU
-  hands the helper, not the helper's pacing; going past 60 there would need a
-  change in QEMU/SPICE itself. Not changed.
+- Each stream is capped at the refresh rate of the screen that shows it, at
+  most 240 Hz (the fastest Mac display). The browser viewer measures its
+  screen from `requestAnimationFrame` gaps (`web/src/desktop/refresh.ts`, the
+  20th-percentile gap of 40 frames, every 5 s while the page is visible, so a
+  window dragged to another display updates it) and sends `fps N` to the
+  encoder; a change under 3 Hz is not sent. On QEMU that reaches the console
+  helper as `set_fps` (`vm-console-stream` stdin `fps N`), on Apple
+  Virtualization `vz-desktop-stream`'s `fps N`; a stream nobody has told
+  starts at 240. The native console window takes its screen's
+  `maximumFramesPerSecond` (again on `windowDidChangeScreen:`) for its
+  `MTKView` and the helper's visible capture admission; with both a window and
+  a browser viewer the capture runs at the faster of the two and the encoder
+  at the viewer's rate. Hidden: 30 Hz. Both helpers pace on the same rational
+  slot grid (`native/console/FramePacing.h`), which lets a frame claim its
+  slot a quarter slot (at most 3 ms) early so that work taking nearly a slot
+  does not push every other frame past the next one. Before this the QEMU
+  stream was held to 60 Hz in three places (capture admission, the
+  `encodeInterval` gate in `native/tools/spice-console.m`, the window's
+  `MTKView`); an earlier try that lowered only the encode gate changed
+  nothing because the capture admission still held 60.
+- Measured 2026-10-27/28 through `veynodevm desktop --stream` (the browser's
+  relay), glxgears, HEVC, 10 s runs, `fps N` sent as the browser would:
+  - QEMU, `alpine-desktop` (XFCE, virgl, 1280x800, Guest mode 75 Hz): the old
+    helper gave 59.9 fps (16.7 ms median gap). Uncapped (240): 122–180 fps
+    between runs (8.2 ms median, about 7.7 Mbit/s), the helper's own
+    per-frame work, since QEMU waits for each draw's acknowledgement and the
+    copy, the unchanged-frame compare and a synchronous encode run in turn on
+    one thread while the Guest renders 270–400 FPS. Viewer 30 → 30.0 fps,
+    60 → 59.6–60.0, 75 → 75.1. At 100–120 the capture holds the rate (119.4
+    copies/s at 120) but about 10 copies/s equal the previous frame and are
+    not sent, so the stream carries 85–109 distinct frames/s: after a draw the
+    grid refuses, the helper acknowledges at once, QEMU renders the next
+    frame and the 2 ms flush retry copies it, so the next admitted draw copies
+    the same image. No frame the Guest showed is lost. The status field
+    `encoder_unchanged_skips_current_epoch` counts these skips.
+  - Apple Virtualization, `alpine-desktop` without a GPU (software
+    rendering): uncapped 123.4 fps (8.0 ms median gap, 7.6 Mbit/s), viewer 60
+    → 59.3 fps (6.3 Mbit/s), 30 → 30.0 (3.4 Mbit/s). It encodes once per
+    guest frame (17 % of one core for the encoder at about 125 fps).
+  - The bitrate target is per second, so more frames each get fewer bits.
+    Not measured: 1920x1080 (HEVC level 4.1 carries about 64 fps there,
+    though the helper only checks the declared level), GNOME, Venus, and a
+    rate measured by a real browser or native window on a 120 Hz or ProMotion
+    screen: the runs above sent `fps N` by hand, and the refresh measurement
+    is covered only by unit tests (`web/test/refresh.test.mjs`).
 - Native window and ProMotion: Virtualization.framework's headers (macOS SDK
   used here) have no refresh-rate setting on its display devices, so a
   `VZVirtualMachineView` window is paced by the framework and the guest
-  display; the QEMU native console's `MTKView` is set to
-  `preferredFramesPerSecond=60`, which matches its 60 Hz source, so raising it
-  alone would show nothing new. Not tested on a ProMotion display.
+  display. The QEMU native console's `MTKView` asks for its screen's maximum.
+
+## Sound and clipboard
+
+Sound plays where the desktop is being watched: the browser tab or the native
+console window. A muted or closed viewer stops it. The microphone is off until
+the person turns it on in that viewer, shows a red dot while the Guest hears it,
+and turns off when the viewer closes; muting the speaker leaves it on. Only the
+newest viewer that asked for sound gets it and feeds the microphone.
+
+The browser viewer's toolbar draws these as core's computer window does
+(`DesktopAudioControls`, `DesktopViewerControls`). The speaker and the
+microphone turn on or off with a click, and hovering or tabbing to either raises
+its panel: the volume (arrow keys on the button change it too) and, where the
+browser can choose one, the output; or which microphone. Moving from one to the
+other slides the one panel over and resizes it while the contents cross-fade.
+The clipboard button opens a panel with the sync switch, a box whose text **Send
+to desktop** puts on the Guest's clipboard (pasting into it needs no browser
+permission), and **Get from desktop**.
+Every failure, and what Send and Get did, is a toast, never a line above the
+picture. Fullscreen takes the whole window, so these stay in reach.
+
+| | QEMU/HVF | Apple Virtualization (Linux) | Apple Virtualization (macOS) |
+| --- | --- | --- | --- |
+| Sound card | `audio` in the VM config (desktop containers and QEMU machines by default; `machine update --audio on\|off`): `virtio-sound-pci` for Linux, `ich9-intel-hda` + `hda-duplex` for Windows, on `-audiodev spice` | none: Apple Virtualization can only play a sound card on the Mac's own speakers | `VZVirtioSoundDeviceConfiguration` with one output stream and no sink (containers created from this change on), so the Guest has an output and the host discards it |
+| Speakers | SPICE playback in `spice-console`, broker record kind 3 to the `audio_start` client | the image's PipeWire sink `veynodevm-speakers`, recorded by the guest agent (`pw-cat`) as desktop stream record kind 4 | the opt-in Guest service (`--allow-observe --allow-audio`) records the system audio with ScreenCaptureKit and sends kind-4 records on vsock 5002; the worker's `MacDesktopStream` connects on the first `{"audio":true}` and passes them into the desktop stream |
+| Microphone | broker `audio_in` (fire-and-forget) into SPICE record; the relay keeps its `audio_start` claim while muted, since the broker takes the microphone only from that client | `{"mic"}` lines on the desktop stream, played into the sink `veynodevm-microphone-feed` of a PipeWire loopback whose source, `veynodevm-microphone`, is the default input (WirePlumber links no playback stream to a source) | none: `{"mic"}` lines are dropped (see below) |
+| Clipboard | the Guest's `spice-vdagent` (the image starts `spice-vdagentd` before the session, whose agent starts from its XDG autostart entry) on the `com.redhat.spice.0` port, through broker `clipboard_watch`/`clipboard_chunk`/`clipboard_get` | the guest agent's X11 `CLIPBOARD` selection owner (XFixes for Guest copies) | the relay's SSH session running `crates/cli/src/macos_clipboard.js` with the built-in `osascript` in the login session (`launchctl asuser`), `NSPasteboard` with a `changeCount` check every 300 ms for Guest copies; nothing installed |
+
+Audio is s16le, stereo out and mono in, about 20 ms per message. The
+microphone is always 48 kHz; speaker records carry their rate, 48 kHz on Apple
+Virtualization and 44.1 kHz from QEMU's SPICE audio. The
+relay (`veynodevm desktop --stream`) turns either source into record kind 20, and
+`desktop.mjs` sends it as a binary message whose first byte is `0xFF`. The
+browser plays it through an AudioWorklet with 60 ms of jitter buffer that skips
+back rather than build up delay.
+
+The clipboard is UTF-8 text of at most 200 KiB, for Linux desktops and macOS
+containers. Its
+panel's switch is kept per desktop in the browser:
+
+- **Sync clipboard** on (default). A Guest copy is written to the page's
+  clipboard. One the browser does not let the page write (the page has no
+  focus, or the browser refuses) waits: a dot on the clipboard button, written
+  when the canvas next gets focus, or at once by **Get from desktop**. The
+  page's text goes to the Guest when the person pastes, and when the canvas
+  regains focus if the browser lets the page read the clipboard without asking. On a Mac, ⌘A/C/V/X/Z reach the Guest as Ctrl shortcuts; other ⌘
+  shortcuts still reach it as Super. In a terminal, ⌘C is therefore Ctrl+C.
+- **Off.** Keys pass through unchanged. The box with **Send to desktop**, and
+  **Get from desktop**, move the text by hand.
+
+The native console window has the same speaker, microphone and clipboard
+controls in its title bar ([native console](../native/console/README.md)), but no
+⌘-to-Ctrl mapping.
+
+### macOS containers
+
+A macOS container's viewers are the browser desktop and the worker's own
+Apple Virtualization window. The window has no sound or clipboard of its own,
+as for Linux desktops on Apple Virtualization; the browser has both. The ⌘
+mapping above is for Linux Guests: `ready` names the Guest (`"guest":"macos"`),
+and for a macOS Guest the page keeps ⌘ as ⌘ (Command in the Guest) and holds
+only ⌘V back for the page's text, as Ctrl+V is held on other systems.
+
+Speakers. Apple Virtualization offers one sound sink,
+`VZHostAudioOutputStreamSink`, which plays the Guest on the Mac's default
+output. That is the simplest choice and needs nothing in the Guest, but it
+does not follow the viewer: it plays with no viewer open (an agent-driven
+container would sound on the Mac), ignores the viewer's mute and volume, and
+never reaches a browser that is not on this Mac. The other host-side option, a
+Core Audio process tap muting and recording the VM's output, taps the
+`com.apple.Virtualization.VirtualMachine` XPC process rather than the worker,
+needs macOS 14.2 and asks the Mac's user for audio-recording permission. So the
+sound card has no sink and the Guest records itself: ScreenCaptureKit audio
+capture (macOS 13, already linked by the Guest service for screenshots,
+covered by the same Screen Recording permission, which the service never
+requests) at 48 kHz stereo, excluding its own process, sent as the Linux
+agent's kind-4 records of 20 ms. The relay, the encoder (`--audio-fd`) and the
+browser treat them as Linux sound, so mute and volume work. Without the Guest
+service, or without its permission, the first `{"audio":true}` gets the
+diagnostic `audio_unavailable` and the speaker stays silent.
+
+Microphone. A virtual input inside the Guest needs an audio driver (a
+CoreAudio HAL plug-in), which [the architecture](architecture.md#where-agent-capabilities-live)
+rules out. Apple Virtualization's own input, `VZHostAudioInputStreamSource`,
+feeds the Mac's default microphone into the Guest: it needs the Mac's
+microphone permission for the worker, it is fixed when the VM starts (there is
+no way to connect or cut it from the viewer's toggle while it runs), so the
+Guest would hear the Mac's room whenever it records, with no viewer and no red
+dot, and a browser on another machine could not use its own microphone. It is
+not wired; a macOS Guest has no microphone, and the viewer's microphone button
+has no effect there.
+
+Clipboard. macOS can do it with its own tools, so it takes no helper: the
+relay starts one SSH session per viewer, on the first clipboard message, and
+the script speaks the agent's `clipboard`/`clipboard_watch`/`clipboard_get`
+lines (the relay escapes non-ASCII so the script reads ASCII). A failed or
+ended session is a `clipboard` error event; the next message starts a new one.
+
+Evidence, live: 2026-10-28, on an M3 Pro host, a `macos-tahoe-vanilla`
+container (macOS 26.6.2) in a disposable home, driven through `veynodevm
+desktop --stream` (the relay the browser uses) by a script that reads the
+records; not through a browser page.
+
+- Clipboard, with nothing installed in the Guest: `{"clipboard":"宿主粘贴 中文
+  🎉😀 ok"}` read back exactly with `pbpaste` in the Guest's login session; a
+  `pbcopy` of "访客复制 🍎✅ line2" there arrived as one `clipboard` event while
+  watching, and `clipboard_get` returned it. (Over SSH, `pbcopy` and `pbpaste`
+  need `LANG=en_US.UTF-8`, or they garble non-ASCII text themselves.) No
+  pasteboard prompt blocked the script's reads.
+- Screen Recording: the image grants it only to
+  `com.apple.screensharing.agent`, not to the Guest service. Without it the
+  first `{"audio":true}` got `audio_unavailable` with the message above, and
+  no prompt appeared in the Guest. For the test, with the user's consent for
+  this one Guest, the grant was clicked by hand through System Settings ›
+  Privacy & Security › Screen & System Audio Recording (+, password, the
+  binary) over Screen Sharing; nothing in VeynodeVM grants it.
+- TCC checks the responsible process. Started over SSH (even with `launchctl
+  asuser`), the service is charged to `sshd-keygen-wrapper` and stays
+  `audio_unavailable` despite its own grant; started as a launchd job in
+  `gui/501` it captured.
+- Sound: a 440 Hz stereo tone played with `afplay` arrived as kind-20 records
+  at 48000 Hz, 2 channels, about 50 a second, measuring 440 Hz with the
+  source's peak (12000), steadily for 19 s in one session. `{"audio":false}`
+  stopped the records within one record, and `{"audio":true}` resumed the tone,
+  three cycles in a row. Earlier runs that played with `afplay -t` showed
+  silent stretches within a session; two runs with plain `afplay` did not, and
+  the cause was not found.
+- Not checked live: playback and the volume control in a browser page, a
+  Guest copy from a GUI app, and an older container without the sound card.
+
+Evidence, static and fixture:
+
+- `macos_clipboard.js` on this host (macOS 27) against a private named
+  pasteboard, through the same shell quoting the relay uses: an empty board
+  is an error, set-then-get returns Chinese and emoji text exactly, a copy by
+  another process is reported once on the next tick while watching and not
+  after unwatching, text over 200 KiB is refused, and the script exits on EOF.
+  The host reports `NSPasteboard.accessBehavior` 2 (always allow) for
+  `osascript`; a Guest's default is not known.
+- Unit tests: the relay's ASCII escaping and the SSH command's quoting; the
+  Guest service's float-to-s16le conversion, record framing, 20 ms chunks and
+  its refusal outside a VirtualMac Guest (`--audio-self-test`); the control
+  daemon accepting `audio` for a macOS Guest.
+- A probe signed with the virtualization entitlement validated a configuration
+  with an output stream and no sink. The worker and Guest service build
+  without warnings.
+
+Evidence:
+
+- Unit and fixture tests cover the QEMU arguments, broker routing and chunking,
+  the relay's records and lines (including the microphone claim kept while
+  muted), the agent's X11 selection handling against a fake server, the jitter
+  buffer, the resampler and the shortcut mapper.
+- Live, 2026-10-27, on an M3 Pro (macOS 27): `alpine-desktop` rebuilt in a
+  disposable `VEYNODEVM_HOME` and driven through the real relay (`veynodevm
+  desktop --stream`), one container on Apple Virtualization and one on QEMU
+  with `--gpus virgl`. On both:
+  - a 440 Hz tone played in the Guest with `pw-cat` arrived as kind-20 records
+    at the right pitch, and muting stopped the records;
+  - a 1 kHz tone sent as `{"mic"}` frames after muting was recorded in the Guest
+    from its default source at about 1 kHz;
+  - text with Chinese and emoji reached the Guest's `CLIPBOARD` exactly;
+  - an `xclip` copy in the Guest came back as a clipboard event.
+- The browser page, the same day, on both containers, in the Chromium of the
+  Claude desktop app's browser pane (an AnalyserNode tapped the page's output):
+  - a 440 Hz tone in the Guest played at 440 Hz (48 kHz on Apple
+    Virtualization, 44.1 kHz on QEMU); one click on the speaker muted and
+    unmuted it, and the volume slider at 50 halved the level;
+  - the microphone button (asking with echo cancellation and noise
+    suppression; the stream itself was a 1 kHz oscillator in place of a real
+    microphone) gave the Guest's default input a continuous 1 kHz tone while
+    the speaker was muted, silence once off, and was off again after the
+    viewer was reopened;
+  - ⌘A selected all in a GTK field and ⌘C copied it in the Guest, a paste on
+    the canvas reached the Guest's clipboard and was pasted with Ctrl+V, and a
+    Guest copy reached the page with its text exact;
+  - with **Sync automatically** off (kept per container), a Guest copy was not
+    written and a paste was not sent.
+  That browser denies `clipboard-write` and `clipboard-read`, so the last step,
+  the write into the Mac's pasteboard, could not succeed there; the paste was a
+  dispatched event and ⌘C a dispatched key, since the pane's automation sends
+  ⌘C without a key code.
+- Brave (Chromium) on the same Mac, the same day, with the toolbar above, on
+  the Apple Virtualization container: an `xclip` copy of Chinese and emoji text
+  in the Guest reached the Mac's pasteboard exactly (`pbpaste`) within 3 s.
+- Not checked live: Chrome, Safari and Firefox themselves (their clipboard
+  permissions and a real microphone prompt), the native window's controls,
+  `ubuntu-desktop` and `ubuntu-gnome` (their non-root session), and Windows HD
+  Audio.
 
 ## Limits
 
@@ -505,12 +730,13 @@ beyond what MCP screenshots already use (Screen Sharing on, the login file).
   runtime-adjustable, but nothing in the browser path drives them yet. Any
   crop or scale change rebuilds the compression session (the bitrate carries
   over) and its next frame is a keyframe.
-  - `vz-desktop-stream PRIVATE_UNIX_SOCKET --codec hevc|h264 [--tracks]`,
+  - `vz-desktop-stream PRIVATE_UNIX_SOCKET --codec hevc|h264 [--tracks] [--audio-fd N]`,
     stdin, one command per line (`T` is a track, 0..7, default 0):
 
     ```text
     stop
-    {"input":[...]}            forwarded to the guest
+    {"input":[...]}            forwarded to the guest (also {"audio"}, {"mic"},
+                               {"clipboard"}, {"clipboard_watch"}, {"clipboard_get"})
     [@T ]keyframe
     [@T ]bitrate N             bits/s, clamped to 250000..40000000
     [@T ]crop X Y W H          source pixels; clamped to the source, W/H made even;
@@ -519,6 +745,8 @@ beyond what MCP screenshots already use (Screen Sharing on, the login file).
                                never larger than the crop; scale 0 0 = view size
     track add T                T = 1..7, needs --tracks
     track remove T             track 0 always exists
+    fps N                      at most N guest frames a second, 1..240 (default
+                               240), every track; no @T
     ```
 
     Only one helper can hold the guest bridge, so viewers share one process:
@@ -538,9 +766,11 @@ beyond what MCP screenshots already use (Screen Sharing on, the login file).
     the same rules against the crop's default codec-fit size (HEVC up to
     1920x1080, H.264 up to 1280x720). The reply and a `view` event carry the
     same fields as on Apple VZ. Crop and scale reset with each encoding
-    epoch. The vm-console broker forwards both methods and the `view` event
-    for the encoder owner; `vm-console-stream` accepts `scale W H` and
-    `crop X Y W H` on stdin and prints `view` lines on stderr. QEMU has one
+    epoch. `{"method":"set_fps","epoch":E,"fps":N}` (1..240, default 240,
+    reset with each epoch) holds capture and encoding to N a second. The
+    vm-console broker forwards these methods and the `view` event for the
+    encoder owner; `vm-console-stream` accepts `scale W H`, `crop X Y W H`
+    and `fps N` on stdin and prints `view` lines on stderr. QEMU has one
     track: the broker serves one encoder owner per epoch, so several tracks
     there would need a broker change.
 - The stream is local only (loopback UI, Host and Origin checked). Remote

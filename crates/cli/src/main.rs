@@ -5,28 +5,18 @@
 //! serves the docker CLI. Tart-format macOS images run as macOS VMs. All state lives under `veynodevm_home` (see
 //! `vm_control::home`); the per-user daemon owns VM processes.
 mod args;
-mod checkpoint;
-mod container;
 mod daemon;
 mod desktop;
-mod desktop_stream;
 mod engine;
-mod gpt;
+mod home;
 mod machine;
-mod macos;
-mod macos_desktop;
-mod macos_driver;
-mod macos_grant;
-mod proxy;
 mod session;
 mod ui;
 
 use anyhow::{bail, Context, Result};
 use args::{desktop_size, memory_mib, parse};
-use serde_json::{json, Value};
-use std::{io::Write, path::PathBuf, time::Duration};
-use veynodevm_oci::Store;
-use vm_control::home;
+use serde_json::{json, Map, Value};
+use std::{io::Write, path::PathBuf};
 
 const USAGE: &str = "veynodevm — OCI containers as GPU-capable micro-VMs on Apple Silicon
 
@@ -112,8 +102,43 @@ Service:
   version
 ";
 
+/// The daemon, as this CLI.
+pub fn api() -> Result<veynodevm_api::Client> {
+    veynodevm_api::Client::from_env(concat!("veynodevm-cli/", env!("CARGO_PKG_VERSION")))
+}
+
+/// An API 1 method that answers once. Daemon services may take minutes
+/// (a disk clone, a guest shutdown), so the wait is long.
+pub fn api_call(method: &str, args: Value) -> Result<Value> {
+    api()?.call_within(method, args, std::time::Duration::from_secs(900))
+}
+
+/// A streaming API 1 method to its end: output to this process's stdout
+/// and stderr, progress to stderr unless `quiet`.
+pub fn api_stream(method: &str, args: Value, quiet: bool) -> Result<Value> {
+    use std::io::Write;
+    api()?.stream(method, args)?.finish(|event| {
+        match event {
+            veynodevm_api::Event::Stdout(data) => {
+                let mut out = std::io::stdout();
+                out.write_all(&data)?;
+                out.flush()?;
+            }
+            veynodevm_api::Event::Stderr(data) => std::io::stderr().write_all(&data)?,
+            veynodevm_api::Event::Event(event) => {
+                if let (false, Some(progress)) = (quiet, event["progress"].as_str()) {
+                    eprintln!("{progress}");
+                }
+            }
+            veynodevm_api::Event::End(_) => {}
+        }
+        Ok(())
+    })
+}
+
+/// A VM-layer method (`vm`, `daemon status`).
 pub fn daemon_call(method: &str, args: Value) -> Result<Value> {
-    vm_control::call(&home::state_dir()?, method, args)
+    api()?.call(method, args)
 }
 
 pub fn random_hex(bytes: usize) -> String {
@@ -141,8 +166,14 @@ fn print_json(value: &Value) -> Result<()> {
     Ok(())
 }
 
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 fn age(seconds: u64) -> String {
-    let d = container::now().saturating_sub(seconds);
+    let d = now().saturating_sub(seconds);
     match d {
         0..=59 => format!("{d} seconds ago"),
         60..=3599 => format!("{} minutes ago", d / 60),
@@ -193,194 +224,190 @@ fn run(rest: &[String], json_output: bool) -> Result<i32> {
         .clone();
     let command: Vec<String> = p.positional[1..].to_vec();
     if p.has("shared") {
-        let store = Store::open(&home::images_dir()?)?;
-        if store.find(&image)?.is_some_and(|i| i.config.os == "darwin") {
+        let os = api_call("image.inspect", json!({"reference":image}))
+            .map(|i| i["config"]["os"].clone())
+            .unwrap_or_default();
+        if os == "darwin" {
             bail!("macOS images run as their own VM; drop --shared")
         }
         return engine::run_shared(rest, RUN_SPEC);
     }
-    let options = container::RunOptions {
-        image,
-        command,
-        entrypoint: p.value("entrypoint").map(|e| {
+    let mut options = Map::new();
+    let mut set = |key: &str, value: Value| {
+        if !value.is_null() {
+            options.insert(key.into(), value);
+        }
+    };
+    set("image", json!(image));
+    set("command", json!(command));
+    set(
+        "entrypoint",
+        json!(p.value("entrypoint").map(|e| {
             if e.is_empty() {
                 vec![]
             } else {
                 vec![e.to_owned()]
             }
-        }),
-        name: p.value("name").map(str::to_owned),
-        detach: p.has("detach"),
-        auto_remove: p.has("rm"),
-        ports: p.values("publish").to_vec(),
-        volumes: p.values("volume").to_vec(),
-        env: p.values("env").to_vec(),
-        workdir: p.value("workdir").map(str::to_owned),
-        user: p.value("user").map(str::to_owned),
-        cpus: p
+        })),
+    );
+    set("name", json!(p.value("name")));
+    set("detach", json!(p.has("detach")));
+    set("autoRemove", json!(p.has("rm")));
+    set("ports", json!(p.values("publish")));
+    set("volumes", json!(p.values("volume")));
+    set("env", json!(p.values("env")));
+    set("workdir", json!(p.value("workdir")));
+    set("user", json!(p.value("user")));
+    set(
+        "cpus",
+        json!(p
             .value("cpus")
             .map(|c| c.parse::<f64>().map(|v| v.ceil().max(1.0) as u32))
             .transpose()
-            .context("invalid --cpus")?,
-        memory_mib: p.value("memory").map(memory_mib).transpose()?,
-        disk_gib: p
+            .context("invalid --cpus")?),
+    );
+    set(
+        "memoryMiB",
+        json!(p.value("memory").map(memory_mib).transpose()?),
+    );
+    set(
+        "diskGiB",
+        json!(p
             .value("disk-size")
-            .map(|d| d.trim_end_matches(['g', 'G']).parse())
+            .map(|d| d.trim_end_matches(['g', 'G']).parse::<u64>())
             .transpose()
-            .context("invalid --disk-size")?,
-        gpus: p.value("gpus").map(str::to_owned),
-        desktop: p.has("desktop"),
-        desktop_size: p.value("desktop-size").map(desktop_size).transpose()?,
-        engine: false,
-        dns: p.values("dns").to_vec(),
-        mtu: p
+            .context("invalid --disk-size")?),
+    );
+    set("gpus", json!(p.value("gpus")));
+    set("desktop", json!(p.has("desktop")));
+    set(
+        "desktopSize",
+        json!(p.value("desktop-size").map(desktop_size).transpose()?),
+    );
+    set("dns", json!(p.values("dns")));
+    set(
+        "mtu",
+        json!(p
             .value("mtu")
-            .map(str::parse)
+            .map(str::parse::<u16>)
             .transpose()
-            .context("invalid --mtu")?,
-        init: p.value("init").map(str::to_owned),
-        quiet: p.has("quiet") || json_output,
-        tty: p.has("tty"),
-        stdin: p.has("interactive"),
-    };
-    container::install_interrupt_handler();
-    let c = container::create_and_start(&options)?;
-    if c.os == "darwin" {
-        return run_macos(
-            &c,
-            &options,
-            p.has("tty"),
-            p.has("interactive"),
-            json_output,
-        );
-    }
-    if options.detach {
+            .context("invalid --mtu")?),
+    );
+    set("init", json!(p.value("init")));
+    set("quiet", json!(p.has("quiet") || json_output));
+    set("tty", json!(p.has("tty")));
+    set("stdin", json!(p.has("interactive")));
+    session::install_interrupt_handler();
+    let row = api_stream("container.run", Value::Object(options), false)?;
+    let id = row["id"].as_str().unwrap_or_default();
+    if p.has("detach") {
         if json_output {
-            print_json(&json!({"id":c.id,"name":c.name}))?;
+            print_json(&json!({"id":id,"name":row["name"]}))?;
         } else {
-            println!("{}", c.id);
+            println!("{id}");
         }
         return Ok(0);
     }
-    attach(&c)
+    if row["os"] == "darwin" {
+        return run_macos(&row, &command, p.has("tty"), p.has("interactive"));
+    }
+    attach(&row)
 }
 
-/// Attach to the entrypoint: its terminal with `-t`, its stdin plus the
-/// console output with `-i`, otherwise just the output.
-fn attach(c: &container::Container) -> Result<i32> {
-    if !(c.tty || c.stdin) {
-        return follow(c);
-    }
-    let stream = session::connect(
-        c,
-        &session::Request {
-            op: "attach",
-            argv: vec![],
-            tty: c.tty,
-            stdin: true,
-            env: vec![],
-            workdir: None,
-            user: None,
-            size: session::terminal_size(),
-        },
-    )?;
-    if !c.tty {
-        // Output comes from the console log; the session only carries stdin.
-        let writer = session::Writer::new(&stream)?;
-        std::thread::spawn(move || {
-            let mut input = std::io::stdin().lock();
-            let mut buffer = [0u8; 8192];
-            loop {
-                match std::io::Read::read(&mut input, &mut buffer) {
-                    Ok(0) | Err(_) => {
-                        let _ = writer.frame(b'e', &[]);
-                        return;
-                    }
-                    Ok(n) => {
-                        if writer.frame(b'i', &buffer[..n]).is_err() {
-                            return;
-                        }
-                    }
-                }
-            }
-        });
-        let code = follow(c);
-        drop(stream);
-        return code;
-    }
-    match session::run(stream, true, true, true)? {
+/// Attach to the entrypoint (`c` is its record or row): its terminal with
+/// `-t`, its stdin plus the console output with `-i`, otherwise just the
+/// output; then report its status and honor `--rm`.
+fn attach(c: &Value) -> Result<i32> {
+    let id = c["id"].as_str().unwrap_or_default();
+    let name = c["name"].as_str().unwrap_or(id);
+    let (tty, stdin) = (c["tty"] == true, c["stdin"] == true && c["os"] != "darwin");
+    match session::run("container.attach", json!({"name":id}), tty, stdin, tty)? {
         session::Ended::Detached => {
-            eprintln!("\r\nveynodevm: detached from {}", c.name);
+            eprintln!("\r\nveynodevm: detached from {name}");
             Ok(0)
         }
-        _ => finish(c, None),
+        session::Ended::Interrupted => {
+            eprintln!("veynodevm: stopping {name}");
+            api_call("container.stop", json!({"name":id,"timeoutS":5}))?;
+            let inspect = api_call("container.inspect", json!({"name":id}))?;
+            finish(c, &inspect["exit_code"], &inspect["errors"])
+        }
+        session::Ended::Done(result) if result["left"] == true => Ok(0),
+        session::Ended::Done(result) if c["os"] == "darwin" => {
+            Ok(result["exitCode"].as_i64().unwrap_or(255) as i32)
+        }
+        session::Ended::Done(result) => finish(c, &result["exitCode"], &result["errors"]),
     }
 }
 
 /// macOS has no entrypoint: COMMAND (or a login shell) runs over SSH once the
 /// Guest is up. In the foreground the container stops when it exits, as a
-/// Linux container does; with `-d` the COMMAND runs in the background.
-fn run_macos(
-    c: &container::Container,
-    options: &container::RunOptions,
-    tty: bool,
-    interactive: bool,
-    json_output: bool,
-) -> Result<i32> {
-    if options.detach {
-        if options.command.is_empty() {
-            // First-boot setup (volumes, the Accessibility grant) happens now
-            // rather than on the first exec.
-            macos::ensure_ready(c, options.quiet)?;
-        } else {
-            macos::start_command(c)?;
-        }
-        if json_output {
-            print_json(&json!({"id":c.id,"name":c.name}))?;
-        } else {
-            println!("{}", c.id);
-        }
-        return Ok(0);
-    }
-    let code = macos::exec(c, &options.command, tty, interactive);
-    if c.auto_remove {
-        container::remove(c, true)?;
+/// Linux container does.
+fn run_macos(c: &Value, command: &[String], tty: bool, interactive: bool) -> Result<i32> {
+    let id = c["id"].as_str().unwrap_or_default();
+    let ended = session::run(
+        "container.exec",
+        json!({"name":id,"argv":command,"tty":tty,"stdin":tty || interactive}),
+        tty,
+        tty || interactive,
+        false,
+    );
+    if c["auto_remove"] == true {
+        api_call("container.rm", json!({"name":id,"force":true}))?;
     } else {
-        container::stop(c, Duration::from_secs(10))?;
+        api_call("container.stop", json!({"name":id,"timeoutS":10}))?;
     }
-    code
+    match ended? {
+        session::Ended::Done(result) => Ok(result["exitCode"].as_i64().unwrap_or(255) as i32),
+        _ => Ok(130),
+    }
 }
 
-fn follow(c: &container::Container) -> Result<i32> {
-    let mut stdout = std::io::stdout();
-    let mut stderr = std::io::stderr();
-    let code = container::stream_logs(c, true, &mut stdout, &mut stderr)?;
-    finish(c, code)
-}
-
-/// After the entrypoint's output ended: wait for the VM, report its status
-/// and honor `--rm`.
-fn finish(c: &container::Container, code: Option<i32>) -> Result<i32> {
-    if container::INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
-        eprintln!("veynodevm: stopping {}", c.name);
-        container::stop(c, Duration::from_secs(5))?;
-    } else {
-        container::wait_stopped(c, Duration::from_secs(20));
+/// After the entrypoint ended: its status, and `--rm`.
+fn finish(c: &Value, code: &Value, errors: &Value) -> Result<i32> {
+    if c["auto_remove"] == true {
+        api_call("container.rm", json!({"name":c["id"],"force":true}))?;
     }
-    let code = code.or_else(|| container::read_console(c).exit);
-    if c.auto_remove {
-        container::remove(c, true)?;
-    }
-    match code {
-        Some(code) => Ok(code),
+    match code.as_i64() {
+        Some(code) => Ok(code as i32),
         None => {
-            let console = container::read_console(c);
-            if let Some(e) = console.errors.last() {
-                bail!("container failed: {e}")
+            if let Some(e) = errors.as_array().and_then(|e| e.last()) {
+                bail!("container failed: {}", e.as_str().unwrap_or_default())
             }
             bail!("container stopped without reporting an exit status")
         }
     }
+}
+
+/// `cp SRC DST` where exactly one side is `CONTAINER:PATH` (macOS).
+fn cp(source: &str, target: &str) -> Result<i32> {
+    let split = |s: &str| -> Option<(String, String)> {
+        let (name, path) = s.split_once(':')?;
+        if name.contains('/') {
+            return None;
+        }
+        find(name).ok().map(|_| (name.to_owned(), path.to_owned()))
+    };
+    let (name, guest, host, inward) = match (split(source), split(target)) {
+        (Some((name, guest)), None) => (name, guest, target, false),
+        (None, Some((name, guest))) => (name, guest, source, true),
+        _ => bail!("cp needs exactly one CONTAINER:PATH argument"),
+    };
+    let result = api_stream(
+        "container.cp",
+        json!({"name":name,"guestPath":guest,"hostPath":std::path::absolute(host)?,"direction":if inward {"in"} else {"out"}}),
+        false,
+    )?;
+    Ok(result["exitCode"].as_i64().unwrap_or(255) as i32)
+}
+
+/// `desktop --stream`: the web UI's desktop relay (`desktop.stream`) on
+/// this process's pipes.
+fn desktop_stream(name: &str, codec: &str, tracks: bool) -> Result<i32> {
+    session::pipe(
+        "desktop.stream",
+        json!({"name":name,"codec":codec,"tracks":tracks}),
+    )
 }
 
 fn ps(rest: &[String], json_output: bool) -> Result<i32> {
@@ -389,24 +416,15 @@ fn ps(rest: &[String], json_output: bool) -> Result<i32> {
         &[("all", Some('a'), false), ("quiet", Some('q'), false)],
         false,
     )?;
-    let mut rows = Vec::new();
-    for c in container::list()? {
-        let (state, status) = container::status_text(&c);
-        let running = !matches!(
-            state.as_str(),
-            "stopped" | "crashed" | "missing" | "unknown"
-        );
-        if !running && !p.has("all") {
-            continue;
-        }
-        rows.push((c, state, status));
-    }
+    let rows = api_call("container.ls", json!({"all":p.has("all")}))?;
     if json_output {
-        return print_json(&Value::Array(rows.iter().map(|(c, state, status)| json!({"id":c.id,"name":c.name,"image":c.image,"command":c.argv,"created_at":c.created_at,"state":state,"status":status,"ports":c.ports,"backend":c.backend,"gpus":c.gpus,"desktop":c.desktop,"desktop_size":c.desktop_size,"vm_id":c.vm_id,"icon":c.icon,"os":c.os,"engine":c.engine,"cpus":c.cpus,"memory_mib":c.memory_mib})).collect())).map(|_| 0);
+        return print_json(&rows).map(|_| 0);
     }
+    let rows = rows.as_array().cloned().unwrap_or_default();
+    let text = |v: &Value| v.as_str().unwrap_or_default().to_owned();
     if p.has("quiet") {
-        for (c, _, _) in rows {
-            println!("{}", c.id);
+        for c in rows {
+            println!("{}", text(&c["id"]));
         }
         return Ok(0);
     }
@@ -414,39 +432,48 @@ fn ps(rest: &[String], json_output: bool) -> Result<i32> {
         "{:<14}{:<24}{:<26}{:<16}{:<24}{:<26}NAMES",
         "CONTAINER ID", "IMAGE", "COMMAND", "CREATED", "STATUS", "PORTS"
     );
-    for (c, _, status) in rows {
-        let mut command = format!("\"{}\"", c.argv.join(" "));
+    for c in rows {
+        let argv: Vec<String> = c["command"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(text)
+            .collect();
+        let mut command = format!("\"{}\"", argv.join(" "));
         if command.chars().count() > 22 {
             command = format!("{}…\"", command.chars().take(20).collect::<String>());
         }
-        let mut image = c.image.clone();
+        let mut image = text(&c["image"]);
         if image.chars().count() > 22 {
             image = format!("{}…", image.chars().take(21).collect::<String>());
         }
-        let ports: Vec<String> = c
-            .ports
-            .iter()
+        let ports: Vec<String> = c["ports"]
+            .as_array()
+            .into_iter()
+            .flatten()
             .map(|p| {
                 format!(
                     "{}:{}->{}/{}",
-                    p.host_address, p.host_port, p.guest_port, p.protocol
+                    text(&p["host_address"]),
+                    p["host_port"],
+                    p["guest_port"],
+                    text(&p["protocol"])
                 )
             })
             .collect();
-        let gpu = c
-            .gpus
-            .as_ref()
+        let gpu = c["gpus"]
+            .as_str()
             .map(|g| format!(" [gpu:{g}]"))
             .unwrap_or_default();
         println!(
             "{:<14}{:<24}{:<26}{:<16}{:<24}{:<26}{}",
-            c.id,
+            text(&c["id"]),
             image,
             command,
-            age(c.created_at),
-            format!("{status}{gpu}"),
+            age(c["created_at"].as_u64().unwrap_or_default()),
+            format!("{}{gpu}", text(&c["status"])),
             ports.join(","),
-            c.name
+            text(&c["name"])
         );
     }
     Ok(0)
@@ -454,14 +481,24 @@ fn ps(rest: &[String], json_output: bool) -> Result<i32> {
 
 fn images(rest: &[String], json_output: bool) -> Result<i32> {
     let p = parse(rest, &[("quiet", Some('q'), false)], false)?;
-    let store = Store::open(&home::images_dir()?)?;
-    let list = store.list()?;
+    let list = api_call("image.ls", json!({}))?;
     if json_output {
-        return print_json(&serde_json::to_value(&list)?).map(|_| 0);
+        return print_json(&list).map(|_| 0);
     }
+    let list = list.as_array().cloned().unwrap_or_default();
+    // Docker's short id: the first 12 hex digits of the config digest.
+    let id = |i: &Value| {
+        let digest = i["config_digest"].as_str().unwrap_or_default();
+        digest
+            .strip_prefix("sha256:")
+            .unwrap_or(digest)
+            .chars()
+            .take(12)
+            .collect::<String>()
+    };
     if p.has("quiet") {
         for i in list {
-            println!("{}", i.id());
+            println!("{}", id(&i));
         }
         return Ok(0);
     }
@@ -472,13 +509,18 @@ fn images(rest: &[String], json_output: bool) -> Result<i32> {
     for i in list {
         println!(
             "{:<40} {:<15} {:<17} {}",
-            i.reference,
-            i.id(),
-            age(i.created_at),
-            human_size(i.size)
+            i["reference"].as_str().unwrap_or_default(),
+            id(&i),
+            age(i["created_at"].as_u64().unwrap_or_default()),
+            human_size(i["size"].as_u64().unwrap_or_default())
         );
     }
     Ok(0)
+}
+
+/// A container's record, as `container.inspect` has it.
+fn find(name: &str) -> Result<Value> {
+    Ok(api_call("container.inspect", json!({"name":name}))?["container"].take())
 }
 
 fn names(
@@ -518,7 +560,6 @@ fn vm(rest: &[String]) -> Result<i32> {
 }
 
 fn main() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
     let json_output = if argv.first().map(String::as_str) == Some("--json") {
         argv.remove(0);
@@ -560,24 +601,21 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
         "ps" => ps(rest, json_output),
         "logs" => {
             let p = parse(rest, &[("follow", Some('f'), false)], false)?;
-            let c = container::find(p.positional.first().context("logs requires a CONTAINER")?)?;
-            if c.os == "darwin" {
-                return macos::logs(&c, p.has("follow"));
-            }
-            container::stream_logs(
-                &c,
-                p.has("follow"),
-                &mut std::io::stdout(),
-                &mut std::io::stderr(),
+            let name = p.positional.first().context("logs requires a CONTAINER")?;
+            let result = api_stream(
+                "container.logs",
+                json!({"name":name,"follow":p.has("follow")}),
+                false,
             )?;
-            Ok(0)
+            // A macOS container's output comes from SSH, whose status counts.
+            Ok(match find(name)?["os"].as_str() {
+                Some("darwin") => result["exitCode"].as_i64().unwrap_or(255) as i32,
+                _ => 0,
+            })
         }
         "attach" => {
-            let c = container::find(rest.first().context("attach requires a CONTAINER")?)?;
-            if c.os == "darwin" {
-                return macos::logs(&c, true);
-            }
-            container::install_interrupt_handler();
+            let c = find(rest.first().context("attach requires a CONTAINER")?)?;
+            session::install_interrupt_handler();
             attach(&c)
         }
         "exec" => {
@@ -593,11 +631,10 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
                 ],
                 true,
             )?;
-            let c = container::find(
-                p.positional
-                    .first()
-                    .context("exec requires CONTAINER COMMAND")?,
-            )?;
+            let name = p
+                .positional
+                .first()
+                .context("exec requires CONTAINER COMMAND")?;
             let argv = &p.positional[1..];
             let (tty, interactive) = (p.has("tty"), p.has("interactive"));
             if argv.is_empty() && !(tty && interactive) {
@@ -615,70 +652,50 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
                     }
                 })
                 .collect();
-            if c.os != "darwin" && (tty || interactive) && !json_output {
-                if tty && !env.iter().any(|e| e.starts_with("TERM=")) {
-                    env.push(format!(
-                        "TERM={}",
-                        std::env::var("TERM").unwrap_or_else(|_| "xterm".into())
-                    ));
-                }
-                let stream = session::connect(
-                    &c,
-                    &session::Request {
-                        op: "exec",
-                        argv: if argv.is_empty() {
-                            session::default_shell()
-                        } else {
-                            argv.to_vec()
-                        },
-                        tty,
-                        stdin: interactive,
-                        env,
-                        workdir: p.value("workdir").map(str::to_owned),
-                        user: p.value("user").map(str::to_owned),
-                        size: session::terminal_size(),
+            if tty && !env.iter().any(|e| e.starts_with("TERM=")) {
+                env.push(format!(
+                    "TERM={}",
+                    std::env::var("TERM").unwrap_or_else(|_| "xterm".into())
+                ));
+            }
+            if (tty || interactive) && !json_output {
+                let request = json!({"name":name,"argv":argv,"user":p.value("user"),"env":env,"workdir":p.value("workdir"),"stdin":interactive,"tty":tty});
+                return match session::run("container.exec", request, tty, interactive, false)? {
+                    session::Ended::Done(result) => match result["exitCode"].as_i64() {
+                        Some(code) => Ok(code as i32),
+                        None => bail!("the session to {name} closed without an exit status"),
                     },
-                )?;
-                return match session::run(stream, tty, interactive, false)? {
-                    session::Ended::Exit(code) => Ok(code),
-                    _ => bail!("the session to {} closed without an exit status", c.name),
+                    _ => Ok(130),
                 };
             }
-            if c.os == "darwin" {
-                if json_output {
-                    let result = macos::exec_capture(&c, argv)?;
-                    print_json(&result)?;
-                    return Ok(result["exit_code"].as_i64().unwrap_or(255) as i32);
-                }
-                return macos::exec(&c, argv, p.has("tty"), p.has("interactive"));
-            }
-            let timeout = p
+            let timeout: Option<u64> = p
                 .value("timeout")
                 .map(str::parse)
                 .transpose()
-                .context("invalid --timeout")?
-                .unwrap_or(30000);
-            let mut identity = json!({});
-            if let Some(user) = p.value("user") {
-                identity["user"] = json!(user);
-            }
-            if !env.is_empty() {
-                identity["env"] = json!(env);
-            }
-            if let Some(workdir) = p.value("workdir") {
-                identity["workdir"] = json!(workdir);
-            }
-            let result = container::exec_as(&c, argv, timeout, &identity)?;
-            if json_output {
-                print_json(&result)?;
+                .context("invalid --timeout")?;
+            let request = json!({"name":name,"argv":argv,"timeoutMs":timeout,"user":p.value("user"),"env":env,"workdir":p.value("workdir"),"stdin":interactive,"tty":tty});
+            let result = if json_output {
+                let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+                let result = api()?.stream("container.exec", request)?.finish(|event| {
+                    match event {
+                        veynodevm_api::Event::Stdout(data) => stdout.extend(data),
+                        veynodevm_api::Event::Stderr(data) => stderr.extend(data),
+                        _ => {}
+                    }
+                    Ok(())
+                })?;
+                print_json(
+                    &json!({"exit_code":result["exitCode"],"stdout":String::from_utf8_lossy(&stdout),"stderr":String::from_utf8_lossy(&stderr),"timed_out":result["timedOut"]}),
+                )?;
+                result
             } else {
-                print!("{}", result["stdout"].as_str().unwrap_or_default());
-                eprint!("{}", result["stderr"].as_str().unwrap_or_default());
-                if result["timed_out"] == true {
+                let result = api_stream("container.exec", request, false)?;
+                if result["timedOut"] == true {
                     eprintln!("veynodevm: command timed out");
                 }
-            }
-            Ok(result["exit_code"].as_i64().unwrap_or(126) as i32)
+                result
+            };
+            Ok(result["exitCode"].as_i64().unwrap_or(126) as i32)
         }
         "checkpoint" => {
             let (action, rest) = rest
@@ -686,18 +703,20 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
                 .context("usage: veynodevm checkpoint create|ls|rm CONTAINER [NAME]")?;
             let p = parse(rest, &[("disk-only", None, false)], false)?;
             let args = &p.positional;
-            let c = container::find(args.first().context("checkpoint requires a CONTAINER")?)?;
+            let c = args.first().context("checkpoint requires a CONTAINER")?;
             let name = || {
                 args.get(1)
                     .map(String::as_str)
                     .context("checkpoint requires a NAME")
             };
             let value = match action.as_str() {
-                "create" => checkpoint::create(&c, name()?, !p.has("disk-only"))?,
-                "ls" | "list" => serde_json::to_value(checkpoint::list(&c)?)?,
+                "create" => api_call(
+                    "checkpoint.create",
+                    json!({"name":c,"checkpoint":name()?,"memory":!p.has("disk-only")}),
+                )?,
+                "ls" | "list" => api_call("checkpoint.ls", json!({"name":c}))?,
                 "rm" | "delete" => {
-                    checkpoint::remove(&c, name()?)?;
-                    json!({"container":c.name,"removed":name()?})
+                    api_call("checkpoint.rm", json!({"name":c,"checkpoint":name()?}))?
                 }
                 other => bail!("unknown checkpoint action: {other} (create, ls, rm)"),
             };
@@ -705,17 +724,21 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
                 print_json(&value)?;
             } else if action == "ls" || action == "list" {
                 println!("{:<24} {:<16} CONSISTENCY", "NAME", "CREATED");
-                for m in checkpoint::list(&c)? {
-                    let consistency = if m.machine_state_bytes.is_some() {
+                for m in value.as_array().into_iter().flatten() {
+                    let consistency = if !m["machine_state_bytes"].is_null() {
                         "running, memory saved"
-                    } else if !m.source_running {
+                    } else if m["source_running"] != true {
                         "stopped"
-                    } else if m.guest_synced {
+                    } else if m["guest_synced"] == true {
                         "running, synced"
                     } else {
                         "running, unsynced"
                     };
-                    println!("{:<24} {:<16} {consistency}", m.name, age(m.created_at));
+                    println!(
+                        "{:<24} {:<16} {consistency}",
+                        m["name"].as_str().unwrap_or_default(),
+                        age(m["created_at"].as_u64().unwrap_or_default())
+                    );
                 }
             } else {
                 println!("{}", name()?);
@@ -741,8 +764,10 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
                 (false, true) => Some(false),
                 _ => None,
             };
-            let report =
-                checkpoint::rollback(&container::find(container)?, name, start, !p.has("cold"))?;
+            let report = api_call(
+                "checkpoint.rollback",
+                json!({"name":container,"checkpoint":name,"start":start,"memory":!p.has("cold")}),
+            )?;
             if json_output {
                 print_json(&report)?;
             } else {
@@ -760,7 +785,7 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
                 let selector = rest
                     .get(1)
                     .context("usage: veynodevm fork rm GROUP|CONTAINER")?;
-                let report = checkpoint::remove_forks(selector)?;
+                let report = api_call("checkpoint.unfork", json!({"selector":selector}))?;
                 if json_output {
                     print_json(&report)?;
                 } else {
@@ -779,20 +804,19 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
                 ],
                 false,
             )?;
-            let source = container::find(p.positional.first().context(
+            let source = p.positional.first().context(
                 "usage: veynodevm fork [-n N] [--checkpoint NAME] [--no-start] CONTAINER",
-            )?)?;
-            let options = checkpoint::ForkOptions {
-                count: p
-                    .value("count")
-                    .map(str::parse)
-                    .transpose()
-                    .context("invalid -n")?
-                    .unwrap_or(1),
-                checkpoint: p.value("checkpoint").map(str::to_owned),
-                start: !p.has("no-start"),
-            };
-            let report = checkpoint::fork(&source, &options)?;
+            )?;
+            let count: u32 = p
+                .value("count")
+                .map(str::parse)
+                .transpose()
+                .context("invalid -n")?
+                .unwrap_or(1);
+            let report = api_call(
+                "checkpoint.fork",
+                json!({"name":source,"count":count,"checkpoint":p.value("checkpoint"),"start":!p.has("no-start")}),
+            )?;
             if json_output {
                 print_json(&report)?;
             } else {
@@ -808,22 +832,18 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
             Ok(0)
         }
         "cp" => match rest {
-            [source, target] => macos::cp(source, target),
+            [source, target] => cp(source, target),
             _ => bail!("usage: veynodevm cp SRC DST (one side CONTAINER:PATH)"),
         },
         "start" => {
             let (p, names) = names(rest, &[("attach", Some('a'), false)])?;
             for name in names {
-                let c = container::find(&name)?;
-                container::start(&c)?;
-                if p.has("attach") && c.os == "darwin" {
-                    return macos::logs(&c, true);
-                }
+                let row = api_call("container.start", json!({"name":name}))?;
                 if p.has("attach") {
-                    container::install_interrupt_handler();
-                    return attach(&c);
+                    session::install_interrupt_handler();
+                    return attach(&row);
                 }
-                println!("{}", c.name);
+                println!("{}", row["name"].as_str().unwrap_or_default());
             }
             Ok(0)
         }
@@ -835,21 +855,16 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
                 .transpose()
                 .context("invalid -t")?;
             for name in names {
-                let c = container::find(&name)?;
-                let timeout = timeout
-                    .map(Duration::from_secs)
-                    .unwrap_or_else(|| container::default_stop_timeout(&c));
-                container::stop(&c, timeout)?;
-                println!("{}", c.name);
+                let row = api_call("container.stop", json!({"name":name,"timeoutS":timeout}))?;
+                println!("{}", row["name"].as_str().unwrap_or_default());
             }
             Ok(0)
         }
         "rm" => {
             let (p, names) = names(rest, &[("force", Some('f'), false)])?;
             for name in names {
-                let c = container::find(&name)?;
-                container::remove(&c, p.has("force"))?;
-                println!("{}", c.name);
+                let row = api_call("container.rm", json!({"name":name,"force":p.has("force")}))?;
+                println!("{}", row["name"].as_str().unwrap_or_default());
             }
             Ok(0)
         }
@@ -857,10 +872,9 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
             let [old, new] = rest else {
                 bail!("rename requires CONTAINER NEW_NAME")
             };
-            let mut c = container::find(old)?;
-            container::rename(&mut c, new)?;
+            let c = api_call("container.rename", json!({"name":old,"newName":new}))?;
             if json_output {
-                print_json(&json!({"id":c.id,"name":c.name}))?;
+                print_json(&json!({"id":c["id"],"name":c["name"]}))?;
             }
             Ok(0)
         }
@@ -893,116 +907,124 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
                     values => values.to_vec(),
                 })
             };
-            let changes = container::Changes {
-                cpus: p
+            let mut changes = Map::new();
+            let mut change = |key: &str, value: Value| {
+                if !value.is_null() {
+                    changes.insert(key.into(), value);
+                }
+            };
+            change(
+                "cpus",
+                json!(p
                     .value("cpus")
-                    .map(|v| v.parse().with_context(|| format!("invalid --cpus {v}")))
-                    .transpose()?,
-                memory_mib: p.value("memory").map(memory_mib).transpose()?,
-                disk_gib: p
+                    .map(|v| v
+                        .parse::<u32>()
+                        .with_context(|| format!("invalid --cpus {v}")))
+                    .transpose()?),
+            );
+            change(
+                "memoryMiB",
+                json!(p.value("memory").map(memory_mib).transpose()?),
+            );
+            change(
+                "diskGiB",
+                json!(p
                     .value("disk-size")
                     .map(|v| {
                         v.trim_end_matches(['g', 'G'])
-                            .parse()
+                            .parse::<u64>()
                             .with_context(|| format!("invalid --disk-size {v} (GiB)"))
                     })
-                    .transpose()?,
-                gpus: p.value("gpus").map(str::to_owned),
-                desktop: p
+                    .transpose()?),
+            );
+            change("gpus", json!(p.value("gpus")));
+            change(
+                "desktop",
+                json!(p
                     .value("desktop")
                     .map(|v| match v {
                         "on" => Ok(true),
                         "off" => Ok(false),
                         other => bail!("--desktop accepts on|off, got {other}"),
                     })
-                    .transpose()?,
-                desktop_size: p.value("desktop-size").map(desktop_size).transpose()?,
-                ports: list("publish"),
-                dns: list("dns"),
-                mtu: p
+                    .transpose()?),
+            );
+            change(
+                "desktopSize",
+                json!(p.value("desktop-size").map(desktop_size).transpose()?),
+            );
+            change("ports", json!(list("publish")));
+            change("dns", json!(list("dns")));
+            change(
+                "mtu",
+                json!(p
                     .value("mtu")
                     .map(|v| match v {
                         "default" => Ok(0),
-                        v => v.parse().with_context(|| format!("invalid --mtu {v}")),
+                        v => v
+                            .parse::<u16>()
+                            .with_context(|| format!("invalid --mtu {v}")),
                     })
-                    .transpose()?,
-                new_mac: p.has("new-mac"),
-            };
-            if changes.cpus.is_none()
-                && changes.memory_mib.is_none()
-                && changes.disk_gib.is_none()
-                && changes.gpus.is_none()
-                && changes.desktop.is_none()
-                && changes.desktop_size.is_none()
-                && changes.ports.is_none()
-                && changes.dns.is_none()
-                && changes.mtu.is_none()
-                && !changes.new_mac
-            {
+                    .transpose()?),
+            );
+            if p.has("new-mac") {
+                change("newMac", json!(true));
+            }
+            if changes.is_empty() {
                 bail!("update needs something to change: --cpus, --memory, --disk-size, --gpus, --desktop, --desktop-size, --publish, --dns, --mtu or --new-mac")
             }
-            let c = container::update(&container::find(name)?, &changes, p.has("restart"))?;
+            let c = api_call(
+                "container.update",
+                json!({"name":name,"changes":changes,"restart":p.has("restart")}),
+            )?;
             if json_output {
-                let (_, disk_bytes, _) = container::disk(&c)?;
-                print_json(
-                    &json!({"id":c.id,"backend":c.backend,"gpus":c.gpus,"desktop":c.desktop,"desktop_size":c.desktop_size,"cpus":c.cpus,"memory_mib":c.memory_mib,"disk_bytes":disk_bytes,"ports":c.ports,"mac_address":c.mac_address}),
-                )?;
+                let mut c = c;
+                c.as_object_mut().map(|o| o.remove("name"));
+                print_json(&c)?;
             } else {
-                println!("{}", c.name);
+                println!("{}", c["name"].as_str().unwrap_or_default());
             }
             Ok(0)
         }
         "icon" => {
             let p = parse(rest, &[("reset", None, false)], false)?;
-            let mut c =
-                container::find(p.positional.first().context("icon requires a CONTAINER")?)?;
-            match (p.positional.get(1), p.has("reset")) {
+            let name = p.positional.first().context("icon requires a CONTAINER")?;
+            let icon = match (p.positional.get(1), p.has("reset")) {
                 (Some(_), true) => bail!("give an icon or --reset, not both"),
-                (Some(icon), false) => c.icon = Some(container::parse_icon(icon)?),
-                (None, true) => c.icon = None,
+                (Some(icon), false) => json!({"name":name,"icon":icon}),
+                (None, true) => json!({"name":name,"icon":null}),
                 (None, false) => {
-                    println!("{}", c.icon.as_deref().unwrap_or(""));
+                    let c = api_call("container.icon", json!({"name":name}))?;
+                    println!("{}", c["icon"].as_str().unwrap_or(""));
                     return Ok(0);
                 }
-            }
-            container::save(&c)?;
+            };
+            let c = api_call("container.icon", icon)?;
             if json_output {
-                print_json(&json!({"id":c.id,"icon":c.icon}))?;
+                print_json(&c)?;
             }
             Ok(0)
         }
         "inspect" => {
             let name = rest.first().context("inspect requires a name")?;
-            if let Ok(c) = container::find(name) {
-                print_json(&container::inspect(&c)?)?;
-            } else {
-                let store = Store::open(&home::images_dir()?)?;
-                let image = store
-                    .find(name)?
-                    .with_context(|| format!("no such container or image: {name}"))?;
-                print_json(&serde_json::to_value(image)?)?;
+            match api_call("container.inspect", json!({"name":name})) {
+                Ok(c) => print_json(&c)?,
+                Err(e) if veynodevm_api::code_of(&e) == veynodevm_api::ErrorCode::NotFound => {
+                    let image = api_call("image.inspect", json!({"reference":name}))
+                        .map_err(|_| anyhow::anyhow!("no such container or image: {name}"))?;
+                    print_json(&image)?;
+                }
+                Err(e) => return Err(e),
             }
             Ok(0)
         }
         "pull" => {
             let name = rest.first().context("pull requires an IMAGE")?;
-            let store = Store::open(&home::images_dir()?)?;
-            let image = store.pull(name, &mut |m| {
-                if !json_output {
-                    eprintln!("{m}")
-                }
-            })?;
-            if image.config.os != "darwin" {
-                store.rootfs(&image, &mut |m| {
-                    if !json_output {
-                        eprintln!("{m}")
-                    }
-                })?;
-            }
+            let image = api_stream("image.pull", json!({"reference":name}), json_output)?;
             if json_output {
-                print_json(&serde_json::to_value(&image)?)?;
+                print_json(&image)?;
             } else {
-                println!("{}", image.reference);
+                println!("{}", image["reference"].as_str().unwrap_or_default());
             }
             Ok(0)
         }
@@ -1018,8 +1040,9 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
                 json_output,
             ),
             Some("gc" | "prune") => {
-                let store = Store::open(&home::images_dir()?)?;
-                let freed = store.gc(&container::images_in_use()?)?;
+                let freed = api_call("image.gc", json!({}))?["removedBytes"]
+                    .as_u64()
+                    .unwrap_or_default();
                 println!("Total reclaimed space: {}", human_size(freed));
                 Ok(0)
             }
@@ -1027,10 +1050,12 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
         },
         "rmi" => {
             let (_, names) = names(rest, &[("force", Some('f'), false)])?;
-            let store = Store::open(&home::images_dir()?)?;
             for name in names {
-                let image = store.remove(&name)?;
-                println!("Untagged: {}", image.reference);
+                let image = api_call("image.rm", json!({"reference":name}))?;
+                println!(
+                    "Untagged: {}",
+                    image["reference"].as_str().unwrap_or_default()
+                );
             }
             Ok(0)
         }
@@ -1040,23 +1065,27 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
                 .value("input")
                 .or(p.positional.first().map(String::as_str))
                 .context("load requires -i ARCHIVE")?;
-            let store = Store::open(&home::images_dir()?)?;
-            for image in store.load(std::path::Path::new(path))? {
-                println!("Loaded image: {}", image.reference);
+            let path = std::path::absolute(path)?;
+            let images = api_stream("image.load", json!({"path":path}), json_output)?;
+            for image in images.as_array().into_iter().flatten() {
+                println!(
+                    "Loaded image: {}",
+                    image["reference"].as_str().unwrap_or_default()
+                );
             }
             Ok(0)
         }
         "desktop" => match rest {
             [close, name] if close == "--close" => desktop::close(name),
             [name] => desktop::open(name),
-            [stream, name] if stream == "--stream" => desktop_stream::run(name, "hevc", false),
+            [stream, name] if stream == "--stream" => desktop_stream(name, "hevc", false),
             [stream, codec, value, name] if stream == "--stream" && codec == "--codec" => {
-                desktop_stream::run(name, value, false)
+                desktop_stream(name, value, false)
             }
             [stream, codec, value, tracks, name]
                 if stream == "--stream" && codec == "--codec" && tracks == "--tracks" =>
             {
-                desktop_stream::run(name, value, true)
+                desktop_stream(name, value, true)
             }
             _ => bail!("usage: veynodevm desktop [--close] CONTAINER|VM"),
         },
@@ -1065,57 +1094,52 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
         "vm" => vm(rest),
         "machine" => machine::command(rest, json_output),
         "daemon" => daemon::command(rest, json_output),
-        "mcp" => {
-            let mut flags = Vec::new();
-            let mut rest = rest.iter();
-            while let Some(flag) = rest.next() {
-                let mapped = match flag.as_str() {
-                    "--lifecycle" | "--allow-lifecycle" => "--allow-lifecycle",
-                    "--execute" | "--allow-execute" => "--allow-execute",
-                    "--files" | "--allow-files" => "--allow-files",
-                    "--input" | "--allow-input" => "--allow-input",
-                    "--browser" | "--allow-browser" => "--allow-browser",
-                    "--clipboard" | "--allow-clipboard" => "--allow-clipboard",
-                    // One VM's cua-driver endpoint instead of the VM tools.
-                    "--vm" => {
-                        flags.push("--vm");
-                        rest.next().context("--vm needs a VM id")?.as_str()
-                    }
-                    // Tool groups narrow the listing; vm-control validates the names.
-                    "--tools" => {
-                        flags.push("--tools");
-                        rest.next().context("--tools needs GROUP,...")?.as_str()
-                    }
-                    other => bail!("unknown mcp flag: {other}"),
-                };
-                flags.push(mapped);
-            }
-            let err = std::os::unix::process::CommandExt::exec(
-                std::process::Command::new(sibling("vm-control")?)
-                    .arg("mcp")
-                    .args(flags),
-            );
-            Err(err.into())
-        }
+        "mcp" => mcp(rest),
         "ui" => ui::command(rest),
-        "__proxy" => proxy::run(rest.first().context("missing id")?).map(|_| 0),
         "__terminal" => match rest {
             [name, rows, cols, argv @ ..] => {
                 session::relay(name, rows.parse()?, cols.parse()?, argv.to_vec())
             }
             _ => bail!("usage: veynodevm __terminal CONTAINER|MACHINE ROWS COLS [COMMAND...]"),
         },
-        "__desktop" => match rest {
-            [vm, method, arguments] => {
-                print_json(&macos_desktop::run(vm, method, arguments)?)?;
-                Ok(0)
-            }
-            _ => bail!("usage: veynodevm __desktop VM METHOD ARGUMENTS"),
-        },
-        "__driver" => match rest {
-            [vm] => macos_driver::run(vm),
-            _ => bail!("usage: veynodevm __driver VM"),
-        },
         other => bail!("unknown command: {other} (see veynodevm --help)"),
+    }
+}
+
+/// `veynodevm mcp`: a stdio MCP server, relayed to a session in the daemon
+/// (`mcp.serve`). `--state-dir` names the daemon by its state directory, as
+/// `vm-mcp-http` does for each HTTPS session.
+fn mcp(rest: &[String]) -> Result<i32> {
+    let mut args = json!({});
+    let mut client = api()?;
+    let mut rest = rest.iter();
+    while let Some(flag) = rest.next() {
+        match flag.as_str() {
+            "--lifecycle" | "--allow-lifecycle" => args["lifecycle"] = json!(true),
+            "--execute" | "--allow-execute" => args["execute"] = json!(true),
+            "--files" | "--allow-files" => args["files"] = json!(true),
+            "--input" | "--allow-input" => args["input"] = json!(true),
+            "--browser" | "--allow-browser" => args["browser"] = json!(true),
+            "--clipboard" | "--allow-clipboard" => args["clipboard"] = json!(true),
+            // One VM's cua-driver endpoint instead of the VM tools.
+            "--vm" => args["vm"] = json!(rest.next().context("--vm needs a VM id")?),
+            // Tool groups narrow the listing; the daemon validates the names.
+            "--tools" => {
+                let list = rest.next().context("--tools needs GROUP,...")?;
+                args["tools"] = json!(list.split(',').map(str::trim).collect::<Vec<_>>());
+            }
+            "--state-dir" => {
+                let dir = rest.next().context("--state-dir needs a directory")?;
+                client = veynodevm_api::Client::at_socket(
+                    PathBuf::from(dir).join("control.sock"),
+                    concat!("veynodevm-mcp/", env!("CARGO_PKG_VERSION")),
+                );
+            }
+            other => bail!("unknown mcp flag: {other}"),
+        }
+    }
+    match session::run_on(&client, "mcp.serve", args, false, true, false)? {
+        session::Ended::Done(_) => Ok(0),
+        _ => Ok(1),
     }
 }

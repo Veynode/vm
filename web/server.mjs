@@ -111,7 +111,7 @@ server.on('upgrade', (req, socket) => {
     socket.end('HTTP/1.1 421 Misdirected Request\r\nconnection: close\r\ncontent-length: 0\r\n\r\n')
     return
   }
-  const options = { cli: process.env.VEYNODEVM_CLI || 'veynodevm', origins }
+  const options = { origins }
   if (req.url.startsWith('/terminal/')) upgradeTerminal(req, socket, options)
   else upgradeDesktop(req, socket, options)
 })

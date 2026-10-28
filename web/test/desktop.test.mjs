@@ -38,7 +38,7 @@ test('unmasked or oversized client frames are refused', () => {
   const big = Buffer.alloc(10)
   big[0] = 0x82
   big[1] = 0x80 | 127
-  big.writeBigUInt64BE(1n << 20n, 2)
+  big.writeBigUInt64BE(1n << 22n, 2)
   assert.throws(() => new FrameReader().push(big), /too large/)
 })
 
@@ -122,7 +122,7 @@ test('a slow link steps a viewer down below 8 Mbps, at most every 1 s, and back 
   assert.equal(governor.observe(5000, 0, 41), 6_000_000)
   assert.equal(governor.observe(5500, 0, 41), null)
   assert.equal(governor.observe(7000, 0, 200), 4_000_000)
-  assert.equal(governor.observe(9000, 300 * 1024, 0), 2_000_000)
+  assert.equal(governor.observe(9000, 300 * 1024, 200), 2_000_000)
   assert.equal(governor.observe(11_000, 0, 41), null)
   assert.equal(governor.observe(15_000, 0, 39), null)
   assert.equal(governor.observe(16_000, 0, 39), 4_000_000)
@@ -146,6 +146,13 @@ test('a long jittery link with no queue is not slowed down', () => {
 test('a deep delay drops a viewer two levels at once', () => {
   const governor = new BitrateGovernor(0)
   assert.equal(governor.observe(1000, 0, 400), 4_000_000)
-  assert.equal(governor.observe(2000, 0, 400), 2_000_000)
+  assert.equal(governor.observe(2000, 0, 400), 1_000_000)
   assert.equal(governor.observe(3000, 0, 400), null)
+})
+
+test('a viewer whose backlog is draining is not stepped down again', () => {
+  const governor = new BitrateGovernor(0)
+  assert.equal(governor.observe(1000, 0, 300), 4_000_000)
+  assert.equal(governor.observe(2500, 0, 200), null, 'delay falling: wait')
+  assert.equal(governor.observe(3500, 0, 290), 1_000_000, 'delay not falling: go on')
 })

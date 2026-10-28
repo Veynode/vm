@@ -2,7 +2,7 @@
 //! reaches over SSH (Windows, macOS containers; docs/computer-use.md). One
 //! child process per VM carries newline JSON-RPC both ways: on Windows an SSH
 //! session running `cua-driver mcp --socket` against the driver daemon in the
-//! desktop session, on macOS `veynodevm __driver`, which runs the driver over
+//! desktop session, on macOS `vm-control __driver`, which runs the driver over
 //! SSH. It keeps the Linux agent's rules (`guest/veynode-agent/driver.go`):
 //! the link owns the MCP handshake, the caller sends only `tools/*`,
 //! `resources/*` and `ping`, request ids are rewritten and restored, and

@@ -457,6 +457,8 @@ func prepareRoot(config containerConfig) error {
 	if config.Desktop {
 		// Apple Virtualization attaches USB keyboard and pointer; QEMU uses virtio input.
 		modprobe("xhci-pci", "usbhid", "hid-generic", "evdev", "virtio-input", "uinput")
+		// QEMU's sound card (Config::audio); Apple Virtualization has none.
+		modprobe("virtio_snd")
 	}
 	if config.Engine {
 		modprobe("bridge", "br_netfilter", "veth", "nf_tables", "nft_chain_nat", "nft_compat", "ip_tables", "iptable_nat", "iptable_filter", "xt_MASQUERADE", "xt_conntrack", "xt_addrtype", "nf_nat", "nf_conntrack", "ipt_REJECT", "xt_nat")

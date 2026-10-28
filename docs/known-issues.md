@@ -94,6 +94,11 @@
   does: a new identity makes the Guest start Setup Assistant ("Update Mac
   Automatically") in front of every window. Each container gets its own
   hostname (its name) at the first boot instead.
+- macOS machines (`machine.create {from}`) reuse the container path, but
+  have only unit and fixture evidence: no live create, first boot, exec,
+  copy or clone has run. Their first boot finishes on the first
+  `machine.exec` or `files.copy`, not at `machine.start`; `machine.update`
+  grows the disk while stopped and APFS at that next command.
 - **GPU** (Apple's paravirtualized Metal, measured with
   `scripts/macos-gpu-bench.swift` on an M3 Pro host, macOS 26.6.2 Guest):
   a game-like frame (4.7M triangles, 2048 draws, 4x MSAA HDR, post pass,
@@ -382,6 +387,78 @@
     (its variables cover logging, frame capture, the shader cache, BC
     emulation and MetalFX upscaling); its log now goes to the worker's
     runtime directory (`DXMT_LOG_PATH`) instead of the current directory.
+  - **Where the 1.4 ms goes** (2026-10-28; a fresh install of the same
+    Windows build with tools 0.1.273, plus host-only microbenchmarks). The
+    guest driver, not QEMU, sets the floor: in `neptune_umd_arm64.dll`
+    (disassembly, matching Neptune's public `npt_ring.c`/`npt_common.h`) every
+    synchronous reply wait (Map, QueryInterface, blob create) yields 256 times
+    (`SwitchToThread`), then sleeps `160 << n` µs raised to at least 1 ms on a
+    high-resolution waitable timer. Live: 256 yields take 0.25–0.26 ms; a
+    1 ms high-resolution timer wakes after 1.50–1.58 ms p50 and a 0.2 ms one
+    after 0.51–0.56 ms (guest wakeups fall on a ~0.5 ms grid, the same with
+    the process at 0.5 ms or 1 ms timer resolution). The driver's own profile
+    (`NPT_DEBUG=profile` in the app's environment, printed to stderr) shows one
+    slow sync call per 64x64 `fill` frame, the staging Map (transport command
+    0x30001), at 1466 µs, while the other sync calls answer in 5–17 µs; the
+    render server's profile (`NPT_DEBUG=profile`) spends 547 µs per Map
+    dispatch on average. A reply that misses the 0.26 ms yield budget costs a
+    whole timer sleep, which is the 64x64 `fill`'s 1.38–1.52 ms (3 runs on this
+    install). The host can't answer inside that budget through DXMT: on the host (same
+    `dxmt-native`, its own `D3D11CreateDevice`), a clear, a one-pixel copy
+    and `Map(READ)` take 250–310 µs p50 at 64x64 and 1080p alike (3 runs of
+    1000), the same as Metal's own command-buffer completion
+    (`waitUntilCompleted` 253 µs p50); spinning on an `MTLSharedEvent`
+    signalled by the same command buffer sees it at 132 µs, but that wait is
+    inside DXMT. Waiting on an `ID3D11Fence` (`Signal`, `Flush`, spin on
+    `GetCompletedValue`) before the `Map` is no faster (503–581 vs 358–495 µs
+    p50 on a loaded host), so the render server can't take that route either.
+    QEMU's side is not it: UTM's QEMU 10.0.12 delivers render-server fences
+    asynchronously ("async fence delivery enabled (render-server proxy)"),
+    and Venus on the same QEMU/HVF/render server waits per frame at host
+    parity (1922 vs 1876 FPS, [GPU and desktop](#gpu-and-desktop)). So no QEMU, vCPU or HVF option removes
+    the floor; it needs a guest driver that waits in sub-millisecond steps or
+    spins longer, or a DXMT whose `Map` waits on a shared event.
+  - **A patched guest driver confirms it** (2026-10-28, live, experiment
+    only; nothing ships). Two instructions per reply-wait site in tools
+    0.1.273's `neptune_umd_arm64.dll` and `neptune_umd_ec.dll` (two sites
+    each) were changed: the yield count (256) and the sleep floor (1000 µs).
+    The Authenticode entry was dropped, and Windows 11 26300 loads the
+    unsigned UMD (copied over the DriverStore file after `takeown`); the
+    pixel test passed with every variant. Three interleaved rounds, guest
+    rebooted after each swap, p50 ms:
+
+    | Case | Stock | Floor 200 µs | 640 yields + floor 200 µs |
+    |---|---|---|---|
+    | 64x64 `fill`, wait every frame | 1.38–1.57 | 1.05–1.58 | 0.41–0.45 |
+    | 1080p `fill`, wait every frame | 3.10–4.55 | 2.26–3.37 | 2.39–2.70 |
+    | 1080p `fill`, wait every 4 frames | 1.96–2.01 | 1.66–1.69 | 1.66–1.67 |
+    | `draws` 2000, wait every 4 frames | 2.04–2.37 | 1.45–2.46 | 1.36–1.46 |
+    | `draws` 2000, wait every frame | 2.01–3.91 | 2.34–2.90 | 1.93–2.75 |
+
+    The longer spin catches the host's ~0.5 ms reply without sleeping; the
+    cost is guest CPU during the wait (the 64x64 loop's CPU time per wall
+    time rose from 0.18–0.28 to 0.48–0.92 of one core). A 1024-yield spin
+    alone (floor kept at 1 ms, before the reboot-per-swap method) reached
+    0.41–0.51 ms at 64x64, but made the 1080p wait-every-frame case slower
+    (3.04–4.38 ms), presumably because a ~2 ms wait then spins ~1 ms
+    before its first 1.5 ms sleep. The fix belongs upstream in Neptune's
+    `npt_ring.c` relax policy; a modified third-party driver isn't something
+    VeynodeVM can ship. Once the guest hung (black screen, no SSH) running
+    the stock UMD while processes started earlier still had a patched one
+    mapped; twice more SSH timed out just after a reboot (patched UMDs) and
+    the VM was force-restarted without a screenshot. The causes were not
+    found.
+
+    The same policy built from Neptune's source (osy/virtio-win-mesa
+    `44d3259`, which matches 0.1.273; clang-cl with the xwin Windows SDK
+    and WDK headers on the Mac; native ARM64 DLL only) gives the same
+    result. It is 640 yields, then 8 sleeps of 200 µs, then the old
+    backoff, tunable with `NPT_RELAX_YIELDS`, `NPT_RELAX_FAST_SLEEPS` and
+    `NPT_RELAX_FAST_US`. In three rounds, with the VM force-restarted after
+    each swap, the 64x64 case went from 1.35–1.38 ms to 0.43–0.49 ms and
+    1080p `fill` waiting every frame from 3.32–4.31 ms to 2.26–3.05 ms. An
+    unmodified source build matched stock (1.38–1.61 ms), and the pixel
+    test passed 9 of 9.
   - **Windows Fast Startup aborts QEMU.** Booting after a clean shutdown (a
     hybrid resume) hit `Assertion failed: (isv), function hvf_vcpu_exec, file
     hvf.c, line 2295` in 4 of 5 boots once viogpu3d was installed; boots
@@ -692,3 +769,63 @@ Virtualization (llvmpipe) and on QEMU with `--gpus virgl` (GLX renderer
   experiment is not in the tree.
 - Alpine 3.22 packages no Venus ICD; Vulkan GPU workloads need an image with
   Mesa's virtio driver (`veynodevm/ubuntu-gpu`).
+
+## Desktop sound and clipboard
+
+How it works: [browser desktop](browser-desktop.md#sound-and-clipboard).
+
+- Checked live on `alpine-desktop` (both backends) through the relay and in
+  the Claude app's Chromium browser pane, and a Guest copy into the Mac's
+  pasteboard in Brave; not in Chrome, Safari or Firefox, the
+  native console window, the Ubuntu images, Windows or macOS containers.
+  See [the evidence](browser-desktop.md#sound-and-clipboard).
+- A browser that denies `clipboard-write` (the Claude app's browser pane does)
+  leaves every Guest copy waiting behind the clipboard button's dot, and **Get
+  from desktop** reports the refusal as a toast.
+- `alpine-desktop` has no CJK or emoji fonts: such text crosses the clipboard
+  exactly but shows as boxes in the Guest.
+- The relay's microphone frames come from the page's audio clock; a sender that
+  falls behind real time leaves short silences in the Guest's recording.
+- Images built before this change have no PipeWire virtual devices (Apple
+  Virtualization: `audio_unavailable`) and no `spice-vdagent` (QEMU: the
+  clipboard reports that the Guest runs no clipboard agent). Rebuild the image
+  to get them.
+- Windows machines get a sound card (HD Audio) but no clipboard: no agent port
+  is wired for them, and they have no `spice-vdagent`.
+- macOS containers (browser desktop only; [design](browser-desktop.md#macos-containers)):
+  - Checked live on macOS 26.6.2 through the relay (clipboard both ways with
+    Chinese and emoji; a 440 Hz tone at 48 kHz; mute), not in a browser page;
+    see [the evidence](browser-desktop.md#macos-containers).
+  - Sound needs the opt-in Guest service started with `--allow-observe
+    --allow-audio` and its Screen Recording permission, which nothing grants
+    for you (the Tart images grant it only to Screen Sharing); `run` does not
+    install that service. Without it the speaker stays silent
+    (`audio_unavailable` in the encoder diagnostics).
+  - TCC charges the service to whatever started it: launched over SSH it
+    counts as `sshd-keygen-wrapper` and gets no audio even with its own grant.
+    Start it as a launchd job in the user's GUI domain.
+  - In some live runs a tone played with `afplay -t` went silent part-way
+    through a session while records kept coming; not reproduced with plain
+    `afplay`, cause unknown.
+  - Only containers created after this change have the sound card. Recreate
+    older ones to get it.
+  - No microphone: the viewer's microphone button does nothing. Apple
+    Virtualization's only input is the Mac's own microphone, fixed for the
+    VM's life, which the viewer could not switch.
+  - The clipboard runs `osascript` over SSH with `sudo -n launchctl asuser`:
+    it needs the image's password-less `sudo`, and each viewer holds one SSH
+    session. A Guest whose pasteboard privacy setting asks before a program
+    reads the pasteboard would show that prompt; none appeared on Tahoe.
+  - The Apple Virtualization window has no sound or clipboard (Linux desktops
+    on Apple Virtualization have none there either).
+- The remote WebRTC desktop (`crates/media-local`, `browser/`) carries
+  neither; only the local viewers do.
+- Text only, at most 200 KiB; images and files are not shared.
+- ⌘-to-Ctrl mapping is in the browser only. In the native console, use the
+  Guest's own Ctrl shortcuts.
+- A browser that fires no `paste` event on the desktop canvas (Safari, until
+  checked) pastes the Guest's own clipboard on ⌘V after 150 ms. The page's
+  text then goes through the clipboard panel's box and **Send to desktop**.
+- Firefox and Safari may refuse to write a Guest copy to the page's clipboard
+  outside the ⌘C gesture. A copy made from the Guest's own menu then waits
+  behind the clipboard button's dot for **Get from desktop**.

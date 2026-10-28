@@ -21,7 +21,7 @@ function attempt(url, headers = {}) {
     },
   }
   // A rejected request never reaches spawn, so the CLI path is irrelevant.
-  upgradeTerminal(req, socket, { cli: '/nonexistent', origins })
+  upgradeTerminal(req, socket, { origins })
   return written.split('\r\n')[0]
 }
 

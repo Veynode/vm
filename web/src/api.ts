@@ -1,5 +1,6 @@
 import { createServerFn } from '@tanstack/react-start'
-import { actionArgs, createArgs, createInput, displaySize, hostPath, machineName, macosImage, sshUser, type MachineSpec } from './machine-input.mjs'
+import { actionRequest, createInput, createRequest, displaySize, hostPath, machineName, macosImage, sshUser, type MachineSpec } from './machine-input.mjs'
+import { daemonLabel, hardwareChanges, runRequest } from './requests.mjs'
 
 export interface Port {
   host_address: string
@@ -28,6 +29,8 @@ export interface ContainerRow {
   os?: string
   /** The shared engine (`veynodevm engine`). */
   engine?: boolean
+  /** `systemd` for `--init systemd`, which has no interactive session. */
+  init?: string | null
   cpus?: number
   memory_mib?: number
 }
@@ -77,29 +80,33 @@ function list(input: unknown, max: number, label: string): string[] {
 }
 
 export const listContainers = createServerFn({ method: 'GET' }).handler(async () => {
-  const { must } = await import('./server/veynodevm')
-  return must<ContainerRow[]>(['ps', '-a'])
+  const { api } = await import('./server/veynodevm')
+  return api<ContainerRow[]>('container.ls', { all: true })
 })
 
 export const listImages = createServerFn({ method: 'GET' }).handler(async () => {
-  const { must } = await import('./server/veynodevm')
-  return must<ImageRow[]>(['images'])
+  const { api } = await import('./server/veynodevm')
+  return api<ImageRow[]>('image.ls')
 })
 
 export const inspectContainer = createServerFn({ method: 'GET' })
   .validator((input: unknown) => id(input))
   .handler(async ({ data }) => {
-    const { must } = await import('./server/veynodevm')
-    return must<any>(['inspect', data])
+    const { api } = await import('./server/veynodevm')
+    try {
+      return await api<any>('container.inspect', { name: data })
+    } catch (error: any) {
+      if (error?.code !== 'not_found') throw error
+      return api<any>('image.inspect', { reference: data })
+    }
   })
 
 export const containerLogs = createServerFn({ method: 'GET' })
   .validator((input: unknown) => id(input))
   .handler(async ({ data }) => {
-    const { veynodevm } = await import('./server/veynodevm')
-    const result = await veynodevm(['logs', data])
-    // logs prints plain text even with --json.
-    const text = result.stdout
+    const { collect } = await import('./server/veynodevm')
+    const { stdout, stderr } = await collect('container.logs', { name: data })
+    const text = stdout + stderr
     return text.length > 256 * 1024 ? text.slice(-256 * 1024) : text
   })
 
@@ -110,10 +117,10 @@ export const containerAction = createServerFn({ method: 'POST' })
     return { action: value.action as 'start' | 'stop' | 'rm', id: id(value.id) }
   })
   .handler(async ({ data }) => {
-    const { must } = await import('./server/veynodevm')
-    const args = data.action === 'rm' ? ['rm', '-f', data.id] : [data.action, data.id]
-    // start/stop/rm print names, not JSON; failures carry a JSON error.
-    await must(args, 120_000)
+    const { api, ensureDaemon } = await import('./server/veynodevm')
+    if (data.action === 'start') await ensureDaemon()
+    const args = data.action === 'rm' ? { name: data.id, force: true } : { name: data.id }
+    await api(`container.${data.action}`, args, 120_000)
     return { ok: true }
   })
 
@@ -123,8 +130,9 @@ export const renameContainer = createServerFn({ method: 'POST' })
     return { id: id(value?.id), name: id(value?.name) }
   })
   .handler(async ({ data }) => {
-    const { must } = await import('./server/veynodevm')
-    return must<{ id: string; name: string }>(['rename', data.id, data.name])
+    const { api } = await import('./server/veynodevm')
+    const row = await api<{ id: string; name: string }>('container.rename', { name: data.id, newName: data.name })
+    return { id: row.id, name: row.name }
   })
 
 /** What the Hardware dialog changes; an absent field is kept. */
@@ -139,6 +147,8 @@ export interface HardwareChanges {
   desktop?: boolean
   /** `WxH`, QEMU desktops only. */
   desktop_size?: string
+  /** QEMU VMs only: a sound card (a desktop container always has one). */
+  audio?: boolean
   /** `HOST:GUEST[/udp]`; empty publishes none. */
   ports?: string[]
   /** Empty goes back to the default servers. */
@@ -148,65 +158,16 @@ export interface HardwareChanges {
   new_mac?: boolean
 }
 
-const PORT = /^(\d{1,3}(\.\d{1,3}){3}:)?\d{1,5}:\d{1,5}(\/(tcp|udp))?$/
-
-function int(value: unknown, min: number, max: number, label: string): number | undefined {
-  if (value === undefined) return undefined
-  if (!Number.isInteger(value) || (value as number) < min || (value as number) > max) throw new Error(`invalid ${label}`)
-  return value as number
-}
-
-/** Checked changes as `update` / `machine update` flags. */
-function hardwareArgs(input: unknown, machine: boolean): string[] {
-  const v = (input ?? {}) as Record<string, unknown>
-  const args: string[] = []
-  const cpus = int(v.cpus, 1, 128, 'CPU count')
-  if (cpus !== undefined) args.push('--cpus', String(cpus))
-  const memory = int(v.memory_mib, 256, 1 << 20, 'memory')
-  if (memory !== undefined) args.push('--memory', `${memory}m`)
-  const disk = int(v.disk_gib, 1, 4096, 'disk size')
-  if (disk !== undefined) args.push('--disk-size', `${disk}G`)
-  if (v.gpus !== undefined) {
-    if (!['', 'virgl', 'venus', ...(machine ? ['neptune'] : [])].includes(v.gpus as string)) throw new Error('invalid GPU')
-    args.push('--gpus', (v.gpus as string) || 'none')
-  }
-  if (!machine && v.desktop !== undefined) {
-    if (typeof v.desktop !== 'boolean') throw new Error('invalid desktop')
-    args.push('--desktop', v.desktop ? 'on' : 'off')
-  }
-  if (!machine && v.desktop_size !== undefined) {
-    if (!(typeof v.desktop_size === 'string' && /^\d{3,4}x\d{3,4}$/.test(v.desktop_size))) throw new Error('invalid desktop size')
-    args.push('--desktop-size', v.desktop_size)
-  }
-  if (v.ports !== undefined) {
-    const ports = list(v.ports, 64, 'ports')
-    if (ports.some((p) => !(machine ? /^\d{1,5}:\d{1,5}$/ : PORT).test(p))) throw new Error('invalid port')
-    args.push(...(ports.length ? ports.flatMap((p) => ['--publish', p]) : ['--publish', 'none']))
-  }
-  if (!machine && v.dns !== undefined) {
-    const dns = list(v.dns, 3, 'DNS servers')
-    if (dns.some((d) => !/^[0-9a-fA-F.:]{2,45}$/.test(d))) throw new Error('invalid DNS server')
-    args.push(...(dns.length ? dns.flatMap((d) => ['--dns', d]) : ['--dns', 'none']))
-  }
-  if (!machine && v.mtu !== undefined) {
-    const mtu = v.mtu === 0 ? 0 : int(v.mtu, 576, 9000, 'MTU')
-    args.push('--mtu', mtu ? String(mtu) : 'default')
-  }
-  if (v.new_mac === true) args.push('--new-mac')
-  if (!args.length) throw new Error('nothing to change')
-  return args
-}
-
-/** `veynodevm update`: a container's hardware, in one re-registration of its VM. */
+/** `container.update`: a container's hardware, in one re-registration of its VM. */
 export const updateContainer = createServerFn({ method: 'POST' })
   .validator((input: unknown) => {
     const value = input as { id?: unknown; changes?: unknown; restart?: unknown }
-    return { id: id(value?.id), args: hardwareArgs(value?.changes, false), restart: value?.restart === true }
+    return { id: id(value?.id), changes: hardwareChanges(value?.changes, false), restart: value?.restart === true }
   })
   .handler(async ({ data }) => {
-    const { must } = await import('./server/veynodevm')
+    const { api } = await import('./server/veynodevm')
     // A restart stops the guest first (up to 30 s under systemd), then boots it.
-    return must<{ id: string }>(['update', ...data.args, ...(data.restart ? ['--restart'] : []), data.id], 120_000)
+    return api<{ id: string }>('container.update', { name: data.id, changes: data.changes, restart: data.restart }, 120_000)
   })
 
 const ICON = /^(monitor|laptop|vm|box|server|terminal|cpu|globe|folder|code)(:(blue|teal|green|yellow|orange|pink|purple|black))?$/
@@ -218,8 +179,8 @@ export const setContainerIcon = createServerFn({ method: 'POST' })
     return { id: id(value.id), icon: value.icon as string | null }
   })
   .handler(async ({ data }) => {
-    const { must } = await import('./server/veynodevm')
-    await must(['icon', data.id, data.icon ?? '--reset'])
+    const { api } = await import('./server/veynodevm')
+    await api('container.icon', { name: data.id, icon: data.icon })
     return { ok: true }
   })
 
@@ -231,25 +192,26 @@ export const execInContainer = createServerFn({ method: 'POST' })
     return { id: id(value.id), argv }
   })
   .handler(async ({ data }) => {
-    const { veynodevm } = await import('./server/veynodevm')
-    const result = await veynodevm<any>(['exec', data.id, ...data.argv], 40_000)
-    if (!result.data) throw new Error(result.error || 'exec failed')
-    return result.data as { exit_code: number; stdout: string; stderr: string; timed_out: boolean }
+    const { collect } = await import('./server/veynodevm')
+    const { result, stdout, stderr } = await collect<{ exitCode: number; timedOut: boolean }>('container.exec', {
+      name: data.id,
+      argv: data.argv,
+    })
+    return { exit_code: result.exitCode, stdout, stderr, timed_out: result.timedOut }
   })
 
 export const pullImage = createServerFn({ method: 'POST' })
   .validator((input: unknown) => image(input))
   .handler(async ({ data }) => {
-    const { must } = await import('./server/veynodevm')
-    return must<ImageRow>(['pull', data], 30 * 60_000)
+    const { collect } = await import('./server/veynodevm')
+    return (await collect<ImageRow>('image.pull', { reference: data })).result
   })
 
 export const removeImage = createServerFn({ method: 'POST' })
   .validator((input: unknown) => image(input))
   .handler(async ({ data }) => {
-    const { veynodevm } = await import('./server/veynodevm')
-    const result = await veynodevm(['rmi', data])
-    if (result.code !== 0) throw new Error(result.stderr.trim() || 'rmi failed')
+    const { api } = await import('./server/veynodevm')
+    await api('image.rm', { reference: data })
     return { ok: true }
   })
 
@@ -294,9 +256,14 @@ export const runContainer = createServerFn({ method: 'POST' })
     return out
   })
   .handler(async ({ data }) => {
-    const { veynodevm } = await import('./server/veynodevm')
-    const args = ['run', '-d']
-    if (data.shared) args.push('--shared')
+    const { collect, ensureDaemon, veynodevm } = await import('./server/veynodevm')
+    if (!data.shared) {
+      await ensureDaemon()
+      const { result } = await collect<{ id: string; name: string }>('container.run', runRequest(data))
+      return { id: result.id, name: result.name }
+    }
+    // The shared engine's containers are the user's docker client's (`veynodevm run --shared`).
+    const args = ['run', '-d', '--shared']
     if (data.name) args.push('--name', data.name)
     for (const p of data.ports) args.push('-p', p)
     for (const v of data.volumes) args.push('-v', v)
@@ -325,12 +292,35 @@ export interface DaemonStatus {
   host_cpus?: number
 }
 
-/** The control daemon (`veynodevm daemon`): it owns every container's and VM's micro-VM. */
-export const daemonStatus = createServerFn({ method: 'GET' }).handler(async () => {
-  const { veynodevm } = await import('./server/veynodevm')
-  const result = await veynodevm<DaemonStatus>(['daemon', 'status'])
-  if (!result.data) throw new Error(result.stderr.trim() || 'daemon status failed')
-  return result.data
+/**
+ * The control daemon: it owns every container's and VM's micro-VM. Its
+ * budget comes over API 1; launchd's label and the log are this home's
+ * (`veynodevm daemon status`).
+ */
+export const daemonStatus = createServerFn({ method: 'GET' }).handler(async (): Promise<DaemonStatus> => {
+  const { api } = await import('./server/veynodevm')
+  const { veynodeHome } = await import('./server/host-files.mjs')
+  const { availableParallelism, homedir } = await import('node:os')
+  const { join } = await import('node:path')
+  const home = veynodeHome()
+  const base = {
+    label: daemonLabel(home, join(process.env.HOME || homedir(), 'Library/Application Support/VeynodeVM')),
+    log: join(home, 'daemon.log'),
+    host_cpus: availableParallelism(),
+  }
+  try {
+    const c = await api<any>('capabilities', {}, 10_000)
+    return {
+      ...base,
+      running: true,
+      state_dir: join(home, 'state'),
+      memory_budget_mib: c?.resource_admission?.vm_memory_budget_mib,
+      assigned_memory_mib: c?.resource_admission?.active_assigned_memory_mib,
+      qemu_registered: c?.backends?.['qemu-hvf']?.registered,
+    }
+  } catch {
+    return { ...base, running: false }
+  }
 })
 
 export const daemonAction = createServerFn({ method: 'POST' })
@@ -346,9 +336,13 @@ export const daemonAction = createServerFn({ method: 'POST' })
   })
 
 export const engineStatus = createServerFn({ method: 'GET' }).handler(async () => {
-  const { veynodevm } = await import('./server/veynodevm')
-  const result = await veynodevm<any>(['engine', 'status'])
-  return result.data ?? { state: 'absent', status: result.stdout.trim() || 'not created' }
+  const { api } = await import('./server/veynodevm')
+  try {
+    return await api<any>('engine.status')
+  } catch (error: any) {
+    if (error?.code === 'not_found') return { state: 'absent', status: 'engine not created (veynodevm engine start)' }
+    throw error
+  }
 })
 
 export const engineAction = createServerFn({ method: 'POST' })
@@ -366,18 +360,16 @@ export const engineAction = createServerFn({ method: 'POST' })
 export const openDesktop = createServerFn({ method: 'POST' })
   .validator((input: unknown) => id(input))
   .handler(async ({ data }) => {
-    const { veynodevm } = await import('./server/veynodevm')
-    const result = await veynodevm(['desktop', data], 30_000)
-    if (result.code !== 0) throw new Error(result.stderr.trim() || 'desktop failed')
+    const { api } = await import('./server/veynodevm')
+    await api('desktop.open', { name: data }, 30_000)
     return { ok: true }
   })
 
 export const closeDesktop = createServerFn({ method: 'POST' })
   .validator((input: unknown) => id(input))
   .handler(async ({ data }) => {
-    const { veynodevm } = await import('./server/veynodevm')
-    const result = await veynodevm(['desktop', '--close', data], 30_000)
-    if (result.code !== 0) throw new Error(result.stderr.trim() || 'desktop --close failed')
+    const { api } = await import('./server/veynodevm')
+    await api('desktop.close', { name: data }, 30_000)
     return { ok: true }
   })
 
@@ -389,14 +381,14 @@ export const systemInfo = createServerFn({ method: 'GET' }).handler(async () => 
   return { cli, home: process.env.VEYNODEVM_HOME ?? null, version }
 })
 
-/* ----- Machines (`veynodevm machine`) ---------------------------------------- */
+/* ----- Machines (`machine.*`) ------------------------------------------------ */
 
 export interface MachineRecord {
   name: string
   /** Stays the same across renames: the address of its pages. */
   id: string
   backend: 'qemu-hvf' | 'apple-virtualization'
-  os: 'linux' | 'windows'
+  os: 'linux' | 'windows' | 'macos'
   iso?: string
   disk_gib: number
   created_at: number
@@ -416,22 +408,24 @@ export interface MachineRow {
   terminal?: boolean
 }
 
-function stderrOf(result: { error?: string; stderr: string }, fallback: string) {
-  return (result.error || result.stderr.trim() || fallback).replace(/^veynodevm: /, '')
-}
-
 export const listMachines = createServerFn({ method: 'GET' }).handler(async () => {
-  const { must, veynodevm } = await import('./server/veynodevm')
+  const { api } = await import('./server/veynodevm')
   const { sshLogin, veynodeHome } = await import('./server/host-files.mjs')
   const { join } = await import('node:path')
-  const [rows, vms] = await Promise.all([must<MachineRow[]>(['machine', 'ls']), veynodevm<any>(['vm', 'ls'])])
-  const list: any[] = Array.isArray(vms.data) ? vms.data : Array.isArray(vms.data?.vms) ? vms.data.vms : []
+  const machines = await api<any[]>('machine.ls')
   return Promise.all(
-    rows.map(async (row) => {
-      const vm = list.find((v) => (v?.config?.id ?? v?.id) === row.machine.name)
-      const config = vm?.config ?? vm
-      const ssh = sshForward(config) ? await sshLogin(join(veynodeHome(), 'machines', row.machine.name)) : null
-      return { ...row, cpus: config?.cpus, memory_mib: config?.memory_mib, desktop: !!vm?.runtime?.console_socket, terminal: !!(ssh?.user && ssh.key) }
+    machines.map(async (m): Promise<MachineRow> => {
+      const config = m.vm?.config
+      const ssh = sshForward(config) ? await sshLogin(join(veynodeHome(), 'machines', m.name)) : null
+      return {
+        machine: m.record,
+        state: m.vmState,
+        disk_used_bytes: m.diskUsedBytes,
+        cpus: config?.cpus,
+        memory_mib: config?.memory_mib,
+        desktop: !!m.vm?.runtime?.console_socket,
+        terminal: !!(ssh?.user && ssh.key),
+      }
     }),
   )
 })
@@ -442,36 +436,39 @@ export const sshForward = (config: any) => (config?.ports ?? []).some((p: any) =
 export const inspectMachine = createServerFn({ method: 'GET' })
   .validator((input: unknown) => machineName(input))
   .handler(async ({ data }) => {
-    const { must } = await import('./server/veynodevm')
+    const { api } = await import('./server/veynodevm')
     const { sshLogin, veynodeHome } = await import('./server/host-files.mjs')
     const { join } = await import('node:path')
-    const info = await must<{ machine: MachineRecord; vm: any }>(['machine', 'inspect', data])
+    const m = await api<any>('machine.inspect', { name: data })
+    const info: { machine: MachineRecord; vm: any } = { machine: m.record, vm: m.vm }
     // Windows shows and sets its login; any machine with one gets a terminal.
     const ssh = info.machine.os === 'windows' || sshForward(info.vm?.config) ? await sshLogin(join(veynodeHome(), 'machines', info.machine.name)) : null
     return { ...info, ssh }
   })
 
 export const machineAction = createServerFn({ method: 'POST' })
-  .validator((input: unknown) => actionArgs(input))
+  .validator((input: unknown) => actionRequest(input))
   .handler(async ({ data }) => {
-    const { veynodevm } = await import('./server/veynodevm')
-    const result = await veynodevm(data, 120_000)
-    if (!result.ok) throw new Error(stderrOf(result, `machine ${data[1]} failed`))
+    const { api, collect, ensureDaemon } = await import('./server/veynodevm')
+    if (data.method === 'machine.start') {
+      await ensureDaemon()
+      await collect(data.method, data.args)
+    } else {
+      await api(data.method, data.args, 120_000)
+    }
     return { ok: true }
   })
 
 export const createMachine = createServerFn({ method: 'POST' })
   .validator((input: unknown): MachineSpec => createInput(input))
   .handler(async ({ data }) => {
-    const { veynodevm } = await import('./server/veynodevm')
+    const { collect, ensureDaemon } = await import('./server/veynodevm')
     const { regularFile } = await import('./server/host-files.mjs')
     if (data.iso) await regularFile(data.iso, 'Installer ISO')
     for (const path of data.attach) await regularFile(path, 'Attached image')
-    const result = await veynodevm(createArgs(data), 10 * 60_000)
-    if (!result.ok) throw new Error(stderrOf(result, 'machine create failed'))
-    const { must } = await import('./server/veynodevm')
-    const info = await must<{ machine: MachineRecord }>(['machine', 'inspect', data.name])
-    return { name: data.name, id: info.machine.id }
+    await ensureDaemon()
+    const { result } = await collect<{ name: string; id: string }>('machine.create', createRequest(data))
+    return { name: result.name, id: result.id }
   })
 
 export const setMachineIcon = createServerFn({ method: 'POST' })
@@ -481,8 +478,8 @@ export const setMachineIcon = createServerFn({ method: 'POST' })
     return { name: machineName(value.name), icon: value.icon as string | null }
   })
   .handler(async ({ data }) => {
-    const { must } = await import('./server/veynodevm')
-    await must(['machine', 'icon', data.name, data.icon ?? '--reset'])
+    const { api } = await import('./server/veynodevm')
+    await api('machine.icon', { name: data.name, icon: data.icon })
     return { ok: true }
   })
 
@@ -492,35 +489,33 @@ export const renameMachine = createServerFn({ method: 'POST' })
     return { name: machineName(value?.name), new_name: machineName(value?.new_name) }
   })
   .handler(async ({ data }) => {
-    const { veynodevm } = await import('./server/veynodevm')
-    const result = await veynodevm(['machine', 'rename', data.name, data.new_name], 60_000)
-    if (!result.ok) throw new Error(stderrOf(result, 'machine rename failed'))
-    return { name: data.new_name }
+    const { api } = await import('./server/veynodevm')
+    const machine = await api<{ name: string }>('machine.rename', { name: data.name, newName: data.new_name }, 60_000)
+    return { name: machine.name }
   })
 
-/** `veynodevm machine update`: a stopped VM's hardware. */
+/** `machine.update`: a stopped VM's hardware. */
 export const updateMachine = createServerFn({ method: 'POST' })
   .validator((input: unknown) => {
     const value = input as { name?: unknown; changes?: unknown }
-    return { name: machineName(value?.name), args: hardwareArgs(value?.changes, true) }
+    return { name: machineName(value?.name), changes: hardwareChanges(value?.changes, true) }
   })
   .handler(async ({ data }) => {
-    const { veynodevm } = await import('./server/veynodevm')
-    const result = await veynodevm(['machine', 'update', data.name, ...data.args], 60_000)
-    if (!result.ok) throw new Error(stderrOf(result, 'machine update failed'))
+    const { api } = await import('./server/veynodevm')
+    await api('machine.update', { ...data.changes, name: data.name }, 60_000)
     return { name: data.name }
   })
 
-/** `veynodevm machine display`: a running Windows machine's resolution, through its SSH login. */
+/** `machine.display`: a running Windows machine's resolution, through its SSH login. */
 export const setMachineDisplay = createServerFn({ method: 'POST' })
   .validator((input: unknown) => {
     const v = (input ?? {}) as Record<string, unknown>
     return { name: machineName(v.name), size: displaySize(v.size) }
   })
   .handler(async ({ data }) => {
-    const { veynodevm } = await import('./server/veynodevm')
-    const result = await veynodevm(['machine', 'display', data.name, data.size], 60_000)
-    if (!result.ok) throw new Error(stderrOf(result, 'machine display failed'))
+    const { api } = await import('./server/veynodevm')
+    const [width, height] = data.size.split('x').map(Number)
+    await api('machine.display', { name: data.name, width, height }, 60_000)
     return { ok: true }
   })
 
@@ -531,12 +526,11 @@ export const setMachineSshKey = createServerFn({ method: 'POST' })
     return { name: machineName(v.name), user: sshUser(v.user), key: hostPath(v.key, [''], 'key path') }
   })
   .handler(async ({ data }) => {
-    const { veynodevm } = await import('./server/veynodevm')
+    const { api } = await import('./server/veynodevm')
     const { regularFile } = await import('./server/host-files.mjs')
-    // The CLI reads and copies the key; it never passes through this process.
+    // The daemon reads and copies the key; it never passes through this process.
     await regularFile(data.key, 'Private key')
-    const result = await veynodevm(['machine', 'ssh-key', data.name, '--user', data.user, '--key', data.key])
-    if (!result.ok) throw new Error(stderrOf(result, 'machine ssh-key failed'))
+    await api('machine.ssh_key', { name: data.name, user: data.user, key: data.key })
     return { ok: true }
   })
 
@@ -546,11 +540,11 @@ export const setMachineSshKey = createServerFn({ method: 'POST' })
 export const macosImageStatus = createServerFn({ method: 'GET' })
   .validator((input: unknown) => macosImage(input))
   .handler(async ({ data }) => {
-    const { veynodevm } = await import('./server/veynodevm')
+    const { api } = await import('./server/veynodevm')
     const { freeBytes, veynodeHome } = await import('./server/host-files.mjs')
     const { pullState } = await import('./server/pulls')
-    const images = await veynodevm<ImageRow[]>(['images'])
-    const pulled = (images.data ?? []).some((i) => i.reference === data || i.reference === `${data}:latest`)
+    const images = await api<ImageRow[]>('image.ls').catch(() => [] as ImageRow[])
+    const pulled = images.some((i) => i.reference === data || i.reference === `${data}:latest`)
     return { pulled, free_bytes: await freeBytes(veynodeHome()), pull: pullState(data) }
   })
 

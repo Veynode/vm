@@ -8,7 +8,7 @@ spec = importlib.util.spec_from_file_location('check_changed', ROOT / 'scripts/c
 check = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(check)
 
-DEPENDENTS = {'cli': set(), 'control': {'cli', 'media-local'}, 'gateway': set(), 'media-local': set(), 'oci': {'cli'}, 'remote-proto': {'gateway', 'media-local'}, 'session-auth': {'media-local'}}
+DEPENDENTS = {'api': {'cli', 'control', 'mcp', 'media-local'}, 'cli': set(), 'control': {'media-local'}, 'mcp': {'control'}, 'gateway': set(), 'media-local': set(), 'oci': {'control'}, 'remote-proto': {'gateway', 'media-local'}, 'session-auth': {'media-local'}}
 SCRIPT_TESTS = {'scripts/summarize-benchmark.py': {'test_benchmark.py'}}
 
 
@@ -21,15 +21,28 @@ def keys(p):
 
 
 class PlanTest(unittest.TestCase):
+    def test_only_the_core_links_the_core(self):
+        linked = dict(DEPENDENTS, control={'cli', 'media-local'})
+        self.assertEqual(check.core_dependents(dependents=linked), ['cli'])
+        self.assertEqual(check.core_dependents(dependents=DEPENDENTS), [])
+        self.assertEqual(check.core_dependents(), [])
+
+    def test_a_manifest_change_checks_the_core_rule(self):
+        self.assertIn('core-deps', plan('crates/cli/Cargo.toml').stages)
+
     def test_crate_change_tests_the_crate_and_lints_dependents(self):
         p = plan('crates/oci/src/tart.rs')
         self.assertEqual(keys(p), {'rustfmt', 'cargo-clippy', 'cargo-test:oci'})
-        self.assertEqual(p.stages['cargo-clippy'].argv, ['cargo', 'clippy', '--locked', '-p', 'veynodevm', '-p', 'veynodevm-oci', '--all-targets', '--', '-D', 'warnings'])
+        self.assertEqual(p.stages['cargo-clippy'].argv, ['cargo', 'clippy', '--locked', '-p', 'vm-control', '-p', 'veynodevm-oci', '--all-targets', '--', '-D', 'warnings'])
         self.assertEqual(p.stages['rustfmt'].triggers, {'crates/oci/src/tart.rs'})
 
-    def test_control_change_reaches_both_dependents(self):
+    def test_control_change_reaches_its_dependent(self):
         argv = plan('crates/control/src/jobs.rs').stages['cargo-clippy'].argv
-        self.assertEqual([argv[i + 1] for i, a in enumerate(argv) if a == '-p'], ['veynodevm', 'vm-control', 'vm-media-local'])
+        self.assertEqual([argv[i + 1] for i, a in enumerate(argv) if a == '-p'], ['vm-control', 'vm-media-local'])
+
+    def test_api_change_reaches_its_clients_and_the_core(self):
+        argv = plan('crates/api/src/frame.rs').stages['cargo-clippy'].argv
+        self.assertEqual([argv[i + 1] for i, a in enumerate(argv) if a == '-p'], ['veynodevm-api', 'veynodevm', 'vm-control', 'veynodevm-mcp', 'vm-media-local'])
 
     def test_workspace_files_run_every_crate(self):
         for path in ('Cargo.lock', 'Cargo.toml', 'vendor/webrtc-0.21.0/src/lib.rs'):
@@ -101,6 +114,17 @@ class LinkTest(unittest.TestCase):
             (root / 'there.md').write_text('x')
             (root / 'a.md').write_text('[ok](there.md#part) [web](https://x.y) [anchor](#a)\n```\n[skip](gone.md)\n```\n[bad](gone.md)\n')
             self.assertEqual(check.check_links(['a.md'], root), ['a.md:5: gone.md'])
+
+
+    def test_mcp_tests_build_the_core_binary_they_run(self):
+        for path in ('crates/mcp/src/lib.rs', 'crates/control/src/mcp.rs'):
+            p = plan(path)
+            self.assertIn('cargo-test:mcp', p.stages, path)
+            self.assertEqual(p.stages['cargo-build:vm-control'].argv[-4:], ['-p', 'vm-control', '--bin', 'vm-control'])
+            order = list(p.stages)
+            self.assertLess(order.index('cargo-build:vm-control'), order.index('cargo-test:mcp'))
+        # The edit loop tests only what changed.
+        self.assertNotIn('cargo-test:mcp', plan('crates/control/src/mcp.rs', quick=True).stages)
 
 
 if __name__ == '__main__':

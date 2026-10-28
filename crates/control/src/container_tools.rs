@@ -1,18 +1,13 @@
 //! MCP `container_*` and `image_*` tools.
 //!
-//! Containers and images are owned by the `veynodevm` CLI (image store,
-//! container records, port publishers), so these tools run the sibling
-//! `veynodevm --json` executable against the same VeynodeVM home as this
-//! daemon state directory. Host bind mounts are deliberately not exposed: an
-//! MCP client must not be able to map arbitrary host directories.
+//! Containers and images are the daemon's, so these tools are API 1 calls
+//! (`container.*`, `checkpoint.*`, `image.*`) to the daemon of this state
+//! directory. Host bind mounts are deliberately not exposed: an MCP client
+//! must not be able to map arbitrary host directories.
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use std::{
-    io::Read,
-    path::{Path, PathBuf},
-    process::{Command, Stdio},
-    time::{Duration, Instant},
-};
+use std::{path::Path, process::Command, time::Duration};
+use veynodevm_api::{Client, ErrorCode, Event};
 
 const OUTPUT_LIMIT: usize = 64 * 1024;
 
@@ -61,65 +56,49 @@ pub fn tools(lifecycle: bool, execute: bool) -> Vec<Value> {
     tools
 }
 
-fn cli() -> Result<PathBuf> {
-    let exe = std::env::current_exe()?.canonicalize()?;
-    let path = exe
-        .parent()
-        .context("executable has no parent")?
-        .join("veynodevm");
-    if !path.is_file() {
-        bail!("veynodevm CLI not found next to {}", exe.display())
-    }
-    Ok(path)
+fn client(dir: &Path) -> Client {
+    Client::at_socket(
+        dir.join("control.sock"),
+        concat!("vm-control-mcp/", env!("CARGO_PKG_VERSION")),
+    )
 }
 
-fn run(dir: &Path, args: &[String], timeout: Duration) -> Result<Value> {
-    let mut command = Command::new(cli()?);
-    command
-        .arg("--json")
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // The daemon state directory is <home>/state; keep the CLI on that home.
+fn api(dir: &Path, method: &str, args: Value, timeout: Duration) -> Result<Value> {
+    client(dir).call_within(method, args, timeout)
+}
+
+/// A streaming method's answer, with its output (the last 64 KiB of each
+/// channel) as `stdout` and `stderr`.
+fn collect(dir: &Path, method: &str, args: Value) -> Result<(Value, String, String)> {
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let result = client(dir).stream(method, args)?.finish(|event| {
+        match event {
+            Event::Stdout(data) => out.extend_from_slice(&data),
+            Event::Stderr(data) => err.extend_from_slice(&data),
+            _ => {}
+        }
+        Ok(())
+    })?;
+    Ok((result, tail(&out), tail(&err)))
+}
+
+fn tail(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let start = text.len().saturating_sub(OUTPUT_LIMIT);
+    let start = (start..text.len())
+        .find(|&i| text.is_char_boundary(i))
+        .unwrap_or(text.len());
+    text[start..].to_owned()
+}
+
+/// `vm-control` with the home of `dir` (a daemon state directory is
+/// `<home>/state`).
+fn core(dir: &Path) -> Result<Command> {
+    let mut command = Command::new(crate::services::core_exe()?);
     if dir.file_name().is_some_and(|n| n == "state") {
         command.env("VEYNODEVM_HOME", dir.parent().unwrap());
     }
-    let mut child = command.spawn()?;
-    let mut stdout = child.stdout.take().unwrap();
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stdout.read_to_end(&mut bytes);
-        bytes
-    });
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(
-                "veynodevm {} timed out",
-                args.first().map(String::as_str).unwrap_or("")
-            )
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    let bytes = reader.join().unwrap_or_default();
-    let text = String::from_utf8_lossy(&bytes);
-    let value = serde_json::from_str::<Value>(text.trim()).unwrap_or_else(|_| {
-        let start = text.len().saturating_sub(OUTPUT_LIMIT);
-        let start = (start..text.len())
-            .find(|&i| text.is_char_boundary(i))
-            .unwrap_or(text.len());
-        json!({"output": &text[start..], "exit_code": status.code()})
-    });
-    if let Some(error) = value.get("error").and_then(Value::as_str) {
-        bail!("{error}")
-    }
-    Ok(value)
+    Ok(command)
 }
 
 fn string(args: &Value, key: &str) -> Result<String> {
@@ -148,45 +127,76 @@ fn strings(args: &Value, key: &str) -> Result<Vec<String>> {
     }
 }
 
-/// The cua-driver link of a macOS container: the CLI runs the driver in the
-/// Guest over SSH on its stdio (`veynodevm __driver`).
+/// The cua-driver link of a macOS container: the driver runs in the Guest
+/// over SSH on the stdio of `vm-control __driver`.
 pub fn macos_driver(dir: &Path, vm: &str) -> crate::driver_link::Link {
     let (dir, vm) = (dir.to_path_buf(), vm.to_owned());
     crate::driver_link::Link::new(Box::new(move || {
-        let mut command = Command::new(cli()?);
+        let mut command = core(&dir)?;
         command.args(["__driver", &vm]);
-        if dir.file_name().is_some_and(|n| n == "state") {
-            command.env("VEYNODEVM_HOME", dir.parent().unwrap());
-        }
         Ok(command)
     }))
 }
 
-/// A desktop or accessibility method of a macOS container: the CLI runs its
-/// helper in the Guest over SSH (`veynodevm __desktop`).
+/// A desktop or accessibility method of a macOS container, run by its
+/// helper in the Guest over SSH (`vm-control __desktop`), in its own process
+/// so a stuck Guest costs the caller only the timeout.
 pub fn desktop(dir: &Path, vm: &str, method: &str, arguments: &Value) -> Result<Value> {
-    run(
-        dir,
-        &[
-            "__desktop".into(),
-            vm.into(),
-            method.into(),
-            arguments.to_string(),
-        ],
-        Duration::from_secs(30),
-    )
+    let mut command = core(dir)?;
+    command
+        .args(["__desktop", vm, method, &arguments.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while child.try_wait()?.is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("{method} on {vm} timed out")
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        bail!(
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+                .trim()
+                .trim_start_matches("vm-control: ")
+        )
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
 }
 
 pub fn call(dir: &Path, name: &str, args: &Value) -> Result<Value> {
     let quick = Duration::from_secs(30);
+    let long = Duration::from_secs(600);
     match name {
-        "container_list" => run(dir, &["ps".into(), "-a".into()], quick),
-        "image_list" => run(dir, &["images".into()], quick),
-        "container_inspect" => run(dir, &["inspect".into(), string(args, "container")?], quick),
-        "container_logs" => run(dir, &["logs".into(), string(args, "container")?], quick),
-        "container_stop" => run(
+        "container_list" => api(dir, "container.ls", json!({"all":true}), quick),
+        "image_list" => api(dir, "image.ls", json!({}), quick),
+        "container_inspect" => {
+            let name = string(args, "container")?;
+            match api(dir, "container.inspect", json!({"name":name}), quick) {
+                Err(e) if veynodevm_api::code_of(&e) == ErrorCode::NotFound => {
+                    api(dir, "image.inspect", json!({"reference":name}), quick)
+                }
+                other => other,
+            }
+        }
+        "container_logs" => {
+            let (result, out, err) = collect(
+                dir,
+                "container.logs",
+                json!({"name":string(args, "container")?}),
+            )?;
+            Ok(json!({"output":format!("{out}{err}"),"exit_code":result["exitCode"]}))
+        }
+        "container_stop" => api(
             dir,
-            &["stop".into(), string(args, "container")?],
+            "container.stop",
+            json!({"name":string(args, "container")?}),
             Duration::from_secs(60),
         ),
         "container_rm" => {
@@ -194,34 +204,34 @@ pub fn call(dir: &Path, name: &str, args: &Value) -> Result<Value> {
             if args["confirm"].as_str() != Some(container.as_str()) {
                 bail!("container_rm requires confirm equal to container")
             }
-            run(dir, &["rm".into(), container], Duration::from_secs(60))
+            api(
+                dir,
+                "container.rm",
+                json!({"name":container}),
+                Duration::from_secs(60),
+            )
         }
-        "container_checkpoint_list" => run(
+        "container_checkpoint_list" => api(
             dir,
-            &["checkpoint".into(), "ls".into(), string(args, "container")?],
+            "checkpoint.ls",
+            json!({"name":string(args, "container")?}),
             quick,
         ),
-        "container_checkpoint" => {
-            let mut argv = vec!["checkpoint".into(), "create".into()];
-            if args["memory"] == false {
-                argv.push("--disk-only".into());
-            }
-            argv.extend([string(args, "container")?, string(args, "name")?]);
-            run(dir, &argv, Duration::from_secs(330))
-        }
+        "container_checkpoint" => api(
+            dir,
+            "checkpoint.create",
+            json!({"name":string(args, "container")?,"checkpoint":string(args, "name")?,"memory":args["memory"] != false}),
+            Duration::from_secs(330),
+        ),
         "container_checkpoint_delete" => {
             let name = string(args, "name")?;
             if args["confirm"].as_str() != Some(name.as_str()) {
                 bail!("container_checkpoint_delete requires confirm equal to name")
             }
-            run(
+            api(
                 dir,
-                &[
-                    "checkpoint".into(),
-                    "rm".into(),
-                    string(args, "container")?,
-                    name,
-                ],
+                "checkpoint.rm",
+                json!({"name":string(args, "container")?,"checkpoint":name}),
                 quick,
             )
         }
@@ -230,93 +240,87 @@ pub fn call(dir: &Path, name: &str, args: &Value) -> Result<Value> {
             if args["confirm"].as_str() != Some(container.as_str()) {
                 bail!("container_rollback requires confirm equal to container")
             }
-            let mut argv = vec!["rollback".into()];
-            match args["start"].as_bool() {
-                Some(true) => argv.push("--start".into()),
-                Some(false) => argv.push("--no-start".into()),
-                None => {}
-            }
-            if args["memory"] == false {
-                argv.push("--cold".into());
-            }
-            argv.extend([container, string(args, "name")?]);
-            run(dir, &argv, Duration::from_secs(300))
+            api(
+                dir,
+                "checkpoint.rollback",
+                json!({"name":container,"checkpoint":string(args, "name")?,"start":args["start"].as_bool(),"memory":args["memory"] != false}),
+                Duration::from_secs(300),
+            )
         }
         "container_fork" => {
             let count = args["count"]
                 .as_u64()
                 .filter(|n| (1..=16).contains(n))
                 .context("count must be 1..16")?;
-            let mut argv = vec!["fork".into(), "-n".into(), count.to_string()];
+            let mut request = json!({"name":string(args, "container")?,"count":count,"start":args["start"] != false});
             if args.get("checkpoint").is_some() {
-                argv.extend(["--checkpoint".into(), string(args, "checkpoint")?]);
+                request["checkpoint"] = json!(string(args, "checkpoint")?);
             }
-            if args["start"] == false {
-                argv.push("--no-start".into());
-            }
-            argv.push(string(args, "container")?);
-            run(dir, &argv, Duration::from_secs(600))
+            api(dir, "checkpoint.fork", request, long)
         }
         "container_fork_rm" => {
             let selector = string(args, "selector")?;
             if args["confirm"].as_str() != Some(selector.as_str()) {
                 bail!("container_fork_rm requires confirm equal to selector")
             }
-            run(
+            api(
                 dir,
-                &["fork".into(), "rm".into(), selector],
+                "checkpoint.unfork",
+                json!({"selector":selector}),
                 Duration::from_secs(300),
             )
         }
         "container_exec" => {
-            let mut argv = vec!["exec".into(), string(args, "container")?];
             let command = strings(args, "command")?;
             if command.is_empty() {
                 bail!("command must not be empty")
             }
-            argv.extend(command);
-            run(dir, &argv, Duration::from_secs(600))
+            let (result, stdout, stderr) = collect(
+                dir,
+                "container.exec",
+                json!({"name":string(args, "container")?,"argv":command}),
+            )?;
+            Ok(
+                json!({"exit_code":result["exitCode"],"stdout":stdout,"stderr":stderr,"timed_out":result["timedOut"]}),
+            )
         }
-        "image_pull" => run(
+        "image_pull" => Ok(collect(
             dir,
-            &["pull".into(), string(args, "image")?],
-            Duration::from_secs(1800),
-        ),
+            "image.pull",
+            json!({"reference":string(args, "image")?}),
+        )?
+        .0),
         "container_run" => {
-            let mut argv: Vec<String> = vec!["run".into(), "-d".into()];
+            let mut options = json!({"image":string(args, "image")?,"command":strings(args, "command")?,"detach":true,"quiet":true});
             if let Some(n) = args["name"].as_str() {
-                argv.extend(["--name".into(), n.into()]);
+                options["name"] = json!(n);
             }
-            for e in strings(args, "env")? {
-                if !e.contains('=') {
-                    bail!("env entries must be KEY=VALUE")
-                }
-                argv.extend(["-e".into(), e]);
+            let env = strings(args, "env")?;
+            if env.iter().any(|e| !e.contains('=')) {
+                bail!("env entries must be KEY=VALUE")
             }
-            for p in strings(args, "ports")? {
-                let p = if p.starts_with("127.0.0.1:") {
+            options["env"] = json!(env);
+            options["ports"] = json!(strings(args, "ports")?
+                .into_iter()
+                .map(|p| if p.starts_with("127.0.0.1:") {
                     p
                 } else {
                     format!("127.0.0.1:{p}")
-                };
-                argv.extend(["-p".into(), p]);
-            }
+                })
+                .collect::<Vec<_>>());
             if let Some(c) = args["cpus"].as_u64() {
-                argv.extend(["--cpus".into(), c.to_string()]);
+                options["cpus"] = json!(c);
             }
             if let Some(m) = args["memory_mib"].as_u64() {
-                argv.extend(["--memory".into(), format!("{m}m")]);
+                options["memoryMiB"] = json!(m);
             }
             if let Some(g) = args["gpus"].as_str() {
-                argv.extend(["--gpus".into(), g.into()]);
+                options["gpus"] = json!(g);
             }
             if args["desktop"] == true {
-                argv.push("--desktop".into());
+                options["desktop"] = json!(true);
             }
-            argv.push("--".into());
-            argv.push(string(args, "image")?);
-            argv.extend(strings(args, "command")?);
-            run(dir, &argv, Duration::from_secs(1800))
+            Ok(collect(dir, "container.run", options)?.0)
         }
         _ => bail!("unknown container tool"),
     }

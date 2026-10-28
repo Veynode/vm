@@ -10,15 +10,13 @@ flate2 = "1"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+veynodevm-api = { path = "../api" }
+veynodevm-mcp = { path = "../mcp" }
+veynodevm-oci = { path = "../oci" }
 
-axum = "0.8"
-futures-util = { version = "0.3", default-features = false }
-axum-server = { version = "0.8", features = ["tls-rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "sync", "time", "signal"] }
 sha2 = { version = "0.10", features = ["asm"] }
-subtle = "2"
-tower-http = { version = "0.6", features = ["timeout"] }
 
 [dev-dependencies]
 tempfile = "3"

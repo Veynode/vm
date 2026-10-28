@@ -10,7 +10,7 @@ Browser ── wss (TLS 443/tcp) ─────┐
                                    └─ QUIC tunnel (7443/udp), dialed out by the Mac, keys pinned both ways
                                         │
 Mac: vm-media-local remote (Keychain host key, handshake, E2E records)
-       hub per VM+codec ── veynodevm desktop --stream --tracks ── vz-desktop-stream / vm-console-stream
+       hub per VM+codec ── desktop.stream {tracks} (API 1) ── vz-desktop-stream / vm-console-stream
 ```
 
 ## Pieces
@@ -21,7 +21,7 @@ Mac: vm-media-local remote (Keychain host key, handshake, E2E records)
 | Handshake domains | `crates/session-auth/src/remote.rs` | `remote-offer`, `remote-answer`, `remote-confirm` on the existing `SessionGate` (grants, revocation, single-use challenges) |
 | Gateway | `crates/gateway` (`vm-gateway`) | WebTransport, WebSocket, `/v1/capabilities`, static UI, ACME HTTP-01, host tunnels |
 | Host | `crates/media-local/src/remote` (`vm-media-local remote`) | Tunnel client, handshake, sessions, shared encoder hub with crop tracks |
-| Relay | `crates/cli/src/desktop_stream.rs` | `veynodevm desktop --stream --codec C --tracks VM`: kind 10 frames with a track byte, `{"encoder":"LINE"}` passthrough |
+| Relay | `crates/control/src/services/desktop_stream.rs` (`desktop.stream`) | `desktop.stream {name, codec, tracks: true}` on the daemon's socket (`--state-dir DIR` for another home): kind 10 frames with a track byte, `{"encoder":"LINE"}` passthrough as `control` messages |
 | Encoders | `native/tools/vz-desktop-stream.m`, `spice-console.m` | Runtime bitrate, crop, scale; VZ tracks ([browser-desktop](browser-desktop.md)) |
 | Browser | `web/src/remote` | Transports, secure records, reassembly, decode worker, crop view, hop stats |
 | Deploy | `deploy/gateway` | Dockerfile, compose with coturn, systemd unit, example config |

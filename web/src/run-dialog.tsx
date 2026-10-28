@@ -10,7 +10,7 @@ import { InfoTip } from '@ui/settings/info-tip'
 import { SettingsRow } from '@ui/settings/settings-row'
 import { SettingsGroup } from '@ui/settings/settings-section'
 import { runContainer } from './api'
-import { FormDialog, lines, useToastAction, words } from './ui'
+import { FormDialog, Hint, gibToMemory, lines, useToastAction, words } from './ui'
 import { useGo } from './page-nav'
 
 export const DESKTOP_SIZES: Record<string, string> = {
@@ -67,7 +67,7 @@ export function RunDialog({ open, close, image }: { open: boolean; close: () => 
         volumes: lines(form.volumes),
         env: lines(form.env),
         cpus: form.cpus ? Number(form.cpus) : undefined,
-        memory: form.memory.trim() || undefined,
+        memory: gibToMemory(form.memory),
         gpus: form.gpus || undefined,
         desktop: form.desktop,
         desktop_size: form.desktop && form.gpus ? form.desktop_size || undefined : undefined,
@@ -106,8 +106,9 @@ export function RunDialog({ open, close, image }: { open: boolean; close: () => 
         <Field label="CPUs">
           <NumberField className="w-full" min={1} max={32} value={form.cpus} onChange={(cpus) => setForm({ ...form, cpus })} />
         </Field>
-        <Field label="Memory" trailingAction={<InfoTip label="About Memory">512m by default, 2g with a GPU.</InfoTip>}>
-          <Input placeholder="512m" value={form.memory} onChange={set('memory')} />
+        <Field label="Memory" trailingAction={<InfoTip label="About Memory">Empty: 0.5 GiB; 2 GiB with a GPU, a desktop or systemd; 4 GiB for a systemd desktop.</InfoTip>}>
+          <NumberField className="w-full" min={0.5} max={128} step={0.5} unit="GiB" value={form.memory} onChange={(memory) => setForm({ ...form, memory })} />
+          {!form.memory && <Hint>Default for the image</Hint>}
         </Field>
       </div>
       <Field label="GPU" trailingAction={<InfoTip label="About GPU">A GPU runs the container on QEMU/HVF.</InfoTip>}>
@@ -125,10 +126,10 @@ export function RunDialog({ open, close, image }: { open: boolean; close: () => 
         </Select>
       </Field>
       <Field label="Volumes" trailingAction={<InfoTip label="About Volumes">One per line: /host/path:/container/path[:ro]</InfoTip>}>
-        <Textarea className="font-mono" rows={2} value={form.volumes} onChange={set('volumes')} />
+        <Textarea className="font-mono" rows={2} placeholder="/Users/you/project:/work" value={form.volumes} onChange={set('volumes')} />
       </Field>
       <Field label="Environment" trailingAction={<InfoTip label="About Environment">One KEY=VALUE per line.</InfoTip>}>
-        <Textarea className="font-mono" rows={3} value={form.env} onChange={set('env')} />
+        <Textarea className="font-mono" rows={3} placeholder="KEY=value" value={form.env} onChange={set('env')} />
       </Field>
       <SettingsGroup>
         <SettingsRow icon={Monitor} label="Desktop display" control={<Switch checked={form.desktop} onCheckedChange={(desktop) => setForm({ ...form, desktop })} />} />

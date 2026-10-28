@@ -442,6 +442,39 @@ cross-process capture-stream identity, host bridge-incarnation binding or macOS
 browser-input enablement in this change. See
 `archive/docs-evidence/apple-console-service-integration.md` for exact evidence.
 
+## Opt-in desktop sound (`--allow-audio`)
+
+`--allow-audio` (which requires `--allow-observe`) records the Guest's system
+audio for the browser desktop with ScreenCaptureKit (`audio.swift`): 48 kHz
+stereo, the service's own sound excluded, under the same existing Screen
+Recording permission as screenshots, never requested by the service. It
+listens on vsock port 5002 for one host (CID 2) connection at a time; a new
+connection replaces the old one. The host sends `{"audio":true}` or
+`{"audio":false}` lines (others are ignored), and the service answers with
+the Linux agent's desktop-stream records: kind 4 (`u32` BE rate, `u8`
+channels, s16le PCM, 20 ms each) or a kind-1 `{"event":"audio_unavailable",
+"message"}` when capture cannot start. Audio past a backlog of eight records
+is dropped rather than delayed. `info.capabilities.audio` is true when the
+flag is set and Screen Recording is granted. The container needs a sound card
+(created with `audio`, which macOS containers get from this change on) so
+that the Guest has an output to play into; the host discards it. Why this
+design: [browser desktop](../../docs/browser-desktop.md#macos-containers).
+
+```sh
+"$HOME/veynode/macos-guest-agent" --allow-observe --allow-audio
+```
+
+TCC checks the process responsible for the service: over SSH that is
+`sshd-keygen-wrapper` (checked live), which gets no audio however the service
+itself is set; from a terminal app it is presumably that app (not checked). Grant the service and run it as a launchd
+job in the user's GUI domain (`launchctl bootstrap gui/$UID PLIST`, then
+`launchctl kickstart`), as the live test did.
+
+`--audio-self-test` (also part of `--self-test`) checks the float-to-s16le
+conversion, the record framing, the 20 ms chunk and the refusal outside a
+VirtualMac Guest. It captures nothing. Live capture on a Guest:
+[browser desktop evidence](../../docs/browser-desktop.md#macos-containers).
+
 ## Opt-in macOS file transfer (staged implementation)
 
 The Guest service now implements the existing bounded Linux file wire protocol

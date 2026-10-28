@@ -35,6 +35,8 @@ type x11Conn struct {
 	root          uint32
 	width, height int
 	atoms         map[string]uint32
+	// Resource ids this client may allocate (a window of its own).
+	idBase, idMask uint32
 }
 
 type x11Error struct{ code, request byte }
@@ -94,7 +96,7 @@ func x11Handshake(conn net.Conn, authName string, authData []byte) (*x11Conn, er
 	}
 	return &x11Conn{conn: conn, root: binary.LittleEndian.Uint32(body[screen:]),
 		width: int(binary.LittleEndian.Uint16(body[screen+20:])), height: int(binary.LittleEndian.Uint16(body[screen+22:])),
-		atoms: map[string]uint32{}}, nil
+		atoms: map[string]uint32{}, idBase: binary.LittleEndian.Uint32(body[4:]), idMask: binary.LittleEndian.Uint32(body[8:])}, nil
 }
 
 func (x *x11Conn) close() { x.conn.Close() }

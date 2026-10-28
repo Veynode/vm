@@ -1,0 +1,214 @@
+//! The registry (`registry.json`, `REGISTRY_SCHEMA`), VM ids and private state files.
+use super::*;
+
+/// The registry format this daemon reads and writes. Version 1 is `registry.json` as a map of VM id to `Config`,
+/// with no version inside it: every earlier build parses exactly that, and `schema_version` is itself a valid VM id.
+pub const REGISTRY_SCHEMA: u64 = 1;
+/// The version lives in a sidecar, `registry.schema` beside `registry.json`: a decimal number, optionally followed by
+/// one newline. Absent means version 1, and at version 1 this daemon never writes the file. A higher version, or a
+/// file that is not exactly that, refuses the start before the registry is read; nothing is rewritten.
+pub(crate) fn check_registry_schema(dir: &Path) -> Result<()> {
+    const REFUSED: &str = "daemon not started, nothing rewritten";
+    let path = dir.join("registry.schema");
+    let malformed = || {
+        anyhow::anyhow!("registry.schema is malformed (expected a decimal registry schema version; this daemon supports {REGISTRY_SCHEMA}); {REFUSED}")
+    };
+    let unreadable = || {
+        format!("registry.schema unreadable (this daemon supports registry schema version {REGISTRY_SCHEMA}); {REFUSED}")
+    };
+    let file = match open_state_file(&path) {
+        Ok(None) => return Ok(()),
+        Ok(Some(file)) => file,
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => return Err(malformed()),
+        Err(error) => return Err(error).context(unreadable()),
+    };
+    let bytes = match read_state_file(file, &path, 21) {
+        Ok(bytes) => bytes,
+        Err(error) if error.is::<StateFileError>() => return Err(malformed()),
+        Err(error) => return Err(error).context(unreadable()),
+    };
+    let digits = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+    // Canonical decimal only: no sign, space or leading zero, and versions start at 1.
+    let found = std::str::from_utf8(digits)
+        .ok()
+        .filter(|text| text.bytes().all(|b| b.is_ascii_digit()) && !text.starts_with('0'))
+        .and_then(|text| text.parse::<u64>().ok())
+        .ok_or_else(malformed)?;
+    if found > REGISTRY_SCHEMA {
+        bail!("registry schema version {found} is newer than this daemon supports ({REGISTRY_SCHEMA}); {REFUSED}")
+    }
+    Ok(())
+}
+#[derive(Debug)]
+pub(crate) enum RegistryError {
+    ReservedId(String),
+    DuplicateKey(String),
+    ProtectedConfigPath(PathBuf),
+}
+impl std::fmt::Display for RegistryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReservedId(id) => write!(f, "VM id {id:?} is reserved for daemon state"),
+            Self::DuplicateKey(key) => {
+                write!(f, "duplicate registry key {key:?}; preserving original")
+            }
+            Self::ProtectedConfigPath(path) => write!(
+                f,
+                "VM configuration path collides with daemon state: {}",
+                path.display()
+            ),
+        }
+    }
+}
+impl std::error::Error for RegistryError {}
+
+#[derive(Debug)]
+pub(crate) enum StateFileError {
+    NotRegular(PathBuf),
+    TooLarge(PathBuf),
+}
+impl std::fmt::Display for StateFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotRegular(path) => write!(f, "{} is not a regular file", path.display()),
+            Self::TooLarge(path) => write!(f, "{} exceeds size limit", path.display()),
+        }
+    }
+}
+impl std::error::Error for StateFileError {}
+
+pub(crate) fn open_state_file(path: &Path) -> std::io::Result<Option<File>> {
+    match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+pub(crate) fn read_state_file(file: File, path: &Path, limit: usize) -> Result<Vec<u8>> {
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(StateFileError::NotRegular(path.into()).into());
+    }
+    if meta.len() > limit as u64 {
+        return Err(StateFileError::TooLarge(path.into()).into());
+    }
+    let mut bytes = Vec::new();
+    file.take((limit + 1) as u64).read_to_end(&mut bytes)?;
+    // The opened file can grow after fstat; the descriptor read has the same bound.
+    if bytes.len() > limit {
+        return Err(StateFileError::TooLarge(path.into()).into());
+    }
+    Ok(bytes)
+}
+pub(crate) fn read_registry(path: &Path) -> Result<BTreeMap<String, Config>> {
+    let Some(file) = open_state_file(path)? else {
+        return Ok(BTreeMap::new());
+    };
+    let bytes = read_state_file(file, path, 16 * MAX_MESSAGE)?;
+    struct RegistryVisitor<'a> {
+        duplicate: &'a mut Option<String>,
+    }
+    impl<'de> serde::de::Visitor<'de> for RegistryVisitor<'_> {
+        type Value = BTreeMap<String, Config>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a map of VM ids to configurations")
+        }
+        fn visit_map<M: serde::de::MapAccess<'de>>(
+            self,
+            mut map: M,
+        ) -> std::result::Result<Self::Value, M::Error> {
+            let mut configs = BTreeMap::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if configs.contains_key(&key) {
+                    *self.duplicate = Some(key);
+                    return Err(serde::de::Error::custom("duplicate registry key"));
+                }
+                configs.insert(key, map.next_value::<Config>()?);
+            }
+            Ok(configs)
+        }
+    }
+    let mut duplicate = None;
+    let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+    let result = serde::Deserializer::deserialize_map(
+        &mut deserializer,
+        RegistryVisitor {
+            duplicate: &mut duplicate,
+        },
+    );
+    if let Some(key) = duplicate {
+        return Err(RegistryError::DuplicateKey(key).into());
+    }
+    let configs = result.context("invalid registry; preserving original")?;
+    deserializer
+        .end()
+        .context("invalid registry; preserving original")?;
+    Ok(configs)
+}
+
+pub use veynodevm_api::validate_id;
+pub(crate) const PROTECTED_STATE_FILES: &[&str] = &["registry.json"];
+pub(crate) fn validate_new_vm_id(id: &str) -> Result<()> {
+    validate_id(id)?;
+    // Only direct JSON state files can collide with <id>.json, including case aliases on macOS.
+    if PROTECTED_STATE_FILES.iter().any(|name| {
+        !name.contains('/')
+            && name
+                .strip_suffix(".json")
+                .is_some_and(|stem| id.eq_ignore_ascii_case(stem))
+    }) {
+        return Err(RegistryError::ReservedId(id.into()).into());
+    }
+    Ok(())
+}
+
+pub(crate) fn private_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)?;
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        bail!("state directory must be a real directory")
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+pub(crate) fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let tmp = path.with_extension(format!("{nonce}.tmp"));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    let result = (|| {
+        serde_json::to_writer_pretty(&mut file, value)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)?;
+        File::open(path.parent().unwrap())?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(tmp);
+    }
+    result
+}
+pub(crate) fn write_vm_config(dir: &Path, path: &Path, config: &Config) -> Result<()> {
+    if PROTECTED_STATE_FILES
+        .iter()
+        .any(|name| path == dir.join(name))
+        || (path.parent() == Some(dir)
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("registry.json")))
+    {
+        return Err(RegistryError::ProtectedConfigPath(path.into()).into());
+    }
+    atomic_json(path, config)
+}

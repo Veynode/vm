@@ -23,6 +23,9 @@ fn native_failure_reason(value: &serde_json::Value) -> &'static str {
     match value["error"]["message"].as_str() {
         Some("HEVC geometry exceeds validated level4 bound") => "hevc_geometry_limit",
         Some("Owned scaling failed") => "owned_scaling_failed",
+        Some("Source generation unavailable; start a fresh encoding epoch after replacement") => {
+            "source_replaced"
+        }
         Some("Scale buffer unavailable") => "scale_buffer_unavailable",
         Some("Encoder preparation failed") => "encoder_preparation_failed",
         Some("Frame submission failed") => "frame_submission_failed",
@@ -179,7 +182,7 @@ fn run() -> Result<()> {
             reply.get("error").unwrap_or(&json!("unexpected response"))
         )
     }
-    let epoch = reply["result"]["epoch"]
+    let mut epoch = reply["result"]["epoch"]
         .as_u64()
         .context("missing encoder epoch")?;
     if epoch == 0 || epoch != start.epoch {
@@ -247,13 +250,16 @@ fn run() -> Result<()> {
         }
     });
     let result = (|| {
-        let until = Instant::now() + Duration::from_secs(180);
         let mut key = 0u64;
+        // A guest resolution change replaces the source and ends the encoding
+        // epoch; the stream stops it and starts the next one (a new SPS).
+        let mut restart = 0u64;
+        let mut retired = Vec::new();
         let mut rate_id = 0u64;
         let mut rate_pending_id = None;
         let mut view_id = 0u64;
         let mut last_record = Instant::now();
-        while Instant::now() < until {
+        loop {
             if media_overflow.load(Ordering::Acquire) {
                 bail!("console media queue overflow; terminating stream")
             }
@@ -272,6 +278,9 @@ fn run() -> Result<()> {
                 Ok(Event::Record(record)) => {
                     last_record = Instant::now();
                     if record.kind == 2 {
+                        if retired.contains(&record.epoch) {
+                            continue;
+                        }
                         if record.epoch != epoch {
                             bail!("cross-epoch media rejected")
                         }
@@ -298,7 +307,39 @@ fn run() -> Result<()> {
                             rate_pending_id = None;
                             continue;
                         }
-                        // A refused scale or crop leaves the stream as it was.
+                        if value["request_id"] == format!("restop{restart}") {
+                            if value.get("error").is_some() {
+                                bail!("console media restart failed: stop refused")
+                            }
+                            request(
+                                &mut socket,
+                                &format!("restart{restart}"),
+                                "start",
+                                Some(&args[3]),
+                            )?;
+                            continue;
+                        }
+                        if value["request_id"] == format!("restart{restart}") {
+                            let next = value["result"]["epoch"].as_u64();
+                            if value.get("error").is_some()
+                                || next != Some(record.epoch)
+                                || next <= Some(epoch)
+                            {
+                                bail!("console media restart failed: start refused")
+                            }
+                            retired.push(epoch);
+                            epoch = record.epoch;
+                            continue;
+                        }
+                        if value["event"] == "session-error"
+                            && record.epoch == epoch
+                            && native_failure_reason(&value) == "source_replaced"
+                        {
+                            restart += 1;
+                            request(&mut socket, &format!("restop{restart}"), "stop", None)?;
+                            continue;
+                        }
+                        // A refused scale, crop or fps leaves the stream as it was.
                         if value["request_id"]
                             .as_str()
                             .is_some_and(|id| id.starts_with("view"))
@@ -351,13 +392,20 @@ fn run() -> Result<()> {
                     serde_json::to_writer(&mut socket, &value)?;
                     socket.write_all(b"\n")?;
                 }
+                Ok(Event::Command(command)) if command.starts_with("fps ") => {
+                    let fps: u64 = command[4..].parse().context("invalid fps command")?;
+                    view_id += 1;
+                    let value =
+                        json!({"request_id":format!("view{view_id}"),"method":"set_fps","fps":fps});
+                    serde_json::to_writer(&mut socket, &value)?;
+                    socket.write_all(b"\n")?;
+                }
                 Ok(Event::Command(command)) if command == "stop" => return Ok(()),
                 Err(mpsc::RecvTimeoutError::Timeout)
                     if last_record.elapsed() < Duration::from_secs(12) => {}
                 _ => bail!("console media disconnected, stalled or invalid command"),
             }
         }
-        Ok(())
     })();
     // Keep the record reader alive while draining pending AUs and awaiting stop ACK.
     if media_overflow.load(Ordering::Acquire) {

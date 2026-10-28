@@ -1,12 +1,32 @@
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 fn main() {
+    // Image pulls (`image.pull`, `container.run`) are HTTPS from the daemon.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     if let Err(e) = run() {
         eprintln!("vm-control: {e:#}");
         std::process::exit(1)
     }
 }
 fn run() -> Result<()> {
+    // Helpers the daemon runs as its own processes: a container's port
+    // publisher, and a macOS Guest's driver link and desktop methods.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    match argv
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        ["__proxy", id] => return vm_control::services::proxy::run(id),
+        ["__driver", vm] => std::process::exit(vm_control::services::macos_driver::run(vm)?),
+        ["__desktop", vm, method, arguments] => {
+            let value = vm_control::services::macos_desktop::run(vm, method, arguments)?;
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            return Ok(());
+        }
+        _ => {}
+    }
     let mut args = std::env::args().skip(1);
     let action=args.next().context("usage: vm-control daemon|mcp|call [--state-dir PATH] [--backend PATH] [--memory-budget-mib MIB] [--worker-key-event-log-dir DIR] [--allow-lifecycle] [--allow-execute] [--allow-files] [--allow-input] [--allow-browser] [--allow-clipboard] [--tools GROUP,...] [--vm ID] [METHOD JSON]")?;
     let mut dir = None;
@@ -157,6 +177,7 @@ fn run() -> Result<()> {
                     venus_runtime: qemu_options.remove("--qemu-venus-runtime"),
                 })
             };
+            migrate_records(&dir);
             vm_control::serve_with_worker_key_event_log(
                 dir,
                 backend,
@@ -192,5 +213,22 @@ fn run() -> Result<()> {
             Ok(())
         }
         _ => bail!("unknown command"),
+    }
+}
+
+/// Records older than this daemon are upgraded before it serves them, when
+/// `state` is its home's: a daemon on another state directory leaves the
+/// home's records to the daemon that serves them.
+fn migrate_records(state: &std::path::Path) {
+    let Ok(root) = vm_control::home::root() else {
+        return;
+    };
+    if state != root.join("state") {
+        return;
+    }
+    for problem in
+        vm_control::services::records::migrate(&root.join("containers"), &root.join("machines"))
+    {
+        eprintln!("vm-control: record left as it is: {problem}");
     }
 }

@@ -6,7 +6,7 @@ import { IconButton } from '@ui/components/ui/icon-button'
 import { Input } from '@ui/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@ui/components/ui/select'
 import { Switch } from '@ui/components/ui/switch'
-import { Cpu, HardDrive, MemoryStick, Monitor, Network, Plus, Power, X, Zap } from '@ui/icons'
+import { Cpu, HardDrive, MemoryStick, Monitor, Network, Plus, Power, Volume2, X, Zap } from '@ui/icons'
 import { Field } from '@ui/settings/field'
 import { InfoTip } from '@ui/settings/info-tip'
 import { Notice } from '@ui/settings/notice'
@@ -14,7 +14,7 @@ import { SettingsRow } from '@ui/settings/settings-row'
 import { SettingsGroup, SettingsSection } from '@ui/settings/settings-section'
 import { daemonStatus, machineAction, updateContainer, updateMachine, type DaemonStatus, type HardwareChanges } from './api'
 import { DESKTOP_SIZES, GPUS } from './run-dialog'
-import { FormDialog, size, useToastAction } from './ui'
+import { FormDialog, Hint, size, useToastAction } from './ui'
 
 /**
  * A container's or VM's hardware as the Hardware section and dialog show it,
@@ -41,6 +41,8 @@ export interface Hardware {
   desktop?: boolean
   /** `WxH`, `''` for the 1280x800 default. */
   desktop_size?: string
+  /** QEMU VMs: the sound card the viewers play and record through. */
+  audio?: boolean
   ports: string[]
   /** Containers only; empty is the default servers. */
   dns?: string[]
@@ -102,6 +104,7 @@ export function machineHardware(m: any, config: any, running: boolean, used?: nu
     disk_gib: m.disk_gib,
     disk_used_bytes: used,
     gpu: gpuChoice(config.qemu_graphics_profile),
+    audio: config.audio === true,
     ports: (config.ports ?? []).map(port),
     mac: config.mac_address ?? null,
   }
@@ -144,13 +147,14 @@ export function HardwareSection({ hw }: { hw: Hardware }) {
           label="Processors and memory"
           value={hw.cpus ? `${hw.cpus} ${hw.cpus === 1 ? 'core' : 'cores'} · ${memoryText(hw.memory_mib)}` : '—'}
         />
-        <SettingsRow icon={HardDrive} label="Disk" value={`${hw.disk_gib} GB${hw.disk_used_bytes !== undefined ? ` · ${size(hw.disk_used_bytes)} used` : ''}`} />
+        <SettingsRow icon={HardDrive} label="Disk" value={`${hw.disk_gib} GiB${hw.disk_used_bytes !== undefined ? ` · ${size(hw.disk_used_bytes)} used` : ''}`} />
         <SettingsRow icon={Network} label="Network" value={<span title={network}>{network}</span>} />
         {/* What the guest reported, else what the GPU runs on. */}
         <SettingsRow icon={Zap} label="GPU" hint={(hw.gpu && hw.renderer) || `Runs on ${qemu ? 'QEMU/HVF' : 'Apple Virtualization'}`} value={gpuText} />
         {hw.kind === 'container' && hw.os !== 'darwin' && (
           <SettingsRow icon={Monitor} label="Display" value={hw.desktop ? (DESKTOP_SIZES[hw.desktop_size ?? ''] ?? hw.desktop_size) : 'Off'} />
         )}
+        {hw.kind === 'machine' && qemu && <SettingsRow icon={Volume2} label="Sound" value={hw.audio ? 'Speakers and microphone' : 'Off'} />}
       </SettingsGroup>
       <HardwareDialog hw={editing ? hw : null} close={() => setEditing(false)} />
     </SettingsSection>
@@ -164,6 +168,7 @@ interface Form {
   gpu: string
   desktop: boolean
   desktop_size: string
+  audio: boolean
   ports: string[]
   dns: string
   mtu: string
@@ -178,6 +183,7 @@ function formOf(hw: Hardware): Form {
     gpu: hw.gpu,
     desktop: !!hw.desktop,
     desktop_size: hw.desktop_size ?? '',
+    audio: !!hw.audio,
     ports: hw.ports,
     dns: (hw.dns ?? []).join(', '),
     mtu: hw.mtu ? String(hw.mtu) : '',
@@ -206,6 +212,7 @@ export function changesOf(hw: Hardware, form: Form): HardwareChanges {
     const mtu = form.mtu.trim() ? Number(form.mtu) : 0
     if (mtu !== (hw.mtu ?? 0)) changes.mtu = mtu
   }
+  if (hw.kind === 'machine' && hw.backend === 'qemu-hvf' && form.audio !== !!hw.audio) changes.audio = form.audio
   const ports = form.ports.map((p) => p.trim()).filter(Boolean)
   if (ports.join() !== hw.ports.join()) changes.ports = ports
   if (form.new_mac) changes.new_mac = true
@@ -213,10 +220,6 @@ export function changesOf(hw: Hardware, form: Form): HardwareChanges {
 }
 
 /** A hint under a field: its limit, or what a change does. */
-function Hint({ children, warn }: { children: ReactNode; warn?: boolean }) {
-  return <p className={`text-caption-1-regular ${warn ? 'text-state-failed-ink' : 'text-ink-2'}`}>{children}</p>
-}
-
 /**
  * Changing a container's or VM's hardware, VMware's "Virtual Machine Settings"
  * in one dialog: every change is applied in one re-registration of its VM.
@@ -302,7 +305,7 @@ export function HardwareDialog({ hw, close }: { hw: Hardware | null; close: () =
           {budget !== undefined && <Hint warn={overBudget}>{overBudget ? `${memoryText(Math.max(0, budget - others))} free` : `Of ${memoryText(budget)} budget`}</Hint>}
         </Field>
         <Field label="Disk">
-          <NumberField className="w-full" min={hw.disk_gib} max={4096} unit="GB" value={form.disk} disabled={locked || macos} onChange={(d) => set('disk', d)} />
+          <NumberField className="w-full" min={hw.disk_gib} max={4096} unit="GiB" value={form.disk} disabled={locked || macos} onChange={(d) => set('disk', d)} />
           <Hint>{macos ? 'Fixed' : 'Grows only'}</Hint>
         </Field>
       </div>
@@ -366,6 +369,14 @@ export function HardwareDialog({ hw, close }: { hw: Hardware | null; close: () =
                   <Switch aria-label="Display" checked={form.desktop} onCheckedChange={(desktop) => set('desktop', desktop)} />
                 </span>
               }
+            />
+          )}
+          {!container && hw.backend === 'qemu-hvf' && (
+            <SettingsRow
+              icon={Volume2}
+              label="Sound"
+              hint="Plays in the window or tab showing it; the microphone is off until turned on there"
+              control={<Switch aria-label="Sound" checked={form.audio} disabled={locked} onCheckedChange={(audio) => set('audio', audio)} />}
             />
           )}
         </SettingsGroup>

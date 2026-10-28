@@ -31,6 +31,10 @@
 // Display.m's renamed main() still references VeynodeConsoleMain, which spice-console.m
 // defines. That file needs GLib and SPICE and is not linked here. The stub is never called.
 int VeynodeConsoleMain(int argc, char **argv){(void)argc;(void)argv;return 2;}
+// Media.m's window hooks need spice-console.m too; these tests open no window.
+NSView *VNMediaControls(void){return [NSView new];}
+void VNMediaWindowChanged(BOOL open,BOOL minimized){(void)open;(void)minimized;}
+void VNMediaWindowBecameKey(void){}
 
 #define DC_WIDTH 64
 #define DC_HEIGHT 32
@@ -59,6 +63,7 @@ static void dcSpinUntilIdle(VNDisplay *dcDisplay){
 - (BOOL)isVisible{return YES;}
 - (BOOL)isMiniaturized{return NO;}
 - (NSWindowOcclusionState)occlusionState{return NSWindowOcclusionStateVisible;}
+- (NSScreen *)screen{return nil;}
 @end
 
 // Fake CAMetalDrawable for the invalid branch, which never presents it. Every

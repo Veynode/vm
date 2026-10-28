@@ -265,3 +265,109 @@ async fn a_slow_viewer_drops_to_keyframes_and_asks_for_one() {
     let lines = [lines, source.lines().await].concat();
     assert!(lines.contains(&"keyframe".to_string()), "{lines:?}");
 }
+
+async fn next(events: &mut mpsc::Receiver<SourceEvent>) -> SourceEvent {
+    tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// A daemon that serves one `desktop.stream`: it checks the request, sends
+/// a relay event and a frame, waits for one control message, and ends.
+fn fake_daemon(dir: &std::path::Path) -> std::thread::JoinHandle<(Value, Value)> {
+    use std::io::{BufRead, BufReader, Write};
+    use veynodevm_api::{frame, Channel};
+    let listener = std::os::unix::net::UnixListener::bind(dir.join("control.sock")).unwrap();
+    std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let hello = json!({"api":1,"daemon":env!("CARGO_PKG_VERSION"),"methods":["desktop.stream"],"home":null,
+            "runtime":{"appleVirtualization":true,"qemu":false}});
+        writeln!(socket, "{}", json!({ "result": hello })).unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        writeln!(socket, "{}", json!({"result":{"stream":true}})).unwrap();
+        let record = |kind: u8, payload: &[u8]| {
+            let mut r = ((payload.len() + 1) as u32).to_be_bytes().to_vec();
+            r.push(kind);
+            r.extend_from_slice(payload);
+            r
+        };
+        let mut video = 7u64.to_be_bytes().to_vec();
+        video.push(1);
+        video.extend_from_slice(&[0, 0, 0, 1, 0x40]);
+        let mut track = vec![2u8];
+        track.extend_from_slice(&video);
+        // One record split across frames, then two in one frame.
+        let ready = record(1, br#"{"event":"ready"}"#);
+        frame::write_frame(&mut socket, Channel::Stdout, &ready[..3]).unwrap();
+        frame::write_frame(&mut socket, Channel::Stdout, &ready[3..]).unwrap();
+        let both = [record(2, &video), record(10, &track)].concat();
+        frame::write_frame(&mut socket, Channel::Stdout, &both).unwrap();
+        let (channel, payload) = frame::read_frame(&mut reader).unwrap().unwrap();
+        assert_eq!(channel, Channel::Control as u8);
+        let control: Value = serde_json::from_slice(&payload).unwrap();
+        frame::write_frame(&mut socket, Channel::End, br#"{"result":{"exitCode":0}}"#).unwrap();
+        (request, control)
+    })
+}
+
+#[tokio::test]
+async fn the_desktop_source_is_the_daemons_desktop_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = fake_daemon(dir.path());
+    let source = DesktopStream {
+        client: veynodevm_api::Client::at_socket(dir.path().join("control.sock"), "hub-test"),
+    };
+    let mut handle = source.start("web", "h264").unwrap();
+    match next(&mut handle.events).await {
+        SourceEvent::Event(v) => assert_eq!(v, json!({"event":"ready"})),
+        other => panic!("{other:?}"),
+    }
+    for track in [0, 2] {
+        match next(&mut handle.events).await {
+            SourceEvent::Frame(f) => {
+                assert_eq!((f.track, f.pts_us, f.keyframe), (track, 7, true));
+                assert_eq!(f.annex_b, [0, 0, 0, 1, 0x40]);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    handle
+        .commands
+        .send(SourceCommand::Encoder("@0 keyframe".into()))
+        .unwrap();
+    match next(&mut handle.events).await {
+        SourceEvent::Ended(message) => assert_eq!(message, "desktop relay ended"),
+        other => panic!("{other:?}"),
+    }
+    let (request, control) = daemon.join().unwrap();
+    assert_eq!(
+        request,
+        json!({"method":"desktop.stream","arguments":{"name":"web","codec":"h264","tracks":true}})
+    );
+    assert_eq!(control, json!({"encoder":"@0 keyframe"}));
+}
+
+#[tokio::test]
+async fn a_daemon_that_is_not_there_ends_the_source_with_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = DesktopStream {
+        client: veynodevm_api::Client::at_socket(dir.path().join("control.sock"), "hub-test"),
+    };
+    let mut handle = source.start("web", "hevc").unwrap();
+    match tokio::time::timeout(Duration::from_secs(5), handle.events.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        SourceEvent::Ended(message) => {
+            assert!(message.starts_with("desktop.stream: "), "{message}")
+        }
+        other => panic!("{other:?}"),
+    }
+}

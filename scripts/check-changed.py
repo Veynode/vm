@@ -19,8 +19,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CRATES = {
+    'api': 'veynodevm-api',
     'cli': 'veynodevm',
     'control': 'vm-control',
+    'mcp': 'veynodevm-mcp',
     'media-local': 'vm-media-local',
     'oci': 'veynodevm-oci',
     'remote-proto': 'vm-remote-proto',
@@ -87,6 +89,22 @@ def crate_dependents(root=ROOT):
     return dependents
 
 
+# Decision 0028: the core is a daemon with one interface, API 1. Its clients
+# (the CLI, the web UI, the core plugin) never link it; only the core's own
+# media side (the console broker) does.
+CORE = 'control'
+# Crates whose tests run another crate's binary, which cargo does not build for them:
+# vm-mcp-http's end-to-end tests run vm-control's stdio MCP server per session.
+RUNS = {'mcp': ('vm-control', 'vm-control')}
+CORE_PARTS = {'media-local'}
+
+
+def core_dependents(root=ROOT, dependents=None):
+    """Crates outside the core that depend on the core crate by path, which decision 0028 forbids."""
+    dependents = crate_dependents(root) if dependents is None else dependents
+    return sorted(dependents[CORE] - CORE_PARTS)
+
+
 def unit_tests_for_scripts(root=ROOT):
     """Map scripts/<file> to the tests/test_*.py modules that load it."""
     found = {}
@@ -141,6 +159,8 @@ def build_plan(paths, quick=False, root=ROOT, dependents=None, script_tests=None
             continue
         if path.startswith(NOT_SOURCE):
             continue
+        if path.startswith('crates/') and path.endswith('/Cargo.toml'):
+            plan.add('core-deps', 'lint', [sys.executable, 'scripts/check-changed.py', '--check-deps'], path)
         if path.startswith('crates/'):
             crate = path.split('/')[1]
             if crate not in CRATES:
@@ -221,9 +241,16 @@ def build_plan(paths, quick=False, root=ROOT, dependents=None, script_tests=None
             clippy += ['-p', CRATES[crate]]
         plan.add('cargo-clippy', 'lint', clippy + ['--all-targets', '--', '-D', 'warnings'], 'rust')
         plan.stages['cargo-clippy'].triggers = {f'crates/{c}' for c in sorted(changed_crates)}
-        for crate in sorted(changed_crates):
+        tested = set(changed_crates)
+        if not quick:
+            # A change to a binary those tests run is a change to what they test.
+            tested |= {c for c, (pkg, _) in RUNS.items() if any(CRATES[d] == pkg for d in changed_crates)}
+        for crate in sorted(tested):
             package = CRATES[crate]
-            if not quick or crate in full_crates:
+            if crate in RUNS:
+                pkg, binary = RUNS[crate]
+                plan.add(f'cargo-build:{binary}', 'test', ['cargo', 'build', '--locked', '-p', pkg, '--bin', binary], f'crates/{crate}')
+            if not quick or crate in full_crates or crate not in changed_crates:
                 plan.add(f'cargo-test:{crate}', 'test', ['cargo', 'test', '--locked', '-p', package], f'crates/{crate}')
                 continue
             for test in sorted(integration.get(crate, ())):
@@ -291,6 +318,7 @@ def main():
     parser.add_argument('--keep-going', action='store_true', help='run every stage even after a failure')
     parser.add_argument('--all', action='store_true', help='run the full gate, scripts/check.sh')
     parser.add_argument('--check-links', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--check-deps', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
     os.chdir(ROOT)
 
@@ -299,6 +327,11 @@ def main():
         for line in broken:
             print(f'broken link: {line}', file=sys.stderr)
         return 1 if broken else 0
+    if args.check_deps:
+        users = core_dependents()
+        for name in users:
+            print(f'crates/{name} depends on crates/{CORE}; use the API (crates/api) instead', file=sys.stderr)
+        return 1 if users else 0
     if args.all:
         return subprocess.call(['scripts/check.sh'])
 

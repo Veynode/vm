@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/control", "crates/media-local", "crates/session-auth", "crates/oci", "crates/cli", "crates/remote-proto", "crates/gateway"]
+members = ["crates/api", "crates/mcp", "crates/control", "crates/media-local", "crates/session-auth", "crates/oci", "crates/cli", "crates/remote-proto", "crates/gateway"]
 resolver = "2"
 exclude = ["vendor/webrtc-0.21.0", "vendor/rtc-0.21.0"]
 

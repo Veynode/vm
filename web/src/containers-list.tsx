@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useRouter } from '@tanstack/react-router'
 import { IconButton } from '@ui/components/ui/icon-button'
-import { Box, Cpu, Palette, PenLine, Play, Square, Trash2 } from '@ui/icons'
+import { Box, Cpu, Monitor, Palette, PenLine, Play, Square, Terminal, Trash2 } from '@ui/icons'
 import { ListRow } from '@ui/settings/list-row'
 import { RowMenu } from '@ui/settings/row-menu'
 import { SettingsGroup } from '@ui/settings/settings-section'
@@ -13,7 +13,8 @@ import { RenameDialog } from './rename-dialog'
 import { RunDialog } from './run-dialog'
 import { containerAction, daemonStatus, inspectContainer, listContainers, type ContainerRow } from './api'
 import { EngineSwitch } from './engine-switch'
-import { ConfirmDialog, EmptyState, PageActions, PageBody, PanelLoadError, StatusTag, message, usePoll, useToastAction } from './ui'
+import { DesktopDialog, TerminalDialog, type ConsoleTarget } from './console-dialog'
+import { ConfirmDialog, EmptyState, PageActions, PageBody, PanelLoadError, StatusTag, failed, message, shortRef, usePoll, useToastAction } from './ui'
 import { useGo } from './page-nav'
 
 export const isUp = (state: string) => !['stopped', 'crashed', 'missing', 'unknown'].includes(state)
@@ -29,8 +30,9 @@ export function ContainersError({ error, reset }: { error: unknown; reset: () =>
 }
 
 /**
- * The containers, one row each: its state, its image, Start or Stop, and
- * Remove in its ··· menu. Drawn at `/containers` and, on a wider screen, at
+ * The containers, one row each: its state, its image, its terminal and
+ * desktop while it runs (as on its page), Start or Stop, and Remove in its
+ * ··· menu. Drawn at `/containers` and, on a wider screen, at
  * `/` beside the places (where a phone shows the places alone).
  */
 export function ContainersPage({ reading }: { reading: Awaited<ReturnType<typeof loadContainers>> }) {
@@ -47,6 +49,8 @@ export function ContainersPage({ reading }: { reading: Awaited<ReturnType<typeof
   const [iconFor, setIconFor] = useState<ContainerRow | null>(null)
   const [renaming, setRenaming] = useState<ContainerRow | null>(null)
   const [hardware, setHardware] = useState<Hardware | null>(null)
+  const [terminal, setTerminal] = useState<ConsoleTarget | null>(null)
+  const [desktop, setDesktop] = useState<ConsoleTarget | null>(null)
   // The dialog needs what only `inspect` reads (the disk, DNS, MTU).
   const openHardware = useToastAction(async (c: ContainerRow) => {
     setHardware(containerHardware(await inspectContainer({ data: c.id }), isUp(c.state)))
@@ -73,14 +77,20 @@ export function ContainersPage({ reading }: { reading: Awaited<ReturnType<typeof
                 // instead, so the state and GPU always read as words.
                 titleAside={
                   <span className="ms-1 inline-flex h-5 shrink-0 items-center gap-1">
-                    <StatusTag state={c.state} status={c.status} />
+                    {failed(c.state, c.status) && <StatusTag state={c.state} status={c.status} />}
                     {c.gpus && <StateTag>GPU {c.gpus}</StateTag>}
                   </span>
                 }
-                meta={c.image}
+                meta={shortRef(c.image)}
                 onSelect={() => go({ to: '/containers/$id', params: { id: c.id } })}
                 actions={
                   <>
+                    {up && !c.init && (
+                      <IconButton size="sm" variant="ghost" icon={Terminal} aria-label={`Terminal of ${c.name}`} title="Terminal" onClick={() => setTerminal({ id: c.id, name: c.name })} />
+                    )}
+                    {up && (c.desktop || c.os === 'darwin') && (
+                      <IconButton size="sm" variant="ghost" icon={Monitor} aria-label={`Desktop of ${c.name}`} title="Desktop" onClick={() => setDesktop({ id: c.id, name: c.name })} />
+                    )}
                     <IconButton size="sm" variant="ghost" icon={up ? Square : Play} aria-label={up ? `Stop ${c.name}` : `Start ${c.name}`} title={up ? 'Stop' : 'Start'} disabled={action.pending} onClick={() => action.run(up ? 'stop' : 'start', c.id)} />
                     <RowMenu label={`More for ${c.name}`} items={[
                         { label: 'Rename', icon: PenLine, onSelect: () => setRenaming(c) },
@@ -112,6 +122,8 @@ export function ContainersPage({ reading }: { reading: Awaited<ReturnType<typeof
       <IconDialog container={iconFor} close={() => setIconFor(null)} />
       <RenameDialog container={renaming} close={() => setRenaming(null)} renamed={() => router.invalidate()} />
       <HardwareDialog hw={hardware} close={() => setHardware(null)} />
+      <TerminalDialog target={terminal} close={() => setTerminal(null)} />
+      <DesktopDialog target={desktop} close={() => setDesktop(null)} />
     </PageBody>
   )
 }

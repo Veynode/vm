@@ -1,15 +1,11 @@
-//! Pushed MCP events through the real stdio adapter and the real TLS endpoint,
-//! against a synthetic daemon socket (tests/mcp_events.py). No VM or Guest.
+//! Pushed MCP events through the real stdio adapter, against a synthetic
+//! daemon socket (tests/mcp_events.py). No VM or Guest. The TLS endpoint's
+//! run of the same script is in crates/mcp/tests/mcp_events.rs.
 fn run(transport: &str) -> serde_json::Value {
-    let mut command = std::process::Command::new(python());
-    command
+    let output = std::process::Command::new(python())
         .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/mcp_events.py"))
         .arg(env!("CARGO_BIN_EXE_vm-control"))
-        .arg(transport);
-    if transport == "https" {
-        command.arg(env!("CARGO_BIN_EXE_vm-mcp-http"));
-    }
-    let output = command
+        .arg(transport)
         .output()
         .expect("Python 3 (with OpenSSL for TLS 1.3 on https) required");
     assert!(
@@ -28,12 +24,6 @@ fn run(transport: &str) -> serde_json::Value {
 fn stdio_events_resources_and_progress() {
     let evidence = run("stdio");
     assert!(evidence["checks"].as_array().unwrap().len() >= 24);
-}
-
-#[test]
-fn https_events_are_streamed_filtered_and_bounded() {
-    let evidence = run("https");
-    assert!(evidence["checks"].as_array().unwrap().len() >= 30);
 }
 
 // TLS 1.3 needs a modern OpenSSL; the macOS system python3 links LibreSSL 2.8.

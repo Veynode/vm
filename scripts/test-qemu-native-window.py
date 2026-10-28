@@ -91,18 +91,21 @@ def pacing_limits(value):
         assert type(n) is int and 0 < n <= maximum, f'invalid pacing limit {key}'
         return n
     if 'capture_limit_fps' in value:
-        integer('capture_limit_fps', 60)
+        integer('capture_limit_fps', 240)
     extended = ['native_window_capture_limit_fps','background_capture_limit_fps','encoder_limit_fps',
                 'idle_encode_interval_ms','display_refresh_preference_hz']
     if any(key in value for key in extended):
-        capture = integer('capture_limit_fps',60)
-        window = integer('native_window_capture_limit_fps',60)
-        background = integer('background_capture_limit_fps',60)
-        encoder = integer('encoder_limit_fps',60)
+        capture = integer('capture_limit_fps',240)
+        window = integer('native_window_capture_limit_fps',240)
+        background = integer('background_capture_limit_fps',240)
+        encoder = integer('encoder_limit_fps',240)
         integer('idle_encode_interval_ms',10000); integer('display_refresh_preference_hz',240)
-        assert encoder <= background <= window <= capture, 'inconsistent pacing ceilings'
+        # A browser stream captures at the window cadence even while the window
+        # is hidden, so the encoder bound follows the window limit.
+        assert background <= window <= capture and encoder <= window, 'inconsistent pacing ceilings'
         if 'capture_current_limit_fps' in value:
-            assert type(value['capture_current_limit_fps']) is int and value['capture_current_limit_fps'] in (background,window)
+            # Visible, the window's screen refresh (at most the window limit); else the background rate.
+            assert type(value['capture_current_limit_fps']) is int and 0 < value['capture_current_limit_fps'] <= window
     else:
         assert 'capture_current_limit_fps' not in value, 'current limit has no pacing contract'
 

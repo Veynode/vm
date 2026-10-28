@@ -610,11 +610,17 @@ let screenSharingEvdev: [Int: UInt32] = {
 /// guest agent speaks on vsock 5001 (see guest/veynode-agent/desktop_linux.go),
 /// so the same bridge and `vz-desktop-stream` encoder serve both. The worker
 /// end of a socketpair stands in for the vsock connection.
-///   host -> here: JSON lines {"method":"start"} then {"input":[...]}
-///   here -> host: u32 BE length, u8 kind, body (1 event, 2 rectangle, 3 frame end)
+///   host -> here: JSON lines {"method":"start"} then {"input":[...]}, {"audio":bool}
+///   here -> host: u32 BE length, u8 kind, body (1 event, 2 rectangle, 3 frame end, 4 audio)
+/// Sound comes from the Guest service's audio port (native/guest-macos/audio.swift), connected
+/// when the viewer first asks for it; its records are passed through unchanged.
 final class MacDesktopStream {
+    typealias AudioConnector = (@escaping (Result<(fd: Int32, release: () -> Void), Error>) -> Void) -> Void
     private let fd: Int32
     private let connect: () throws -> RFBClient
+    private let audioConnector: AudioConnector?
+    private var audio: (fd: Int32, release: () -> Void)?
+    private var audioWanted = false, audioConnecting = false
     private let output = NSLock()
     private let rfbWrites = NSLock()
     private let state = NSLock()
@@ -628,18 +634,23 @@ final class MacDesktopStream {
     private var writeNanoseconds: UInt64 = 0
     private var sentBytes: UInt64 = 0
 
-    private init(fd: Int32, connect: @escaping () throws -> RFBClient) { self.fd = fd; self.connect = connect }
+    private init(fd: Int32, connect: @escaping () throws -> RFBClient, audio: AudioConnector?) {
+        self.fd = fd; self.connect = connect; self.audioConnector = audio
+    }
 
-    /// Takes ownership of `fd` and serves it on its own threads.
-    static func start(fd: Int32, connect: @escaping () throws -> RFBClient) {
+    /// Takes ownership of `fd` and serves it on its own threads. `audio` is nil when the VM has no sound card.
+    static func start(fd: Int32, connect: @escaping () throws -> RFBClient, audio: AudioConnector? = nil) {
         var noSignal: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size))
-        let stream = MacDesktopStream(fd: fd, connect: connect)
+        let stream = MacDesktopStream(fd: fd, connect: connect, audio: audio)
         Thread.detachNewThread { stream.run() }
     }
 
     private var finished: Bool { state.lock(); defer { state.unlock() }; return ended }
-    private func finish() { state.lock(); ended = true; state.unlock() }
+    private func finish() {
+        state.lock(); ended = true; let link = audio; audio = nil; state.unlock()
+        if let link { shutdown(link.fd, SHUT_RDWR) }
+    }
 
     private func writeAll(_ bytes: UnsafeRawBufferPointer) throws {
         var offset = 0
@@ -745,12 +756,75 @@ final class MacDesktopStream {
     private func readInput(initial: [UInt8]) {
         var pending = initial
         while !finished, let bytes = line(timeoutMilliseconds: nil, pending: &pending) {
-            guard let message = (try? JSONSerialization.jsonObject(with: Data(bytes))) as? [String: Any], let events = message["input"] as? [[String: Any]] else { continue }
+            guard let message = (try? JSONSerialization.jsonObject(with: Data(bytes))) as? [String: Any] else { continue }
+            if let on = message["audio"] as? Bool { setAudio(on); continue }
+            // The microphone has no way into a macOS Guest without an audio driver.
+            guard let events = message["input"] as? [[String: Any]] else { continue }
             do { try locked { try apply(events) } } catch {
                 try? event(["event": "input_error", "message": (error as? ScreenSharingError)?.message ?? error.localizedDescription])
             }
         }
         finish()
+    }
+
+    /// Starts or stops the Guest's sound, connecting to its audio port on first use.
+    private func setAudio(_ on: Bool) {
+        guard let audioConnector else {
+            if on { try? event(["event": "audio_unavailable", "message": "this container has no sound card; recreate it to get one"]) }
+            return
+        }
+        state.lock()
+        audioWanted = on
+        let link = audio, connecting = audioConnecting
+        if link == nil && on && !connecting && !ended { audioConnecting = true }
+        state.unlock()
+        if let link { sendAudio(link.fd, on); return }
+        guard on, !connecting else { return }
+        audioConnector { result in
+            switch result {
+            case .failure(let failure):
+                self.state.lock(); self.audioConnecting = false; self.state.unlock()
+                try? self.event(["event": "audio_unavailable", "message": "the Guest service is not running with --allow-audio (\(failure.localizedDescription))"])
+            case .success(let link):
+                self.state.lock()
+                self.audioConnecting = false
+                let ended = self.ended, wanted = self.audioWanted
+                if !ended { self.audio = link }
+                self.state.unlock()
+                if ended { Darwin.close(link.fd); link.release(); return }
+                Thread.detachNewThread { self.relayAudio(link) }
+                self.sendAudio(link.fd, wanted)
+            }
+        }
+    }
+    private func sendAudio(_ descriptor: Int32, _ on: Bool) {
+        let line = Array((on ? "{\"audio\":true}\n" : "{\"audio\":false}\n").utf8)
+        _ = line.withUnsafeBytes { Darwin.write(descriptor, $0.baseAddress!, $0.count) }
+    }
+    /// Copies the Guest service's audio and event records into the stream until either side ends.
+    private func relayAudio(_ link: (fd: Int32, release: () -> Void)) {
+        var noSignal: Int32 = 1
+        setsockopt(link.fd, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size))
+        defer {
+            state.lock(); if audio?.fd == link.fd { audio = nil }; state.unlock()
+            Darwin.close(link.fd); link.release()
+        }
+        func read(_ count: Int) -> [UInt8]? {
+            var bytes = [UInt8](repeating: 0, count: count), offset = 0
+            while offset < count {
+                let n = bytes.withUnsafeMutableBytes { Darwin.read(link.fd, $0.baseAddress! + offset, count - offset) }
+                if n < 0 && errno == EINTR { continue }
+                guard n > 0 else { return nil }
+                offset += n
+            }
+            return bytes
+        }
+        while !finished, let head = read(5) {
+            let length = Int(head[0]) << 24 | Int(head[1]) << 16 | Int(head[2]) << 8 | Int(head[3])
+            // Same bound as vz-desktop-stream's guest audio (5 + 64 KiB), events alike.
+            guard length >= 2, length <= 6 + 64 * 1024, head[4] == 1 || head[4] == 4, let body = read(length - 1) else { return }
+            do { try record(head[4], [], body) } catch { return }
+        }
     }
 
     /// {"t":"abs","x","y"} 0..32767, {"t":"key","code":evdev,"down"} (BTN_LEFT..BTN_MIDDLE are the

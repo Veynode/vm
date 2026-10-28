@@ -1,23 +1,49 @@
 //! Per-user control daemon management. `daemon start` registers a launchd
 //! user agent so the daemon (and the VMs it owns) outlive the terminal.
+use crate::home;
 use crate::{daemon_call, print_json, sibling};
 use anyhow::{bail, Context, Result};
 use serde_json::json;
 use std::{
     os::unix::process::CommandExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
 };
-use vm_control::home;
 
 pub const LABEL: &str = "dev.veynode.veynodevm";
 
-fn plist_path() -> Result<PathBuf> {
+/// This home's launchd label. The default home keeps `LABEL`; another
+/// `VEYNODEVM_HOME` gets its own, so starting or stopping a test home's daemon
+/// never boots out the default one (and the VMs it owns).
+fn label() -> Result<String> {
+    let home = std::env::var_os("HOME").context("HOME is not set")?;
+    Ok(label_for(
+        &home::root()?,
+        &PathBuf::from(home).join("Library/Application Support/VeynodeVM"),
+    ))
+}
+
+fn label_for(root: &Path, default: &Path) -> String {
+    if root == default {
+        return LABEL.to_owned();
+    }
+    // FNV-1a: stable across builds, unlike std's hasher.
+    let hash = root
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325u64, |h, b| {
+            (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
+        });
+    format!("{LABEL}.{hash:016x}")
+}
+
+fn plist_path(label: &str) -> Result<PathBuf> {
     let home = std::env::var_os("HOME").context("HOME is not set")?;
     Ok(PathBuf::from(home)
         .join("Library/LaunchAgents")
-        .join(format!("{LABEL}.plist")))
+        .join(format!("{label}.plist")))
 }
 
 fn escape(s: &str) -> String {
@@ -26,7 +52,7 @@ fn escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-pub fn plist(control: &str, log: &str, home_dir: Option<&str>) -> String {
+pub fn plist(label: &str, control: &str, log: &str, home_dir: Option<&str>) -> String {
     let environment = home_dir
         .map(|h| format!("  <key>EnvironmentVariables</key>\n  <dict><key>VEYNODEVM_HOME</key><string>{}</string></dict>\n", escape(h)))
         .unwrap_or_default();
@@ -35,7 +61,7 @@ pub fn plist(control: &str, log: &str, home_dir: Option<&str>) -> String {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>{LABEL}</string>
+  <key>Label</key><string>{}</string>
   <key>ProgramArguments</key>
   <array><string>{}</string><string>daemon</string></array>
 {environment}  <key>RunAtLoad</key><true/>
@@ -46,6 +72,7 @@ pub fn plist(control: &str, log: &str, home_dir: Option<&str>) -> String {
 </dict>
 </plist>
 "#,
+        escape(label),
         escape(control),
         escape(log),
         escape(log)
@@ -73,6 +100,7 @@ fn wait(up: bool) -> Result<()> {
 
 pub fn command(rest: &[String], json_output: bool) -> Result<i32> {
     let uid = unsafe { libc::getuid() };
+    let label = label()?;
     match rest.first().map(String::as_str).unwrap_or("status") {
         "run" => {
             // Foreground, for development and debugging.
@@ -89,19 +117,20 @@ pub fn command(rest: &[String], json_output: bool) -> Result<i32> {
             }
             let root = home::private_dir(&home::root()?)?;
             let control = sibling("vm-control")?;
-            let path = plist_path()?;
+            let path = plist_path(&label)?;
             std::fs::create_dir_all(path.parent().unwrap())?;
             let custom_home = std::env::var("VEYNODEVM_HOME").ok();
             std::fs::write(
                 &path,
                 plist(
+                    &label,
                     &control.to_string_lossy(),
                     &root.join("daemon.log").to_string_lossy(),
                     custom_home.as_deref(),
                 ),
             )?;
             let _ = Command::new("launchctl")
-                .args(["bootout", &format!("gui/{uid}/{LABEL}")])
+                .args(["bootout", &format!("gui/{uid}/{label}")])
                 .output();
             let status = Command::new("launchctl")
                 .args(["bootstrap", &format!("gui/{uid}")])
@@ -111,12 +140,12 @@ pub fn command(rest: &[String], json_output: bool) -> Result<i32> {
                 bail!("launchctl bootstrap failed")
             }
             wait(true)?;
-            println!("daemon started ({LABEL})");
+            println!("daemon started ({label})");
             Ok(0)
         }
         "stop" => {
             let output = Command::new("launchctl")
-                .args(["bootout", &format!("gui/{uid}/{LABEL}")])
+                .args(["bootout", &format!("gui/{uid}/{label}")])
                 .output()?;
             if !output.status.success() && running() {
                 bail!("daemon is running outside launchd; stop that process directly")
@@ -131,7 +160,7 @@ pub fn command(rest: &[String], json_output: bool) -> Result<i32> {
                     "running": true,
                     "state_dir": home::state_dir()?,
                     "log": home::root()?.join("daemon.log"),
-                    "label": LABEL,
+                    "label": label,
                     "memory_budget_mib": c["resource_admission"]["vm_memory_budget_mib"],
                     "assigned_memory_mib": c["resource_admission"]["active_assigned_memory_mib"],
                     "qemu_registered": c["backends"]["qemu-hvf"]["registered"],
@@ -151,7 +180,7 @@ pub fn command(rest: &[String], json_output: bool) -> Result<i32> {
             }
             Err(_) if json_output => {
                 print_json(
-                    &json!({"running": false, "label": LABEL, "log": home::root()?.join("daemon.log"), "host_cpus": host_cpus()}),
+                    &json!({"running": false, "label": label, "log": home::root()?.join("daemon.log"), "host_cpus": host_cpus()}),
                 )?;
                 Ok(1)
             }
@@ -173,11 +202,22 @@ fn host_cpus() -> usize {
 mod tests {
     #[test]
     fn plist_escapes() {
-        let p = super::plist("/a&b/vm-control", "/l<og", Some("/h"));
+        let p = super::plist(super::LABEL, "/a&b/vm-control", "/l<og", Some("/h"));
         assert!(
             p.contains("/a&amp;b/vm-control")
                 && p.contains("/l&lt;og")
                 && p.contains("VEYNODEVM_HOME")
         );
+    }
+
+    #[test]
+    fn each_home_has_its_own_label() {
+        use std::path::Path;
+        let default = Path::new("/Users/u/Library/Application Support/VeynodeVM");
+        assert_eq!(super::label_for(default, default), super::LABEL);
+        let a = super::label_for(Path::new("/tmp/a"), default);
+        let b = super::label_for(Path::new("/tmp/b"), default);
+        assert!(a.starts_with("dev.veynode.veynodevm.") && a != b && a != super::LABEL);
+        assert_eq!(a, super::label_for(Path::new("/tmp/a"), default));
     }
 }

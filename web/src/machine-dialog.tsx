@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { NumberField } from '@console/components/ui/NumberField'
 import { Input } from '@ui/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@ui/components/ui/select'
 import { Switch } from '@ui/components/ui/switch'
@@ -11,7 +12,7 @@ import { SettingsRow } from '@ui/settings/settings-row'
 import { SettingsGroup } from '@ui/settings/settings-section'
 import { createMachine, macosImageStatus, runContainer, startMacosPull } from './api'
 import type { PullState } from './server/pulls'
-import { ConfirmDialog, FormDialog, lines, message, size, useToast, useToastAction } from './ui'
+import { ConfirmDialog, FormDialog, Hint, gibToMemory, lines, message, size, useToast, useToastAction } from './ui'
 import { useGo } from './page-nav'
 
 type System = 'linux' | 'windows' | 'macos'
@@ -38,15 +39,20 @@ const MACOS_IMAGES: Record<string, string> = {
 const MACOS_ON_DISK = 26 * 2 ** 30
 const PULL_RESERVE = 8 * 2 ** 30
 
+/** `machine create`'s own defaults; a macOS container takes its image's (empty). */
+const SIZES: Record<System, { cpus: string; memory: string; diskSize: string }> = {
+  linux: { cpus: '4', memory: '4', diskSize: '32' },
+  windows: { cpus: '4', memory: '4', diskSize: '64' },
+  macos: { cpus: '', memory: '', diskSize: '' },
+}
+
 const EMPTY = {
+  ...SIZES.linux,
   system: 'linux' as System,
   name: '',
   iso: '',
   virtio: '',
   attach: '',
-  diskSize: '',
-  memory: '',
-  cpus: '',
   gpus: '',
   backend: 'apple',
   diskBus: 'virtio',
@@ -92,6 +98,12 @@ export function NewMachineDialog({ open, close }: { open: boolean; close: () => 
   }
   const set = (key: keyof typeof form) => (e: { target: { value: string } }) => setForm({ ...form, [key]: e.target.value })
   const choose = (key: keyof typeof form) => (value: string) => setForm({ ...form, [key]: value })
+  // A size still at the old system's default takes the new one's; one the user set stays.
+  const switchSystem = (next: System) => {
+    const sizes = { ...SIZES[next] }
+    for (const key of ['cpus', 'memory', 'diskSize'] as const) if (form[key] !== SIZES[form.system][key]) sizes[key] = form[key]
+    setForm({ ...form, ...sizes, system: next, gpus: '' })
+  }
 
   const system = form.system
   const qemu = system === 'windows' || !!form.gpus || form.backend === 'qemu'
@@ -139,8 +151,8 @@ export function NewMachineDialog({ open, close }: { open: boolean; close: () => 
           volumes: [],
           env: [],
           cpus: form.cpus ? Number(form.cpus) : undefined,
-          memory: form.memory.trim() || undefined,
-          disk_size: form.diskSize ? Number(form.diskSize.replace(/[gG]$/, '')) : undefined,
+          memory: gibToMemory(form.memory),
+          disk_size: form.diskSize ? Number(form.diskSize) : undefined,
         },
       })
       close()
@@ -153,8 +165,8 @@ export function NewMachineDialog({ open, close }: { open: boolean; close: () => 
         os: system,
         name: form.name.trim(),
         iso: form.iso.trim() || undefined,
-        diskSize: form.diskSize.trim() || undefined,
-        memory: form.memory.trim() || undefined,
+        diskSize: form.diskSize.trim() ? `${form.diskSize}G` : undefined,
+        memory: gibToMemory(form.memory),
         cpus: form.cpus ? Number(form.cpus) : undefined,
         gpus: (form.gpus || undefined) as 'virgl' | 'venus' | 'neptune' | undefined,
         backend: system === 'linux' && !form.gpus ? (form.backend as 'apple' | 'qemu') : undefined,
@@ -185,7 +197,7 @@ export function NewMachineDialog({ open, close }: { open: boolean; close: () => 
         onSubmit={() => (needsPull ? setConfirming(true) : create.run())}
       >
         <Field label="System">
-          <Choice items={SYSTEMS} value={system} onChange={(v) => setForm({ ...form, system: v as System, gpus: '' })} />
+          <Choice items={SYSTEMS} value={system} onChange={(v) => switchSystem(v as System)} />
         </Field>
         {system === 'windows' && (
           <Notice title="Bring your own Windows 11 ARM64 ISO and the virtio-win driver ISO">
@@ -230,7 +242,7 @@ export function NewMachineDialog({ open, close }: { open: boolean; close: () => 
               label={system === 'windows' ? 'More images' : 'Seed images'}
               trailingAction={<InfoTip label="About attached images">One path per line (.iso, .img, .raw), attached read-only: cloud-init, kickstart or Autounattend.</InfoTip>}
             >
-              <Textarea className="font-mono" rows={2} value={form.attach} onChange={set('attach')} />
+              <Textarea className="font-mono" rows={2} placeholder="/Users/you/Downloads/seed.iso" value={form.attach} onChange={set('attach')} />
             </Field>
           </>
         )}
@@ -241,13 +253,16 @@ export function NewMachineDialog({ open, close }: { open: boolean; close: () => 
         )}
         <div className="grid grid-cols-1 gap-4 narrow:grid-cols-3">
           <Field label="CPUs">
-            <Input type="number" min={1} max={32} placeholder="4" value={form.cpus} onChange={set('cpus')} />
+            <NumberField className="w-full" min={1} max={32} value={form.cpus} onChange={(cpus) => setForm({ ...form, cpus })} />
+            {system === 'macos' && !form.cpus && <Hint>From the image</Hint>}
           </Field>
           <Field label="Memory">
-            <Input placeholder={system === 'macos' ? '8g' : '4g'} value={form.memory} onChange={set('memory')} />
+            <NumberField className="w-full" min={0.5} max={128} step={0.5} unit="GiB" value={form.memory} onChange={(memory) => setForm({ ...form, memory })} />
+            {system === 'macos' && !form.memory && <Hint>From the image</Hint>}
           </Field>
-          <Field label="Disk" trailingAction={<InfoTip label="About Disk">{system === 'macos' ? 'GiB; grows the image disk.' : 'Sparse: takes host space as the guest writes.'}</InfoTip>}>
-            <Input placeholder={system === 'windows' ? '64G' : system === 'macos' ? '100' : '32G'} value={form.diskSize} onChange={set('diskSize')} />
+          <Field label="Disk" trailingAction={<InfoTip label="About Disk">{system === 'macos' ? 'Grows the image disk.' : 'Sparse: takes host space as the guest writes.'}</InfoTip>}>
+            <NumberField className="w-full" min={4} max={4096} unit="GiB" value={form.diskSize} onChange={(diskSize) => setForm({ ...form, diskSize })} />
+            {system === 'macos' && !form.diskSize && <Hint>From the image</Hint>}
           </Field>
         </div>
         {system !== 'macos' && (

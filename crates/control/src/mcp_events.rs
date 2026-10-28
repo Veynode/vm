@@ -8,7 +8,7 @@
 //! 500 ms tick reads the daemon's lifecycle event log (`events`), log sizes
 //! (`log_read`) and subscribed jobs (`exec_poll`); each subscribed screen has
 //! one thread looping over a 5 s `screen_wait`. Polling tools keep working.
-use crate::{call, validate_id, write_json};
+use crate::{call, write_json};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::{
@@ -35,7 +35,6 @@ const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 const SCREEN_WAIT_MS: u64 = 5_000;
 const SCREEN_SETTLE_MS: u64 = 750;
 const SCREEN_MIN_INTERVAL: Duration = Duration::from_secs(1);
-const PREFIX: &str = "veynode://vm/";
 pub const EVENT_META: &str = "veynode.dev/event";
 
 pub const INSTRUCTIONS: &str = "Events: tools/call with _meta.progressToken receives notifications/progress about once a second until its result. vm_exec_poll takes wait_ms (up to 30000) to wait for the job instead of polling. Resources veynode://vm/{id}/status, /screen, /log/serial, /log/worker and /job/{job_id} can be read and subscribed; notifications/resources/updated carries _meta[\"veynode.dev/event\"]: status started, stopped, crashed, guest_reset or state; screen changed then settled (at most one change a second); log appended with its size; job finished with exit_code (Guest output arrives with the exit, read the job resource or poll for it). Clients without notifications keep using vm_status, vm_screen_wait and vm_exec_poll.";
@@ -52,50 +51,7 @@ impl Out {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Resource {
-    Status(String),
-    Screen(String),
-    Log(String, &'static str),
-    Job(String, String),
-}
-impl Resource {
-    pub fn parse(uri: &str) -> Option<Self> {
-        let rest = uri.strip_prefix(PREFIX)?;
-        let parts: Vec<&str> = rest.split('/').collect();
-        let id = parts.first()?.to_string();
-        validate_id(&id).ok()?;
-        match parts[1..] {
-            ["status"] => Some(Self::Status(id)),
-            ["screen"] => Some(Self::Screen(id)),
-            ["log", "serial"] => Some(Self::Log(id, "serial")),
-            ["log", "worker"] => Some(Self::Log(id, "worker")),
-            ["job", job]
-                if job.len() == 32 && job.bytes().all(|b| b"0123456789abcdef".contains(&b)) =>
-            {
-                Some(Self::Job(id, job.into()))
-            }
-            _ => None,
-        }
-    }
-    pub fn vm(&self) -> &str {
-        match self {
-            Self::Status(id) | Self::Screen(id) | Self::Log(id, _) | Self::Job(id, _) => id,
-        }
-    }
-    pub fn uri(&self) -> String {
-        match self {
-            Self::Status(id) => format!("{PREFIX}{id}/status"),
-            Self::Screen(id) => format!("{PREFIX}{id}/screen"),
-            Self::Log(id, stream) => format!("{PREFIX}{id}/log/{stream}"),
-            Self::Job(id, job) => format!("{PREFIX}{id}/job/{job}"),
-        }
-    }
-}
-/// The VM a resource URI names, for transports that authorize by VM.
-pub fn resource_vm(uri: &str) -> Option<String> {
-    Resource::parse(uri).map(|r| r.vm().to_string())
-}
+pub use veynodevm_mcp::resource::{resource_vm, Resource, PREFIX};
 
 /// Adds the event capabilities and instructions to an `initialize` reply.
 pub fn initialize(reply: &mut Value) {

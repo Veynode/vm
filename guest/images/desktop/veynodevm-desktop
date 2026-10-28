@@ -54,7 +54,20 @@ if [ -z "${MESA_LOADER_DRIVER_OVERRIDE:-}" ] && echo "$vulkan" | grep -q "driver
 fi
 glxinfo -B 2>/dev/null | grep -E "OpenGL (renderer|version) string" | sed 's/^/desktop: /'
 echo "desktop: XFCE session starting on :0${user:+ as $user}"
-if [ -n "$user" ]; then
-    exec runuser -u "$user" -- env HOME="$home" USER="$user" LOGNAME="$user" dbus-run-session startxfce4
+# On QEMU the SPICE agent port shares the clipboard with the viewer; the
+# session's half, spice-vdagent, starts from its XDG autostart entry.
+if [ -e /dev/virtio-ports/com.redhat.spice.0 ] && command -v spice-vdagentd >/dev/null; then
+    mkdir -p /run/spice-vdagentd
+    spice-vdagentd || echo "desktop: spice-vdagentd failed; no clipboard with the viewer" >&2
 fi
-exec dbus-run-session startxfce4
+# PipeWire for the session's sound: QEMU's sound card, or on Apple
+# Virtualization the virtual devices the guest agent relays to the viewer.
+session='if command -v pipewire >/dev/null; then
+    pipewire & for _ in $(seq 50); do [ -S "$XDG_RUNTIME_DIR/pipewire-0" ] && break; sleep 0.1; done
+    wireplumber & pipewire-pulse &
+fi
+exec startxfce4'
+if [ -n "$user" ]; then
+    exec runuser -u "$user" -- env HOME="$home" USER="$user" LOGNAME="$user" dbus-run-session sh -c "$session"
+fi
+exec dbus-run-session sh -c "$session"

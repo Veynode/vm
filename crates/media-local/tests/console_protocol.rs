@@ -707,3 +707,148 @@ fn actual_stream_shim_private_fd_correlates_rate_and_preserves_stop_ack() {
     assert!(!media.is_empty());
     assert!(!media.windows(10).any(|w| w == b"request_id"));
 }
+
+#[test]
+fn stream_shim_starts_a_fresh_epoch_when_the_source_is_replaced() {
+    let broker = Broker::start("source-replaced");
+    let mut shim = Shim::start(&broker);
+    let mut stdout = shim.0.stdout.take().unwrap();
+    // One access unit from the replaced epoch, then the fresh epoch's.
+    let mut epochs = Vec::new();
+    for _ in 0..2 {
+        let mut header = [0u8; 13];
+        stdout.read_exact(&mut header).unwrap();
+        let size = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+        let mut body = vec![0; size];
+        stdout.read_exact(&mut body).unwrap();
+        epochs.push(
+            broker
+                .log()
+                .iter()
+                .filter(|v| v["method"] == "start")
+                .count(),
+        );
+    }
+    assert_eq!(epochs, [1, 2]);
+    assert!(
+        shim.0.try_wait().unwrap().is_none(),
+        "the stream kept running"
+    );
+    let (status, stderr) = shim.stop_line_then_eof();
+    assert!(status.success(), "{stderr}");
+}
+
+#[test]
+fn audio_goes_to_the_newest_listener_and_only_its_microphone_reaches_native() {
+    let broker = Broker::start("normal");
+    let mut first = broker.connect();
+    let mut second = broker.connect();
+    let listen = |client: &mut Client, id: &str| {
+        client.send(id, "audio_start");
+        let mut kinds = Vec::new();
+        for _ in 0..2 {
+            let record = client.record();
+            if record.kind == 1 {
+                let value = record.value().unwrap();
+                assert_eq!(value["request_id"], id);
+                assert_eq!(value["result"]["listening"], true);
+            } else {
+                assert_eq!((record.kind, record.epoch), (3, 0));
+                assert_eq!(&record.body[..5], &[0, 0, 0xbb, 0x80, 2]);
+            }
+            kinds.push(record.kind);
+        }
+        kinds.sort();
+        assert_eq!(kinds, [1, 3]);
+    };
+    listen(&mut first, "a1");
+    listen(&mut second, "a2");
+    // The first client lost the audio: its microphone frame is dropped, the second's is forwarded.
+    for (client, pcm) in [(&mut first, "AAAA"), (&mut second, "AQAB")] {
+        writeln!(
+            client.stream,
+            "{}",
+            json!({"request_id":"m","method":"audio_in","pcm":pcm})
+        )
+        .unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !broker.log().iter().any(|v| v["method"] == "audio_in") {
+        assert!(
+            Instant::now() < deadline,
+            "microphone frame never reached native"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let frames: Vec<_> = broker
+        .log()
+        .into_iter()
+        .filter(|v| v["method"] == "audio_in")
+        .collect();
+    assert_eq!(frames, [json!({"method":"audio_in","pcm":"AQAB"})]);
+    // No reply to a microphone frame: the next record is the stop acknowledgement.
+    second.send("s", "audio_stop");
+    assert_eq!(second.response("s")["result"]["listening"], false);
+    // A malformed frame ends that connection without touching native.
+    writeln!(
+        first.stream,
+        "{}",
+        json!({"request_id":"x","method":"audio_in","pcm":"not base64!"})
+    )
+    .unwrap();
+    assert!(read_record(&mut first.reader).is_err());
+    assert_eq!(
+        broker
+            .log()
+            .iter()
+            .filter(|v| v["method"] == "audio_in")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn clipboard_text_goes_up_in_parts_and_its_events_reach_every_watcher() {
+    let broker = Broker::start("normal");
+    let mut first = broker.connect();
+    let mut second = broker.connect();
+    let mut bystander = broker.connect();
+    for (client, id) in [(&mut first, "w1"), (&mut second, "w2")] {
+        client.send(id, "clipboard_watch");
+        assert_eq!(client.response(id)["result"]["watching"], true);
+    }
+    // "你好, world" in two base64 parts; neither gets a reply.
+    for (data, last) in [("5L2g5aW9", false), ("LCB3b3JsZA==", true)] {
+        writeln!(
+            first.stream,
+            "{}",
+            json!({"request_id":"c","method":"clipboard_chunk","data":data,"last":last})
+        )
+        .unwrap();
+    }
+    writeln!(
+        first.stream,
+        "{}",
+        json!({"request_id":"g","method":"clipboard_get"})
+    )
+    .unwrap();
+    for client in [&mut first, &mut second] {
+        let record = client.record();
+        assert_eq!((record.kind, record.epoch), (1, 0));
+        assert_eq!(
+            record.value().unwrap(),
+            json!({"event":"clipboard","text":"你好, world"})
+        );
+    }
+    // A client that never watched hears nothing: its next record is its own reply.
+    bystander.send("s", "status");
+    assert!(bystander.response("s")["result"].is_object());
+    // A part that is not base64 ends that connection.
+    writeln!(
+        second.stream,
+        "{}",
+        json!({"request_id":"x","method":"clipboard_chunk","data":"a!b?","last":true})
+    )
+    .unwrap();
+    assert!(read_record(&mut second.reader).is_err());
+}

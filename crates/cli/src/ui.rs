@@ -4,9 +4,9 @@
 //! browser on it. There is no sign-in: the server only binds 127.0.0.1 and
 //! checks the Host header (the WebSockets also the Origin); server functions
 //! call back into this executable (`VEYNODEVM_CLI`).
+use crate::home;
 use anyhow::{bail, Context, Result};
 use std::process::Command;
-use vm_control::home;
 
 pub fn command(rest: &[String]) -> Result<i32> {
     let p = crate::args::parse(
@@ -24,9 +24,7 @@ pub fn command(rest: &[String]) -> Result<i32> {
         .transpose()
         .context("invalid --port")?
         .unwrap_or(3417);
-    let runtime = home::Runtime::load()?;
-    let server = runtime
-        .web
+    let server = home::web_server()?
         .context("web UI not registered: cd web && npm ci && npm run build, then scripts/install-dev-runtime.py")?;
     if !server
         .with_file_name("dist")
@@ -38,7 +36,7 @@ pub fn command(rest: &[String]) -> Result<i32> {
             server.parent().unwrap().display()
         )
     }
-    let node = veynodevm_oci::store::which("node").context("node not found on PATH")?;
+    let node = home::which("node").context("node not found on PATH")?;
     std::net::TcpListener::bind(("127.0.0.1", port))
         .with_context(|| format!("127.0.0.1:{port} is in use (use --port)"))?;
     let url = format!("http://127.0.0.1:{port}/");

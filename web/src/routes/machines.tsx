@@ -14,7 +14,7 @@ import { RenameMachineDialog } from '../rename-dialog'
 import { daemonStatus, listMachines, machineAction, type MachineRow } from '../api'
 import { EngineSwitch } from '../engine-switch'
 import type { MachineAction } from '../machine-input.mjs'
-import { ConfirmDialog, EmptyState, PageActions, PageBody, PanelLoadError, StatusTag, message, size, usePoll, useToastAction } from '../ui'
+import { ConfirmDialog, EmptyState, PageActions, PageBody, PanelLoadError, StatusTag, failed, message, size, usePoll, useToastAction } from '../ui'
 import { useGo } from '../page-nav'
 import { DesktopDialog, TerminalDialog, type ConsoleTarget } from '../console-dialog'
 
@@ -39,7 +39,7 @@ export function resources(row: { cpus?: number; memory_mib?: number; disk_used_b
   const parts = []
   if (row.cpus) parts.push(`${row.cpus} CPU`)
   if (row.memory_mib) parts.push(row.memory_mib % 1024 === 0 ? `${row.memory_mib / 1024} GiB` : `${row.memory_mib} MiB`)
-  parts.push(row.disk_used_bytes !== undefined ? `${size(row.disk_used_bytes)} of ${row.machine.disk_gib} GB disk` : `${row.machine.disk_gib} GB disk`)
+  parts.push(row.disk_used_bytes !== undefined ? `${size(row.disk_used_bytes)} of ${row.machine.disk_gib} GiB disk` : `${row.machine.disk_gib} GiB disk`)
   return parts.join(' · ')
 }
 
@@ -89,7 +89,7 @@ function Machines() {
                 // the state and ISO tags give way to dots.
                 titleAside={
                   <span className="ms-1 inline-flex h-5 shrink-0 items-center gap-1">
-                    <StatusTag state={m.state} status={m.state} />
+                    {failed(m.state, m.state) && <StatusTag state={m.state} status={m.state} />}
                     {m.machine.iso && <StateTag>ISO</StateTag>}
                   </span>
                 }

@@ -29,5 +29,8 @@ export function sshUser(input: unknown): string
 export function displaySize(input: unknown): string
 export function macosImage(input: unknown): string
 export function createInput(input: unknown): MachineSpec
-export function createArgs(spec: MachineSpec): string[]
-export function actionArgs(input: unknown): string[]
+export function memoryMiB(value: string): number
+export function diskGiB(value: string): number
+export function portPair(value: string): { host: number; guest: number }
+export function createRequest(spec: MachineSpec): Record<string, unknown>
+export function actionRequest(input: unknown): { method: string; args: { name: string; force?: boolean } }

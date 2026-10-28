@@ -6,6 +6,7 @@
 #import "InputFrameDiagnostic.h"
 #import "FrameAcquisition.h"
 #import "DrawTiming.h"
+#import "Media.h"
 #include "FramePacing.h"
 #include "EncodedGeometry.h"
 #include "InputFocus.h"
@@ -20,6 +21,8 @@ static uint64_t sourceGeneration,sourceSequence;
 static int64_t sourceCapturedMono;
 static VNDisplayedFrameStore *displayed;
 static BOOL enabled,visible;
+// The maximum refresh of the screen the window is on, at most VN_VISIBLE_FPS.
+static unsigned screenFPS=60;
 static VNNativeControl *nativeControl;
 static VNInputFrameDiagnostic *inputFrameDiagnostic;
 static VNFrameAcquisition *frameAcquisition;
@@ -39,11 +42,12 @@ void VeynodeDisplayInvalidate(void){
     initializeState();[publicationLock lock];if(latest)[pool releasePixel:latest];latest=NULL;sourceGeneration=sourceSequence=0;sourceCapturedMono=0;[displayed invalidate];[frameAcquisition invalidateFrames];[publicationLock unlock];
 }
 BOOL VeynodeDisplayVisible(void){initializeState();[publicationLock lock];BOOL result=enabled&&visible;[publicationLock unlock];return result;}
+unsigned VeynodeDisplayVisibleFPS(void){initializeState();[publicationLock lock];unsigned result=enabled&&visible?screenFPS:0;[publicationLock unlock];return result;}
 static NSDictionary *nativeInputStatus(void){
     return nativeControl?[nativeControl status]:@{@"native_frame_acquisition_protocol":@1,@"native_frame_acquisition_negotiated":@NO,@"native_frame_acquisition_enabled":@NO,@"native_input_protocol":@1,@"native_input_supported":@YES,@"native_input_available":@NO,@"input_enabled":@NO,@"display_only":@YES,@"native_input_state":@"view_only",@"native_input_ready":@NO,@"native_release_confirmed":@YES,@"native_input_epoch":[NSNull null],@"native_input_queued_transitions":@0,@"native_input_pending_move":@NO,@"native_input_transition_limit":@32};
 }
 NSDictionary *VeynodeDisplayCapabilities(void){
-    NSMutableDictionary *caps=[@{@"native_window":(MTLCreateSystemDefaultDevice()!=nil?@YES:@NO),@"display_instance":[displayed instance],@"native_window_protocol":@2,@"displayed_frame_protocol":@1,@"display_only":@YES,@"input_enabled":@NO,@"display_path":@"owned-BGRA-MetalKit-no-video-encoding",@"capture_limit_fps":@60,@"native_window_capture_limit_fps":@60,@"background_capture_limit_fps":@30,@"encoder_limit_fps":@60,@"idle_encode_interval_ms":@1000,@"display_refresh_preference_hz":@60,@"physical_presentation_measurement":@"unavailable",@"presented_time_sample_limit":@120,@"presented_time_source":@"CAMetalDrawable.addPresentedHandler/presentedTime",@"owned_slot_limit":@3,@"display_gpu_inflight_limit":@1} mutableCopy];
+    NSMutableDictionary *caps=[@{@"native_window":(MTLCreateSystemDefaultDevice()!=nil?@YES:@NO),@"display_instance":[displayed instance],@"native_window_protocol":@2,@"displayed_frame_protocol":@1,@"display_only":@YES,@"input_enabled":@NO,@"display_path":@"owned-BGRA-MetalKit-no-video-encoding",@"capture_limit_fps":@VN_VISIBLE_FPS,@"native_window_capture_limit_fps":@VN_VISIBLE_FPS,@"background_capture_limit_fps":@VN_BACKGROUND_FPS,@"encoder_limit_fps":@VN_VISIBLE_FPS,@"idle_encode_interval_ms":@1000,@"display_refresh_preference_hz":@VN_VISIBLE_FPS,@"physical_presentation_measurement":@"unavailable",@"presented_time_sample_limit":@120,@"presented_time_source":@"CAMetalDrawable.addPresentedHandler/presentedTime",@"owned_slot_limit":@3,@"display_gpu_inflight_limit":@1} mutableCopy];
     [caps addEntriesFromDictionary:nativeInputStatus()];return caps;
 }
 
@@ -135,7 +139,7 @@ static NSString *displayMetalFailure(NSString *phase,NSError *error){
     if(self.window){[self.window makeKeyAndOrderFront:nil];return nil;}
     NSString *failure=[self prepareMetal];if(failure)return failure;
     self.view=[[VNReadOnlyView alloc] initWithFrame:NSMakeRect(0,0,960,640) device:self.device];self.view.delegate=self;
-    self.view.colorPixelFormat=MTLPixelFormatBGRA8Unorm;self.view.clearColor=MTLClearColorMake(0.03,0.03,0.03,1);self.view.framebufferOnly=YES;self.view.preferredFramesPerSecond=60;self.view.enableSetNeedsDisplay=NO;self.view.paused=NO;
+    self.view.colorPixelFormat=MTLPixelFormatBGRA8Unorm;self.view.clearColor=MTLClearColorMake(0.03,0.03,0.03,1);self.view.framebufferOnly=YES;self.view.preferredFramesPerSecond=VN_VISIBLE_FPS;self.view.enableSetNeedsDisplay=NO;self.view.paused=NO;
     __weak VNDisplay *weak=self;self.view.inputEvent=^(NSEvent *event){[weak inputEvent:event];};
     NSView *container=[[NSView alloc] initWithFrame:NSMakeRect(0,0,960,640)];
     self.view.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;[container addSubview:self.view];
@@ -145,12 +149,14 @@ static NSString *displayMetalFailure(NSString *phase,NSError *error){
     self.window.title=@"Veynode VM Console";self.window.releasedWhenClosed=NO;self.window.delegate=self;self.window.contentView=container;self.window.acceptsMouseMovedEvents=YES;
     self.inputTimer=[NSTimer timerWithTimeInterval:0.05 repeats:YES block:^(NSTimer *timer){[weak updateInput];}];[[NSRunLoop mainRunLoop] addTimer:self.inputTimer forMode:NSRunLoopCommonModes];
     [publicationLock lock];enabled=YES;[publicationLock unlock];
+    NSTitlebarAccessoryViewController *media=[NSTitlebarAccessoryViewController new];media.view=VNMediaControls();media.layoutAttribute=NSLayoutAttributeTrailing;[self.window addTitlebarAccessoryViewController:media];VNMediaWindowChanged(YES,NO);
     [self.window center];[self.window makeKeyAndOrderFront:nil];[NSApp activateIgnoringOtherApps:YES];[self updateVisibility];return nil;
 }
 - (void)close {
     [self suspendInputWithReason:@"window_closed"];[self.inputTimer invalidate];self.inputTimer=nil;
     NSAssert([NSThread isMainThread],@"AppKit thread");
     [publicationLock lock];enabled=NO;visible=NO;if(latest)[pool releasePixel:latest];latest=NULL;sourceGeneration=sourceSequence=0;sourceCapturedMono=0;[displayed invalidate];[frameAcquisition invalidateFrames];[publicationLock unlock];
+    if(self.window)VNMediaWindowChanged(NO,NO);
     self.windowEpoch++;self.view.paused=YES;self.view.delegate=nil;self.window.delegate=nil;[self.window close];self.window=nil;self.view=nil;
     // A previously submitted GPU command retains its own frame lease until its
     // completion handler; closing a window never overwrites/recycles that slot.
@@ -173,11 +179,15 @@ static NSString *displayMetalFailure(NSString *phase,NSError *error){
 - (void)windowDidChangeBackingProperties:(NSNotification *)notification{[self invalidateLayout];[self refreshLayout];}
 - (void)updateVisibility {
     BOOL current=self.window&&self.window.visible&&!self.window.miniaturized&&(self.window.occlusionState&NSWindowOcclusionStateVisible);
-    [publicationLock lock];BOOL changed=visible!=(enabled&&current);visible=enabled&&current;if(changed){[displayed invalidate];[frameAcquisition invalidateFrames];}[publicationLock unlock];if(changed){[self suspendInputWithReason:@"visibility_changed"];self.lastGeneration=UINT64_MAX;self.lastSequence=UINT64_MAX;}
+    NSInteger maximum=self.window.screen.maximumFramesPerSecond;unsigned fps=maximum>0?(unsigned)MIN(maximum,(NSInteger)VN_VISIBLE_FPS):60;
+    if(self.view&&self.view.preferredFramesPerSecond!=(NSInteger)fps)self.view.preferredFramesPerSecond=fps;
+    [publicationLock lock];screenFPS=fps;BOOL changed=visible!=(enabled&&current);visible=enabled&&current;if(changed){[displayed invalidate];[frameAcquisition invalidateFrames];}[publicationLock unlock];if(changed){[self suspendInputWithReason:@"visibility_changed"];self.lastGeneration=UINT64_MAX;self.lastSequence=UINT64_MAX;}
 }
 - (void)windowDidChangeOcclusionState:(NSNotification *)notification{[self updateVisibility];}
-- (void)windowDidMiniaturize:(NSNotification *)notification{[self updateVisibility];}
-- (void)windowDidDeminiaturize:(NSNotification *)notification{[self updateVisibility];}
+- (void)windowDidChangeScreen:(NSNotification *)notification{[self updateVisibility];}
+- (void)windowDidMiniaturize:(NSNotification *)notification{[self updateVisibility];VNMediaWindowChanged(YES,YES);}
+- (void)windowDidDeminiaturize:(NSNotification *)notification{[self updateVisibility];VNMediaWindowChanged(YES,NO);}
+- (void)windowDidBecomeKey:(NSNotification *)notification{VNMediaWindowBecameKey();}
 - (void)suspendInput{[self suspendInputWithReason:@"explicit"];}
 - (void)suspendInputWithReason:(NSString *)reason{[nativeControl suspendWithReason:reason];[self.heldKeys removeAllObjects];[self.heldButtons removeAllObjects];self.inputWasReady=NO;}
 - (void)windowDidResignKey:(NSNotification *)notification{[self suspendInputWithReason:@"window_focus_lost"];}
@@ -246,7 +256,7 @@ static NSString *VNInputNotice(NSDictionary *s){
 }
 - (NSDictionary *)status {
     [self updateVisibility];[self refreshLayout];[self updateInput];
-    NSMutableDictionary *value=[VeynodeDisplayCapabilities() mutableCopy];value[@"window_open"]=(self.window!=nil?@YES:@NO);value[@"window_visible"]=(self.window.visible?@YES:@NO);value[@"capture_current_limit_fps"]=@(VeynodeDisplayVisible()?60:30);value[@"capture_native_visible"]=@(VeynodeDisplayVisible());value[@"physical_presentations"]=[NSNull null];value[@"display_gpu_inflight"]=@(self.inflight);value[@"drawables_submitted"]=@(self.submitted);value[@"gpu_commands_completed"]=@(self.completed);value[@"gpu_commands_failed"]=@(self.failed);value[@"pool"]=[pool statistics];
+    NSMutableDictionary *value=[VeynodeDisplayCapabilities() mutableCopy];value[@"window_open"]=(self.window!=nil?@YES:@NO);value[@"window_visible"]=(self.window.visible?@YES:@NO);unsigned visibleFPS=VeynodeDisplayVisibleFPS();value[@"capture_current_limit_fps"]=@(visibleFPS?visibleFPS:VN_BACKGROUND_FPS);value[@"capture_native_visible"]=@(VeynodeDisplayVisible());value[@"physical_presentations"]=[NSNull null];value[@"display_gpu_inflight"]=@(self.inflight);value[@"drawables_submitted"]=@(self.submitted);value[@"gpu_commands_completed"]=@(self.completed);value[@"gpu_commands_failed"]=@(self.failed);value[@"pool"]=[pool statistics];
     BOOL appActive=NSApp.active,windowKey=self.window.keyWindow,firstResponder=self.view&&self.window.firstResponder==self.view;
     value[@"native_input_focus"]=@{@"application_active":(appActive?@YES:@NO),@"window_key":(windowKey?@YES:@NO),@"first_responder":(firstResponder?@YES:@NO),@"input_target_focused":(VNInputMayDispatch(appActive,windowKey,firstResponder)?@YES:@NO)};
     CGSize drawable=self.view?self.view.drawableSize:CGSizeZero;
@@ -332,7 +342,11 @@ static NSString *VNInputNotice(NSDictionary *s){
                 [self.presented recordTime:time generation:generation sequence:sequence windowEpoch:displayEpoch];
                 [self updateVisibility];[self refreshLayout];
                 [publicationLock lock];
-                if(enabled&&visible&&self.windowEpoch==displayEpoch&&sourceGeneration==generation)[displayed commitCandidate:candidate presentedTime:time receivedMonotonic:received];
+                // macOS 27 runs this handler with presentedTime 0 for every drawable of
+                // a visible window; the handler itself still means Core Animation took
+                // it, so its own time on the same clock stands in.
+                double stamp=isfinite(time)&&time>0?time:CACurrentMediaTime();
+                if(enabled&&visible&&self.windowEpoch==displayEpoch&&sourceGeneration==generation)[displayed commitCandidate:candidate presentedTime:stamp receivedMonotonic:received];
                 [publicationLock unlock];
                 [timing attempt:attempt presentedMainAt:(timed?NSProcessInfo.processInfo.systemUptime:0)];
             });
@@ -443,12 +457,20 @@ int VeynodeDisplaySelfTest(void){@autoreleasepool{
     NSCAssert([stats[@"presented_time_samples"] count]==120&&[stats[@"presented_time_evicted_count"] intValue]==10,@"bounded presentation metadata ring");
     NSCAssert([stats[@"presented_time_samples"][0][@"source_sequence"] intValue]==11,@"preserve actual source sequence with timestamp");
     VNFramePacing pacing={0};NSUInteger frames=0;
-    for(int i=0;i<600;i++){int64_t t=(int64_t)i*1000000/60;frames+=VNFramePacingAdmit(&pacing,t,YES);NSCAssert(!VNFramePacingAdmit(&pacing,t,YES),@"same timestamp cannot catch up");}
-    NSCAssert(frames==600,@"rational 60 Hz admission has no integer drift");
-    frames=0;for(int i=0;i<600;i++)frames+=VNFramePacingAdmit(&pacing,10000000+(int64_t)i*1000000/60,NO);
+    for(int i=0;i<600;i++){int64_t t=(int64_t)i*1000000/60;frames+=VNFramePacingAdmit(&pacing,t,VN_VISIBLE_FPS);NSCAssert(!VNFramePacingAdmit(&pacing,t,VN_VISIBLE_FPS),@"same timestamp cannot catch up");}
+    NSCAssert(frames==600,@"a 240 Hz ceiling admits every draw of a 60 Hz source");
+    frames=0;for(int i=0;i<1000;i++)frames+=VNFramePacingAdmit(&pacing,20000000+(int64_t)i*1000,VN_VISIBLE_FPS);
+    NSCAssert(frames==241,@"rational 240 Hz ceiling has no integer drift (the slot after the last event is claimed early)");
+    frames=0;for(int i=0;i<1000;i++)frames+=VNFramePacingAdmit(&pacing,22000000+(int64_t)i*1000,120);
+    NSCAssert(frames==121,@"a 120 Hz screen admits 120 of a 1 kHz source, plus the next slot claimed early");
+    frames=0;for(int i=0;i<1000;i++)frames+=VNFramePacingAdmit(&pacing,24000000+(int64_t)i*1000,1000);
+    NSCAssert(frames==241,@"a faster screen is held to the 240 Hz ceiling");
+    VNFramePacing busy={0};frames=0;for(int64_t t=40000000;t<50000000;){if(VNFramePacingAdmit(&busy,t,120)){frames++;t+=7300;}else t+=2000;}
+    NSCAssert(frames>=1199&&frames<=1201,@"7.3 ms of work per frame still keeps a 120 Hz cadence");
+    frames=0;for(int i=0;i<600;i++)frames+=VNFramePacingAdmit(&pacing,10000000+(int64_t)i*1000000/60,VN_BACKGROUND_FPS);
     NSCAssert(frames==300,@"background 30 Hz admits half a 60 Hz source");
-    NSCAssert(VNFramePacingAdmit(&pacing,30000000,NO)&&!VNFramePacingAdmit(&pacing,30000000,NO),@"late event cannot create catch-up burst");
-    NSCAssert(VNFramePacingAdmit(&pacing,30000001,YES),@"visible policy transition starts fresh cadence");
+    NSCAssert(VNFramePacingAdmit(&pacing,30000000,VN_BACKGROUND_FPS)&&!VNFramePacingAdmit(&pacing,30000000,VN_BACKGROUND_FPS),@"late event cannot create catch-up burst");
+    NSCAssert(VNFramePacingAdmit(&pacing,30000001,60),@"a rate change starts fresh cadence");
     CVPixelBufferRef a=VeynodeDisplayAcquire(128,80),b=VeynodeDisplayAcquire(128,80),c=VeynodeDisplayAcquire(128,80);NSCAssert(a&&b&&c&&a!=b&&b!=c&&a!=c,@"three owned slots");NSCAssert(!VeynodeDisplayAcquire(128,80),@"bounded pool");
     [publicationLock lock];enabled=YES;[publicationLock unlock];
     VeynodeDisplayPublish(a,1,1,1000);NSCAssert([pool retainPixel:a],@"GPU lease");VeynodeDisplayRelease(a);VeynodeDisplayInvalidate();
@@ -458,7 +480,7 @@ int VeynodeDisplaySelfTest(void){@autoreleasepool{
     [publicationLock lock];enabled=NO;[publicationLock unlock];VeynodeDisplayInvalidate();VeynodeDisplayRelease(replacement);
     NSCAssert([[pool statistics][@"leases"] unsignedIntegerValue]==0,@"close/invalidation releases all except actual GPU leases");
     CVPixelBufferRef d=VeynodeDisplayAcquire(128,80);VeynodeDisplayPublish(d,3,1,1000);VeynodeDisplayRelease(d);NSCAssert(!latest,@"closed display cannot republish");
-    puts("PASS HEVC/H264 landscape/portrait/small/max geometry and invalid boundaries; bounded presentation metadata policy (synthetic inputs only), rational 60/30 Hz pacing, policy transition and no catch-up burst; actual CVPixelBuffer bounded slot leases, replacement, in-flight pin, generation invalidation and closed publication. No AppKit window, SPICE connection or GPU command.");return 0;
+    puts("PASS HEVC/H264 landscape/portrait/small/max geometry and invalid boundaries; bounded presentation metadata policy (synthetic inputs only), rational per-screen (at most 240) and 30 Hz pacing, policy transition and no catch-up burst; actual CVPixelBuffer bounded slot leases, replacement, in-flight pin, generation invalidation and closed publication. No AppKit window, SPICE connection or GPU command.");return 0;
 }}
 int main(int argc,char **argv){@autoreleasepool{
     initializeState();

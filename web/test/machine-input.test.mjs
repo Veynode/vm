@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { actionArgs, createArgs, createInput, diskSize, displaySize, hostPath, machineName, macosImage, memory, port, sshUser, ISO_EXTENSIONS } from '../src/machine-input.mjs'
+import { actionRequest, createInput, createRequest, diskSize, displaySize, hostPath, machineName, macosImage, memory, port, sshUser, ISO_EXTENSIONS } from '../src/machine-input.mjs'
 import { freeBytes, regularFile, veynodeHome } from '../src/server/host-files.mjs'
 
 test('machine names: no options, paths or shell syntax', () => {
@@ -100,19 +100,28 @@ test('create: a checked form becomes one argv element per value', () => {
     ports: ['2222:22'],
     attach: ['/Users/me/virtio-win.iso', '/Users/me/autounattend.img'],
   })
-  assert.deepEqual(createArgs(spec), [
-    'machine', 'create', 'win11', '--os', 'windows', '--iso', '/Users/me/Win 11.iso', '--disk-size', '64G', '--memory', '8g', '--cpus', '6',
-    '--gpus', 'neptune', '--disk-bus', 'nvme', '--publish', '2222:22', '--attach', '/Users/me/virtio-win.iso', '--attach', '/Users/me/autounattend.img',
-  ])
-  assert.deepEqual(createArgs(createInput({ name: 'ubuntu' })), ['machine', 'create', 'ubuntu', '--os', 'linux'])
+  assert.deepEqual(createRequest(spec), {
+    name: 'win11',
+    os: 'windows',
+    iso: '/Users/me/Win 11.iso',
+    diskGiB: 64,
+    memoryMiB: 8192,
+    cpus: 6,
+    gpu: 'neptune',
+    diskBus: 'nvme',
+    ports: [{ host: 2222, guest: 22 }],
+    attach: ['/Users/me/virtio-win.iso', '/Users/me/autounattend.img'],
+  })
+  assert.deepEqual(createRequest(createInput({ name: 'ubuntu' })), { name: 'ubuntu', os: 'linux' })
+  assert.deepEqual(createRequest(createInput({ name: 'u', memory: '4096', diskSize: '1T' })), { name: 'u', os: 'linux', memoryMiB: 4096, diskGiB: 1024 })
 })
 
-test('actions map to machine subcommands only', () => {
-  assert.deepEqual(actionArgs({ action: 'kill', name: 'u' }), ['machine', 'stop', '--force', 'u'])
-  assert.deepEqual(actionArgs({ action: 'rm', name: 'u' }), ['machine', 'rm', 'u'])
-  assert.deepEqual(actionArgs({ action: 'eject', name: 'u' }), ['machine', 'eject', 'u'])
-  for (const action of ['ssh', 'create', 'exec', '', undefined]) assert.throws(() => actionArgs({ action, name: 'u' }), /invalid action/)
-  assert.throws(() => actionArgs({ action: 'start', name: '-f' }), /invalid machine name/)
+test('actions map to machine methods only', () => {
+  assert.deepEqual(actionRequest({ action: 'kill', name: 'u' }), { method: 'machine.stop', args: { name: 'u', force: true } })
+  assert.deepEqual(actionRequest({ action: 'rm', name: 'u' }), { method: 'machine.rm', args: { name: 'u' } })
+  assert.deepEqual(actionRequest({ action: 'start', name: 'u' }), { method: 'machine.start', args: { name: 'u' } })
+  for (const action of ['ssh', 'create', 'exec', '', undefined]) assert.throws(() => actionRequest({ action, name: 'u' }), /invalid action/)
+  assert.throws(() => actionRequest({ action: 'start', name: '-f' }), /invalid machine name/)
 })
 
 test('display sizes are WIDTHxHEIGHT within the CLI bounds', () => {

@@ -1,19 +1,19 @@
 //! One encoder per VM and codec, shared by every remote viewer of it.
 //!
 //! The Apple Virtualization guest bridge and the QEMU console broker each
-//! serve one encoder, so viewers cannot each start their own. The hub runs
-//! `veynodevm desktop --stream --codec C --tracks VM` once and fans its access units
+//! serve one encoder, so viewers cannot each start their own. The hub opens
+//! the daemon's `desktop.stream` (API 1) once and fans its access units
 //! out to per-viewer [`Pacer`]s. A viewer that zooms on a phone asks for a
 //! crop rectangle; viewers asking for the same rectangle share an encoder
 //! track, at most `tracks_per_vm` exist, and a viewer that finds none free
 //! (or a QEMU VM, which has one track) keeps the full screen and zooms in
 //! the browser.
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, Notify};
 use vm_remote_proto::abr;
 use vm_remote_proto::pacer::{Frame, KeyframeLimiter, Offer, Pacer};
@@ -64,50 +64,93 @@ pub trait Source: Send + Sync {
     fn start(&self, vm: &str, codec: &str) -> Result<SourceHandle>;
 }
 
-/// The production source: `veynodevm desktop --stream --codec C --tracks VM`.
-pub struct DesktopProcess {
-    pub program: std::path::PathBuf,
+/// The production source: the daemon's `desktop.stream {name, codec,
+/// tracks: true}` (docs/api.md). Its `stdout` frames are the relay records
+/// [`read_records`] parses; commands go out as `control` messages.
+pub struct DesktopStream {
+    pub client: veynodevm_api::Client,
 }
 
-impl Source for DesktopProcess {
+impl Source for DesktopStream {
     fn start(&self, vm: &str, codec: &str) -> Result<SourceHandle> {
-        let mut child = tokio::process::Command::new(&self.program)
-            .args(["desktop", "--stream", "--codec", codec, "--tracks", vm])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("start {}", self.program.display()))?;
-        let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = child.stdout.take().unwrap();
+        let client = self.client.clone();
+        let args = json!({ "name": vm, "codec": codec, "tracks": true });
+        // A blocking API client on threads; the records cross to the async
+        // parser through a socket pair, so they keep their order and the
+        // stream's end reaches the parser after its last record.
+        let (writer, reader) = std::os::unix::net::UnixStream::pair()?;
+        reader.set_nonblocking(true)?;
+        let mut reader = tokio::net::UnixStream::from_std(reader)?;
+        let ended = Arc::new(Mutex::new(None::<String>));
+        let (sender_tx, sender_rx) = std::sync::mpsc::channel();
         let (event_tx, events) = mpsc::channel(64);
         let (commands, mut command_rx) = mpsc::unbounded_channel::<SourceCommand>();
-        tokio::spawn(async move {
-            while let Some(c) = command_rx.recv().await {
-                let line = match c {
-                    SourceCommand::Input(events) => json!({ "events": events }),
-                    SourceCommand::Encoder(line) => json!({ "encoder": line }),
+        let end = ended.clone();
+        std::thread::Builder::new()
+            .name("desktop-stream".into())
+            .spawn(move || {
+                let message = relay(&client, args, writer, &sender_tx);
+                *end.lock().unwrap() = Some(message);
+            })?;
+        std::thread::Builder::new()
+            .name("desktop-commands".into())
+            .spawn(move || {
+                let Ok(sender) = sender_rx.recv() else {
+                    return;
                 };
-                let mut bytes = serde_json::to_vec(&line).unwrap_or_default();
-                bytes.push(b'\n');
-                if stdin.write_all(&bytes).await.is_err() {
-                    break;
+                let sender: veynodevm_api::StreamSender = sender;
+                while let Some(c) = command_rx.blocking_recv() {
+                    let message = match c {
+                        SourceCommand::Input(events) => json!({ "events": events }),
+                        SourceCommand::Encoder(line) => json!({ "encoder": line }),
+                    };
+                    if sender.control(&message).is_err() {
+                        break;
+                    }
                 }
-            }
-            // Closing stdin stops the relay, which releases held input and
-            // the guest bridge.
-            drop(stdin);
-            let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-        });
+                // Leaving the stream stops the relay, which releases held
+                // input and the guest bridge.
+                sender.cancel();
+            })?;
         tokio::spawn(async move {
-            let ended = match read_records(&mut stdout, &event_tx).await {
-                Ok(()) => "desktop relay ended".to_string(),
+            let parsed = read_records(&mut reader, &event_tx).await;
+            let ended = ended.lock().unwrap().take();
+            let message = match parsed {
                 Err(e) => format!("{e:#}"),
+                Ok(()) => ended.unwrap_or_else(|| "desktop relay ended".to_string()),
             };
-            let _ = event_tx.send(SourceEvent::Ended(ended)).await;
+            let _ = event_tx.send(SourceEvent::Ended(message)).await;
         });
         Ok(SourceHandle { events, commands })
+    }
+}
+
+/// `desktop.stream` to its end, its `stdout` copied to `to`; what ended it.
+fn relay(
+    client: &veynodevm_api::Client,
+    args: Value,
+    mut to: std::os::unix::net::UnixStream,
+    sender: &std::sync::mpsc::Sender<veynodevm_api::StreamSender>,
+) -> String {
+    use std::io::Write;
+    let mut stream = match client.stream("desktop.stream", args) {
+        Ok(stream) => stream,
+        Err(e) => return format!("desktop.stream: {e:#}"),
+    };
+    let _ = sender.send(stream.sender());
+    loop {
+        match stream.next_event() {
+            Ok(veynodevm_api::Event::Stdout(data)) => {
+                if to.write_all(&data).is_err() {
+                    return "desktop relay ended".to_string();
+                }
+            }
+            Ok(veynodevm_api::Event::End(Ok(_))) => return "desktop relay ended".to_string(),
+            Ok(veynodevm_api::Event::End(Err(e))) => return format!("desktop.stream: {e}"),
+            Ok(_) => {}
+            // Cancelled when the hub left, or the daemon went away.
+            Err(e) => return format!("desktop relay ended: {e:#}"),
+        }
     }
 }
 

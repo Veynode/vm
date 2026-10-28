@@ -5,6 +5,22 @@ This implementation operates real Apple `vm-apple` subprocesses and an opt-in Li
 `guest_info` and `exec` require the actual guest integration service on vsock 5000.
 There is no simulated product backend.
 
+## Source layout
+
+| Module | What it holds |
+|---|---|
+| [`src/config.rs`](src/config.rs) | a VM's `Config` and its checks |
+| [`src/registry.rs`](src/registry.rs) | `registry.json`, `REGISTRY_SCHEMA`, VM ids, private state files |
+| [`src/wire.rs`](src/wire.rs) | response bounds, line frames, socket buffers |
+| [`src/server.rs`](src/server.rs) | the socket: peer admission, connections, `call` |
+| [`src/api_server.rs`](src/api_server.rs), [`src/services/`](src/services/) | API 1 ([docs/api.md](../../docs/api.md)): `hello`, streams, and the `machine.*`, `container.*`, `image.*`, `engine.*`, `terminal.*`, `desktop.*` services |
+| [`src/manager.rs`](src/manager.rs) | the `Manager`: every VM, its worker and the VM-level methods |
+| [`src/running.rs`](src/running.rs), [`src/worker.rs`](src/worker.rs) | a running worker and how one starts |
+| [`src/pending.rs`](src/pending.rs), [`src/exec.rs`](src/exec.rs) | requests in flight and guest command execution |
+| [`src/capabilities.rs`](src/capabilities.rs) | capabilities, known limits and control features per backend and Guest |
+| [`src/mcp.rs`](src/mcp.rs) | the MCP stdio server |
+| [`src/daemon_log.rs`](src/daemon_log.rs) | the bounded line log |
+
 ## Local usage
 
 ```sh
@@ -107,8 +123,10 @@ seven-entry report.
 
 The explicit `snapshot` cell means live snapshot/save/restore, not an offline
 disk clone. `balloon` repeats `memory_reclaim`; an attached balloon device alone
-does not establish working host memory reclaim. `clipboard` is unsupported:
-no clipboard channel is implemented. The existing Windows cells retain their
+does not establish working host memory reclaim. `clipboard` is unsupported as
+an MCP capability: no clipboard channel reaches agents through the daemon. The
+desktop viewers share a Linux desktop's text clipboard with the person viewing
+it ([browser desktop](../../docs/browser-desktop.md#sound-and-clipboard)). The existing Windows cells retain their
 registration-refusal reasons. QEMU macOS cells now explicitly report unsupported;
 this does not enable macOS registration on QEMU.
 
@@ -182,6 +200,11 @@ The override applies to that daemon invocation and is not persisted in VM config
 
 ## MCP sessions
 
+The MCP server is the daemon's: `vm-control mcp` serves one session on stdio, and the daemon serves one per
+`mcp.serve` stream ([docs/api.md](../../docs/api.md#mcp)), which `veynodevm mcp` relays to. The HTTPS endpoint
+(`vm-mcp-http`) and the protocol tables both share (tool groups, cua-driver scopes, resource URIs, response bounds)
+are in [`crates/mcp`](../mcp/src/lib.rs), which links only the API crate.
+
 Each MCP connection gets an internal random owner token, its session id. The
 adapter injects it and it cannot be supplied in MCP tool arguments. There is no
 control lease: any caller with input permission and a recent matching screenshot
@@ -214,7 +237,7 @@ veynodevm mcp --input --tools core,screen,input
 | `cua` | `cua_*`: cua-driver in Linux desktops, Windows machines and macOS containers ([below](#cua-driver-tools)); hidden unless named, `all` or `vm_tools_enable` | observe, input, browser, clipboard, execute |
 
 `all` names every group. The mapping lives in
-[`src/tool_groups.rs`](src/tool_groups.rs), apart from the tool definitions: a new
+[`crates/mcp/src/tool_groups.rs`](../mcp/src/tool_groups.rs), apart from the tool definitions: a new
 tool needs a line there or a matching prefix, and the `every_tool_has_a_group`
 test fails until it has one. An unmapped tool stays listed.
 
@@ -336,7 +359,7 @@ reconnected on demand with at most 5 starts a minute and closed with the worker.
   that serves `\\.\pipe\cua-driver`. The link is the driver's own
   `mcp --socket` proxy over one SSH session. A user must be logged on to the
   console.
-- **macOS containers**: `veynodevm __driver VM` copies the pinned darwin binary to
+- **macOS containers**: `vm-control __driver VM` copies the pinned darwin binary to
   `~/.veynodevm/cua-driver-<sha>` when missing and runs it with
   `CUA_DRIVER_EMBEDDED=1` over SSH.
 
@@ -546,7 +569,7 @@ observe):
 | `container_fork` | `count` (1–16) new containers from one checkpoint or the live layer | — |
 | `container_fork_rm` | stop and delete a fork group, or every fork of a source | selector |
 
-The tools run `veynodevm checkpoint|rollback|fork` (`crates/cli/src/checkpoint.rs`).
+The tools call the daemon's `checkpoint.*` methods ([`src/services/checkpoint.rs`](src/services/checkpoint.rs)).
 A Linux container's only mutable state is `rw.raw`: the image root, boot assets
 and configuration disk are read-only. A checkpoint is `clonefile` of that layer
 into `<container>/checkpoints/NAME/`, so it costs no data blocks until the
@@ -661,7 +684,8 @@ installs a migration blocker for accelerated virtio-gpu.
 
 ## HTTPS endpoint
 
-`vm-mcp-http` exposes `/mcp` using rustls with TLS terminating on the user's Mac.
+`vm-mcp-http` ([`crates/mcp`](../mcp/src/bin/vm-mcp-http.rs)) exposes `/mcp` using rustls with TLS terminating on
+the user's Mac. Each session runs `vm-control mcp` (the binary beside it, or `--control-bin PATH`).
 It defaults to `127.0.0.1:8443`; wider binding requires an explicit bind address.
 No public deployment or firewall changes are made by this repository.
 
@@ -1335,7 +1359,7 @@ JSON form is 78.9 KB, the compact form 15.7 KB and compact `interactive_only`
 `veynodevm` macOS containers answer the same seven tools with the macOS
 Accessibility API, which the first boot grants to the Guest's SSH sessions.
 The daemon validates the arguments as for Linux, then
-runs `veynodevm __desktop VM METHOD ARGUMENTS`, which runs
+runs `vm-control __desktop VM METHOD ARGUMENTS`, which runs
 `native/tools/vm-macos-desktop.swift` (built by
 `native/tools/build-vm-macos-desktop.sh`, registered as `macos_desktop` in
 `runtime.json`) in the Guest over SSH with the arguments on stdin. The CLI

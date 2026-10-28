@@ -3,14 +3,15 @@
 #include "hevc-profile.h"
 #include "../console/EncodedGeometry.h"
 #include "../console/ScreenshotDiagnostic.h"
+#include "../console/FramePacing.h"
 #ifdef VEYNODE_NATIVE_DISPLAY
 #import "../console/Display.h"
 #import "../console/InputFrameDiagnostic.h"
 #import "../console/FrameAcquisition.h"
-#include "../console/FramePacing.h"
 #import "../console/CopyTiming.h"
 #import "../console/AsyncScreenshot.h"
 #import "../console/RecordWriter.h"
+#import "../console/Media.h"
 #include <time.h>
 #include <math.h>
 #define main VeynodeConsoleMain
@@ -22,6 +23,7 @@
 #import <ImageIO/ImageIO.h>
 #import <CoreGraphics/CoreGraphics.h>
 #include <spice-client.h>
+#include <spice/vd_agent.h>
 #include <glib.h>
 #include <sys/ioctl.h>
 #include <poll.h>
@@ -72,10 +74,19 @@ static gint64 capturedWall,capturedMono,lastCapture,firstPTS,lastEncode;
 // interval is captured and encoded at the next slot instead of waiting for
 // another draw or the 1 Hz idle refresh (typing would otherwise lag seconds).
 static BOOL sourceDirty,encodeDirty;
-static const gint64 encodeInterval=16667;
-// Capture is already on a 60 Hz slot grid; a copy admitted a hair early on that grid
-// must not wait another flush tick, or the stream averages 54 fps instead of 60.
-static const gint64 encodeSlack=3000;
+// A browser stream's rate: the viewer's screen refresh it reports with `set_fps`,
+// else 240 Hz, the fastest Mac display. Frames past what the viewer's screen
+// shows would only split the same bitrate thinner.
+static const unsigned maxStreamFPS=240;
+static unsigned streamFPS=maxStreamFPS;
+static gint64 encodeInterval(void){return 1000000/streamFPS;}
+// Capture runs at the stream's rate unless a visible native window wants more; only
+// then does encoding need its own grid. A second grid at the same rate would sit at
+// another phase and refuse captures (at 120 the stream lost about a third of its frames).
+static unsigned captureFPS=maxStreamFPS;
+// Copies not encoded because they matched the previous frame, this epoch.
+static NSUInteger unchangedSkips;
+static VNFramePacing encodePacing;
 static int generationFD=-1;
 static NSMutableData *input;
 static const NSUInteger maxAU=4*1024*1024;
@@ -153,8 +164,9 @@ static BOOL createEncoderWith(CVPixelBufferRef pixel,NSDictionary *spec,BOOL rep
     if(!problem){
     // The colour description is written into the stream: untagged, decoders (ffmpeg,
     // some browsers) assume BT.601 and shift every colour of the BT.709 conversion.
-    // The H.264 hint stays at 30: at 60 the encoder picks a level above the
-    // Constrained Baseline 3.1 this helper guarantees. Frames still go at 60.
+    // The rate hints only pick the level: at 60 the H.264 encoder picks one above
+    // the Constrained Baseline 3.1 this helper guarantees, and above 60 HEVC's
+    // passes 4.1. Frames still go at the Guest's rate.
     NSDictionary *properties=@{(__bridge NSString *)kVTCompressionPropertyKey_RealTime:@YES,(__bridge NSString *)kVTCompressionPropertyKey_AllowFrameReordering:@NO,(__bridge NSString *)kVTCompressionPropertyKey_AverageBitRate:@8000000,(__bridge NSString *)kVTCompressionPropertyKey_ExpectedFrameRate:useHEVC?@60:@30,(__bridge NSString *)kVTCompressionPropertyKey_ColorPrimaries:(__bridge NSString *)kCVImageBufferColorPrimaries_ITU_R_709_2,(__bridge NSString *)kVTCompressionPropertyKey_TransferFunction:(__bridge NSString *)kCVImageBufferTransferFunction_ITU_R_709_2,(__bridge NSString *)kVTCompressionPropertyKey_YCbCrMatrix:(__bridge NSString *)kCVImageBufferYCbCrMatrix_ITU_R_709_2,(__bridge NSString *)kVTCompressionPropertyKey_MaxKeyFrameInterval:@120,(__bridge NSString *)kVTCompressionPropertyKey_ProfileLevel:(__bridge NSString *)(useHEVC?kVTProfileLevel_HEVC_Main_AutoLevel:kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel)};
     for(NSString *key in properties){result=VTSessionSetProperty(encoder,(__bridge CFStringRef)key,(__bridge CFTypeRef)properties[key]);if(result!=noErr){problem=[NSString stringWithFormat:@"Encoder property rejected %@: %d",key,(int)result];break;}}
     }
@@ -295,7 +307,7 @@ static BOOL sourceUnchanged(CVPixelBufferRef pixel){
 static void encodeLatest(gint64 now,BOOL idle){
  if(!active||!cacheValid())return;
  BOOL same=encoder&&sourceUnchanged(owned); // always refreshes the kept copy
- if(same&&!idle&&!forceKeyframe){encodeDirty=NO;return;}
+ if(same&&!idle&&!forceKeyframe){encodeDirty=NO;unchangedSkips++;return;}
  if(!same){lastChange=now;leaveStill();}
  if(!encoder){
   if(!resolveView(&view)){fail(@"Source geometry cannot fit even codec bounds");sessionFailure();return;}
@@ -375,9 +387,10 @@ static void scanout(SpiceDisplayChannel *channel,GParamSpec *spec,gpointer conte
 static BOOL captureSource(gint64 now){
  if(!surfaceLive()){awaitSource(@"generation_retired_during_draw");return NO;}
 #ifdef VEYNODE_NATIVE_DISPLAY
- BOOL nativeVisible=VeynodeDisplayVisible();
- // A browser stream gets the visible cadence even while the window is hidden.
- if(!VNFramePacingAdmit(&capturePacing,now,nativeVisible||active)){capturePacingDrops++;sourceDirty=YES;return NO;}
+ unsigned windowFPS=VeynodeDisplayVisibleFPS();BOOL nativeVisible=windowFPS>0;
+ // A browser stream gets its own rate even while the window is hidden; both together get the faster.
+ unsigned fps=MAX(windowFPS,active?streamFPS:0);captureFPS=fps?fps:VN_BACKGROUND_FPS;
+ if(!VNFramePacingAdmit(&capturePacing,now,captureFPS)){capturePacingDrops++;sourceDirty=YES;return NO;}
  CVPixelBufferRef next=VeynodeDisplayAcquire(sourceWidth,sourceHeight);
  // Pool exhaustion drops this copy without blocking ACK; the flush retries.
  if(!next){capturePoolDrops++;sourceDirty=YES;return NO;}
@@ -385,7 +398,7 @@ static BOOL captureSource(gint64 now){
  if(!surfaceLive()){VeynodeDisplayRelease(next);awaitSource(@"generation_retired_during_copy");return NO;}
  clearCache();owned=next;sourceCopies++;sequence++;cachedGeneration=generation;capturedMono=g_get_monotonic_time();capturedWall=g_get_real_time();lastCapture=now;if(nativeVisible)visibleSourceCopies++;else backgroundSourceCopies++;VeynodeDisplayPublish(owned,generation,sequence,capturedMono);
 #else
- if(lastCapture&&now-lastCapture<encodeInterval){sourceDirty=YES;return NO;}
+ captureFPS=streamFPS;if(lastCapture&&now-lastCapture<encodeInterval()){sourceDirty=YES;return NO;}
  cachedGeneration=0;if(!owned)owned=allocatePixel(sourceWidth,sourceHeight);
  if(!owned||!copyPixels(surface,sourceWidth,sourceHeight,0,0,sourceWidth,sourceHeight,owned)){clearCache();captureFail(@"source_copy_failed");return NO;}
  if(!surfaceLive()){awaitSource(@"generation_retired_during_copy");return NO;}
@@ -394,7 +407,7 @@ static BOOL captureSource(gint64 now){
  sourceDirty=NO;encodeDirty=YES;return YES;
 }
 static void encodeIfDue(gint64 now){
- if(!fatal&&active&&cacheValid()&&encodeDirty&&(!lastEncode||now-lastEncode>=encodeInterval-encodeSlack))encodeLatest(now,NO);
+ if(!fatal&&active&&cacheValid()&&encodeDirty&&(captureFPS<=streamFPS||VNFramePacingAdmit(&encodePacing,now,streamFPS)))encodeLatest(now,NO);
 }
 static void draw(SpiceDisplayChannel *channel,guint32 x,guint32 y,guint32 w,guint32 h,gpointer context){@autoreleasepool{
  received++;gint64 now=g_get_monotonic_time();
@@ -410,6 +423,90 @@ static gboolean flush(gpointer data){@autoreleasepool{
  encodeIfDue(now);
  return G_SOURCE_CONTINUE;
 }}
+// Guest audio (Config::audio): SPICE playback PCM becomes kind-3 records
+// (u32 BE rate, u8 channels, s16le PCM) while a broker client listens, and
+// broker `audio_in` lines (48 kHz mono s16le, base64) feed SPICE record.
+// Audio is best effort: a backed-up stdout drops audio, never fails capture.
+static BOOL audioListening;static int playbackRate,playbackChannels;
+static SpiceRecordChannel *recordChannel;static int recordRate,recordChannels;
+static void playbackStart(SpicePlaybackChannel *channel,gint format,gint channels,gint rate,gpointer data){playbackRate=format==SPICE_AUDIO_FMT_S16?rate:0;playbackChannels=channels;}
+static void playbackStop(SpicePlaybackChannel *channel,gpointer data){playbackRate=0;}
+static void playbackData(SpicePlaybackChannel *channel,gpointer pcm,gint size,gpointer data){
+ if(!playbackRate||playbackChannels<1||playbackChannels>2||size<=0||size>65536)return;
+#ifdef VEYNODE_NATIVE_DISPLAY
+ VeynodeAudioPlay(pcm,(NSUInteger)size,playbackRate,playbackChannels);
+#endif
+ if(!audioListening||closing||fatal)return;
+#ifdef VEYNODE_NATIVE_DISPLAY
+ if(!outputWriter||outputWriter.pending>4)return;
+#else
+ struct pollfd p={.fd=STDOUT_FILENO,.events=POLLOUT};if(poll(&p,1,0)!=1||(p.revents&(POLLHUP|POLLERR|POLLNVAL)))return;
+#endif
+ uint32_t rate=CFSwapInt32HostToBig((uint32_t)playbackRate);uint8_t count=(uint8_t)playbackChannels;
+ NSMutableData *body=[NSMutableData dataWithBytes:&rate length:4];[body appendBytes:&count length:1];[body appendBytes:pcm length:(NSUInteger)size];record(3,0,body);
+}
+static void recordStart(SpiceRecordChannel *channel,gint format,gint channels,gint rate,gpointer data){recordRate=format==SPICE_AUDIO_FMT_S16?rate:0;recordChannels=channels;}
+static void recordStop(SpiceRecordChannel *channel,gpointer data){recordRate=0;}
+// Mono 48 kHz in; the record stream's own rate and channel count out (linear resampling).
+static void audioIn(NSData *mono){
+ if(!recordChannel||!recordRate||recordChannels<1||recordChannels>2||mono.length<2)return;
+ const int16_t *in=mono.bytes;NSUInteger frames=mono.length/2,outFrames=(NSUInteger)((uint64_t)frames*(uint64_t)recordRate/48000);if(!outFrames)return;
+ NSMutableData *out=[NSMutableData dataWithLength:outFrames*recordChannels*2];int16_t *o=out.mutableBytes;
+ for(NSUInteger i=0;i<outFrames;i++){double at=(double)i*48000/recordRate;NSUInteger a=MIN((NSUInteger)at,frames-1),b=MIN(a+1,frames-1);double t=at-(double)a;int16_t v=(int16_t)lrint(in[a]*(1-t)+in[b]*t);for(int c=0;c<recordChannels;c++)o[i*recordChannels+c]=v;}
+ spice_record_channel_send_data(recordChannel,o,out.length,(guint32)(g_get_monotonic_time()/1000));
+}
+// Guest clipboard (the Guest's spice-vdagent): a Guest copy becomes the event
+// {"event":"clipboard","text"}; viewer text arrives as broker `clipboard_chunk`
+// lines (base64 parts, the last with "last":true) and is offered to the Guest.
+// UTF-8 text only, at most clipboardMax bytes.
+static const NSUInteger clipboardMax=200*1024;
+static SpiceMainChannel *mainChannel;static NSData *hostClipboard;static NSMutableData *clipboardParts;static BOOL guestClipboard;
+static void clipboardEvent(NSDictionary *value){NSMutableDictionary *event=[value mutableCopy];event[@"event"]=@"clipboard";emit(0,event);
+#ifdef VEYNODE_NATIVE_DISPLAY
+ if(value[@"text"])VeynodeClipboardFromGuest(value[@"text"]);
+#endif
+}
+static gboolean clipboardGrab(SpiceMainChannel *channel,guint selection,guint32 *types,guint32 ntypes,gpointer data){
+ if(selection!=VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD)return FALSE;
+ guestClipboard=YES;hostClipboard=nil;
+ for(guint32 i=0;i<ntypes;i++)if(types[i]==VD_AGENT_CLIPBOARD_UTF8_TEXT){spice_main_channel_clipboard_selection_request(channel,selection,VD_AGENT_CLIPBOARD_UTF8_TEXT);return TRUE;}
+ return TRUE;
+}
+static void clipboardData(SpiceMainChannel *channel,guint selection,guint type,const guchar *bytes,guint size,gpointer data){
+ if(selection!=VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD||type!=VD_AGENT_CLIPBOARD_UTF8_TEXT)return;
+ if(size>clipboardMax){clipboardEvent(@{@"error":@"the Guest's clipboard is over 200 KiB"});return;}
+ NSString *text=[[NSString alloc] initWithBytes:bytes length:size encoding:NSUTF8StringEncoding];
+ // A Windows-style agent sends CRLF; the viewer's side is Unix text.
+ if(text&&spice_main_channel_agent_test_capability(channel,VD_AGENT_CAP_GUEST_LINEEND_CRLF))text=[text stringByReplacingOccurrencesOfString:@"\r\n" withString:@"\n"];
+ clipboardEvent(text?@{@"text":text}:@{@"error":@"the Guest's clipboard is not UTF-8 text"});
+}
+static gboolean clipboardRequest(SpiceMainChannel *channel,guint selection,guint type,gpointer data){
+ if(selection!=VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD||type!=VD_AGENT_CLIPBOARD_UTF8_TEXT||!hostClipboard)return FALSE;
+ spice_main_channel_clipboard_selection_notify(channel,selection,type,hostClipboard.bytes,hostClipboard.length);return TRUE;
+}
+static void clipboardRelease(SpiceMainChannel *channel,guint selection,gpointer data){if(selection==VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD)guestClipboard=NO;}
+static void clipboardSet(NSData *text){
+ if(text.length>clipboardMax||![[NSString alloc] initWithData:text encoding:NSUTF8StringEncoding]){clipboardEvent(@{@"error":@"clipboard text must be UTF-8 of at most 200 KiB"});return;}
+ gboolean agent=FALSE;if(mainChannel)g_object_get(mainChannel,"agent-connected",&agent,NULL);
+ if(!agent){clipboardEvent(@{@"error":@"the Guest runs no clipboard agent (spice-vdagent)"});return;}
+ hostClipboard=text;guestClipboard=NO;guint32 type=VD_AGENT_CLIPBOARD_UTF8_TEXT;
+ spice_main_channel_clipboard_selection_grab(mainChannel,VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD,&type,1);
+}
+static void clipboardGet(void){
+ if(guestClipboard&&mainChannel)spice_main_channel_clipboard_selection_request(mainChannel,VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD,VD_AGENT_CLIPBOARD_UTF8_TEXT);
+ else if(hostClipboard)clipboardEvent(@{@"text":[[NSString alloc] initWithData:hostClipboard encoding:NSUTF8StringEncoding]});
+ else clipboardEvent(@{@"text":@""});
+}
+#ifdef VEYNODE_NATIVE_DISPLAY
+// The native window's side runs on AppKit's thread; SPICE calls belong to the GLib loop's.
+static gboolean clipboardSetOnLoop(gpointer data){clipboardSet(CFBridgingRelease(data));return G_SOURCE_REMOVE;}
+static gboolean audioInOnLoop(gpointer data){audioIn(CFBridgingRelease(data));return G_SOURCE_REMOVE;}
+static gboolean clipboardGetOnLoop(gpointer data){clipboardGet();return G_SOURCE_REMOVE;}
+void VeynodeClipboardGet(void){g_main_context_invoke(NULL,clipboardGetOnLoop,NULL);}
+void VeynodeClipboardSet(NSString *text){g_main_context_invoke(NULL,clipboardSetOnLoop,(gpointer)CFBridgingRetain([text dataUsingEncoding:NSUTF8StringEncoding]));}
+// The native window's microphone, already mono 48 kHz s16le.
+void VeynodeAudioCapture(NSData *mono){g_main_context_invoke(NULL,audioInOnLoop,(gpointer)CFBridgingRetain(mono));}
+#endif
 static void channelEvent(SpiceChannel *channel,SpiceChannelEvent event,gpointer data){
  if(closing)return;
  if(channelLogCount++<32){int type=0,ident=0;g_object_get(channel,"channel-type",&type,"channel-id",&ident,NULL);NSData *log=[NSJSONSerialization dataWithJSONObject:@{@"event":@"channel-event",@"channel_type":@(type),@"channel_id":@(ident),@"event_code":@(event)} options:NSJSONWritingSortedKeys error:nil];fwrite(log.bytes,1,log.length,stderr);fputc('\n',stderr);fflush(stderr);}
@@ -422,6 +519,12 @@ static void channelEvent(SpiceChannel *channel,SpiceChannelEvent event,gpointer 
  clearCache();captureFail(@"spice_disconnected");}
 }
 static void newChannel(SpiceSession *session,SpiceChannel *channel,gpointer data){
+ if(SPICE_IS_MAIN_CHANNEL(channel)){mainChannel=SPICE_MAIN_CHANNEL(channel);g_signal_connect(channel,"main-clipboard-selection-grab",G_CALLBACK(clipboardGrab),NULL);g_signal_connect(channel,"main-clipboard-selection-request",G_CALLBACK(clipboardRequest),NULL);g_signal_connect(channel,"main-clipboard-selection-release",G_CALLBACK(clipboardRelease),NULL);g_signal_connect(channel,"main-clipboard-selection",G_CALLBACK(clipboardData),NULL);}
+#ifdef VEYNODE_NATIVE_DISPLAY
+ if(SPICE_IS_PLAYBACK_CHANNEL(channel))VeynodeAudioAvailable();
+#endif
+ if(SPICE_IS_PLAYBACK_CHANNEL(channel)){g_signal_connect(channel,"playback-start",G_CALLBACK(playbackStart),NULL);g_signal_connect(channel,"playback-stop",G_CALLBACK(playbackStop),NULL);g_signal_connect(channel,"playback-data",G_CALLBACK(playbackData),NULL);spice_channel_connect(channel);return;}
+ if(SPICE_IS_RECORD_CHANNEL(channel)){recordChannel=SPICE_RECORD_CHANNEL(channel);g_signal_connect(channel,"record-start",G_CALLBACK(recordStart),NULL);g_signal_connect(channel,"record-stop",G_CALLBACK(recordStop),NULL);spice_channel_connect(channel);return;}
  if(SPICE_IS_DISPLAY_CHANNEL(channel)){g_signal_connect(channel,"notify::gl-scanout",G_CALLBACK(scanout),NULL);g_signal_connect(channel,"gl-draw",G_CALLBACK(draw),NULL);g_signal_connect(channel,"channel-event",G_CALLBACK(channelEvent),NULL);spice_channel_connect(channel);}
  else if(SPICE_IS_MAIN_CHANNEL(channel))g_signal_connect(channel,"channel-event",G_CALLBACK(channelEvent),NULL);
 }
@@ -433,7 +536,7 @@ static void windowCommand(NSString *method,NSString *ident,NSDictionary *frame,N
  if(displayCommandPending){reject(ident,0,@"native_window_busy");return;}displayCommandPending=YES;
  GMainContext *context=g_main_context_ref(g_main_loop_get_context(loop));
  VeynodeDisplayCommand(method,frame,diagnosticID,receiptFields,^(NSDictionary *result,NSString *error){
-  void (^finish)(void)=[^{displayCommandPending=NO;if(!closing&&!fatal){if(error)reject(ident,0,error);else{if([method isEqual:@"show_window"]&&cacheValid())VeynodeDisplayPublish(owned,generation,sequence,capturedMono);if([method isEqual:@"validate_displayed_frame"]){reply(ident,0,result);return;}NSMutableDictionary *status=[result mutableCopy];if(!copyTiming)copyTiming=[VNCopyTiming new];status[@"copy_timing"]=[copyTiming statistics];status[@"screenshot_timing"]=lastScreenshotTiming?:[NSNull null];status[@"source_width"]=@(cacheValid()?sourceWidth:0);status[@"source_height"]=@(cacheValid()?sourceHeight:0);status[@"source_frame_available"]=@(cacheValid());status[@"encoder_width"]=@(encoder?width:0);status[@"encoder_height"]=@(encoder?height:0);status[@"source_draw_events"]=@(received);status[@"source_copies"]=@(sourceCopies);status[@"capture_pacing_drops"]=@(capturePacingDrops);status[@"capture_pool_drops"]=@(capturePoolDrops);status[@"visible_source_copies"]=@(visibleSourceCopies);status[@"background_source_copies"]=@(backgroundSourceCopies);status[@"encoder_output_frames_current_epoch"]=@(encoded);status[@"encoder_idle_frames_current_epoch"]=@(idleFrames);status[@"encoder_active"]=@(active);status[@"sampled_monotonic_us"]=@(g_get_monotonic_time());reply(ident,0,status);}}} copy];
+  void (^finish)(void)=[^{displayCommandPending=NO;if(!closing&&!fatal){if(error)reject(ident,0,error);else{if([method isEqual:@"show_window"]&&cacheValid())VeynodeDisplayPublish(owned,generation,sequence,capturedMono);if([method isEqual:@"validate_displayed_frame"]){reply(ident,0,result);return;}NSMutableDictionary *status=[result mutableCopy];if(!copyTiming)copyTiming=[VNCopyTiming new];status[@"copy_timing"]=[copyTiming statistics];status[@"screenshot_timing"]=lastScreenshotTiming?:[NSNull null];status[@"source_width"]=@(cacheValid()?sourceWidth:0);status[@"source_height"]=@(cacheValid()?sourceHeight:0);status[@"source_frame_available"]=@(cacheValid());status[@"encoder_width"]=@(encoder?width:0);status[@"encoder_height"]=@(encoder?height:0);status[@"source_draw_events"]=@(received);status[@"source_copies"]=@(sourceCopies);status[@"capture_pacing_drops"]=@(capturePacingDrops);status[@"capture_pool_drops"]=@(capturePoolDrops);status[@"visible_source_copies"]=@(visibleSourceCopies);status[@"background_source_copies"]=@(backgroundSourceCopies);status[@"encoder_output_frames_current_epoch"]=@(encoded);status[@"encoder_idle_frames_current_epoch"]=@(idleFrames);status[@"encoder_unchanged_skips_current_epoch"]=@(unchangedSkips);status[@"encoder_active"]=@(active);status[@"sampled_monotonic_us"]=@(g_get_monotonic_time());reply(ident,0,status);}}} copy];
   // A C trampoline owns the retained block; no stdout emission from AppKit.
   extern gboolean VeynodeConsoleInvoke(gpointer);
   extern void VeynodeConsoleInvokeFree(gpointer);
@@ -510,11 +613,20 @@ static NSDictionary *screenshot(NSDictionary **diagnostic){
 static void command(NSData *line){
  id obj=[NSJSONSerialization JSONObjectWithData:line options:0 error:nil];
  if(![obj isKindOfClass:NSDictionary.class]){reject(nil,0,@"invalid_request");return;}NSDictionary *request=obj;id ident=request[@"id"];
+ // Microphone frames are fire-and-forget: no id, no reply.
+ if([request[@"method"] isEqual:@"audio_in"]&&request.count==2&&[request[@"pcm"] isKindOfClass:NSString.class]){NSData *pcm=[[NSData alloc] initWithBase64EncodedString:request[@"pcm"] options:0];if(pcm.length&&pcm.length<=1920&&!(pcm.length%2))audioIn(pcm);return;}
+ // Clipboard parts are fire-and-forget too; a malformed or oversized text is dropped whole.
+ if([request[@"method"] isEqual:@"clipboard_chunk"]&&request.count==3&&[request[@"data"] isKindOfClass:NSString.class]&&[request[@"last"] isKindOfClass:NSNumber.class]){
+  NSData *part=[[NSData alloc] initWithBase64EncodedString:request[@"data"] options:0];if(!clipboardParts)clipboardParts=[NSMutableData new];
+  if(!part||clipboardParts.length+part.length>clipboardMax){clipboardParts=nil;clipboardEvent(@{@"error":@"clipboard text must be UTF-8 of at most 200 KiB"});return;}
+  [clipboardParts appendData:part];if([request[@"last"] boolValue]){clipboardSet(clipboardParts);clipboardParts=nil;}return;}
+ if([request[@"method"] isEqual:@"clipboard_get"]&&request.count==1){clipboardGet();return;}
  if(!([ident isKindOfClass:NSString.class]&&[ident length]>0&&[ident length]<=128)){reject(nil,0,@"invalid_id");return;}
 #ifdef VEYNODE_NATIVE_DISPLAY
  if(shutdownID){reject(ident,0,@"shutdown_pending");return;}
 #endif
  NSString *method=request[@"method"];if(![method isKindOfClass:NSString.class]){reject(ident,0,@"invalid_method");return;}
+ if([method isEqual:@"audio_start"]||[method isEqual:@"audio_stop"]){if(request.count!=2){reject(ident,0,@"invalid_request");return;}audioListening=[method isEqual:@"audio_start"];reply(ident,0,@{@"listening":@(audioListening),@"playback":@(playbackRate>0),@"record":@(recordChannel!=NULL)});return;}
  if([method isEqual:@"capabilities"]){if(request.count!=2){reject(ident,0,@"invalid_window_request");return;}reply(ident,0,displayCapabilities());return;}
  if([@[@"show_window",@"close_window",@"window_status",@"validate_displayed_frame"] containsObject:method]){
   BOOL validating=[method isEqual:@"validate_displayed_frame"];id diagnosticID=request[@"diagnostic_id"];
@@ -554,7 +666,7 @@ static void command(NSData *line){
   NSString *codec=request[@"codec"];if(![codec isKindOfClass:NSString.class]||(![codec isEqual:@"h264"]&&![codec isEqual:@"hevc"])){reject(ident,e,@"unsupported_codec");return;}
   id level=request[@"level"];if(level&&(![level isKindOfClass:NSNumber.class]||CFGetTypeID((__bridge CFTypeRef)level)==CFBooleanGetTypeID()||![codec isEqual:@"h264"]||([level intValue]!=31&&[level intValue]!=40))){reject(ident,e,@"unsupported_level");return;}
   h264Level=level?[level intValue]:31;
-  epoch=lastEpoch=e;codecName=codec;useHEVC=[codec isEqual:@"hevc"];active=YES;forceKeyframe=YES;cropX=cropY=cropWidth=cropHeight=scaleWidth=scaleHeight=0;carriedBitrate=nil;firstPTS=lastEncode=0;encoded=keyframes=idleFrames=0;actualH264Profile=nil;actualHEVCProfile=nil;hardwareVerified=NO;failure=nil;
+  epoch=lastEpoch=e;codecName=codec;useHEVC=[codec isEqual:@"hevc"];active=YES;streamFPS=maxStreamFPS;encodePacing.initialized=false;forceKeyframe=YES;cropX=cropY=cropWidth=cropHeight=scaleWidth=scaleHeight=0;carriedBitrate=nil;firstPTS=lastEncode=0;encoded=keyframes=idleFrames=unchangedSkips=0;actualH264Profile=nil;actualHEVCProfile=nil;hardwareVerified=NO;failure=nil;
   reply(ident,e,@{@"state":cacheValid()?@"encoding":@"waiting-frame",@"epoch":@(epoch),@"frame_available":@(cacheValid())});if(cacheValid())encodeLatest(g_get_monotonic_time(),NO);return;
  }
  if(!active||e!=epoch){reject(ident,e,@"stale_or_inactive_epoch");return;}
@@ -586,6 +698,10 @@ static void command(NSData *line){
   }
   NSMutableDictionary *result=[viewFields(&after) mutableCopy];[result removeObjectForKey:@"event"];result[@"width"]=@(after.outW);result[@"height"]=@(after.outH);result[@"source_width"]=@(sourceWidth);result[@"source_height"]=@(sourceHeight);
   reply(ident,e,result);return;
+ }
+ if([method isEqual:@"set_fps"]){
+  if(!rateUInt(request[@"fps"],1,maxStreamFPS)){reject(ident,e,@"invalid_request");return;}
+  streamFPS=[request[@"fps"] unsignedIntValue];reply(ident,e,@{@"fps":@(streamFPS)});return;
  }
  if([method isEqual:@"stop"]){closeEncoder();if(failure){reject(ident,e,@"encoder_drain_failed");failure=nil;return;}reply(ident,e,@{@"state":@"stopped",@"encoded":@(encoded),@"keyframes":@(keyframes),@"idle_frames":@(idleFrames),@"frame_available":@(cacheValid()),@"source_generation":@(generation),@"source_sequence":@(sequence)});return;}
  if([method isEqual:@"keyframe"]){forceKeyframe=YES;reply(ident,e,@{@"requested":@YES});if(cacheValid()&&g_get_monotonic_time()-lastEncode>=33333)encodeLatest(g_get_monotonic_time(),YES);return;}
@@ -627,7 +743,7 @@ int main(int argc,char **argv){@autoreleasepool{
 #ifdef VEYNODE_NATIVE_DISPLAY
  outputWriter=[[VNRecordWriter alloc] initWithFD:STDOUT_FILENO];if(!outputWriter)return 1;
 #endif
- loop=g_main_loop_new(NULL,FALSE);SpiceSession *session=spice_session_new();g_object_set(session,"unix-path",argv[1],NULL);g_signal_connect(session,"channel-new",G_CALLBACK(newChannel),NULL);
+ loop=g_main_loop_new(NULL,FALSE);SpiceSession *session=spice_session_new();g_object_set(session,"unix-path",argv[1],"enable-audio",TRUE,NULL);g_signal_connect(session,"channel-new",G_CALLBACK(newChannel),NULL);
  GIOChannel *channel=g_io_channel_unix_new(STDIN_FILENO);g_io_add_watch(channel,G_IO_IN|G_IO_HUP|G_IO_ERR,control,NULL);g_timeout_add(100,tick,NULL);g_timeout_add(2,flush,NULL);
 #ifdef VEYNODE_NATIVE_DISPLAY
  g_timeout_add(10,screenshotTick,NULL);

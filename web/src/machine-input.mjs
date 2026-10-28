@@ -1,8 +1,7 @@
-// Input checks for `veynodevm machine ...` and the macOS pull, kept free of
-// I/O so they run in the server functions' validators and in web/test. They
-// mirror crates/cli/src/machine.rs; the CLI checks everything again. Every
-// value ends up as one argv element (no shell), and none can start with `-`,
-// so nothing typed in the browser can become a CLI option.
+// Input checks for `machine.*` and the macOS pull, kept free of I/O so they
+// run in the server functions' validators and in web/test, and the API 1
+// arguments they become (docs/api.md), as crates/cli/src/machine.rs sends
+// them; the daemon checks everything again.
 
 export const NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/
 const MEMORY = /^(\d{1,7})([mMgG])?$/
@@ -124,19 +123,37 @@ export function createInput(input) {
   return out
 }
 
-/** The argv after `veynodevm --json` for a checked `createInput`. */
-export function createArgs(spec) {
-  const args = ['machine', 'create', spec.name, '--os', spec.os]
-  if (spec.iso) args.push('--iso', spec.iso)
-  if (spec.diskSize) args.push('--disk-size', spec.diskSize)
-  if (spec.memory) args.push('--memory', spec.memory)
-  if (spec.cpus) args.push('--cpus', String(spec.cpus))
-  if (spec.gpus) args.push('--gpus', spec.gpus)
-  if (spec.backend) args.push('--backend', spec.backend)
-  if (spec.diskBus) args.push('--disk-bus', spec.diskBus)
-  if (spec.monitor) args.push('--monitor')
-  for (const p of spec.ports) args.push('--publish', p)
-  for (const a of spec.attach) args.push('--attach', a)
+/** `4g`, `4096m`, `4096` → MiB, for a value `memory` accepted. */
+export function memoryMiB(value) {
+  const m = MEMORY.exec(value)
+  return Number(m[1]) * (/[gG]/.test(m[2] ?? '') ? 1024 : 1)
+}
+
+/** `64G`, `1T`, `64` → GiB, for a value `diskSize` accepted. */
+export function diskGiB(value) {
+  const m = DISK.exec(value)
+  return Number(m[1]) * (/[tT]/.test(m[2] ?? '') ? 1024 : 1)
+}
+
+/** `HOST:GUEST` → `{host, guest}`, for a value `port` accepted. */
+export function portPair(value) {
+  const [host, guest] = value.split(':').map(Number)
+  return { host, guest }
+}
+
+/** The `machine.create` arguments for a checked `createInput`. */
+export function createRequest(spec) {
+  const args = { name: spec.name, os: spec.os }
+  if (spec.gpus) args.gpu = spec.gpus
+  if (spec.backend) args.backend = spec.backend
+  if (spec.diskBus) args.diskBus = spec.diskBus
+  if (spec.iso) args.iso = spec.iso
+  if (spec.diskSize) args.diskGiB = diskGiB(spec.diskSize)
+  if (spec.cpus) args.cpus = spec.cpus
+  if (spec.memory) args.memoryMiB = memoryMiB(spec.memory)
+  if (spec.monitor) args.monitor = true
+  if (spec.attach.length) args.attach = spec.attach
+  if (spec.ports.length) args.ports = spec.ports.map(portPair)
   return args
 }
 
@@ -151,11 +168,11 @@ export function displaySize(input) {
 
 export const MACHINE_ACTIONS = ['start', 'stop', 'kill', 'eject', 'rm']
 
-/** `{action, name}` → the argv after `veynodevm --json`. */
-export function actionArgs(input) {
+/** `{action, name}` → the method and its arguments; `start` is a stream. */
+export function actionRequest(input) {
   const v = input && typeof input === 'object' ? input : {}
   if (!MACHINE_ACTIONS.includes(v.action)) throw new Error('invalid action')
   const name = machineName(v.name)
-  if (v.action === 'kill') return ['machine', 'stop', '--force', name]
-  return ['machine', v.action, name]
+  if (v.action === 'kill') return { method: 'machine.stop', args: { name, force: true } }
+  return { method: `machine.${v.action}`, args: { name } }
 }

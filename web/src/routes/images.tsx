@@ -10,7 +10,7 @@ import { SettingsGroup } from '@ui/settings/settings-section'
 import { ImageIcon } from '../container-icon'
 import { RunDialog } from '../run-dialog'
 import { listImages, pullImage, removeImage } from '../api'
-import { ConfirmDialog, EmptyState, FormDialog, PageActions, PageBody, PanelLoadError, age, message, size, useToast, useToastAction } from '../ui'
+import { ConfirmDialog, EmptyState, FormDialog, PageActions, PageBody, PanelLoadError, age, message, shortRef, size, useToast, useToastAction } from '../ui'
 
 export const Route = createFileRoute('/images')({
   loader: () => listImages(),
@@ -42,7 +42,7 @@ function Images() {
             <ListRow
               key={i.reference}
               icon={<ImageIcon reference={i.reference} />}
-              title={i.reference}
+              title={shortRef(i.reference)}
               meta={`${size(i.size)} · ${age(i.created_at)}`}
               metaWhole
               actions={

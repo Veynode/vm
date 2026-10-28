@@ -15,7 +15,7 @@ RUN apt-get update \
       xserver-xorg-core xserver-xorg-input-libinput x11-xserver-utils udev \
       xfce4 xfce4-terminal dbus dbus-x11 adwaita-icon-theme fonts-dejavu-core \
       mesa-vulkan-drivers libgl1-mesa-dri libegl1 mesa-utils vulkan-tools ca-certificates \
-      at-spi2-core \
+      at-spi2-core pipewire pipewire-bin pipewire-pulse pipewire-alsa wireplumber spice-vdagent \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=zink-layer /src/libVkLayer_veynodevm_zink.so /usr/lib/aarch64-linux-gnu/
 COPY zink/veynodevm_zink_layer.json /usr/share/vulkan/implicit_layer.d/
@@ -34,6 +34,7 @@ RUN tar -xzf /tmp/cua-driver.tar.gz -C /tmp \
  && install -D -m 0644 -t /usr/share/doc/cua-driver /tmp/cua-driver-rs-0.38.0-linux-arm64/LICENSE /tmp/cua-driver-rs-0.38.0-linux-arm64/THIRD_PARTY_NOTICES.md \
  && rm -rf /tmp/cua-driver.tar.gz /tmp/cua-driver-rs-0.38.0-linux-arm64
 COPY desktop/veynodevm-desktop /usr/local/bin/veynodevm-desktop
+COPY desktop/veynodevm-audio.conf /etc/pipewire/pipewire.conf.d/veynodevm-audio.conf
 COPY desktop/10-veynodevm.conf /etc/X11/xorg.conf.d/10-veynodevm.conf
 ENV VEYNODEVM_DESKTOP_USER=veynode VK_DRIVER_FILES=/usr/share/vulkan/icd.d/virtio_icd.json
 CMD ["/usr/local/bin/veynodevm-desktop"]
