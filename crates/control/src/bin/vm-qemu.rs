@@ -385,7 +385,8 @@ impl Qmp {
             if Instant::now() >= deadline {
                 bail!("QMP startup timed out after 12 seconds")
             }
-            thread::sleep(Duration::from_millis(50));
+            // QEMU binds the socket within a few hundred ms; a refused connect is cheap.
+            thread::sleep(Duration::from_millis(5));
         };
         stream.set_read_timeout(Some(Duration::from_secs(3)))?;
         stream.set_write_timeout(Some(Duration::from_secs(3)))?;
@@ -1724,7 +1725,13 @@ fn run() -> Result<bool> {
     let guest_exec = config
         .qemu_guest_exec
         .then(|| {
-            guest_transport::nonce().map(|host| guest_exec::Transport::start(&agent_path, host))
+            // Readiness and replies wake the loop instead of waiting out its timeout.
+            let wake = capture_wake.clone();
+            guest_transport::nonce().map(|host| {
+                guest_exec::Transport::start_notifying(&agent_path, host, move || {
+                    let _ = wake.try_send(Wake::Observe);
+                })
+            })
         })
         .transpose()?;
     let mut exec_pending: Vec<(Value, guest_exec::Pending)> = Vec::new();

@@ -1453,10 +1453,14 @@ pub fn exec_as(
                 && (text.contains("guest_unavailable") || text.contains("invalid_state")));
         refused && active(&vm_state(container))
     };
+    // A refusal costs one local round trip, so retry soon: 10 ms doubling to 100 ms
+    // keeps a just-started container's first exec within ~100 ms of the Guest.
+    let mut delay = Duration::from_millis(10);
     loop {
         match exec_once(container, argv, timeout_ms, identity) {
             Err(e) if retryable(&e) && Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(500));
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_millis(100));
             }
             other => return other,
         }
@@ -1526,6 +1530,7 @@ pub fn wait_for_ip(container: &Container, timeout: Duration) -> Result<String> {
     let deadline = Instant::now() + timeout;
     let path = container_dir(&container.id)?.join("console.log");
     let mut position = 0;
+    let mut delay = Duration::from_millis(10);
     loop {
         if let Ok(mut file) = File::open(&path) {
             file.seek(SeekFrom::Start(position))?;
@@ -1548,7 +1553,8 @@ pub fn wait_for_ip(container: &Container, timeout: Duration) -> Result<String> {
         if Instant::now() > deadline {
             bail!("timed out waiting for container IP address")
         }
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(Duration::from_millis(100));
     }
 }
 

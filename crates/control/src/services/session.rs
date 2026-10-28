@@ -124,6 +124,8 @@ pub fn connect(container: &Container, request: &Request) -> Result<TcpStream> {
     line.push(b'\n');
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut last_error = None;
+    // A refused connect is cheap; retry soon while the Guest is still coming up.
+    let mut delay = Duration::from_millis(10);
     while Instant::now() < deadline {
         if !container::active(&container::vm_state(&container)) {
             bail!("container {} is not running", container.name)
@@ -143,7 +145,8 @@ pub fn connect(container: &Container, request: &Request) -> Result<TcpStream> {
             Ok(Err(refusal)) => bail!("{}: {refusal}", container.name),
             Err(e) => last_error = Some(e),
         }
-        thread::sleep(Duration::from_millis(500));
+        thread::sleep(delay);
+        delay = (delay * 2).min(Duration::from_millis(100));
     }
     Err(last_error
         .unwrap_or_else(|| anyhow::anyhow!("timed out"))

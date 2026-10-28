@@ -205,13 +205,20 @@ impl Transport {
     pub fn state(&self) -> &'static str {
         *self.state.lock().unwrap()
     }
+    #[cfg(test)]
     pub fn start(path: &Path, host: String) -> Self {
-        Self::start_configured(path, host, |_| Ok(()))
+        Self::start_notifying(path, host, || {})
+    }
+    /// `notify` runs on this transport's thread whenever `state()` changes or a
+    /// `Pending` gets its result, so a caller can block instead of polling for them.
+    pub fn start_notifying(path: &Path, host: String, notify: impl Fn() + Send + 'static) -> Self {
+        Self::start_configured(path, host, |_| Ok(()), notify)
     }
     fn start_configured(
         path: &Path,
         host: String,
         setup: impl FnOnce(&UnixStream) -> Result<()> + Send + 'static,
+        notify: impl Fn() + Send + 'static,
     ) -> Self {
         let (tx, rx) = mpsc::sync_channel::<Task>(2);
         let state = Arc::new(Mutex::new("starting"));
@@ -278,6 +285,7 @@ impl Transport {
                     bail!("serial execution handshake rejected")
                 }
                 *status.lock().unwrap() = "ready";
+                notify();
                 let mut sequence = 0u64;
                 let mut pending = BTreeMap::<u64, Awaited>::new();
                 let mut bytes = Vec::new();
@@ -405,6 +413,7 @@ impl Transport {
                         if let Some(task) = record.task {
                             task.lane.store(false, Ordering::Release);
                             let _ = task.reply.send(Ok(response));
+                            notify();
                         }
                     }
                     // Sleep in poll(2) until the socket has bytes (a reply, EOF or a
@@ -436,6 +445,7 @@ impl Transport {
             stopped.store(true, Ordering::Release);
             *status.lock().unwrap() = "fenced";
             saved.lock().unwrap().stop();
+            notify();
         });
         Self {
             tx,
@@ -1069,22 +1079,27 @@ mod tests {
             );
             bytes.len()
         });
-        let transport = Transport::start_configured(&path, "c".repeat(64), |socket| {
-            let size: libc::c_int = 1024;
-            if unsafe {
-                libc::setsockopt(
-                    socket.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_SNDBUF,
-                    (&size as *const libc::c_int).cast(),
-                    std::mem::size_of_val(&size) as libc::socklen_t,
-                )
-            } != 0
-            {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            Ok(())
-        });
+        let transport = Transport::start_configured(
+            &path,
+            "c".repeat(64),
+            |socket| {
+                let size: libc::c_int = 1024;
+                if unsafe {
+                    libc::setsockopt(
+                        socket.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_SNDBUF,
+                        (&size as *const libc::c_int).cast(),
+                        std::mem::size_of_val(&size) as libc::socklen_t,
+                    )
+                } != 0
+                {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                Ok(())
+            },
+            || {},
+        );
         ready.recv_timeout(Duration::from_secs(2)).unwrap();
         let mut pending=transport.request_before(json!({"id":"start","method":"exec_start","argv":["/bin/echo","x".repeat(7000),"y".repeat(7000),"z".repeat(7000),"w".repeat(7000)],"timeout_ms":1000}),Instant::now()+Duration::from_millis(20)).unwrap();
         // Reader resumes at 50ms, between the 20ms dispatch deadline and the old
