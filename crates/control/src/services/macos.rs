@@ -775,11 +775,12 @@ pub fn create_and_start(
             init: None,
             tty: false,
             stdin: false,
+            idle_pause_s: options.idle_pause_s,
         };
         container::save(&container)?;
         daemon_call("create", vm)?;
-        if let Err(e) =
-            daemon_call("start", json!({"id":vm_id})).and_then(|_| wait_started(&container))
+        if let Err(e) = daemon_call("start", container::start_request(&container))
+            .and_then(|_| wait_started(&container))
         {
             let _ = daemon_call("force_stop", json!({"id":vm_id,"confirm":vm_id}));
             let _ = daemon_call("delete", json!({"id":vm_id,"confirm":vm_id}));
@@ -1178,6 +1179,7 @@ pub fn create_machine(ctx: &Ctx, args: &Value, io: &StreamIo) -> Result<Value> {
             disk_source: None,
             image: Some(image.reference.clone()),
             drivers_iso: None,
+            idle_pause_s: None,
         };
         machines::save(&machine)?;
         Ok(machines::view(ctx, &machine))

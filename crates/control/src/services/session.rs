@@ -322,6 +322,7 @@ pub fn terminal(_: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
         out.lock().unwrap().write_all(&bytes)?;
         Ok(())
     };
+    let _awake = super::util::KeepAwake::new(&super::util::vm_of(name));
     let result = (|| -> Result<i32> {
         let session = open(name, rows, cols, argv)?;
         record(1, br#"{"event":"ready"}"#)?;

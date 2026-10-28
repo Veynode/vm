@@ -52,6 +52,43 @@
 - Hard links whose target is hidden by a later layer are skipped during
   flattening (reported as a warning).
 
+## Pause and idle pause
+
+- `pause` and `--idle-pause` save CPU and power, not memory: the Guest's RAM
+  stays resident. Neither balloon nor free page reporting returns it to the
+  host on either backend (`memory_reclaim` in the capabilities).
+- Idle is what the host sees: API and MCP calls on the VM, open console and
+  desktop viewers, terminals, exec and attach streams, running Guest jobs and
+  connections through an Apple container's published ports. A batch job,
+  cron or download inside the Guest that nobody on the host is waiting for
+  does not count, and is frozen when the VM is paused; set `--idle-pause` only
+  where that is acceptable.
+- QEMU containers and machines publish ports with slirp `hostfwd`, which the
+  daemon does not see: traffic to them neither keeps the VM awake nor wakes
+  it, and a connection to a paused QEMU VM hangs until something else resumes
+  it.
+- After a resume the Guest's wall clock lags by the time spent paused. Apple
+  Linux Guests running the agent are stepped to the host clock
+  (`clock_sync`); QEMU Guests and macOS and Windows Guests keep the lag until
+  their own time sync corrects it. Open TCP connections to the outside may
+  have timed out.
+- The idle policy lives in the container or machine record and is handed to
+  the daemon at each start; VMs started through the VM layer alone have none
+  unless `start` or `idle_policy` sets it. The shared engine is never paused.
+- QEMU's serial execution transport fences itself (and stops QEMU) when the
+  Guest misses heartbeats; the worker suspends that check from just before
+  `stop` until `cont` succeeds, so a paused Guest's silence is not a fault.
+- Checked live once, 2026-10-28, with `alpine:3.20` containers and
+  `--idle-pause 60s` on both backends: the idle pause came 60-70 s after the
+  last activity; `exec` resumed a VM paused for idleness (Apple 1.3 s, QEMU
+  0.16 s end to end) and it paused again 66 s later; on Apple an HTTP request
+  through a published port resumed it and was answered (0.05 s), and the
+  Guest clock was stepped to the host's, while a QEMU Guest lagged by about
+  the time spent paused; `pause` refused `exec` until `unpause`, and `stop`
+  of a paused container worked (QEMU in 10 s, as when it is not paused).
+  Machines, macOS containers, desktops and the native console were not
+  checked, and the web UI has no pause buttons (it shows `Up (Paused)`).
+
 ## Checkpoints, rollback and forks
 
 - Memory is saved only on Apple Virtualization, for containers created since

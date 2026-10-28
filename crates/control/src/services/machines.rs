@@ -55,6 +55,10 @@ pub struct Machine {
     /// The driver image attached for a Windows install.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drivers_iso: Option<PathBuf>,
+    /// `machine update --idle-pause`: the daemon pauses the VM after this
+    /// many seconds without activity (`crate::idle`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_pause_s: Option<u64>,
 }
 
 fn linux() -> String {
@@ -348,6 +352,7 @@ pub fn view(ctx: &Ctx, machine: &Machine) -> Value {
         "createdAt": machine.created_at,
         "diskUsedBytes": used,
         "icon": machine.icon,
+        "idlePauseS": machine.idle_pause_s.unwrap_or(0),
         "vmState": raw,
         "record": machine,
         "vm": status,
@@ -585,6 +590,7 @@ pub fn create(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
             disk_source: disk.clone(),
             image: None,
             drivers_iso: opt_string(&args, "driversIso")?.map(PathBuf::from),
+            idle_pause_s: None,
         };
         save(&machine)?;
         Ok(view(ctx, &machine))
@@ -640,7 +646,10 @@ pub fn start(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
         return Err(state_error(format!("{name} is running")));
     }
     io.progress("Starting")?;
-    ctx.vm("start", json!({"id":name}))?;
+    ctx.vm(
+        "start",
+        json!({"id":name,"idle_pause_s":machine.idle_pause_s.unwrap_or(0)}),
+    )?;
     if flag(&args, "wait")? {
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
@@ -658,6 +667,22 @@ pub fn start(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
         }
     }
     Ok(view(ctx, &machine))
+}
+
+/// `machine.pause`: stops the VM's vCPUs; its memory stays in use.
+pub fn pause(ctx: &Ctx, args: Value) -> Result<Value> {
+    let name = name_arg(&args)?;
+    load(&name)?;
+    ctx.vm("pause", json!({"id":name}))?;
+    Ok(json!({ "name": name }))
+}
+
+/// `machine.unpause`: resumes a paused machine.
+pub fn unpause(ctx: &Ctx, args: Value) -> Result<Value> {
+    let name = name_arg(&args)?;
+    load(&name)?;
+    ctx.vm("resume", json!({"id":name}))?;
+    Ok(json!({ "name": name }))
 }
 
 pub fn stop(ctx: &Ctx, args: Value) -> Result<Value> {
@@ -861,8 +886,23 @@ pub fn grown_disk(current: u64, requested: Option<u64>) -> Result<Option<u64>> {
 
 pub fn update(ctx: &Ctx, args: Value) -> Result<Value> {
     let name = name_arg(&args)?;
-    let changes = Changes::from_args(&args)?;
     let mut machine = load(&name)?;
+    // The idle pause needs no restart: it is recorded, and a running VM gets it now.
+    if let Some(seconds) = opt_u64(&args, "idlePauseS")? {
+        machine.idle_pause_s =
+            super::container::check_idle_pause(seconds).map_err(|e| invalid(e.to_string()))?;
+        save(&machine)?;
+        if running(&vm_state(ctx, &name)) {
+            ctx.vm("idle_policy", json!({"id":name,"idle_pause_s":seconds}))?;
+        }
+        if args
+            .as_object()
+            .is_some_and(|a| a.keys().all(|k| k == "name" || k == "idlePauseS"))
+        {
+            return Ok(json!({ "name": name }));
+        }
+    }
+    let changes = Changes::from_args(&args)?;
     let old = stopped_config(ctx, &name, "changing its hardware")?;
     let mut config = old.clone();
     edit_config(&mut config, &machine, &changes)?;
@@ -1194,6 +1234,7 @@ pub fn endpoints(ctx: &Ctx, args: Value) -> Result<Value> {
 pub fn exec(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
     let name = name_arg(&args)?;
     let machine = load(&name)?;
+    let _awake = util::KeepAwake::new(&name);
     let status = ctx.vm("status", json!({"id":name}))?;
     if !running(status["state"].as_str().unwrap_or("unknown")) {
         return Err(state_error(format!("{name} is not running")));
@@ -1343,6 +1384,7 @@ mod tests {
             disk_source: None,
             image: None,
             drivers_iso: None,
+            idle_pause_s: None,
         }
     }
 

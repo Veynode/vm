@@ -248,6 +248,8 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
     var ownerDisconnected = false
     var ownerRetiring = false
     var snapshotRetirement: LinuxSnapshotRetirement?
+    // Commands that arrive while `resume` is in progress, run once it ends.
+    var resumeQueue: [[String:Any]]?
     var guestIOActive = 0
     var serialWritesActive = 0
     let snapshotIO = DispatchQueue(label:"veynode.linux-snapshot.io",qos:.utility)
@@ -788,6 +790,7 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
     }
     func command(_ object:[String:Any]) {
         guard !ownerDisconnected else { return }
+        if resumeQueue != nil, object["method"] as? String != "status" { resumeQueue!.append(object); return }
         let id = object["id"] ?? NSNull()
         func ok(_ result:Any) { emit(["id":id,"result":result]) }
         func error(_ code:String,_ message:String) { emit(["id":id,"error":["code":code,"message":message]]) }
@@ -799,6 +802,7 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
         case "snapshot_support", "snapshot_capture", "snapshot_resume", "snapshot_retire":
             linuxSnapshotCommand(object)
         case "machine_state_save": machineStateSave(object)
+        case "pause", "resume": pauseResume(object)
         case "guest_request": guestRequest(object)
         case "guest_stream_probe":
             guard Set(object.keys).isSubset(of:["id","method"]) else { error("invalid_request","Expected only id and method"); return }

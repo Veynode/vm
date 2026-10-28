@@ -93,6 +93,8 @@ pub fn classify(message: &str) -> ErrorCode {
         "in use",
         "is running",
         "not running",
+        "is paused",
+        "not paused",
         "is stopped",
         "busy",
         "must be stopped",

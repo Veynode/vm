@@ -17,6 +17,7 @@ const LINUX_PIECE: usize = 384 * 1024;
 
 pub fn copy(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
     let name = machines::resolve(string(&args, "name")?);
+    let _awake = super::util::KeepAwake::new(&name);
     let host = Path::new(string(&args, "hostPath")?);
     let guest = string(&args, "guestPath")?;
     let inward = match string(&args, "direction")? {

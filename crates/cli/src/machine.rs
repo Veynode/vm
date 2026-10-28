@@ -3,7 +3,11 @@
 //! installed from the user's own ISO (`--os windows`, QEMU/HVF only). The
 //! daemon owns machines (`machine.*` in docs/api.md); this module turns flags
 //! into those calls and prints their answers.
-use crate::{api_call, api_stream, args::memory_mib, args::parse, print_json};
+use crate::{
+    api_call, api_stream,
+    args::{idle_seconds, memory_mib, parse},
+    print_json,
+};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
 use std::fs;
@@ -21,10 +25,14 @@ pub const USAGE: &str =
                       [-v, --volume HOST_DIR:TAG[:ro]]... (virtiofs share)
   machine start NAME            Boot (installer ISO first while attached, then the disk)
   machine stop [-f] NAME        ACPI power button (-f kills the VM)
+  machine pause|unpause NAME    Stop or resume the VM's vCPUs (its memory stays in use)
   machine eject NAME            Detach the installer ISO and seed images (machine stopped)
   machine update NAME [--cpus N] [-m, --memory SIZE] [--disk-size SIZE] (grow only)
                       [--gpus none|virgl|venus|neptune] [-p, --publish HOST:GUEST|none]...
                       [--new-mac]   Change a stopped machine's hardware (QEMU: GPU, ports)
+                      [--idle-pause DURATION|off]
+                                Pause the VM after 5m, 1h, ... without activity;
+                                applies at once, running or not
   machine clone NAME NEW_NAME   APFS copy of a stopped machine, with a new MAC address
   machine exec NAME CMD...      Run a command in the guest (-i passes stdin)
   machine ssh-key NAME --user USER --key PRIVATE_KEY
@@ -184,11 +192,12 @@ fn update_args(rest: &[String]) -> Result<Value> {
             ("publish", Some('p'), true),
             ("new-mac", None, false),
             ("audio", None, true),
+            ("idle-pause", None, true),
         ],
         false,
     )?;
     let [name] = p.positional.as_slice() else {
-        bail!("usage: veynodevm machine update NAME [--cpus N] [-m SIZE] [--disk-size SIZE] [--gpus ...] [-p HOST:GUEST|none]... [--audio on|off] [--new-mac]")
+        bail!("usage: veynodevm machine update NAME [--cpus N] [-m SIZE] [--disk-size SIZE] [--gpus ...] [-p HOST:GUEST|none]... [--audio on|off] [--new-mac] [--idle-pause DURATION|off]")
     };
     let mut args = Map::new();
     args.insert("name".into(), json!(name));
@@ -240,8 +249,11 @@ fn update_args(rest: &[String]) -> Result<Value> {
         }
         Some(other) => bail!("--audio takes on or off, got {other}"),
     }
+    if let Some(value) = p.value("idle-pause") {
+        args.insert("idlePauseS".into(), json!(idle_seconds(value)?));
+    }
     if args.len() == 1 {
-        bail!("machine update needs at least one of --cpus, --memory, --disk-size, --gpus, --publish, --audio, --new-mac")
+        bail!("machine update needs at least one of --cpus, --memory, --disk-size, --gpus, --publish, --audio, --new-mac, --idle-pause")
     }
     Ok(Value::Object(args))
 }
@@ -285,6 +297,10 @@ pub fn command(rest: &[String], json_output: bool) -> Result<i32> {
         }
         "stop" => {
             let reply = api_call("machine.stop", json!({"name":name()?,"force":force}))?;
+            done(reply["name"].as_str().unwrap_or_default(), json_output)?;
+        }
+        "pause" | "unpause" => {
+            let reply = api_call(&format!("machine.{action}"), json!({"name":name()?}))?;
             done(reply["name"].as_str().unwrap_or_default(), json_output)?;
         }
         "eject" => {

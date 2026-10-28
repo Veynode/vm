@@ -4,7 +4,10 @@
 //! is a small detached helper (`vm-control __proxy <id>`) that listens on the
 //! requested host address and splices connections to `<guest-ip>:<port>`. It
 //! exits when the container's VM stops. QEMU containers use slirp hostfwd.
-use super::container::{self, Container};
+use super::{
+    container::{self, Container},
+    util::KeepAwake,
+};
 use anyhow::{Context, Result};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -90,7 +93,9 @@ fn splice(mut from: TcpStream, mut to: TcpStream) {
 }
 
 /// Accept on `listener` until `stop` is set, splicing to `ip:guest_port`.
-fn serve(listener: TcpListener, ip: String, guest_port: u16, stop: Arc<AtomicBool>) {
+/// A connection is activity of VM `vm`: it resumes the VM if the idle monitor
+/// paused it, and keeps it awake while open.
+fn serve(listener: TcpListener, vm: String, ip: String, guest_port: u16, stop: Arc<AtomicBool>) {
     let _ = listener.set_nonblocking(true);
     let target = match format!("{ip}:{guest_port}").parse::<SocketAddr>() {
         Ok(t) => t,
@@ -106,14 +111,22 @@ fn serve(listener: TcpListener, ip: String, guest_port: u16, stop: Arc<AtomicBoo
             Err(_) => continue,
         };
         let _ = client.set_nonblocking(false);
+        let awake = Arc::new(KeepAwake::new(&vm));
         match TcpStream::connect_timeout(&target, Duration::from_secs(5)) {
             Ok(upstream) => {
                 let (a, b) = match (client.try_clone(), upstream.try_clone()) {
                     (Ok(a), Ok(b)) => (a, b),
                     _ => continue,
                 };
-                thread::spawn(move || splice(client, upstream));
-                thread::spawn(move || splice(b, a));
+                let held = awake.clone();
+                thread::spawn(move || {
+                    splice(client, upstream);
+                    drop(held);
+                });
+                thread::spawn(move || {
+                    splice(b, a);
+                    drop(awake);
+                });
             }
             Err(e) => {
                 eprintln!("connect {target}: {e}");
@@ -170,9 +183,9 @@ pub fn run(id: &str) -> Result<()> {
     let ip = container::wait_for_ip(&container, Duration::from_secs(180))?;
     eprintln!("publishing {} port(s) to {ip}", listeners.len());
     for (listener, guest_port) in listeners {
-        let ip = ip.clone();
+        let (ip, vm) = (ip.clone(), container.vm_id.clone());
         let never = Arc::new(AtomicBool::new(false));
-        thread::spawn(move || serve(listener, ip, guest_port, never));
+        thread::spawn(move || serve(listener, vm, ip, guest_port, never));
     }
     // The engine also follows ports published by its inner containers
     // (`docker run -p`), always on host loopback.
@@ -210,8 +223,8 @@ pub fn run(id: &str) -> Result<()> {
                 Ok(listener) => {
                     let stop = Arc::new(AtomicBool::new(false));
                     dynamic.insert(port, stop.clone());
-                    let ip = ip.clone();
-                    thread::spawn(move || serve(listener, ip, port, stop));
+                    let (ip, vm) = (ip.clone(), container.vm_id.clone());
+                    thread::spawn(move || serve(listener, vm, ip, port, stop));
                     eprintln!("published engine port 127.0.0.1:{port}");
                 }
                 Err(e) => {

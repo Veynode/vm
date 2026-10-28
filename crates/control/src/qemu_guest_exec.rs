@@ -135,6 +135,9 @@ pub struct Transport {
     state: Arc<Mutex<&'static str>>,
     stop: Arc<AtomicBool>,
     lane: Arc<AtomicBool>,
+    /// The VM's vCPUs are stopped (`pause`): no heartbeats, no new requests,
+    /// and no deadline runs out until it resumes.
+    paused: Arc<AtomicBool>,
     stream: Arc<Mutex<super::guest_transport::Lifetime>>,
     #[cfg(test)]
     iterations: Arc<std::sync::atomic::AtomicU64>,
@@ -142,6 +145,12 @@ pub struct Transport {
 impl Transport {
     pub fn state(&self) -> &'static str {
         *self.state.lock().unwrap()
+    }
+    /// Set before the vCPUs stop and cleared once they run again. A stopped
+    /// Guest cannot answer, so its silence is not a fault: deadlines in flight
+    /// move by the time spent paused and heartbeats start again on resume.
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Release);
     }
     pub fn start(path: &Path, host: String) -> Self {
         Self::start_configured(path, host, |_| Ok(()))
@@ -158,6 +167,8 @@ impl Transport {
         let stopped = stop.clone();
         let stream = Arc::new(Mutex::new(super::guest_transport::Lifetime::default()));
         let saved = stream.clone();
+        let paused = Arc::new(AtomicBool::new(false));
+        let frozen = paused.clone();
         let path = path.to_owned();
         #[cfg(test)]
         let iterations = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -219,6 +230,7 @@ impl Transport {
                 let mut next_heartbeat = Instant::now();
                 // A task taken off the channel by the idle wait below, dispatched next pass.
                 let mut carried: Option<Task> = None;
+                let mut paused_since: Option<Instant> = None;
                 loop {
                     #[cfg(test)]
                     counted.fetch_add(1, Ordering::Relaxed);
@@ -226,6 +238,24 @@ impl Transport {
                         bail!("serial execution cancelled")
                     }
                     let now = Instant::now();
+                    match (frozen.load(Ordering::Acquire), paused_since) {
+                        (true, None) => paused_since = Some(now),
+                        (false, Some(since)) => {
+                            let paused_for = now.duration_since(since);
+                            for p in pending.values_mut() {
+                                p.deadline += paused_for;
+                            }
+                            next_heartbeat = now;
+                            paused_since = None;
+                        }
+                        _ => {}
+                    }
+                    if paused_since.is_some() {
+                        // A reply sent just before the stop waits in the socket; nothing is
+                        // sent and nothing times out until the vCPUs run again.
+                        thread::sleep(Duration::from_millis(50));
+                        continue;
+                    }
                     if pending.values().any(|p| {
                         now >= p.deadline
                             || p.task
@@ -378,6 +408,7 @@ impl Transport {
             tx,
             state,
             stop,
+            paused,
             lane: Arc::new(AtomicBool::new(false)),
             stream,
             #[cfg(test)]
@@ -407,6 +438,9 @@ impl Transport {
         }
         if self.state() != "ready" || self.stop.load(Ordering::Acquire) {
             bail!("serial execution unavailable or fenced")
+        }
+        if self.paused.load(Ordering::Acquire) {
+            bail!("serial execution unavailable: the VM is paused")
         }
         let lane = self.lane.clone();
         if lane.swap(true, Ordering::AcqRel) {
@@ -684,6 +718,73 @@ mod tests {
             .unwrap();
         assert_eq!(poll(&mut job).unwrap()["id"], "poll");
         assert!(server.join().unwrap() >= 2, "heartbeat schedule slipped");
+    }
+    #[test]
+    fn a_paused_guest_is_not_fenced_and_heartbeats_resume() {
+        let d = tempfile::Builder::new()
+            .prefix("v2pause-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = d.path().join("a.sock");
+        let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let frozen = Arc::new(AtomicBool::new(false));
+        let thawed = Arc::new(AtomicBool::new(false));
+        let (guest_frozen, guest_thawed) = (frozen.clone(), thawed.clone());
+        let server = thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let (g, h) = hello(&mut s);
+            let mut after = 0;
+            loop {
+                let r = initial(&mut s, Instant::now() + Duration::from_secs(5)).unwrap();
+                match r.request.as_ref().unwrap()["method"].as_str().unwrap() {
+                    "heartbeat" => {
+                        // A stopped Guest answers only once its vCPUs run again.
+                        while guest_frozen.load(Ordering::Acquire)
+                            && !guest_thawed.load(Ordering::Acquire)
+                        {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        if guest_thawed.load(Ordering::Acquire) {
+                            after += 1;
+                        }
+                        reply(&mut s, &g, &h, r, json!({"alive":true}));
+                    }
+                    "exec_poll" => {
+                        reply(&mut s, &g, &h, r, json!({"state":"running"}));
+                        break;
+                    }
+                    _ => panic!("unexpected"),
+                }
+            }
+            thread::sleep(Duration::from_millis(30));
+            after
+        });
+        let t = Transport::start(&path, "c".repeat(64));
+        let until = Instant::now() + Duration::from_secs(2);
+        while t.state() == "starting" {
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(2));
+        }
+        thread::sleep(Duration::from_millis(100));
+        frozen.store(true, Ordering::Release);
+        t.set_paused(true);
+        assert!(t.request(json!({"id":"info","method":"info"})).is_err());
+        // Longer than a heartbeat's 1 s deadline.
+        thread::sleep(Duration::from_millis(1500));
+        assert_eq!(
+            t.state(),
+            "ready",
+            "a paused Guest's silence fenced the transport"
+        );
+        t.set_paused(false);
+        thawed.store(true, Ordering::Release);
+        thread::sleep(Duration::from_millis(700));
+        let mut job = t
+            .request(json!({"id":"poll","method":"exec_poll","job_id":"b".repeat(32)}))
+            .unwrap();
+        assert_eq!(poll(&mut job).unwrap()["id"], "poll");
+        assert_eq!(t.state(), "ready");
+        assert!(server.join().unwrap() >= 1, "heartbeats did not resume");
     }
     #[test]
     fn heartbeat_requires_exact_proof() {

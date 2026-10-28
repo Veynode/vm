@@ -149,3 +149,39 @@ extension Runner {
         }
     }
 }
+
+// `pause` and `resume` (`veynodevm pause`, the daemon's idle pause): the vCPUs
+// stop and the Guest's memory stays resident. Commands that arrive while the
+// VM resumes wait for it (`resumeQueue`), so the daemon can send `resume`
+// followed by the request that woke it.
+extension Runner {
+    func pauseResume(_ object: [String:Any]) {
+        let id = object["id"] ?? NSNull()
+        let pause = object["method"] as? String == "pause"
+        func reject(_ code: String, _ message: String) { emit(["id":id,"error":["code":code,"message":message]]) }
+        guard Set(object.keys).isSubset(of:["id","method"]) else { reject("invalid_request","Expected only id and method"); return }
+        guard !installing, !snapshotBusy, snapshotCaptureID == nil else {
+            reject("invalid_state","VM is installing or holds a snapshot transaction"); return
+        }
+        func finish(_ result: Result<Void, Error>) {
+            reportState()
+            switch result {
+            case .failure(let error): reject("backend_error",error.localizedDescription)
+            case .success: emit(["id":id,"result":["state":stateName(vm.state)]])
+            }
+        }
+        if pause {
+            guard vm.state == .running, vm.canPause else { reject("invalid_state","VM is not running (state \(stateName(vm.state)))"); return }
+            vm.pause { result in finish(result) }
+        } else {
+            guard vm.state == .paused, vm.canResume else { reject("invalid_state","VM is not paused (state \(stateName(vm.state)))"); return }
+            resumeQueue = []
+            vm.resume { result in
+                let queued = self.resumeQueue ?? []
+                self.resumeQueue = nil
+                finish(result)
+                queued.forEach { self.command($0) }
+            }
+        }
+    }
+}

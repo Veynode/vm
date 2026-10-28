@@ -72,6 +72,7 @@ mod capabilities;
 mod config;
 mod daemon_log;
 mod exec;
+mod idle;
 mod manager;
 mod mcp;
 mod pending;

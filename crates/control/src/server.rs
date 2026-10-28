@@ -59,6 +59,7 @@ pub fn serve_with_worker_key_event_log(
     manager.validate_registry();
     let manager = Arc::new(Mutex::new(manager));
     spawn_exit_monitor(&manager);
+    idle::spawn_monitor(&manager);
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for connection in listener.incoming() {
         let stream = connection?;

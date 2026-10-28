@@ -14,7 +14,7 @@ mod session;
 mod ui;
 
 use anyhow::{bail, Context, Result};
-use args::{desktop_size, memory_mib, parse};
+use args::{desktop_size, idle_seconds, memory_mib, parse};
 use serde_json::{json, Map, Value};
 use std::{io::Write, path::PathBuf};
 
@@ -30,6 +30,7 @@ Containers:
       -u, --user USER  --entrypoint CMD  --cpus N  -m, --memory SIZE
       --disk-size GiB  --dns IP  --mtu N  --gpus all|virgl|venus  --desktop [--desktop-size WxH]  --shared
       --init systemd   (boot the image's /sbin/init as PID 1: a full distribution)
+      --idle-pause DURATION  (pause the VM after 5m, 1h, ... without activity)
       (--gpus selects QEMU/HVF; otherwise Apple Virtualization)
       macOS images (e.g. ghcr.io/cirruslabs/macos-tahoe-vanilla) run as macOS VMs
       with Metal; COMMAND runs over SSH (-d: in the background, see logs; no
@@ -46,15 +47,19 @@ Containers:
   cp SRC DST                         Copy files; one side is CONTAINER:PATH (macOS)
   start [-a] CONTAINER               Start a stopped container
   stop [-t SECONDS] CONTAINER...     Stop containers
+  pause|unpause CONTAINER...         Stop or resume a container's vCPUs (its
+                                     memory stays in use)
   rm [-f] CONTAINER...               Remove containers
   inspect CONTAINER|IMAGE            Show low-level details
   rename CONTAINER NEW_NAME           Rename a container
   update [--cpus N] [-m SIZE] [--disk-size GiB] [--gpus none|virgl|venus]
          [--desktop on|off] [--desktop-size WxH] [-p HOST:GUEST... | -p none]
-         [--dns IP... | --dns none] [--mtu N|default] [--new-mac] [--restart] CONTAINER
+         [--dns IP... | --dns none] [--mtu N|default] [--new-mac] [--restart]
+         [--idle-pause DURATION|off] CONTAINER
                                      Change a container's hardware in one go: a GPU
                                      switches QEMU/HVF <-> Apple Virtualization; the
-                                     disk only grows; --restart if it is running
+                                     disk only grows; --restart if it is running.
+                                     --idle-pause applies at once, running or not
   icon CONTAINER [KIND[:COLOR]|--reset]
                                      Show or set the icon the web UI draws
   desktop [--close] CONTAINER|VM     Open (or close) the native desktop window
@@ -85,7 +90,7 @@ Shared engine (docker CLI compatible):
 Full Linux distributions (UEFI, installed from the distribution's ISO):
   machine create NAME [--iso PATH] [--disk-size 40G] [-m 4g] [--cpus 4]
                       [--gpus virgl|venus | --backend apple|qemu] [--monitor]
-  machine start|stop [-f]|eject|inspect|rm NAME     machine ls
+  machine start|stop [-f]|pause|unpause|eject|inspect|rm NAME     machine ls
   (--gpus or --backend qemu selects QEMU/HVF; otherwise Apple Virtualization)
 
 Virtual machines:
@@ -213,6 +218,7 @@ const RUN_SPEC: &[(&str, Option<char>, bool)] = &[
     ("mtu", None, true),
     ("init", None, true),
     ("quiet", Some('q'), false),
+    ("idle-pause", None, true),
 ];
 
 fn run(rest: &[String], json_output: bool) -> Result<i32> {
@@ -224,6 +230,9 @@ fn run(rest: &[String], json_output: bool) -> Result<i32> {
         .clone();
     let command: Vec<String> = p.positional[1..].to_vec();
     if p.has("shared") {
+        if p.has("idle-pause") {
+            bail!("--idle-pause applies to micro-VM containers; the shared engine is not paused")
+        }
         let os = api_call("image.inspect", json!({"reference":image}))
             .map(|i| i["config"]["os"].clone())
             .unwrap_or_default();
@@ -294,6 +303,10 @@ fn run(rest: &[String], json_output: bool) -> Result<i32> {
             .context("invalid --mtu")?),
     );
     set("init", json!(p.value("init")));
+    set(
+        "idlePauseS",
+        json!(p.value("idle-pause").map(idle_seconds).transpose()?),
+    );
     set("quiet", json!(p.has("quiet") || json_output));
     set("tty", json!(p.has("tty")));
     set("stdin", json!(p.has("interactive")));
@@ -860,6 +873,14 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
             }
             Ok(0)
         }
+        "pause" | "unpause" => {
+            let (_, names) = names(rest, &[])?;
+            for name in names {
+                let row = api_call(&format!("container.{command}"), json!({"name":name}))?;
+                println!("{}", row["name"].as_str().unwrap_or_default());
+            }
+            Ok(0)
+        }
         "rm" => {
             let (p, names) = names(rest, &[("force", Some('f'), false)])?;
             for name in names {
@@ -893,11 +914,12 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
                     ("mtu", None, true),
                     ("new-mac", None, false),
                     ("restart", None, false),
+                    ("idle-pause", None, true),
                 ],
                 false,
             )?;
             let [name] = p.positional.as_slice() else {
-                bail!("usage: veynodevm update [--cpus N] [-m SIZE] [--disk-size GiB] [--gpus none|virgl|venus] [--desktop on|off] [--desktop-size WxH] [-p HOST:GUEST[/udp]...|--publish none] [--dns IP...|--dns none] [--mtu N|default] [--new-mac] [--restart] CONTAINER")
+                bail!("usage: veynodevm update [--cpus N] [-m SIZE] [--disk-size GiB] [--gpus none|virgl|venus] [--desktop on|off] [--desktop-size WxH] [-p HOST:GUEST[/udp]...|--publish none] [--dns IP...|--dns none] [--mtu N|default] [--new-mac] [--restart] [--idle-pause DURATION|off] CONTAINER")
             };
             // `none` alone clears a list.
             let list = |name: &str| {
@@ -970,8 +992,12 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
             if p.has("new-mac") {
                 change("newMac", json!(true));
             }
+            change(
+                "idlePauseS",
+                json!(p.value("idle-pause").map(idle_seconds).transpose()?),
+            );
             if changes.is_empty() {
-                bail!("update needs something to change: --cpus, --memory, --disk-size, --gpus, --desktop, --desktop-size, --publish, --dns, --mtu or --new-mac")
+                bail!("update needs something to change: --cpus, --memory, --disk-size, --gpus, --desktop, --desktop-size, --publish, --dns, --mtu, --new-mac or --idle-pause")
             }
             let c = api_call(
                 "container.update",
