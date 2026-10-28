@@ -99,6 +99,20 @@ interleaved rounds per variant, medians; the full rows are in
   through: random 4 KiB reads ~35k → ~43k IOPS, others within noise.
 - `stop` of an idle container: 0.36 s on both backends (QEMU was a 10 s
   timeout, then a hard stop).
+- A synchronous `exec` polls its Guest job every 50 ms for its first half
+  second, then every tenth of its run time (at most 250 ms): during a 10 s
+  command the Guest takes ~114 timer interrupts a second on Apple
+  Virtualization (was ~338) and ~277 on QEMU (was ~430). An idle Linux Guest
+  takes ~34 a second on Apple Virtualization and ~90 on QEMU (GICv2 and the
+  serial heartbeat); setting the agent's GOMAXPROCS to 1 changed neither.
+- Windows 11 ARM64 on QEMU, idle at the desktop: the QEMU process ~12% of a
+  core (unchanged; its vCPUs and the runtime's display refresh), the SPICE
+  console helper 0.6% (was 3.6%, ~1,000 wakeups a second, now ~30). `machine
+  exec` of `cmd /c exit 0`: ~1.3 s with Windows PowerShell JIT-compiling,
+  ~0.4 s once .NET's ARM64 native images exist (the installer now builds
+  them at first logon), ~0.3 s with the shared SSH connection and the exit
+  seen at once. The High performance plan and Balanced measured the same
+  within noise.
 - Published ports (Apple Virtualization's publisher) block in `poll` between
   connections instead of a 100 ms accept step with the wake RPC inline: a
   new connection's connect, one-byte echo and close went from ~108 ms to
