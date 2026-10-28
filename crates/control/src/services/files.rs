@@ -1,7 +1,8 @@
-//! `files.copy`: one file between the host and a machine's guest. Windows
-//! machines copy over SSH with scp; Linux machines through the guest
-//! service's exec, in base64 pieces (bounded by its 30 s commands); macOS
-//! guests through `services::macos`.
+//! `files.copy`: between the host and a machine's guest. Windows machines
+//! copy one file in over SSH with scp, and Linux machines made from a cloud
+//! image files and directories both ways with scp; other Linux machines
+//! through the guest service's exec, in base64 pieces (bounded by its 30 s
+//! commands); macOS guests through `services::macos`.
 use super::{
     machines::{self, base64},
     util::string,
@@ -54,6 +55,13 @@ pub fn copy(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
             ssh.copy(host, &guest.replace('\\', "/"), Duration::from_secs(600))?;
         }
         "macos" => super::macos::copy_machine(ctx, &machine, inward, host, guest, io)?,
+        _ if super::machine_guest::has_login(&machine) => {
+            let target = super::machine_guest::ready(ctx, &machine, &|line| {
+                let _ = io.progress(line);
+            })?;
+            let command = super::machine_guest::copy_command(&target, inward, host, guest);
+            return Ok(json!({ "exitCode": super::pump::run(command, false, io)? }));
+        }
         _ if inward => linux_in(ctx, &name, host, guest, io)?,
         _ => linux_out(ctx, &name, host, guest)?,
     }

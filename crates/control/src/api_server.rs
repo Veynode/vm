@@ -3,6 +3,7 @@
 //! daemon's services and run on the connection's own thread without the
 //! manager lock; every other method is the VM layer, dispatched as a legacy
 //! request is and answered with a code.
+use crate::backend::QemuRegistration;
 use crate::{services, Manager};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -20,7 +21,7 @@ use std::{
 use veynodevm_api::{
     answer,
     frame::{read_frame, read_line, write_chunked, write_frame, write_line},
-    refusal, refuse, Channel, ErrorCode, Hello, Runtime, API, MAX_LINE,
+    refusal, refuse, Channel, ErrorCode, Gpu, Hello, Runtime, API, MAX_LINE,
 };
 
 /// The daemon's version, as `hello` reports it.
@@ -109,7 +110,7 @@ impl Ctx {
     }
 }
 
-fn hello_answer(manager: &Manager) -> Hello {
+fn hello_answer(runtime: Runtime) -> Hello {
     let mut methods = vec!["hello".to_string()];
     methods.extend(services::names().map(str::to_string));
     methods.extend(VM_METHODS.iter().map(|m| m.to_string()));
@@ -120,14 +121,94 @@ fn hello_answer(manager: &Manager) -> Hello {
         home: crate::home::root()
             .ok()
             .map(|path| path.to_string_lossy().into_owned()),
-        runtime: runtime(manager),
+        runtime,
     }
 }
 
-fn runtime(manager: &Manager) -> Runtime {
+fn runtime(apple_virtualization: bool, qemu: Option<&QemuRegistration>) -> Runtime {
     Runtime {
-        apple_virtualization: manager.backend.is_file(),
-        qemu: manager.qemu.is_some(),
+        apple_virtualization,
+        qemu: qemu.is_some(),
+        gpu: qemu.map(gpu_cached),
+    }
+}
+
+/// Checking a GPU profile hashes every runtime artifact, which takes
+/// seconds, so hello answers from the last check while the registration and
+/// the files it names keep their paths, sizes and modification times. A start
+/// checks the runtime again whatever hello said.
+fn gpu_cached(qemu: &QemuRegistration) -> Gpu {
+    static LAST: Mutex<Option<(String, Gpu)>> = Mutex::new(None);
+    let key = gpu_key(qemu);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((cached, gpu)) = last.as_ref() {
+        if *cached == key {
+            return gpu.clone();
+        }
+    }
+    let gpu = gpu(qemu);
+    *last = Some((key, gpu.clone()));
+    gpu
+}
+
+fn gpu_key(qemu: &QemuRegistration) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let mut files = vec![
+        qemu.library.clone(),
+        qemu.resources.join("edk2-aarch64-code.fd"),
+    ];
+    files.extend(qemu.spice_library.clone());
+    // What Neptune::locate looks for around the QEMU framework.
+    if let Some(frameworks) = qemu.library.ancestors().nth(4) {
+        files.push(frameworks.join("dxmt-native.framework/Versions/A/dxmt-native"));
+        let contents = frameworks.parent().unwrap_or(frameworks);
+        files.push(contents.join("Resources/vulkan/icd.d/MoltenVK_icd.json"));
+    }
+    if let Some(path) = &qemu.venus_runtime {
+        files.push(path.clone());
+        if let Ok(r) = crate::qemu_graphics::Registration::load(path) {
+            for artifact in [
+                r.loader,
+                r.host_library,
+                r.render_server,
+                r.qemu_library,
+                r.spice_library,
+                r.icd,
+                r.firmware,
+            ] {
+                files.push(artifact.path);
+            }
+            files.push(r.frameworks_dir);
+        }
+    }
+    let mut key = format!("{qemu:?}");
+    for file in files {
+        let stamp = std::fs::metadata(&file)
+            .map(|m| format!("{}:{}:{}", m.len(), m.mtime(), m.mtime_nsec()))
+            .unwrap_or_default();
+        key.push_str(&format!("\n{}={stamp}", file.display()));
+    }
+    key
+}
+
+/// `virgl` runs wherever QEMU does; `venus` and `neptune` need their
+/// verified runtimes.
+fn gpu(qemu: &QemuRegistration) -> Gpu {
+    use crate::qemu_graphics::Profile;
+    let venus = qemu.require_profile(Profile::VenusMoltenvkExperimental);
+    let neptune = qemu.require_profile(Profile::NeptuneDxmtExperimental);
+    let mut reason = std::collections::BTreeMap::new();
+    if let Err(e) = &venus {
+        reason.insert("venus".to_string(), format!("{e:#}"));
+    }
+    if let Err(e) = &neptune {
+        reason.insert("neptune".to_string(), format!("{e:#}"));
+    }
+    Gpu {
+        virgl: true,
+        venus: venus.is_ok(),
+        neptune: neptune.is_ok(),
+        reason,
     }
 }
 
@@ -154,16 +235,21 @@ pub(crate) fn serve(
         .chars()
         .take(128)
         .collect::<String>();
-    let (hello, ctx) = {
+    let (state_dir, apple_virtualization, qemu) = {
         let manager = manager.lock().unwrap();
         (
-            hello_answer(&manager),
-            Ctx {
-                state_dir: manager.dir.clone(),
-                runtime: runtime(&manager),
-                client,
-            },
+            manager.dir.clone(),
+            manager.backend.is_file(),
+            manager.qemu.clone(),
         )
+    };
+    // Outside the lock: a GPU check that misses its cache takes seconds.
+    let runtime = runtime(apple_virtualization, qemu.as_ref());
+    let hello = hello_answer(runtime.clone());
+    let ctx = Ctx {
+        state_dir,
+        runtime,
+        client,
     };
     write_line(&mut stream, &json!({ "result": hello }))?;
     let Some(line) = read_line(&mut reader, MAX_LINE)? else {

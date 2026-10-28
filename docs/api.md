@@ -21,8 +21,12 @@ The daemon's interface for every client: the `veynodevm` CLI, the MCP server, th
 ```
 
 ```json
-{"result":{"api":1,"daemon":"0.4.0","methods":["hello","machine.ls","…"],"home":"/Users/a/Library/Application Support/VeynodeVM","runtime":{"appleVirtualization":true,"qemu":false}}}
+{"result":{"api":1,"daemon":"0.4.0","methods":["hello","machine.ls","…"],"home":"/Users/a/Library/Application Support/VeynodeVM","runtime":{"appleVirtualization":true,"qemu":true,"gpu":{"virgl":true,"venus":false,"neptune":true,"reason":{"venus":"…"}}}}}
 ```
+
+`runtime.gpu` is present when a QEMU/HVF runtime is registered: the `gpu` values a QEMU machine can start with here,
+and in `reason` why one cannot. The daemon checks the runtime's files once and answers from that check while their
+sizes and modification times stay the same; `machine.start` checks again.
 
 `methods` lists every method this daemon serves. A daemon that does not serve the asked `api` answers
 `{"error":"…","code":"version"}` and closes. A daemon older than API 1 answers `hello` itself with an error and no
@@ -89,7 +93,7 @@ type Machine = {
   name: string; id: string; os: "linux" | "macos" | "windows";
   backend: "apple-virtualization" | "qemu-hvf";
   state: "stopped" | "starting" | "running" | "stopping" | "failed";
-  source: { disk?: string; from?: string; iso?: string; driversIso?: string };
+  source: { disk?: string; digest?: string; from?: string; iso?: string; driversIso?: string };
   cpus: number; memoryMiB: number; diskGiB: number;
   gpu: "virgl" | "venus" | "neptune" | null; macAddress: string | null;
   shares: { hostPath: string; tag: string; readOnly: boolean; guestPath: string | null }[];
@@ -102,7 +106,7 @@ type Machine = {
 |---|---|---|---|
 | `machine.ls` | call | `{}` | `Machine[]` sorted by name |
 | `machine.inspect` | call | `{name}` | `Machine` |
-| `machine.create` | stream | `{name, os, cpus, memoryMiB, diskGiB?, shares?, ports?, gpu?, backend?, diskBus?, attach?}` and one source: `{disk}` (a raw Linux disk, cloned), `{from}` (an OCI reference; macOS), `{iso, unattended?, driversIso?}` | `Machine`; `progress` events |
+| `machine.create` | stream | `{name, os, cpus, memoryMiB, diskGiB?, shares?, ports?, gpu?, backend?, diskBus?, attach?}` and one source: `{disk}` (a raw or qcow2 Linux disk; see below), `{from}` (an OCI reference; macOS), `{iso, unattended?, driversIso?}` | `Machine`; `progress` events |
 | `machine.start` | stream | `{name, wait?}` | `Machine`; with `wait`, ends once the guest answers |
 | `machine.stop` | call | `{name, force?}` | `{name}` |
 | `machine.rm` | call | `{name, force?}` | `{name}` |
@@ -112,9 +116,28 @@ type Machine = {
 | `machine.eject` | call | `{name}` | `{name}` |
 | `machine.icon` | call | `{name, icon: string \| null}` | `{name}` |
 | `machine.ssh_key` | call | `{name, user, key}` | `{name}` |
-| `machine.display` | call | `{name, width, height}` | `{name, width, height}` |
+| `machine.resolution` | call | `{name, width, height}` (a running Windows machine, through its login) | `{name, width, height}` |
+| `machine.display` | call | `{name, epoch}` (running) | `{format:"stream", address, port, token, epoch}`; see [the screen endpoint](#the-screen-endpoint) |
+| `machine.sound`, `machine.microphone` | call | `{name, epoch}` (a running QEMU machine) | `{format:"pcm", rate:48000, channels, address, port, token, epoch}`; see [the sound endpoints](#the-sound-endpoints) |
 | `machine.endpoints` | call | `{name}` | `{address: string\|null, hostAddress: string\|null, ports: {host, guest, address}[]}` |
 | `machine.exec` | stream | `{name, argv, user?, env?: ["K=V"], cwd?, stdin: bool, tty?: bool}` | `{exitCode}`; output on `stdout`/`stderr`, input on `stdin`, signals on `control` |
+
+- **Linux disk images.** `disk` is an upstream cloud image (Ubuntu 24.04 or Debian 13 arm64, raw or qcow2). The
+  daemon converts it to raw once per digest under `<home>/machine-images`, APFS-clones it per machine and grows the
+  disk and its GPT to `diskGiB`; `source.digest` is the image's sha256. A NoCloud seed (`seed.iso`) gives the guest
+  the login `veynode` with the home's key, passwordless `sudo`, the hostname, the shares at `/mnt/TAG` and the
+  guest agent. `machine.clone` writes a new seed, so the clone gets a new hostname and machine-id.
+- **Ports.** On QEMU, `ports` are user-mode forwards on 127.0.0.1. On Apple Virtualization the daemon publishes them
+  from 127.0.0.1 to the guest's lease address while the machine runs. `machine.endpoints` lists both with
+  `address` 127.0.0.1.
+- **Windows.** `{iso, unattended: true, driversIso}` installs Windows 11 ARM64 without a person: the daemon writes the
+  answer file seed, presses the ISO's key prompt, waits for the install (up to 3 hours) and ejects the media. The
+  machine has the login `veynode` with its own key and OpenSSH, and is left stopped.
+- **exec on Linux disk images** runs over SSH as `veynode` (the lease address on Apple Virtualization, a private
+  loopback forward on QEMU), with no time or output limit. `user` `root` runs it through `sudo -n`; `cwd`, `env`,
+  stdin and signals pass through, and the command gets a hang-up when the client goes. `machine.start` with `wait`
+  ends once SSH answers. `files.copy` uses `scp` the same way, for files and directories. Other Linux machines use
+  the guest agent.
 
 ### Files
 
@@ -128,6 +151,35 @@ as a machine: an APFS clone of the image disk (grown to `diskGiB`), the image's 
 the first boot over SSH (key, hostname, disk, then the Accessibility and Automation grant) with `progress` events;
 commands run as the login, shares mount at `/Volumes/My Shared Files/TAG`, and `machine.clone` keeps the identity
 with a new MAC address and hostname. Apple allows two macOS VMs running at once.
+
+### The screen endpoint
+
+`machine.display` starts a loopback TCP listener in the daemon that speaks core's screen-stream protocol (the
+header of core's `apps/macos-runtime/native/screen-stream.swift`):
+
+- The viewer sends `token` and a newline within 5 s, then input messages: kind u8 and a fixed-size payload.
+- The endpoint sends kind u8, length u32 BE, payload: capabilities (11) first, then video (1: width and height u16
+  BE, flags u8 with 1 = key frame, Annex B H.264 or HEVC) and codec changes (12).
+- The newest viewer replaces the one before it.
+- The same `epoch` answers the same endpoint. A new one replaces it, with a new port and token, and cuts its viewers.
+  The endpoint ends when the machine stops.
+
+Each viewer opens `desktop.stream` on the daemon's own socket: QEMU's SPICE console, or on Apple Virtualization the
+Linux guest agent or macOS Screen Sharing.
+
+### The sound endpoints
+
+`machine.sound` and `machine.microphone` start loopback TCP listeners with the screen endpoint's rules for the
+token, the newest viewer and `epoch`. After the token and a newline:
+
+- A sound viewer reads raw s16le 48 kHz stereo PCM (`channels` 2) for as long as it stays connected. The daemon
+  converts the Guest's rate if it differs. A viewer that stops reading for 2 s is cut.
+- A microphone viewer writes raw s16le 48 kHz mono PCM (`channels` 1). The daemon sends it to the Guest in 10 ms
+  frames.
+
+Both ride one connection per machine to the VM's SPICE console broker, which plays the Guest's sound to the client
+that asked last. Apple Virtualization machines, macOS included, answer `unsupported`; core's own in-guest program
+carries sound there.
 
 ### Containers
 

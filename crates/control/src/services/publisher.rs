@@ -3,12 +3,13 @@
 //! lease address at `guest`. It runs as threads of the daemon from
 //! `machine.start` until `machine.stop`, `machine.rm` or the machine stops by
 //! itself. QEMU machines forward their ports in the VM (user networking).
-use super::{guest, progress, Machine};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use serde_json::json;
 use std::{
     collections::HashMap,
     io::{Read, Write},
     net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -20,19 +21,30 @@ use std::{
 /// Running publishers by machine name.
 static RUNNING: Mutex<Option<HashMap<String, Arc<AtomicBool>>>> = Mutex::new(None);
 
+/// What a publisher needs of its machine.
+#[derive(Clone)]
+pub struct Published {
+    /// The daemon's state directory, for its VM status.
+    pub state_dir: PathBuf,
+    pub name: String,
+    pub mac_address: Option<String>,
+    /// `(host, guest)` TCP ports.
+    pub ports: Vec<(u16, u16)>,
+}
+
 /// Starts the machine's publisher, replacing a running one. Binding happens
 /// here, so a host port in use fails `machine.start`.
-pub fn start(machine: &Machine) -> Result<()> {
+pub fn start(machine: Published) -> Result<()> {
     stop(&machine.name);
-    if machine.ports.is_empty() || machine.backend == "qemu-hvf" {
+    if machine.ports.is_empty() {
         return Ok(());
     }
     let mut listeners = Vec::new();
-    for port in &machine.ports {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port.host))
-            .with_context(|| format!("bind 127.0.0.1:{}", port.host))?;
+    for (host, guest) in &machine.ports {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, *host))
+            .with_context(|| format!("bind 127.0.0.1:{host}"))?;
         listener.set_nonblocking(true)?;
-        listeners.push((listener, port.guest));
+        listeners.push((listener, *guest));
     }
     let stopped = Arc::new(AtomicBool::new(false));
     RUNNING
@@ -40,10 +52,9 @@ pub fn start(machine: &Machine) -> Result<()> {
         .unwrap()
         .get_or_insert_with(HashMap::new)
         .insert(machine.name.clone(), stopped.clone());
-    let machine = machine.clone();
     thread::spawn(move || {
         if let Err(error) = run(&machine, listeners, &stopped) {
-            progress(&format!("publisher of {}: {error:#}", machine.name));
+            crate::log_line(&format!("publisher of {}: {error:#}", machine.name));
         }
         let mut running = RUNNING.lock().unwrap();
         if let Some(map) = running.as_mut() {
@@ -56,6 +67,35 @@ pub fn start(machine: &Machine) -> Result<()> {
         }
     });
     Ok(())
+}
+
+fn vm_state(state_dir: &Path, name: &str) -> String {
+    crate::call(state_dir, "status", json!({"id":name}))
+        .ok()
+        .and_then(|v| v["state"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// The guest's lease, waited for while the machine runs.
+fn wait_lease(machine: &Published) -> Result<String> {
+    let deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        if let Some(ip) = super::machine_guest::lease(&machine.name, machine.mac_address.as_deref())
+        {
+            return Ok(ip);
+        }
+        let state = vm_state(&machine.state_dir, &machine.name);
+        if !matches!(state.as_str(), "running" | "starting" | "created") {
+            bail!(
+                "{} stopped before it took a DHCP lease ({state})",
+                machine.name
+            )
+        }
+        if Instant::now() > deadline {
+            bail!("timed out waiting for {}'s DHCP lease", machine.name)
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
 }
 
 /// Stops the machine's publisher, if one runs; its connections end.
@@ -80,11 +120,11 @@ pub fn running(name: &str) -> bool {
 }
 
 fn run(
-    machine: &Machine,
+    machine: &Published,
     listeners: Vec<(TcpListener, u16)>,
     stopped: &Arc<AtomicBool>,
 ) -> Result<()> {
-    let ip = guest::wait_lease(machine, Instant::now() + Duration::from_secs(600))?;
+    let ip = wait_lease(machine)?;
     let targets: Vec<(TcpListener, SocketAddr)> = listeners
         .into_iter()
         .map(|(listener, guest)| Ok((listener, format!("{ip}:{guest}").parse()?)))
@@ -104,7 +144,7 @@ fn run(
         }
         if checked.elapsed() > Duration::from_secs(2) {
             checked = Instant::now();
-            if super::state(&machine.name) != "running" {
+            if vm_state(&machine.state_dir, &machine.name) != "running" {
                 return Ok(());
             }
         }

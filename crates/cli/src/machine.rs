@@ -337,7 +337,10 @@ pub fn command(rest: &[String], json_output: bool) -> Result<i32> {
                 .split_once('x')
                 .context("size is WIDTHxHEIGHT, e.g. 1920x1080")?;
             let (w, h): (u32, u32) = (w.parse()?, h.parse()?);
-            let reply = api_call("machine.display", json!({"name":name,"width":w,"height":h}))?;
+            let reply = api_call(
+                "machine.resolution",
+                json!({"name":name,"width":w,"height":h}),
+            )?;
             if json_output {
                 print_json(&json!({"name":reply["name"],"display":reply["display"]}))?;
             } else {

@@ -9,19 +9,18 @@
 //! payload); the endpoint sends kind u8, length u32 BE, payload:
 //! capabilities (11) first, then video (1: width, height u16 BE, flags u8
 //! with 1 = key frame, Annex B) and codec changes (12). Each connection runs
-//! `vm-control desktop-stream` (`crate::desktop_stream`: QEMU's SPICE console encoder, or the Apple
+//! a `desktop.stream` (`services::desktop_stream`: QEMU's SPICE console encoder, or the Apple
 //! Virtualization guest agent / Screen Sharing encoder) and translates its
 //! records; the newest connection replaces the one before it. A new epoch
 //! replaces the endpoint and cuts every connection of the old one; it ends
 //! when the machine stops.
-use super::{progress, random_hex, refuse, Machine};
+use super::util::random_hex;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     io::{BufReader, Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
-    process::{Child, ChildStdin, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -29,6 +28,7 @@ use std::{
     thread,
     time::Duration,
 };
+use veynodevm_api::{refuse, ErrorCode};
 
 /// Serves one authorized viewer of an endpoint until it disconnects or is cut.
 pub(super) type Viewer = Arc<dyn Fn(&str, TcpStream) -> Result<()> + Send + Sync>;
@@ -68,11 +68,11 @@ type Endpoints = HashMap<(String, &'static str), Endpoint>;
 static ENDPOINTS: Mutex<Option<Endpoints>> = Mutex::new(None);
 
 /// `machine.display`: the endpoint of `epoch`, started if it is new.
-pub fn display(machine: &Machine, epoch: u64) -> Result<Value> {
+pub fn display(name: &str, epoch: u64) -> Result<Value> {
     // Held by the viewer whose encoder owns the desktop.
     let desktop = Arc::new(Mutex::new(()));
     endpoint(
-        machine,
+        name,
         "display",
         epoch,
         json!({"format":"stream"}),
@@ -84,16 +84,16 @@ pub fn display(machine: &Machine, epoch: u64) -> Result<Value> {
 /// one (new port and token) that cuts the one before it. Each authorized
 /// viewer goes to `viewer`, the newest cutting the one before it.
 pub(super) fn endpoint(
-    machine: &Machine,
+    name: &str,
     stream: &'static str,
     epoch: u64,
     fields: Value,
     viewer: Viewer,
 ) -> Result<Value> {
-    if !super::running(&super::state(&machine.name)) {
-        refuse!("state", "{} is not running", machine.name)
+    if !running(name) {
+        return Err(refuse(ErrorCode::State, format!("{name} is not running")));
     }
-    let key = (machine.name.clone(), stream);
+    let key = (name.to_owned(), stream);
     let mut endpoints = ENDPOINTS.lock().unwrap();
     let endpoints = endpoints.get_or_insert_with(HashMap::new);
     if let Some(current) = endpoints.get(&key) {
@@ -114,7 +114,7 @@ pub(super) fn endpoint(
     };
     let answer = endpoint.answer();
     let (name, token, stopped, active) = (
-        machine.name.clone(),
+        name.to_owned(),
         endpoint.token.clone(),
         endpoint.stopped.clone(),
         endpoint.active.clone(),
@@ -122,6 +122,13 @@ pub(super) fn endpoint(
     thread::spawn(move || listen(&name, stream, listener, &token, &stopped, &active, &viewer));
     endpoints.insert(key, endpoint);
     Ok(answer)
+}
+
+/// Whether the daemon's VM `name` is up.
+pub(super) fn running(name: &str) -> bool {
+    crate::home::state_dir()
+        .and_then(|dir| crate::call(&dir, "status", json!({"id":name})))
+        .is_ok_and(|vm| super::machines::running(vm["state"].as_str().unwrap_or("unknown")))
 }
 
 /// Stops the machine's endpoints, if any run (stop, rm, rename).
@@ -591,10 +598,38 @@ impl Input {
 
 type Socket = Arc<Mutex<TcpStream>>;
 
-/// One running `vm-control desktop-stream` and the codec it encodes.
+/// One `desktop.stream` of the machine (`services::desktop_stream`: QEMU's
+/// SPICE console encoder, or the Apple Virtualization guest agent / Screen
+/// Sharing encoder), on the daemon's own socket, and the codec it encodes.
 struct Pipeline {
-    child: Child,
-    stdin: ChildStdin,
+    sender: veynodevm_api::StreamSender,
+}
+
+/// A `desktop.stream`'s `stdout` frames as one byte stream; its end is end of file.
+struct Records {
+    stream: veynodevm_api::Stream,
+    buffer: Vec<u8>,
+    at: usize,
+}
+
+impl Read for Records {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        while self.at == self.buffer.len() {
+            match self.stream.next_event() {
+                Ok(veynodevm_api::Event::Stdout(data)) => (self.buffer, self.at) = (data, 0),
+                Ok(veynodevm_api::Event::End(Err(error))) => {
+                    return Err(std::io::Error::other(error.message))
+                }
+                Ok(veynodevm_api::Event::End(Ok(_))) => return Ok(0),
+                Ok(_) => {}
+                Err(error) => return Err(std::io::Error::other(format!("{error:#}"))),
+            }
+        }
+        let n = out.len().min(self.buffer.len() - self.at);
+        out[..n].copy_from_slice(&self.buffer[self.at..self.at + n]);
+        self.at += n;
+        Ok(n)
+    }
 }
 
 impl Pipeline {
@@ -605,47 +640,38 @@ impl Pipeline {
         size: Arc<Mutex<Option<(u32, u32)>>>,
         sent_codec: Arc<Mutex<bool>>,
     ) -> Result<Self> {
-        let mut child = Command::new(std::env::current_exe()?)
-            .args([
-                "desktop-stream",
-                "--codec",
-                if hevc { "hevc" } else { "h264" },
-                name,
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
+        let client = veynodevm_api::Client::at_socket(
+            crate::home::state_dir()?.join("control.sock"),
+            "machine.display",
+        );
+        let stream = client
+            .stream(
+                "desktop.stream",
+                json!({"name":name,"codec":if hevc {"hevc"} else {"h264"}}),
+            )
             .context("starting the desktop encoder")?;
-        let stdout = child.stdout.take().unwrap();
-        let stdin = child.stdin.take().unwrap();
+        let sender = stream.sender();
+        let records = Records {
+            stream,
+            buffer: Vec::new(),
+            at: 0,
+        };
         thread::spawn(move || {
-            if let Err(error) = relay(stdout, &socket, hevc, &size, &sent_codec) {
-                progress(&format!("display relay: {error:#}"));
+            if let Err(error) = relay(records, &socket, hevc, &size, &sent_codec) {
+                crate::log_line(&format!("display relay: {error:#}"));
             }
         });
-        Ok(Self { child, stdin })
+        Ok(Self { sender })
     }
 
     fn send(&mut self, line: &Value) -> bool {
-        let mut bytes = serde_json::to_vec(line).unwrap_or_default();
-        bytes.push(b'\n');
-        self.stdin.write_all(&bytes).is_ok()
+        self.sender.control(line).is_ok()
     }
 
-    /// Ends the encoder by closing its stdin (it then releases held input
-    /// and the Apple Virtualization bridge), killing it after 3 s.
+    /// Ends the encoder: the daemon cancels the stream, which releases held
+    /// input and the Apple Virtualization bridge.
     fn stop(self) {
-        let Pipeline { mut child, stdin } = self;
-        drop(stdin);
-        for _ in 0..150 {
-            if matches!(child.try_wait(), Ok(Some(_))) {
-                return;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        let _ = child.kill();
-        let _ = child.wait();
+        self.sender.cancel();
     }
 }
 
@@ -800,7 +826,9 @@ fn listen(
                         let _ = previous.shutdown(Shutdown::Both);
                     }
                     if let Err(error) = viewer(&name, stream) {
-                        progress(&format!("{stream_name} viewer of {name} ended: {error:#}"));
+                        crate::log_line(&format!(
+                            "{stream_name} viewer of {name} ended: {error:#}"
+                        ));
                     }
                 });
             }
@@ -811,7 +839,7 @@ fn listen(
         }
         if checked.elapsed() > Duration::from_secs(2) {
             checked = std::time::Instant::now();
-            if !super::running(&super::state(name)) {
+            if !running(name) {
                 let mut endpoints = ENDPOINTS.lock().unwrap();
                 if let Some(map) = endpoints.as_mut() {
                     let key = (name.to_owned(), stream_name);

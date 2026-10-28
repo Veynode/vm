@@ -154,6 +154,20 @@ pub fn open(mut reply: Value) -> Result<Value, ApiError> {
 pub struct Runtime {
     pub apple_virtualization: bool,
     pub qemu: bool,
+    /// The GPU accelerations the QEMU runtime can run; absent without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<Gpu>,
+}
+
+/// What `gpu` a QEMU machine may ask for on this host.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Gpu {
+    pub virgl: bool,
+    pub venus: bool,
+    pub neptune: bool,
+    /// Why an acceleration is missing, by name.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub reason: std::collections::BTreeMap<String, String>,
 }
 
 /// `hello`'s answer.

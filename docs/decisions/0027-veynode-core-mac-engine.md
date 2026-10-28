@@ -109,8 +109,8 @@ Gaps 1 and 2 block that; gaps 3 and 4 complete it.
 
 ## The contract
 
-The contract is the daemon's versioned local API, not the CLI. [api.md](../api.md) and its JSON Schema
-([crates/api/v1.schema.json](../../crates/api/v1.schema.json)) state every method, shape and error code core relies
+The contract is the daemon's versioned local API, not the CLI. [api.md](../api.md) and its shared vectors
+([crates/api/tests/vectors](../../crates/api/tests/vectors/wire.json)) state every method, shape and error code core relies
 on, at API 1; [core-contract.md](../core-contract.md) says what core ships and what was verified. The daemon, its
 workers and the API are the core layer. The CLI, the MCP servers, the web UI and the browser desktop relay are the
 wrapper layer: clients of the daemon, outside core's archive. The owner's later decisions changed how these gaps
@@ -124,7 +124,7 @@ closed:
   turns on Screen Recording and Accessibility for a guest app, for core's own macOS program.
 - **Windows.** Windows is offered from the user's ISO, with `iso` and `unattended`. The daemon runs the unattended
   install itself, so core's archive needs neither Python nor the CLI.
-- **exec.** `machine.exec` runs over SSH on all three guests, so the 30 s and 64 KiB bounds do not apply to it.
+- **exec.** `machine.exec` runs over SSH on Linux cloud images, macOS and Windows, so the 30 s and 64 KiB bounds do not apply to it.
 - **clone.** `machine.clone` exists (gap 3).
 - **Ports.** Both answers to the port open question apply. `machine.endpoints` returns the guest's NAT address, and
   `-p` on Apple Virtualization goes through a host publisher.
@@ -132,10 +132,9 @@ closed:
   screen-stream protocol (`machine.display` with an epoch). It offers raw PCM sound and microphone endpoints
   (`machine.sound`, `machine.microphone`) only for QEMU, on its SPICE audio. It never offers them for macOS.
 - **Handshake.** Every connection opens with `hello`: the API version, and `methods`, core's capability check.
-- **Daemon.** `vm-control --home H service install` runs the daemon of core's own home as a launchd agent, beside
-  the owner's.
-- **Archive.** `scripts/package-core.sh` builds the minimal `veynodevm.app` archive: vm-control without its MCP
-  servers, the workers and their helpers.
+- **Daemon and archive.** [0028](0028-core-split-and-api-1.md) replaced the core-only archive and
+  `service install`: core unpacks the one release archive (`scripts/package-release.py`) and starts the shared
+  daemon with `veynodevm daemon start`.
 
 ## Container side (for MCP)
 

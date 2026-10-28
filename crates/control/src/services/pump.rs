@@ -1,6 +1,6 @@
 //! A host process wired to a stream: its stdout and stderr to the client, the
 //! client's stdin and signals to it, and the client leaving ends it. This is
-//! how commands in SSH guests (macOS, Windows) run.
+//! how commands in SSH guests (Linux, macOS, Windows) run.
 use crate::api_server::{Input, StreamIo};
 use anyhow::{Context, Result};
 use std::{
@@ -14,7 +14,20 @@ use std::{
 /// Runs `command` to its end; with `stdin`, the client's input feeds it,
 /// otherwise it gets none. The result is its exit code, `128 + signal` when a
 /// signal ended it.
-pub fn run(mut command: Command, stdin: bool, io: &StreamIo) -> Result<i32> {
+pub fn run(command: Command, stdin: bool, io: &StreamIo) -> Result<i32> {
+    run_with(command, stdin, io, None)
+}
+
+/// [`run`], with the client's signals going to `signal` (the guest command
+/// behind an SSH session, which a local signal would not reach) instead of
+/// the host process. Each runs on a thread of its own, so that input keeps
+/// flowing meanwhile.
+pub fn run_with(
+    mut command: Command,
+    stdin: bool,
+    io: &StreamIo,
+    signal: Option<super::machine_guest::Signal>,
+) -> Result<i32> {
     let mut child = command
         .stdin(if stdin { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
@@ -69,8 +82,18 @@ pub fn run(mut command: Command, stdin: bool, io: &StreamIo) -> Result<i32> {
                 unsafe { libc::kill(pid, libc::SIGKILL) };
             }
             while let Some(message) = io.control(Duration::ZERO) {
-                if let Some(signal) = message["signal"].as_str().and_then(signal_number) {
-                    unsafe { libc::kill(pid, signal) };
+                let Some(name) = message["signal"].as_str() else {
+                    continue;
+                };
+                match (&signal, signal_number(name)) {
+                    (Some(forward), Some(_)) => {
+                        let (forward, name) = (forward.clone(), name.to_owned());
+                        thread::spawn(move || forward(&name));
+                    }
+                    (None, Some(number)) => unsafe {
+                        libc::kill(pid, number);
+                    },
+                    (_, None) => {}
                 }
             }
             match input.as_mut().map(|_| io.stdin(Duration::from_millis(20))) {

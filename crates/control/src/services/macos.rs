@@ -187,7 +187,7 @@ pub fn guest_ip(guest: &dyn Guest, timeout: Duration) -> Result<String> {
     }
 }
 
-fn key() -> Result<PathBuf> {
+pub fn key() -> Result<PathBuf> {
     let dir = home::private_dir(&home::root()?.join("ssh"))?;
     let key = dir.join("id_ed25519");
     if !key.exists() {
@@ -972,6 +972,8 @@ struct MachineSpec {
     memory_mib: Option<u64>,
     disk_gib: Option<u64>,
     shares: Vec<(String, PathBuf, bool)>,
+    /// `(host, guest)`, served by the daemon's publisher while it runs.
+    ports: Vec<(u16, u16)>,
 }
 
 fn machine_spec(args: &Value) -> Result<MachineSpec> {
@@ -1015,7 +1017,6 @@ fn machine_spec(args: &Value) -> Result<MachineSpec> {
         "driversIso",
         "unattended",
         "attach",
-        "ports",
         "diskBus",
         "monitor",
     ] {
@@ -1066,6 +1067,10 @@ fn machine_spec(args: &Value) -> Result<MachineSpec> {
         memory_mib: number("memoryMiB", 256..=1 << 20)?,
         disk_gib: number("diskGiB", 4..=4096)?,
         shares,
+        ports: match &args["ports"] {
+            Value::Null => Vec::new(),
+            ports => machines::parse_ports(ports)?,
+        },
     })
 }
 
@@ -1178,6 +1183,9 @@ pub fn create_machine(ctx: &Ctx, args: &Value, io: &StreamIo) -> Result<Value> {
             disk_source: None,
             image: Some(image.reference.clone()),
             drivers_iso: None,
+            digest: None,
+            ports: machines::record_ports(&spec.ports),
+            ssh_port: None,
         };
         machines::save(&machine)?;
         Ok(machines::view(ctx, &machine))
@@ -1329,10 +1337,6 @@ mod tests {
             (
                 json!({"name":"m","from":"i","iso":"/x.iso"}),
                 "iso is not an option",
-            ),
-            (
-                json!({"name":"m","from":"i","ports":[]}),
-                "ports is not an option",
             ),
             (json!({"name":"m","from":"i","gpu":"virgl"}), "Metal GPU"),
             (

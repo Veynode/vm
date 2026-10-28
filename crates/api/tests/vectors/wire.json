@@ -10,5 +10,18 @@
     {"name": "stream start", "value": {"result": {"stream": true}}},
     {"name": "refusal", "value": {"error": "no machine dev", "code": "not_found"}},
     {"name": "version refusal", "value": {"error": "send hello with api 1", "code": "version"}}
+  ],
+  "machines": [
+    {"name": "hello answer", "value": {"result": {"api": 1, "daemon": "0.1.0", "methods": ["hello", "machine.ls"], "home": "/Users/me/Library/Application Support/VeynodeVM", "runtime": {"appleVirtualization": true, "qemu": true, "gpu": {"virgl": true, "venus": false, "neptune": true}}}}},
+    {"name": "machine.create request", "value": {"method": "machine.create", "arguments": {"name": "dev", "os": "linux", "backend": "qemu-hvf", "gpu": "virgl", "cpus": 4, "memoryMiB": 4096, "diskGiB": 32, "disk": "/Users/me/images/debian-13-genericcloud-arm64.qcow2", "shares": [{"hostPath": "/Users/me/src", "tag": "src", "readOnly": false}], "ports": [{"host": 18080, "guest": 8000}]}}},
+    {"name": "machine.create windows request", "value": {"method": "machine.create", "arguments": {"name": "win", "os": "windows", "gpu": "neptune", "cpus": 4, "memoryMiB": 8192, "diskGiB": 64, "iso": "/Users/me/Win11_ARM64.iso", "unattended": true, "driversIso": "/Users/me/virtio-win.iso"}}},
+    {"name": "machine", "value": {"name": "dev", "id": "6f1c2b8e-1d2a-4c55-9a43-0b7f2f0c9a11", "os": "linux", "backend": "qemu-hvf", "state": "running", "source": {"disk": "/Users/me/images/debian-13-genericcloud-arm64.qcow2", "digest": "sha256:39fefc05e50b2d02f416f78b79c400e3af6b81215fa8d15c671f48398f7f335c", "from": null, "iso": null, "driversIso": null}, "cpus": 4, "memoryMiB": 4096, "diskGiB": 32, "gpu": "virgl", "macAddress": "aa:cf:d1:27:05:72", "shares": [{"hostPath": "/Users/me/src", "tag": "src", "readOnly": false, "guestPath": "/mnt/src"}], "ports": [{"host": 18080, "guest": 8000}], "createdAt": 1793113670, "diskUsedBytes": 1073741824}},
+    {"name": "machine.exec request", "value": {"method": "machine.exec", "arguments": {"name": "dev", "argv": ["sh", "-c", "id -un"], "user": "root", "env": ["LANG=C.UTF-8"], "stdin": false}}},
+    {"name": "exec end", "value": {"result": {"exitCode": 0}}},
+    {"name": "files.copy request", "value": {"method": "files.copy", "arguments": {"name": "dev", "direction": "in", "hostPath": "/Users/me/a.txt", "guestPath": "/tmp/a.txt"}}},
+    {"name": "machine.endpoints answer", "value": {"result": {"address": "192.168.64.2", "hostAddress": "192.168.64.1", "ports": [{"host": 18080, "guest": 8000, "address": "127.0.0.1"}]}}},
+    {"name": "machine.display request", "value": {"method": "machine.display", "arguments": {"name": "dev", "epoch": 1}}},
+    {"name": "machine.display answer", "value": {"result": {"format": "stream", "address": "127.0.0.1", "port": 50123, "token": "3f9a0c1d5e7b2a4c", "epoch": 1}}},
+    {"name": "machine.sound answer", "value": {"result": {"format": "pcm", "rate": 48000, "channels": 2, "address": "127.0.0.1", "port": 50124, "token": "8b1e4d2f6a0c9e3b", "epoch": 1}}}
   ]
 }

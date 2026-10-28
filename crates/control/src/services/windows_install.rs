@@ -8,10 +8,13 @@
 //! disk, and are injected into the installed system. The first logon turns
 //! Fast Startup off, installs Windows' OpenSSH Server with this machine's
 //! key for the administrator, and powers the machine off: that ends the
-//! install. The installed disk then boots once, until SSH takes the key.
-use super::{
-    call, create, eject, guest, load, progress, ssh_key, start, CreateRequest, MachinePort,
-};
+//! install, and `machine.create` ends with the machine stopped.
+//!
+//! With `gpu` `neptune`, the first logon also installs viogpu3d, the Neptune
+//! guest driver, from UTM's guest tools ([`GUEST_TOOLS`]), which the daemon
+//! downloads and attaches as another CD-ROM. Its catalog is signed through
+//! Microsoft's hardware program, so `pnputil` installs it without a prompt.
+use super::progress;
 use crate::home;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -24,21 +27,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-
-/// What `install` needs from `machine.create`.
-pub struct Install {
-    pub name: String,
-    pub iso: PathBuf,
-    pub drivers: PathBuf,
-    pub cpus: u32,
-    pub memory_mib: u64,
-    pub disk_gib: u64,
-    pub gpu: Option<String>,
-    /// The host port forwarded to the Guest's OpenSSH Server.
-    pub ssh_port: u16,
-    /// The answer file, seed image and key.
-    pub work: PathBuf,
-}
 
 /// The login the answer file creates.
 pub const USER: &str = "veynode";
@@ -60,6 +48,26 @@ const VIRTIO_DRIVERS: [&str; 8] = [
     "vioinput",
     "pvpanic",
 ];
+/// UTM's guest tools 0.1.273, the release whose viogpu3d speaks Neptune wire
+/// format 1, as UTM 5.0.5's runtime does (0.1.274 speaks 2 and fails;
+/// docs/known-issues.md). Downloaded from UTM's QEMU release, not shipped.
+pub const GUEST_TOOLS: veynodevm_oci::download::Pinned = veynodevm_oci::download::Pinned {
+    url:
+        "https://github.com/utmapp/qemu/releases/download/v10.0.12-utm/utm-guest-tools-0.1.273.iso",
+    size: 140_195_840,
+    sha256: "7d2c0343e92358ad5e65078b08ec1dad873eb91b3c154aef60531bf6c2f04601",
+};
+/// The Neptune driver's directory on the guest tools CD-ROM.
+const NEPTUNE_DRIVER: &str = "Drivers\\viogpu3d\\w11\\ARM64";
+
+/// [`GUEST_TOOLS`] in the home's download cache, fetched the first time.
+pub fn guest_tools() -> Result<PathBuf> {
+    let path =
+        home::private_dir(&home::root()?.join("downloads"))?.join("utm-guest-tools-0.1.273.iso");
+    veynodevm_oci::download::fetch(&GUEST_TOOLS, &path, &mut |m| progress(m))?;
+    Ok(path)
+}
+
 /// Windows PE and Setup letter CD-ROMs from D:, in an order we don't control.
 const DRIVE_LETTERS: &str = "DEFGHIJK";
 
@@ -108,6 +116,7 @@ pub fn answer(
     edition: &str,
     product_key: &str,
     authorized_key: &str,
+    neptune: bool,
 ) -> String {
     let component = |name: &str| {
         format!(
@@ -179,6 +188,13 @@ pub fn answer(
         // No Fast Startup: QEMU/HVF aborts (assert isv) resuming its hybrid
         // shutdown image once the Neptune GPU driver is installed.
         "powercfg /hibernate off".to_owned(),
+    ]);
+    if neptune {
+        first_logon.push(format!(
+            "cmd /c for %d in ({letters}) do @if exist %d:\\{NEPTUNE_DRIVER}\\viogpu3d.inf pnputil /add-driver %d:\\{NEPTUNE_DRIVER}\\viogpu3d.inf /install"
+        ));
+    }
+    first_logon.extend([
         openssh_server(authorized_key),
         // Powering off tells the host the install is complete.
         "shutdown /s /t 20 /c \"VeynodeVM install complete\"".to_owned(),
@@ -348,8 +364,15 @@ impl Qmp {
     }
 }
 
+fn call(method: &str, args: Value) -> Result<Value> {
+    crate::call(&home::state_dir()?, method, args)
+}
+
 fn vm_state(name: &str) -> String {
-    super::state(name)
+    call("status", json!({"id":name}))
+        .ok()
+        .and_then(|v| v["state"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| "missing".into())
 }
 
 /// New bytes of the machine's serial log, from where it stood at `new`.
@@ -472,17 +495,23 @@ fn wait_installed(name: &str, timeout: Duration) -> Result<()> {
     )
 }
 
-/// Creates and installs the machine; it is left running, logged in to over
-/// SSH. A failure leaves the machine for inspection.
-pub fn install(i: &Install) -> Result<()> {
-    let work = home::private_dir(&i.work)?;
+/// The install's key pair and answer-file image, in `work` (private), for
+/// `machine.create` to attach before the machine is registered.
+pub struct Prepared {
+    pub key: PathBuf,
+    pub seed: PathBuf,
+}
+
+pub fn prepare(name: &str, work: &Path, neptune: bool) -> Result<Prepared> {
+    let work = home::private_dir(work)?;
     let key = work.join("id_ed25519");
     if !key.exists() {
         let status = Command::new("/usr/bin/ssh-keygen")
             .args(["-q", "-t", "ed25519", "-N", "", "-C"])
-            .arg(format!("veynodevm-{}", i.name))
+            .arg(format!("veynodevm-{name}"))
             .arg("-f")
             .arg(&key)
+            .stdin(std::process::Stdio::null())
             .status()
             .context("running ssh-keygen")?;
         if !status.success() {
@@ -490,41 +519,26 @@ pub fn install(i: &Install) -> Result<()> {
         }
     }
     let authorized = fs::read_to_string(key.with_extension("pub"))?;
-    let xml = answer(USER, PASSWORD, EDITION, PRODUCT_KEY, &authorized);
+    let xml = answer(USER, PASSWORD, EDITION, PRODUCT_KEY, &authorized, neptune);
     let seed = make_seed(&work, "VEYNODEWIN", &[("Autounattend.xml", &xml)])?;
-    progress(&format!("creating machine {}", i.name));
-    create(&CreateRequest {
-        name: i.name.clone(),
-        os: Some("windows".into()),
-        iso: Some(i.iso.clone()),
-        cpus: Some(i.cpus),
-        memory_mib: Some(i.memory_mib),
-        disk_gib: Some(i.disk_gib),
-        ports: vec![MachinePort {
-            host: i.ssh_port,
-            guest: 22,
-        }],
-        gpu: i.gpu.clone(),
-        attach: vec![seed, i.drivers.clone()],
-        monitor: true,
-        ..Default::default()
-    })?;
-    let serial = Serial::new(&i.name)?;
+    Ok(Prepared { key, seed })
+}
+
+/// Installs a registered machine from its ISO with the prepared answer
+/// file: Setup runs unattended and the first logon powers it off. The
+/// machine is left stopped. A failure leaves it for inspection.
+pub fn install(name: &str) -> Result<()> {
+    let serial = Serial::new(name)?;
     let started = Instant::now();
-    start(&i.name, false)?;
-    press_any_key(&i.name, &serial)?;
+    progress("starting the Windows installer");
+    call("start", json!({"id":name}))?;
+    press_any_key(name, &serial)?;
     progress("Windows Setup runs unattended; the first logon powers the machine off");
-    wait_installed(&i.name, Duration::from_secs(180 * 60))?;
+    wait_installed(name, Duration::from_secs(180 * 60))?;
     progress(&format!(
         "installed in {} minutes",
         started.elapsed().as_secs() / 60
     ));
-    eject(&i.name)?;
-    // The daemon's exec, file and desktop tools log in with this key.
-    ssh_key(&i.name, USER, &key)?;
-    progress("booting installed Windows from its disk");
-    start(&i.name, false)?;
-    guest::ready(&load(&i.name)?, false)?;
     Ok(())
 }
 
@@ -534,7 +548,14 @@ mod tests {
 
     #[test]
     fn the_answer_file_installs_unattended_with_ssh_and_no_fast_startup() {
-        let xml = answer("a<b", "p&w", EDITION, PRODUCT_KEY, "ssh-ed25519 AAAA key\n");
+        let xml = answer(
+            "a<b",
+            "p&w",
+            EDITION,
+            PRODUCT_KEY,
+            "ssh-ed25519 AAAA key\n",
+            false,
+        );
         assert!(xml.starts_with("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<unattend "));
         assert!(xml.contains("<Name>a&lt;b</Name>") && xml.contains("<Value>p&amp;w</Value>"));
         assert!(xml.contains("<Key>/IMAGE/NAME</Key><Value>Windows 11 Pro</Value>"));
@@ -547,5 +568,16 @@ mod tests {
         // The last first-logon command powers the machine off.
         let last = xml.rfind("<Order>").unwrap();
         assert!(xml[last..].contains("shutdown /s /t 20"));
+        assert!(!xml.contains("viogpu3d"));
+    }
+
+    #[test]
+    fn neptune_installs_its_driver_after_fast_startup_is_off() {
+        let xml = answer("u", "p", EDITION, PRODUCT_KEY, "k", true);
+        let driver = xml
+            .find("pnputil /add-driver %d:\\Drivers\\viogpu3d\\w11\\ARM64\\viogpu3d.inf /install")
+            .unwrap();
+        assert!(xml.find("powercfg /hibernate off").unwrap() < driver);
+        assert!(driver < xml.find("administrators_authorized_keys").unwrap());
     }
 }

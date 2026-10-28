@@ -13,7 +13,7 @@ pub mod frame;
 
 pub use client::{Client, Event, Stream, StreamSender};
 pub use envelope::{
-    answer, classify, code_of, open, refusal, refuse, ApiError, ErrorCode, Hello, Runtime,
+    answer, classify, code_of, open, refusal, refuse, ApiError, ErrorCode, Gpu, Hello, Runtime,
 };
 pub use frame::Channel;
 

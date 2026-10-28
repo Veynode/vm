@@ -10,6 +10,7 @@ unpacks it and uses the daemon and CLI over API 1 (docs/api.md):
     libexec/      host helpers registered in runtime.json, when built
     VeynodeVM.app the Apple Virtualization worker (vm-apple)
     share/boot/   the micro-VM kernel, initramfs and module squashfs
+    share/guest/  the Linux guest agent for cloud-image machines, when built
     web/          the web UI server and its built app (with --web)
     install.py    registers this directory in <home>/runtime.json
     MANIFEST.json version, commit, every file's SHA-256, signing
@@ -91,6 +92,10 @@ def inputs(root, profile, web):
     need(root / 'native/.build/vm-apple', 'VeynodeVM.app/Contents/MacOS/vm-apple')
     for file in BOOT.values():
         need(root / '.local/boot' / file, f'share/boot/{file}')
+    # The Linux guest agent the daemon puts on a cloud image's seed.
+    agent = root / '.local/bin/veynode-guest'
+    if agent.exists():
+        files.append((agent, 'share/guest/veynode-agent'))
     helpers = {}
     for key, name in HELPERS.items():
         source = root / '.local/bin' / name

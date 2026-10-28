@@ -6,13 +6,16 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 pub mod checkpoint;
+pub mod cloud_init;
 pub mod container;
 pub mod containers;
 pub mod desktop_stream;
+pub mod display;
 pub mod engine;
 pub mod files;
 pub mod gpt;
 pub mod images;
+pub mod machine_guest;
 pub mod machines;
 pub mod macos;
 pub mod macos_desktop;
@@ -20,10 +23,13 @@ pub mod macos_driver;
 pub mod macos_grant;
 pub mod mcp;
 pub mod proxy;
+pub mod publisher;
 pub mod pump;
 pub mod records;
 pub mod session;
+pub mod sound;
 pub mod util;
+pub mod windows_install;
 
 /// This core's own executable, `vm-control`, which runs the helpers the
 /// daemon starts as processes (`__proxy`, `__driver`).
@@ -121,7 +127,10 @@ const TABLE: &[(&str, Handler)] = &[
     ("machine.eject", Call(machines::eject)),
     ("machine.icon", Call(machines::icon)),
     ("machine.ssh_key", Call(machines::ssh_key)),
+    ("machine.resolution", Call(machines::resolution)),
     ("machine.display", Call(machines::display)),
+    ("machine.sound", Call(machines::sound)),
+    ("machine.microphone", Call(machines::microphone)),
     ("machine.endpoints", Call(machines::endpoints)),
     ("machine.exec", Stream(machines::exec)),
     ("files.copy", Stream(files::copy)),

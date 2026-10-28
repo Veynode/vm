@@ -157,18 +157,18 @@ fn a_linux_machine_from_a_disk_through_its_stopped_life() {
         ),
         ErrorCode::Invalid
     );
-    // Apple Virtualization machines publish no ports.
-    assert_eq!(
-        code(
-            client
-                .call(
-                    "machine.update",
-                    json!({"name":"life1","ports":[{"host":2222,"guest":22}]})
-                )
-                .unwrap_err()
-        ),
-        ErrorCode::Invalid
-    );
+    // Apple Virtualization machines keep their ports in the record; the
+    // daemon publishes them while the machine runs.
+    client
+        .call(
+            "machine.update",
+            json!({"name":"life1","ports":[{"host":2222,"guest":22}]}),
+        )
+        .unwrap();
+    let published = client
+        .call("machine.inspect", json!({"name":"life1"}))
+        .unwrap();
+    assert_eq!(published["ports"], json!([{"host":2222,"guest":22}]));
 
     let copy = client
         .call("machine.clone", json!({"name":"life1","newName":"life2"}))
@@ -196,7 +196,8 @@ fn a_linux_machine_from_a_disk_through_its_stopped_life() {
         .unwrap();
     assert_eq!(
         endpoints,
-        json!({"address":null,"hostAddress":null,"ports":[]})
+        json!({"address":null,"hostAddress":null,
+            "ports":[{"host":2222,"guest":22,"address":"127.0.0.1"}]})
     );
     assert_eq!(
         code(
@@ -269,7 +270,7 @@ fn refusals_carry_the_codes_the_plugin_maps() {
         ErrorCode::Unsupported
     );
     assert_eq!(
-        bad(json!({"name":"mac","os":"macos","from":"ghcr.io/x/y:1","ports":[]})),
+        bad(json!({"name":"mac","os":"macos","from":"ghcr.io/x/y:1","iso":"/x.iso"})),
         ErrorCode::Invalid
     );
 

@@ -55,6 +55,32 @@ pub struct Machine {
     /// The driver image attached for a Windows install.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drivers_iso: Option<PathBuf>,
+    /// `sha256:` of the disk image the machine was made from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    /// An Apple Virtualization machine's published ports, which the
+    /// daemon's publisher serves while it runs (QEMU forwards its own, in
+    /// the VM configuration).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<Port>,
+    /// The private loopback forward to guest port 22 of a QEMU machine the
+    /// daemon logs in to (a cloud image's seed, an unattended Windows
+    /// install); never shown as a published port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_port: Option<u16>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Port {
+    pub host: u16,
+    pub guest: u16,
+}
+
+pub fn record_ports(ports: &[(u16, u16)]) -> Vec<Port> {
+    ports
+        .iter()
+        .map(|&(host, guest)| Port { host, guest })
+        .collect()
 }
 
 fn linux() -> String {
@@ -185,7 +211,7 @@ fn ports_config(ports: &[(u16, u16)]) -> Value {
 }
 
 /// `[{host, guest}]` TCP ports.
-fn parse_ports(value: &Value) -> Result<Vec<(u16, u16)>> {
+pub fn parse_ports(value: &Value) -> Result<Vec<(u16, u16)>> {
     let Some(items) = value.as_array() else {
         return Err(invalid("ports must be an array of {host, guest}"));
     };
@@ -294,11 +320,17 @@ pub fn view(ctx: &Ctx, machine: &Machine) -> Value {
         Some(v) => v["state"].as_str().unwrap_or("unknown").to_owned(),
         None => vm_state(ctx, &machine.name),
     };
-    let config = status.as_ref().map_or(Value::Null, |s| s["config"].clone());
     let used = dir(&machine.name)
         .ok()
         .and_then(|d| fs::metadata(d.join(disk_file(machine))).ok())
         .map_or(0, |m| m.blocks() * 512);
+    render(machine, &raw, status, used)
+}
+
+/// The `Machine` shape of `machine` in VM state `raw`, from the daemon's
+/// `status` answer.
+fn render(machine: &Machine, raw: &str, status: Option<Value>, used: u64) -> Value {
+    let config = status.as_ref().map_or(Value::Null, |s| s["config"].clone());
     let guest_path = |tag: &str| match machine.os.as_str() {
         "linux" => json!(format!("/mnt/{tag}")),
         "macos" => json!(format!("{}/{tag}", super::macos::SHARED)),
@@ -316,27 +348,22 @@ pub fn view(ctx: &Ctx, machine: &Machine) -> Value {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let ports = config["ports"]
-        .as_array()
-        .map(|ports| {
-            ports
-                .iter()
-                .filter(|p| p["guest_port"] != crate::services::SESSION_PORT)
-                .map(|p| json!({"host":p["host_port"],"guest":p["guest_port"]}))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let ports: Vec<Value> = published(machine, &config)
+        .into_iter()
+        .map(|(host, guest)| json!({"host":host,"guest":guest}))
+        .collect();
     json!({
         "name": machine.name,
         "id": machine.id,
         "os": machine.os,
         "backend": machine.backend,
-        "state": api_state(&raw),
+        "state": api_state(raw),
         "source": {
             "iso": machine.iso,
             "disk": machine.disk_source,
             "from": machine.image,
             "driversIso": machine.drivers_iso,
+            "digest": machine.digest,
         },
         "cpus": config["cpus"],
         "memoryMiB": config["memory_mib"],
@@ -352,6 +379,60 @@ pub fn view(ctx: &Ctx, machine: &Machine) -> Value {
         "record": machine,
         "vm": status,
     })
+}
+
+/// The machine's published ports, `(host, guest)`: an Apple Virtualization
+/// machine's from its record, a QEMU machine's from its forwards, without
+/// the guest agent's session port and the daemon's SSH forward.
+pub fn published(machine: &Machine, config: &Value) -> Vec<(u16, u16)> {
+    if machine.backend != "qemu-hvf" {
+        return machine.ports.iter().map(|p| (p.host, p.guest)).collect();
+    }
+    config["ports"]
+        .as_array()
+        .map(|ports| {
+            ports
+                .iter()
+                .filter(|p| p["guest_port"] != crate::services::SESSION_PORT)
+                .filter(|p| {
+                    machine.ssh_port.is_none()
+                        || p["host_port"].as_u64() != machine.ssh_port.map(u64::from)
+                })
+                .filter_map(|p| {
+                    Some((
+                        p["host_port"].as_u64()? as u16,
+                        p["guest_port"].as_u64()? as u16,
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `machine.display`, `machine.sound`, `machine.microphone`: the running
+/// machine's loopback endpoint of that stream for the viewer's `epoch`
+/// (`services::display`, `services::sound`).
+pub fn display(_: &Ctx, args: Value) -> Result<Value> {
+    let (machine, epoch) = endpoint_args(&args)?;
+    super::display::display(&machine.name, epoch)
+}
+
+pub fn sound(_: &Ctx, args: Value) -> Result<Value> {
+    let (machine, epoch) = endpoint_args(&args)?;
+    super::sound::sound(&machine, epoch)
+}
+
+pub fn microphone(_: &Ctx, args: Value) -> Result<Value> {
+    let (machine, epoch) = endpoint_args(&args)?;
+    super::sound::microphone(&machine, epoch)
+}
+
+fn endpoint_args(args: &Value) -> Result<(Machine, u64)> {
+    let machine = load(&name_arg(args)?)?;
+    let epoch = args["epoch"]
+        .as_u64()
+        .ok_or_else(|| invalid("epoch takes a non-negative integer"))?;
+    Ok((machine, epoch))
 }
 
 fn name_arg(args: &Value) -> Result<String> {
@@ -421,11 +502,6 @@ fn create_spec(ctx: &Ctx, args: &Value) -> Result<(Spec, u64, Option<PathBuf>)> 
         Value::Null => Vec::new(),
         ports => parse_ports(ports)?,
     };
-    if !publish.is_empty() && !qemu {
-        return Err(invalid(
-            "ports are a QEMU option (Apple Virtualization guests are reachable at their address)",
-        ));
-    }
     let existing = |field: &str, path: &str| {
         fs::canonicalize(path).map_err(|_| invalid(format!("{field} not found: {path}")))
     };
@@ -452,10 +528,12 @@ fn create_spec(ctx: &Ctx, args: &Value) -> Result<(Spec, u64, Option<PathBuf>)> 
     if let Some(drivers) = opt_string(args, "driversIso")? {
         attach.push(existing("driversIso", drivers)?);
     }
-    if flag(args, "unattended")? && attach.is_empty() {
-        return Err(refuse(
-            ErrorCode::Unsupported,
-            "an unattended Windows install needs its answer file attached (attach: an image holding Autounattend.xml)",
+    if flag(args, "unattended")? && !windows {
+        return Err(invalid("unattended is a Windows install"));
+    }
+    if flag(args, "unattended")? && args["driversIso"].is_null() {
+        return Err(invalid(
+            "an unattended Windows install needs driversIso (virtio-win 0.1.302 or later, ARM64)",
         ));
     }
     let shares = match &args["shares"] {
@@ -522,23 +600,32 @@ pub fn create(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
     if opt_string(&args, "os")? == Some("macos") || !args["from"].is_null() {
         return super::macos::create_machine(ctx, &args, io);
     }
-    let (spec, disk_gib, disk) = create_spec(ctx, &args)?;
+    let (mut spec, disk_gib, disk) = create_spec(ctx, &args)?;
     let name = spec.name.clone();
     let dir = dir(&name)?;
     if dir.exists() || vm_state(ctx, &name) != "missing" {
         return Err(state_error(format!("machine {name} already exists")));
     }
     home::private_dir(&dir)?;
-    let result = (|| -> Result<Value> {
+    let unattended = flag(&args, "unattended")?;
+    let result = super::with_progress(io, || -> Result<Value> {
         let target = dir.join("disk.raw");
+        let mut digest = None;
         let disk_gib = match &disk {
             Some(source) => {
+                // A cloud image (raw or qcow2) becomes a raw base disk,
+                // converted once per image and cloned for each machine.
+                let cache = home::private_dir(&home::root()?.join("machine-images"))?;
+                let (base, sha) = veynodevm_oci::disk::base_disk(&cache, source, &mut |line| {
+                    super::progress(line)
+                })?;
+                digest = Some(sha);
                 io.progress("Cloning the disk")?;
-                if util::clone_file(source, &target).is_err() {
+                if util::clone_file(&base, &target).is_err() {
                     io.progress("Copying the disk (it is on another volume)")?;
-                    fs::copy(source, &target)?;
-                    fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
+                    fs::copy(&base, &target)?;
                 }
+                fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
                 let have = fs::metadata(&target)?.len();
                 let want = disk_gib << 30;
                 if want < have && !args["diskGiB"].is_null() {
@@ -548,10 +635,7 @@ pub fn create(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
                     )));
                 }
                 if want > have {
-                    OpenOptions::new()
-                        .write(true)
-                        .open(&target)?
-                        .set_len(want)?;
+                    grow_raw(&target, want)?;
                 }
                 want.max(have).div_ceil(1 << 30)
             }
@@ -566,6 +650,46 @@ pub fn create(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
                 disk_gib
             }
         };
+        let id = util::random_hex(6);
+        // The daemon logs in to a cloud image's guest (its seed) and to an
+        // unattended Windows install (its answer file) over SSH; on QEMU
+        // through a private loopback forward.
+        let login = (disk.is_some() && !spec.windows) || unattended;
+        let ssh_port = if login && spec.qemu {
+            let port = super::machine_guest::unused_port()?;
+            spec.publish.push((port, 22));
+            Some(port)
+        } else {
+            None
+        };
+        let mut install = None;
+        if disk.is_some() && !spec.windows {
+            io.progress("Writing the cloud-init seed")?;
+            let tags: Vec<(String, bool)> = spec
+                .shares
+                .iter()
+                .map(|(tag, _, read_only)| (tag.clone(), *read_only))
+                .collect();
+            spec.attach.push(seed(&dir, &id, &name, spec.qemu, &tags)?);
+            write_login(&dir, super::cloud_init::USER, None)?;
+        } else if unattended {
+            io.progress("Writing the answer file")?;
+            let neptune = spec.gpu_profile == Some("neptune-dxmt-experimental");
+            let prepared = super::windows_install::prepare(&name, &dir.join("install"), neptune)?;
+            spec.attach.insert(0, prepared.seed.clone());
+            if neptune {
+                // The Neptune guest driver, installed at the first logon.
+                spec.attach.push(super::windows_install::guest_tools()?);
+            }
+            spec.monitor = true;
+            install = Some(prepared);
+        }
+        // Apple Virtualization ports are the publisher's, not the VM's.
+        let ports = if spec.qemu {
+            Vec::new()
+        } else {
+            record_ports(&std::mem::take(&mut spec.publish))
+        };
         io.progress("Registering the machine")?;
         ctx.vm("create", vm_config(&spec, &dir))?;
         let machine = Machine {
@@ -579,23 +703,98 @@ pub fn create(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
             os: if spec.windows { "windows" } else { "linux" }.into(),
             iso: spec.iso.clone(),
             disk_gib,
-            id: util::random_hex(6),
+            id,
             created_at: util::now(),
             icon: None,
             disk_source: disk.clone(),
             image: None,
             drivers_iso: opt_string(&args, "driversIso")?.map(PathBuf::from),
+            digest,
+            ports,
+            ssh_port,
         };
         save(&machine)?;
-        Ok(view(ctx, &machine))
-    })();
+        if let Some(prepared) = install {
+            super::windows_install::install(&name)?;
+            eject(ctx, json!({"name":name}))?;
+            write_login(
+                &dir,
+                super::windows_install::USER,
+                Some(&fs::read(&prepared.key)?),
+            )?;
+            for file in ["id_ed25519", "id_ed25519.pub", "seed.iso"] {
+                let _ = fs::remove_file(dir.join("install").join(file));
+            }
+            let _ = fs::remove_dir(dir.join("install"));
+        }
+        Ok(view(ctx, &load(&name)?))
+    });
     if result.is_err() {
+        if running(&vm_state(ctx, &name)) {
+            let _ = ctx.vm("force_stop", json!({"id":name,"confirm":name}));
+            wait_stopped(ctx, &name, Duration::from_secs(20));
+        }
         if vm_state(ctx, &name) != "missing" {
             let _ = ctx.vm("delete", json!({"id":name,"confirm":name}));
         }
         cleanup_files(&dir);
     }
     result
+}
+
+/// A cloud image's NoCloud seed (`seed.iso` in `dir`): host name, the login
+/// with the home key, the shares mounted, and on Apple Virtualization the
+/// guest agent for the display endpoint.
+fn seed(
+    dir: &Path,
+    instance: &str,
+    name: &str,
+    qemu: bool,
+    tags: &[(String, bool)],
+) -> Result<PathBuf> {
+    let key = fs::read_to_string(super::macos::key()?.with_extension("pub"))?;
+    let agent = if qemu {
+        None
+    } else {
+        super::cloud_init::agent()
+    };
+    let work = dir.join(format!(".work-{}", util::random_hex(4)));
+    home::private_dir(&work)?;
+    let out = dir.join("seed.iso");
+    let written = super::cloud_init::Seed {
+        instance_id: instance,
+        hostname: &super::cloud_init::hostname(name),
+        authorized_key: &key,
+        shares: tags,
+        qemu,
+        agent: agent.as_deref(),
+    }
+    .write(&work, &out);
+    let _ = fs::remove_dir_all(&work);
+    written?;
+    Ok(out)
+}
+
+/// The SSH login the daemon uses for the machine (`ssh/user`, and its own
+/// key when it has one; else the home key).
+fn write_login(dir: &Path, user: &str, key: Option<&[u8]>) -> Result<()> {
+    let ssh = home::private_dir(&dir.join("ssh"))?;
+    let mut files = vec![("user", user.as_bytes())];
+    if let Some(key) = key {
+        files.push(("id_ed25519", key));
+    }
+    for (file, bytes) in files {
+        let tmp = ssh.join(format!("{file}.tmp"));
+        let _ = fs::remove_file(&tmp);
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, bytes))?;
+        fs::rename(tmp, ssh.join(file))?;
+    }
+    Ok(())
 }
 
 /// Remove only the files a machine owns, then its directory (never recursive).
@@ -607,6 +806,7 @@ pub fn cleanup_files(dir: &Path) {
         "serial.log",
         "machine.json",
         "machine.json.tmp",
+        "seed.iso",
         // macOS machines (`services::macos`).
         "login",
         "askpass",
@@ -617,7 +817,7 @@ pub fn cleanup_files(dir: &Path) {
     ] {
         let _ = fs::remove_file(dir.join(file));
     }
-    for sub in ["ssh", "machine"] {
+    for sub in ["ssh", "machine", "install"] {
         if let Ok(entries) = fs::read_dir(dir.join(sub)) {
             for entry in entries.flatten() {
                 let _ = fs::remove_file(entry.path());
@@ -641,6 +841,19 @@ pub fn start(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
     }
     io.progress("Starting")?;
     ctx.vm("start", json!({"id":name}))?;
+    if !machine.ports.is_empty() && machine.backend != "qemu-hvf" {
+        let config = ctx.vm("status", json!({"id":name}))?["config"].clone();
+        let published = super::publisher::Published {
+            state_dir: ctx.state_dir.clone(),
+            name: name.clone(),
+            mac_address: config["mac_address"].as_str().map(str::to_owned),
+            ports: machine.ports.iter().map(|p| (p.host, p.guest)).collect(),
+        };
+        if let Err(error) = super::publisher::start(published) {
+            let _ = ctx.vm("force_stop", json!({"id":name,"confirm":name}));
+            return Err(error);
+        }
+    }
     if flag(&args, "wait")? {
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
@@ -656,8 +869,48 @@ pub fn start(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
             }
             std::thread::sleep(Duration::from_millis(250));
         }
+        // A guest the daemon logs in to is ready once it takes the login.
+        if super::machine_guest::has_login(&machine) {
+            super::machine_guest::ready(ctx, &machine, &|line| {
+                let _ = io.progress(line);
+            })?;
+        } else if machine.os == "windows" && machine.ssh_port.is_some() {
+            windows_ready(ctx, &name, io)?;
+        }
     }
     Ok(view(ctx, &machine))
+}
+
+/// Waits for a Windows machine's OpenSSH Server to take its login.
+fn windows_ready(ctx: &Ctx, name: &str, io: &StreamIo) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let mut said = false;
+    loop {
+        let status = ctx.vm("status", json!({"id":name}))?;
+        if !running(status["state"].as_str().unwrap_or("unknown")) {
+            bail!("{name} stopped while starting")
+        }
+        let config: crate::Config = serde_json::from_value(status["config"].clone())?;
+        let ssh = crate::windows_guest::Ssh::locate(&ctx.state_dir, &config)?;
+        let answered = ssh
+            .stdio("exit 0")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if answered {
+            return Ok(());
+        }
+        if !said {
+            io.progress(&format!("waiting for {name} to accept SSH"))?;
+            said = true;
+        }
+        if Instant::now() > deadline || io.closed() {
+            bail!("{name} did not accept the SSH login in time")
+        }
+        std::thread::sleep(Duration::from_secs(3));
+    }
 }
 
 pub fn stop(ctx: &Ctx, args: Value) -> Result<Value> {
@@ -671,6 +924,8 @@ pub fn stop(ctx: &Ctx, args: Value) -> Result<Value> {
     } else {
         ctx.vm("shutdown", json!({"id":name}))?;
     }
+    super::publisher::stop(&name);
+    super::display::stop(&name);
     Ok(json!({ "name": name }))
 }
 
@@ -697,6 +952,8 @@ pub fn rm(ctx: &Ctx, args: Value) -> Result<Value> {
         ctx.vm("force_stop", json!({"id":name,"confirm":name}))?;
         wait_stopped(ctx, &name, Duration::from_secs(20));
     }
+    super::publisher::stop(&name);
+    super::display::stop(&name);
     if state != "missing" {
         ctx.vm("delete", json!({"id":name,"confirm":name}))?;
     }
@@ -830,15 +1087,20 @@ pub fn edit_config(config: &mut Value, machine: &Machine, changes: &Changes) -> 
         }
     }
     match &changes.publish {
+        // Apple Virtualization ports are the record's (`update`).
+        Some(_) if !qemu => {}
         None => {}
-        Some(ports) if ports.is_empty() => {
-            fields.remove("ports");
-        }
-        Some(_) if !qemu => return Err(invalid(
-            "ports are a QEMU option (Apple Virtualization guests are reachable at their address)",
-        )),
         Some(ports) => {
-            fields.insert("ports".into(), ports_config(ports));
+            // The daemon's own SSH forward stays.
+            let mut ports = ports.clone();
+            if let Some(ssh) = machine.ssh_port {
+                ports.push((ssh, 22));
+            }
+            if ports.is_empty() {
+                fields.remove("ports");
+            } else {
+                fields.insert("ports".into(), ports_config(&ports));
+            }
         }
     }
     if let Some(mac) = &changes.mac_address {
@@ -870,20 +1132,36 @@ pub fn update(ctx: &Ctx, args: Value) -> Result<Value> {
     if config != old {
         reregister(ctx, &name, old, config)?;
     }
+    if let (Some(ports), false) = (&changes.publish, machine.backend == "qemu-hvf") {
+        machine.ports = record_ports(ports);
+        save(&machine)?;
+    }
     if let Some(gib) = grow {
         // Sparse: the new end takes no host space until the guest writes it.
         if machine.os == "macos" {
             super::macos::grow_machine_disk(&dir(&name)?, gib)?;
         } else {
-            OpenOptions::new()
-                .write(true)
-                .open(dir(&name)?.join("disk.raw"))?
-                .set_len(gib << 30)?;
+            grow_raw(&dir(&name)?.join("disk.raw"), gib << 30)?;
         }
         machine.disk_gib = gib;
         save(&machine)?;
     }
     Ok(json!({ "name": name }))
+}
+
+/// Grows a raw disk to `size` bytes, moving its backup GPT header to the new
+/// end when it has a GPT (a blank installer disk has none yet).
+fn grow_raw(path: &Path, size: u64) -> Result<()> {
+    let mut sector = [0u8; 8];
+    let gpt = fs::File::open(path).and_then(|f| {
+        use std::os::unix::fs::FileExt;
+        f.read_exact_at(&mut sector, 512)
+    });
+    if gpt.is_ok() && &sector == b"EFI PART" {
+        super::gpt::grow(path, size)
+    } else {
+        Ok(OpenOptions::new().write(true).open(path)?.set_len(size)?)
+    }
 }
 
 /// Every string in a VM configuration that names a file under `from`, moved under `to`.
@@ -982,10 +1260,39 @@ pub fn clone(ctx: &Ctx, args: Value) -> Result<Value> {
         }
         config["id"] = json!(new);
         moved_paths(&mut config, &from, &to);
+        let id = util::random_hex(6);
+        // Two machines cannot share host ports; the daemon's SSH forward
+        // gets a port of its own.
+        let ssh_port = machine
+            .ssh_port
+            .map(|_| super::machine_guest::unused_port())
+            .transpose()?;
         if let Some(fields) = config.as_object_mut() {
             fields.insert("mac_address".into(), json!(util::random_mac()));
-            // Two machines cannot share host ports.
             fields.remove("ports");
+            if let Some(port) = ssh_port {
+                fields.insert("ports".into(), ports_config(&[(port, 22)]));
+            }
+        }
+        // A cloud image's copy is a new cloud-init instance: it takes a new
+        // host name, machine-id and host keys at its first boot.
+        if from.join("seed.iso").is_file() {
+            let tags: Vec<(String, bool)> = config["shares"]
+                .as_array()
+                .map(|shares| {
+                    shares
+                        .iter()
+                        .filter_map(|s| {
+                            Some((
+                                s["tag"].as_str()?.to_owned(),
+                                s["read_only"].as_bool().unwrap_or(false),
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            seed(&to, &id, &new, machine.backend == "qemu-hvf", &tags)?;
+            let _ = fs::remove_file(to.join("ssh/known_hosts"));
         }
         if machine.os == "macos" {
             super::macos::fresh_identity(&from, &to, &mut config)?;
@@ -993,8 +1300,10 @@ pub fn clone(ctx: &Ctx, args: Value) -> Result<Value> {
         ctx.vm("create", config.clone())?;
         let copy = Machine {
             name: new.clone(),
-            id: util::random_hex(6),
+            id,
             created_at: util::now(),
+            ports: Vec::new(),
+            ssh_port,
             ..machine.clone()
         };
         save(&copy)?;
@@ -1093,9 +1402,9 @@ pub fn base64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-/// `machine.display`: a Windows machine's display mode, through the daemon's
+/// `machine.resolution`: a Windows machine's display mode, through the daemon's
 /// Windows guest login; answers with the guest's own `result=0 now=WxH` line.
-pub fn display(ctx: &Ctx, args: Value) -> Result<Value> {
+pub fn resolution(ctx: &Ctx, args: Value) -> Result<Value> {
     let name = name_arg(&args)?;
     let machine = load(&name)?;
     if machine.os != "windows" {
@@ -1164,31 +1473,26 @@ pub fn endpoints(ctx: &Ctx, args: Value) -> Result<Value> {
     let (address, host) = if machine.backend == "qemu-hvf" {
         (None, Some("10.0.2.2".to_string()))
     } else {
-        let address = config["mac_address"]
-            .as_str()
-            .filter(|_| live)
-            .and_then(util::leased_ip);
+        // By MAC, else by the host name a cloud image's seed gave it.
+        let address = live
+            .then(|| super::machine_guest::lease(&name, config["mac_address"].as_str()))
+            .flatten();
         let host = address.as_deref().and_then(|ip| {
             let (net, _) = ip.rsplit_once('.')?;
             Some(format!("{net}.1"))
         });
         (address, host)
     };
-    let ports = config["ports"]
-        .as_array()
-        .map(|ports| {
-            ports
-                .iter()
-                .filter(|p| p["guest_port"] != crate::services::SESSION_PORT)
-                .map(|p| json!({"host":p["host_port"],"guest":p["guest_port"],"address":p["host_address"]}))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let ports: Vec<Value> = published(&machine, config)
+        .into_iter()
+        .map(|(host, guest)| json!({"host":host,"guest":guest,"address":"127.0.0.1"}))
+        .collect();
     Ok(json!({"address":address,"hostAddress":host,"ports":ports}))
 }
 
-/// `machine.exec`. Windows and macOS guests run the command over SSH, with
-/// input, output and signals streamed. Linux guests run it through the guest
+/// `machine.exec`. Windows and macOS guests, and Linux guests made from a
+/// cloud image, run the command over SSH, with input, output and signals
+/// streamed and no time bound. Other Linux guests run it through the guest
 /// service's bounded synchronous exec (at most 30 s, output when it ends);
 /// their input is read to its end first and handed to the command whole.
 pub fn exec(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
@@ -1222,6 +1526,19 @@ pub fn exec(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
             pump::run(ssh.stdio(&windows_start(&argv, &env)), stdin, io)?
         }
         "macos" => super::macos::exec_machine(ctx, &machine, &argv, &env, &args, stdin, io)?,
+        _ if super::machine_guest::has_login(&machine) => {
+            let target = super::machine_guest::ready(ctx, &machine, &|line| {
+                let _ = io.progress(line);
+            })?;
+            let (command, signal) = super::machine_guest::exec_command(
+                &target,
+                &argv,
+                &env,
+                opt_string(&args, "cwd")?,
+                opt_string(&args, "user")?,
+            )?;
+            pump::run_with(command, stdin, io, Some(signal))?
+        }
         _ => linux_exec(ctx, &name, argv, env, &args, stdin, io)?,
     };
     Ok(json!({ "exitCode": code }))
@@ -1343,6 +1660,39 @@ mod tests {
             disk_source: None,
             image: None,
             drivers_iso: None,
+            digest: None,
+            ports: Vec::new(),
+            ssh_port: None,
+        }
+    }
+
+    /// The view keeps the `Machine` shape core's plugin reads
+    /// (crates/api/tests/vectors, its fake daemon's `view`).
+    #[test]
+    fn the_view_matches_the_shared_vector() {
+        let vectors: Value =
+            serde_json::from_str(include_str!("../../../api/tests/vectors/wire.json")).unwrap();
+        let expected = vectors["machines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == "machine")
+            .unwrap()["value"]
+            .clone();
+        let mut m = machine("qemu-hvf", "linux");
+        m.name = "dev".into();
+        m.id = expected["id"].as_str().unwrap().into();
+        m.created_at = 1793113670;
+        m.disk_source = Some(expected["source"]["disk"].as_str().unwrap().into());
+        m.digest = Some(expected["source"]["digest"].as_str().unwrap().into());
+        m.ssh_port = Some(40022);
+        let status = json!({"config":{"cpus":4,"memory_mib":4096,
+            "qemu_graphics_profile":"virgl","mac_address":"aa:cf:d1:27:05:72",
+            "shares":[{"path":"/Users/me/src","tag":"src","read_only":false}],
+            "ports":[{"host_port":18080,"guest_port":8000},{"host_port":40022,"guest_port":22}]}});
+        let view = render(&m, "running", Some(status), 1073741824);
+        for (key, value) in expected.as_object().unwrap() {
+            assert_eq!(&view[key], value, "{key}");
         }
     }
 

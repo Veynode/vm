@@ -156,9 +156,19 @@ const NETWORK: &str = "version: 2\nethernets:\n  primary:\n    match: {name: \"e
 /// The Linux arm64 guest agent shipped with this program: next to it, in
 /// the app bundle's `Resources/guest`, or a checkout's `.local/bin` build.
 pub fn agent() -> Option<PathBuf> {
-    super::resource("guest/veynode-agent")
-        .or_else(|| super::resource("veynode-agent"))
-        .or_else(|| super::checkout_file(".local/bin/veynode-guest"))
+    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+    let dir = exe.parent()?;
+    let shipped = [
+        dir.join("guest/veynode-agent"),
+        dir.join("veynode-agent"),
+        dir.join("../Resources/guest/veynode-agent"),
+        dir.join("../share/guest/veynode-agent"),
+    ];
+    let checkout = exe
+        .ancestors()
+        .find(|d| d.join("crates/cli/Cargo.toml").is_file())
+        .map(|root| root.join(".local/bin/veynode-guest"));
+    shipped.into_iter().chain(checkout).find(|p| p.is_file())
 }
 
 #[cfg(test)]

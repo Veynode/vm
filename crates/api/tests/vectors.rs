@@ -53,3 +53,18 @@ fn lines_open_as_the_vectors_say() {
         b"{\"arguments\":{\"api\":1,\"client\":\"veynode-core/1\"},\"method\":\"hello\"}\n"
     );
 }
+
+#[test]
+fn hello_answer_reads_with_its_gpu() {
+    let machines = vectors()["machines"].as_array().unwrap().clone();
+    let answer = machines
+        .iter()
+        .find(|case| case["name"] == "hello answer")
+        .unwrap()["value"]
+        .clone();
+    let hello: veynodevm_api::Hello =
+        serde_json::from_value(open(answer.clone()).unwrap()).unwrap();
+    let gpu = hello.runtime.gpu.clone().unwrap();
+    assert!(gpu.virgl && gpu.neptune && !gpu.venus);
+    assert_eq!(serde_json::to_value(&hello).unwrap(), answer["result"]);
+}

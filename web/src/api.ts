@@ -506,7 +506,7 @@ export const updateMachine = createServerFn({ method: 'POST' })
     return { name: data.name }
   })
 
-/** `machine.display`: a running Windows machine's resolution, through its SSH login. */
+/** `machine.resolution`: a running Windows machine's resolution, through its SSH login. */
 export const setMachineDisplay = createServerFn({ method: 'POST' })
   .validator((input: unknown) => {
     const v = (input ?? {}) as Record<string, unknown>
@@ -515,7 +515,7 @@ export const setMachineDisplay = createServerFn({ method: 'POST' })
   .handler(async ({ data }) => {
     const { api } = await import('./server/veynodevm')
     const [width, height] = data.size.split('x').map(Number)
-    await api('machine.display', { name: data.name, width, height }, 60_000)
+    await api('machine.resolution', { name: data.name, width, height }, 60_000)
     return { ok: true }
   })
 

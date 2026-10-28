@@ -9,7 +9,7 @@
 //! machine, which asked `audio_start`: the broker plays the Guest's sound to
 //! the client that asked last and takes the microphone from it only.
 //! Apple Virtualization machines have no VeynodeVM sound relay.
-use super::{base64, display, refuse, Machine};
+use super::{display, machines::base64, machines::Machine};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::{
@@ -21,6 +21,7 @@ use std::{
     thread,
     time::Duration,
 };
+use veynodevm_api::{refuse, ErrorCode};
 
 /// The endpoints' sample rate.
 const RATE: u32 = 48_000;
@@ -31,7 +32,7 @@ const MIC_FRAME: usize = 960;
 pub fn sound(machine: &Machine, epoch: u64) -> Result<Value> {
     let socket = console(machine)?;
     display::endpoint(
-        machine,
+        &machine.name,
         "sound",
         epoch,
         json!({"format":"pcm","rate":RATE,"channels":2}),
@@ -43,7 +44,7 @@ pub fn sound(machine: &Machine, epoch: u64) -> Result<Value> {
 pub fn microphone(machine: &Machine, epoch: u64) -> Result<Value> {
     let socket = console(machine)?;
     display::endpoint(
-        machine,
+        &machine.name,
         "microphone",
         epoch,
         json!({"format":"pcm","rate":RATE,"channels":1}),
@@ -54,26 +55,37 @@ pub fn microphone(machine: &Machine, epoch: u64) -> Result<Value> {
 /// The VM's console broker socket, refusing machines without a sound card.
 fn console(machine: &Machine) -> Result<String> {
     if machine.backend != "qemu-hvf" {
-        refuse!(
-            "unsupported",
-            "{} runs on Apple Virtualization, which has no VeynodeVM sound relay",
-            machine.name
-        )
+        return Err(refuse(
+            ErrorCode::Unsupported,
+            format!(
+                "{} runs on Apple Virtualization, which has no VeynodeVM sound relay",
+                machine.name
+            ),
+        ));
     }
-    let status = super::call("status", json!({"id":machine.name}))?;
-    if !super::running(status["state"].as_str().unwrap_or_default()) {
-        refuse!("state", "{} is not running", machine.name)
+    let status = crate::call(
+        &crate::home::state_dir()?,
+        "status",
+        json!({"id":machine.name}),
+    )?;
+    if !super::machines::running(status["state"].as_str().unwrap_or_default()) {
+        return Err(refuse(
+            ErrorCode::State,
+            format!("{} is not running", machine.name),
+        ));
     }
     if status["config"]["audio"] != true {
-        refuse!(
-            "unsupported",
-            "{} has no sound card (machine.update with audio, while stopped)",
-            machine.name
-        )
+        return Err(refuse(
+            ErrorCode::Unsupported,
+            format!(
+                "{} has no sound card (machine.update with audio, while stopped)",
+                machine.name
+            ),
+        ));
     }
     match status["runtime"]["console_socket"].as_str() {
         Some(socket) => Ok(socket.to_owned()),
-        None => refuse!("failed", "{} has no console broker", machine.name),
+        None => bail!("{} has no console broker", machine.name),
     }
 }
 
@@ -121,7 +133,7 @@ fn shared(name: &str, socket: &str) -> Result<Arc<Link>> {
     let label = name.to_owned();
     thread::spawn(move || {
         if let Err(error) = pump(reader, &weak) {
-            super::progress(&format!("sound of {label}: {error:#}"));
+            crate::log_line(&format!("sound of {label}: {error:#}"));
         }
     });
     // The broker ends a connection that sends nothing for 300 s (a muted microphone).
