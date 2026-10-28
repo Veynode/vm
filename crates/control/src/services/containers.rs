@@ -127,6 +127,32 @@ pub fn pause(_: &Ctx, args: Value) -> Result<Value> {
     Ok(row(&c))
 }
 
+/// `container.sleep`: hibernates the container now if it can be, else
+/// pauses it; either way its next use wakes it.
+pub fn sleep(_: &Ctx, args: Value) -> Result<Value> {
+    only(&args, &["name"])?;
+    let c = find(&args)?;
+    if c.engine {
+        return Err(refuse(
+            ErrorCode::Unsupported,
+            format!("{} runs the shared engine; it cannot sleep", c.name),
+        ));
+    }
+    super::daemon_call("sleep", json!({"id":c.vm_id}))?;
+    Ok(row(&c))
+}
+
+/// `container.keepAwake`: no idle pause or hibernation for `seconds` (0
+/// ends it early); wakes the container if it sleeps.
+pub fn keep_awake(_: &Ctx, args: Value) -> Result<Value> {
+    only(&args, &["name", "seconds"])?;
+    let c = find(&args)?;
+    let seconds = opt_u64(&args, "seconds")?
+        .ok_or_else(|| refuse(ErrorCode::Invalid, "keepAwake requires seconds"))?;
+    super::daemon_call("keep_awake", json!({"id":c.vm_id,"seconds":seconds}))?;
+    Ok(row(&c))
+}
+
 /// `container.unpause`: resumes a paused container.
 pub fn unpause(_: &Ctx, args: Value) -> Result<Value> {
     only(&args, &["name"])?;

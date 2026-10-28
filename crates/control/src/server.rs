@@ -179,13 +179,26 @@ pub(crate) fn vm_result(
     admitted_at: std::time::Instant,
 ) -> Result<Value> {
     let mut deferred = None;
-    let value = {
+    let mut waited = false;
+    let value = loop {
         let mut manager = manager.lock().unwrap();
         // Include socket reads and queue/manager-lock delay.
-        if admitted_at.elapsed() > Duration::from_secs(30) {
+        if !waited && admitted_at.elapsed() > Duration::from_secs(30) {
             bail!("controller request expired before dispatch")
         }
-        manager.dispatch(request.clone(), &mut deferred)?
+        match manager.dispatch(request.clone(), &mut deferred) {
+            // A worker saving its machine state answers once it has stopped;
+            // the request then restores the VM (`idle.rs`).
+            Err(error)
+                if error.to_string() == idle::HIBERNATING
+                    && admitted_at.elapsed() < idle::SAVE_WAIT =>
+            {
+                drop(manager);
+                waited = true;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            result => break result?,
+        }
     };
     match deferred {
         Some(p) => p.wait(stream),

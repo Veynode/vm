@@ -145,6 +145,8 @@ camelCase like the rest of the API.
 | `container.start` | call | `{name}` | row |
 | `container.stop` | call | `{name, timeoutS?}` | row |
 | `container.pause` / `container.unpause` | call | `{name}` | row (`state` `paused`, `status` `Up (Paused)`) |
+| `container.sleep` | call | `{name}` | row; hibernated if it can be, else paused; its next use wakes it |
+| `container.keepAwake` | call | `{name, seconds}` (0 ends it early, at most 86400) | row; no idle pause or hibernation until then |
 | `container.rm` | call | `{name, force?}` | `{id, name}` |
 | `container.rename` | call | `{name, newName}` | row |
 | `container.update` | call | `{name, restart?, changes: {cpus?, memoryMiB?, diskGiB?, gpus?, desktop?, desktopSize?, ports?, dns?, mtu?, newMac?, idlePauseS?, idleHibernateS?}}` | `{id, name, backend, gpus, cpus, memory_mib, disk_bytes, ports, mac_address, …}` |
@@ -231,5 +233,13 @@ frees the Guest's memory. `status` then reports `hibernated` with `hibernation: 
 worker holds the request until the VM runs; the clock is stepped); the file is removed once the restored VM runs,
 or when its restore fails, and the next start boots afresh. `shutdown`, `force_stop` and `delete` discard it, as
 does a start with `restore_machine_state` or a snapshot restore. While the worker saves, methods that need the Guest
-are refused (`state`). `events` carries `hibernating`, `hibernate_failed`, `restoring`, `restored` and
-`hibernation_discarded`. A container's `state` is then `hibernated` and its `status` `Up (Hibernated)`.
+wait (up to 300 s) and then restore it. `events` carries `hibernating`, `hibernate_failed`, `restoring`,
+`restored` and `hibernation_discarded`. A container's `state` is then `hibernated` and its `status` `Up (Hibernated)`.
+
+Before it pauses or hibernates a running Apple Linux VM, the daemon asks the guest agent's `activity` (one-minute
+load from `/proc/loadavg`): at 0.5 or more the Guest is busy, which counts as activity, so work started in the
+background is not frozen. A Guest that does not answer counts as quiet. Two methods let a client say what the monitor
+cannot see: `sleep {id}` does now what the idle monitor would (hibernates a VM that can be, pauses any other the way
+the monitor does, so its next use wakes it; refused while Guest jobs or a snapshot run), and `keep_awake {id,
+seconds}` (0 to 86400; 0 ends it) keeps it from both until then and wakes it if it sleeps; `idle.awake_for_s` shows
+what is left. MCP has them as `vm_sleep` and `vm_keep_awake` (lifecycle tools).

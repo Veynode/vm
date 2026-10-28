@@ -66,6 +66,9 @@ leave management capacity when all four command slots are executing synchronousl
   `async_exec` when command execution is enabled. `max_timeout_ms` remains
   30000 for synchronous execution; `max_async_timeout_ms` reports the manager's
   asynchronous bound.
+- `activity`: `{load1, running}` from `/proc/loadavg` (one-minute load,
+  runnable tasks besides the reader); the host's idle monitor asks before it
+  pauses or hibernates the VM. Needs no permission.
 - `exec`: existing synchronous API; `argv` (1–128 arguments, no NUL) and
   `timeout_ms` (1–30000). Results now also contain `cancelled:false`.
 - `exec_start`: same arguments; only verified Linux `cgroup-v2-clone3-kill`

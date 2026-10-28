@@ -100,9 +100,14 @@
   first use after hibernation waits for the restore, which costs about
   1.2 s per GiB of Guest memory in use (the same as a warm checkpoint), and
   the state file takes that much disk until the restore removes it.
-- A request that arrives while the worker is still saving is refused rather
-  than queued; a connection through a published port then fails, and the
-  next one restores the VM.
+- A request that arrives while the worker is still saving waits for the save
+  (up to 300 s) and then restores the VM, so the first use after a fresh
+  hibernation pays for both.
+- The Guest's own work is judged by its one-minute load (`activity`, Apple
+  Linux Guests with a current agent): a background job that mostly waits on
+  the network (a slow download, a chat client) keeps the load low and is
+  frozen like an idle Guest. `keep_awake` (`veynodevm keep-awake`,
+  `vm_keep_awake`) covers what the load does not show.
 - The idle policy lives in the daemon's memory and the container record: a
   daemon restart forgets it until the container's next start, but a
   hibernated VM is still restored on its next use.
@@ -118,6 +123,14 @@
   at 129 s; `start` restored a hibernated container, and `stop` discarded
   the state (1.2 s) so the next start booted afresh. Larger memory, desktops,
   volumes and a daemon restart while hibernated were not checked.
+- Checked live once more, 2026-10-29, with a guest agent and worker built
+  from this tree: a container whose entrypoint spun the CPU for 150 s with
+  `--idle-hibernate 60s` was not hibernated until 287 s (load fallen, then a
+  quiet minute); `veynodevm sleep` hibernated it at once, an `exec` sent
+  during the save waited and ran in 0.64 s, and a second `sleep` right after
+  that restore hibernated it again; `keep-awake 150s` held it awake until it
+  hibernated at 217 s. `vm_sleep` and `vm_keep_awake` were not called
+  through an MCP client.
 
 ## Checkpoints, rollback and forks
 

@@ -29,6 +29,14 @@ pub(crate) const MIN_SECONDS: u64 = 60;
 pub(crate) const MAX_SECONDS: u64 = 7 * 24 * 3600;
 /// A pause or resume the worker has not reported within this long did not happen.
 const SETTLE: Duration = Duration::from_secs(15);
+/// The longest `keep_awake`.
+pub(crate) const MAX_HOLD_SECONDS: u64 = 24 * 3600;
+/// A Guest whose one-minute load is at least this is busy (`activity`).
+const GUEST_BUSY_LOAD: f64 = 0.5;
+/// The refusal while the worker saves; `vm_result` waits it out and retries.
+pub(crate) const HIBERNATING: &str = "VM is hibernating; try again once it has stopped";
+/// How long `vm_result` waits for a save before it passes the refusal on.
+pub(crate) const SAVE_WAIT: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PausedBy {
@@ -57,6 +65,10 @@ pub(crate) struct Idle {
     pub(crate) hibernating: Option<mpsc::Receiver<Value>>,
     /// The worker was started from the hibernation file.
     pub(crate) restoring: bool,
+    /// `keep_awake`: the VM counts as busy until then.
+    pub(crate) hold: Option<Instant>,
+    /// The Guest's answer to `activity`, asked once a pause or hibernation is due.
+    pub(crate) probe: Option<(Instant, mpsc::Receiver<Value>)>,
 }
 impl Idle {
     pub(crate) fn new(now: Instant) -> Self {
@@ -67,7 +79,12 @@ impl Idle {
             paused: None,
             hibernating: None,
             restoring: false,
+            hold: None,
+            probe: None,
         }
+    }
+    pub(crate) fn held_awake(&self, now: Instant) -> bool {
+        self.hold.is_some_and(|until| now < until)
     }
     /// Who holds the VM paused: the daemon asked, and the worker reports it.
     pub(crate) fn held(&self, state: &str) -> Option<PausedBy> {
@@ -129,7 +146,23 @@ pub(crate) fn passive(method: &str) -> bool {
             | "resume"
             | "wake"
             | "idle_policy"
+            | "sleep"
+            | "keep_awake"
     )
+}
+
+/// Whether the Guest's `activity` reply shows work in progress.
+pub(crate) fn guest_busy(reply: &Value) -> bool {
+    reply["result"]["result"]["load1"]
+        .as_f64()
+        .is_some_and(|load| load >= GUEST_BUSY_LOAD)
+}
+
+/// What the monitor knows of the Guest's own work.
+enum GuestWork {
+    Asked,
+    Busy,
+    Quiet,
 }
 
 /// `idle_pause_s`: absent, null or 0 is no idle pause.
@@ -291,8 +324,14 @@ impl Manager {
     }
 
     /// Asks the worker to save the machine state and exit.
-    fn hibernate(&mut self, id: &str) -> Result<()> {
+    fn hibernate(&mut self, id: &str, reason: &str) -> Result<()> {
+        // A restore the monitor has not settled yet: its file is the old state,
+        // and the flag would make the new one look like a failed restore.
+        self.settle_restore(id);
         let path = container_state::hibernation_path(&self.configs[id])?;
+        if self.idle.get(id).is_some_and(|idle| idle.restoring) {
+            bail!("VM is busy: it is still restoring")
+        }
         // A file no restore removed would make the worker refuse.
         let _ = fs::remove_file(&path);
         let (_, reply) = self.write_command(id, json!({"method":"hibernate","path":path}))?;
@@ -301,7 +340,7 @@ impl Manager {
         idle.hibernating = Some(reply);
         idle.paused = None;
         self.events
-            .publish(id, "hibernating", json!({"reason":"idle"}));
+            .publish(id, "hibernating", json!({ "reason": reason }));
         Ok(())
     }
 
@@ -371,7 +410,7 @@ impl Manager {
             return Ok(None);
         };
         if state == "hibernated" || self.idle.get(id).is_some_and(|i| i.hibernating.is_some()) {
-            bail!("VM is hibernating; try again once it has stopped")
+            bail!(HIBERNATING)
         }
         let now = Instant::now();
         let idle = self.idle.entry(id.into()).or_insert_with(|| Idle::new(now));
@@ -436,17 +475,20 @@ impl Manager {
                 }
             }
         }
-        if !matches!(method, "pause" | "resume" | "wake" | "idle_policy") {
+        if !matches!(
+            method,
+            "pause" | "resume" | "wake" | "idle_policy" | "sleep" | "keep_awake"
+        ) {
             return self.idle_gate(method, id);
         }
         validate_id(id)?;
         if !self.configs.contains_key(id) {
             bail!("VM not found")
         }
-        let allowed: &[&str] = if method == "idle_policy" {
-            &["id", "idle_pause_s", "idle_hibernate_s"]
-        } else {
-            &["id"]
+        let allowed: &[&str] = match method {
+            "idle_policy" => &["id", "idle_pause_s", "idle_hibernate_s"],
+            "keep_awake" => &["id", "seconds"],
+            _ => &["id"],
         };
         if args
             .as_object()
@@ -474,11 +516,27 @@ impl Manager {
                 "idle_hibernate_s": idle.hibernate.map_or(0, |a| a.as_secs()),
             })));
         }
+        if method == "keep_awake" {
+            let seconds = args["seconds"]
+                .as_u64()
+                .filter(|s| *s <= MAX_HOLD_SECONDS)
+                .with_context(|| format!("keep_awake requires seconds, 0..{MAX_HOLD_SECONDS}"))?;
+            let idle = self.idle.entry(id.into()).or_insert_with(|| Idle::new(now));
+            idle.hold = (seconds > 0).then(|| now + Duration::from_secs(seconds));
+        }
+        // `keep_awake` also wakes the VM, like the heartbeat.
+        let method = if method == "keep_awake" {
+            "wake"
+        } else {
+            method
+        };
         self.settle_hibernating(id);
         let Some(state) = self.live_state(id) else {
             if self.hibernated(id).is_some() {
-                if method == "pause" {
-                    bail!("VM is hibernated; it is not running")
+                match method {
+                    "pause" => bail!("VM is hibernated; it is not running"),
+                    "sleep" => return Ok(Some(json!({"state":"hibernated"}))),
+                    _ => {}
                 }
                 self.restore_hibernated(id)?;
                 return Ok(Some(json!({"state":"restoring"})));
@@ -489,14 +547,17 @@ impl Manager {
             bail!("VM is not running")
         };
         if state == "hibernated" || self.idle.get(id).is_some_and(|i| i.hibernating.is_some()) {
-            if method == "wake" {
+            if method == "sleep" {
                 return Ok(Some(json!({"state":"hibernating"})));
             }
-            bail!("VM is hibernating; try again once it has stopped")
+            bail!(HIBERNATING)
         }
         let idle = self.idle.entry(id.into()).or_insert_with(|| Idle::new(now));
         idle.last = now;
         let held = idle.held(&state);
+        if method == "sleep" {
+            return self.sleep(id, &state, held, deferred);
+        }
         match method {
             "pause" => {
                 if held.is_some() {
@@ -519,6 +580,84 @@ impl Manager {
         Ok(Some(Value::Null))
     }
 
+    /// `sleep`: what the idle monitor would do now, on request. A VM that can
+    /// be hibernated is; any other is paused the way the monitor pauses it,
+    /// so the next use resumes it.
+    fn sleep(
+        &mut self,
+        id: &str,
+        state: &str,
+        held: Option<PausedBy>,
+        deferred: &mut Option<Completion>,
+    ) -> Result<Option<Value>> {
+        if held == Some(PausedBy::Request) {
+            bail!("VM is paused on request; resume it first")
+        }
+        if state != "running" && state != "paused" {
+            bail!("VM is not running")
+        }
+        if self.snapshot_ops.active_vm(id)
+            || self.running[id].execution_quiescing
+            || !self.jobs.lock().unwrap().snapshot_idle(id)
+        {
+            bail!("VM is busy: Guest jobs or a snapshot operation are still running")
+        }
+        let now = Instant::now();
+        let idle = self.idle.get_mut(id).unwrap();
+        idle.hold = None;
+        idle.probe = None;
+        if container_state::hibernation_path(&self.configs[id]).is_ok() {
+            self.hibernate(id, "request")?;
+            return Ok(Some(json!({"state":"hibernating"})));
+        }
+        if held == Some(PausedBy::Idle) {
+            return Ok(Some(json!({"state":"paused"})));
+        }
+        idle.paused = Some((PausedBy::Idle, now));
+        *deferred = Some(self.forward(id, "pause")?);
+        self.events.publish(
+            id,
+            "idle_paused",
+            json!({"state":"paused","reason":"request"}),
+        );
+        Ok(Some(Value::Null))
+    }
+
+    /// Before a due pause or hibernation of a running Apple Linux Guest, asks
+    /// its agent how busy it is; the answer is read on the next pass. A Guest
+    /// that does not answer (no agent, an older one) counts as quiet.
+    fn guest_work(&mut self, id: &str, state: &str, now: Instant) -> GuestWork {
+        let config = &self.configs[id];
+        if state != "running"
+            || config.backend != Backend::AppleVirtualization
+            || config.guest != "linux"
+        {
+            return GuestWork::Quiet;
+        }
+        match self.idle.get_mut(id).and_then(|idle| idle.probe.take()) {
+            Some((at, reply)) => match reply.try_recv() {
+                Ok(reply) if guest_busy(&reply) => GuestWork::Busy,
+                Ok(_) | Err(mpsc::TryRecvError::Disconnected) => GuestWork::Quiet,
+                Err(mpsc::TryRecvError::Empty) if now.duration_since(at) < 3 * PASS => {
+                    self.idle.get_mut(id).unwrap().probe = Some((at, reply));
+                    GuestWork::Asked
+                }
+                Err(mpsc::TryRecvError::Empty) => GuestWork::Quiet,
+            },
+            None => {
+                let number = self.running[id].next;
+                let request = json!({"id":number.to_string(),"method":"activity"});
+                match self.write_command(id, json!({"method":"guest_request","request":request})) {
+                    Ok((_, reply)) => {
+                        self.idle.get_mut(id).unwrap().probe = Some((now, reply));
+                        GuestWork::Asked
+                    }
+                    Err(_) => GuestWork::Quiet,
+                }
+            }
+        }
+    }
+
     /// The `idle` field of `status`: the policy and, while the daemon holds
     /// the VM paused, who asked.
     pub(crate) fn idle_view(&self, id: &str, state: &Value) -> Value {
@@ -530,6 +669,7 @@ impl Manager {
             "idle_pause_s": idle.after.map_or(0, |a| a.as_secs()),
             "idle_hibernate_s": idle.hibernate.map_or(0, |a| a.as_secs()),
             "idle_s": Instant::now().duration_since(idle.last).as_secs(),
+            "awake_for_s": idle.hold.map(|until| until.saturating_duration_since(Instant::now()).as_secs()).filter(|s| *s > 0),
             "paused_by": held.map(PausedBy::name),
         })
     }
@@ -561,27 +701,39 @@ pub(crate) fn monitor_pass(manager: &Mutex<Manager>) {
         let busy = manager.leases.watched(&id)
             || manager.snapshot_ops.active_vm(&id)
             || manager.running[&id].execution_quiescing
-            || !manager.jobs.lock().unwrap().snapshot_idle(&id);
+            || !manager.jobs.lock().unwrap().snapshot_idle(&id)
+            || manager.idle[&id].held_awake(now);
         let idle = manager.idle.get_mut(&id).unwrap();
         idle.settle(&state, now);
         if busy {
             idle.last = now;
+            idle.probe = None;
             continue;
         }
-        if idle.hibernate_due(&state, busy, now) {
-            let quiet = now.duration_since(idle.last).as_secs();
-            if let Err(error) = manager.hibernate(&id) {
+        let hibernate = idle.hibernate_due(&state, busy, now);
+        if !hibernate && !idle.due(&state, busy, now) {
+            idle.probe = None;
+            continue;
+        }
+        let quiet = now.duration_since(idle.last).as_secs();
+        // Work the host cannot see, like a build started in the background.
+        match manager.guest_work(&id, &state, now) {
+            GuestWork::Asked => continue,
+            GuestWork::Busy => {
+                manager.idle.get_mut(&id).unwrap().last = now;
+                continue;
+            }
+            GuestWork::Quiet => {}
+        }
+        if hibernate {
+            if let Err(error) = manager.hibernate(&id, "idle") {
                 log_line(&format!(
                     "vm-control: idle hibernation of {id} after {quiet} s failed: {error:#}"
                 ));
             }
             continue;
         }
-        if !idle.due(&state, busy, now) {
-            continue;
-        }
-        idle.paused = Some((PausedBy::Idle, now));
-        let quiet = now.duration_since(idle.last).as_secs();
+        manager.idle.get_mut(&id).unwrap().paused = Some((PausedBy::Idle, now));
         match manager.write_command(&id, json!({"method":"pause"})) {
             Ok(_) => manager.events.publish(
                 &id,
@@ -699,6 +851,20 @@ mod tests {
             None,
             "no policy asks nothing of the VM"
         );
+    }
+
+    #[test]
+    fn guest_busy_reads_the_agents_load() {
+        let reply =
+            |load: Value| json!({"id":3,"result":{"id":"3","result":{"load1":load,"running":0}}});
+        assert!(guest_busy(&reply(json!(1.2))));
+        assert!(guest_busy(&reply(json!(0.5))));
+        assert!(!guest_busy(&reply(json!(0.1))));
+        let unknown = json!({"id":3,"result":{"id":"3","error":{"code":"unknown_method"}}});
+        assert!(!guest_busy(&unknown), "an older agent counts as quiet");
+        assert!(!guest_busy(
+            &json!({"id":3,"error":{"code":"invalid_state"}})
+        ));
     }
 
     #[test]

@@ -134,6 +134,8 @@ const TABLE: &[(&str, Handler)] = &[
     ("container.stop", Call(containers::stop)),
     ("container.pause", Call(containers::pause)),
     ("container.unpause", Call(containers::unpause)),
+    ("container.sleep", Call(containers::sleep)),
+    ("container.keepAwake", Call(containers::keep_awake)),
     ("container.rm", Call(containers::rm)),
     ("container.rename", Call(containers::rename)),
     ("container.update", Call(containers::update)),

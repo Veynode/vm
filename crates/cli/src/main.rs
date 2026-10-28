@@ -52,6 +52,9 @@ Containers:
   stop [-t SECONDS] CONTAINER...     Stop containers
   pause|unpause CONTAINER...         Stop or resume a container's vCPUs (its
                                      memory stays in use)
+  sleep CONTAINER...                 Hibernate a container now if it can be
+                                     (else pause it); its next use wakes it
+  keep-awake DURATION|off CONTAINER  No idle pause or hibernation for that long
   rm [-f] CONTAINER...               Remove containers
   inspect CONTAINER|IMAGE            Show low-level details
   rename CONTAINER NEW_NAME           Rename a container
@@ -888,6 +891,26 @@ fn dispatch(argv: &[String], json_output: bool) -> Result<i32> {
                 let row = api_call(&format!("container.{command}"), json!({"name":name}))?;
                 println!("{}", row["name"].as_str().unwrap_or_default());
             }
+            Ok(0)
+        }
+        "sleep" => {
+            let (_, names) = names(rest, &[])?;
+            for name in names {
+                let row = api_call("container.sleep", json!({"name":name}))?;
+                println!("{}", row["name"].as_str().unwrap_or_default());
+            }
+            Ok(0)
+        }
+        "keep-awake" => {
+            let [duration, name] = rest else {
+                bail!("usage: veynodevm keep-awake DURATION|off CONTAINER")
+            };
+            let seconds = idle_seconds(duration)?;
+            let row = api_call(
+                "container.keepAwake",
+                json!({"name":name,"seconds":seconds}),
+            )?;
+            println!("{}", row["name"].as_str().unwrap_or_default());
             Ok(0)
         }
         "rm" => {
