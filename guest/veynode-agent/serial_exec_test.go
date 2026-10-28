@@ -171,6 +171,40 @@ func TestSerialV2WatchdogCancelsRealJob(t *testing.T) {
 		}
 	}
 }
+
+// The watchdog sleeps until the heartbeat deadline instead of ticking. Each wake
+// must re-arm from the newest heartbeat, and silence must still fence at 2 s.
+func TestSerialV2WatchdogRearmsFromLatestHeartbeat(t *testing.T) {
+	m := testManager(t)
+	c, done, base := serialExecPair(t, m)
+	seq := uint64(0)
+	var last time.Time
+	// Longer than one watchdog period: an unrefreshed deadline would fence here.
+	until := time.Now().Add(serialHeartbeatTimeout + 800*time.Millisecond)
+	for time.Now().Before(until) {
+		seq++
+		// Taken before the Guest can record this heartbeat, so never later than it.
+		last = time.Now()
+		v2Send(t, c, base, seq, request{ID: "heart", Method: "heartbeat"})
+		if r := v2Read(t, c); r.Sequence != seq || r.Response.Error != nil {
+			t.Fatal(r)
+		}
+		select {
+		case e := <-done:
+			t.Fatal("fenced while heartbeats arrived", e)
+		case <-time.After(400 * time.Millisecond):
+		}
+	}
+	select {
+	case e := <-done:
+		t.Fatal("fenced before the heartbeat deadline", time.Since(last), e)
+	case <-time.After(time.Until(last.Add(serialHeartbeatTimeout - 200*time.Millisecond))):
+	}
+	serialEnded(t, done)
+	if waited := time.Since(last); waited > serialHeartbeatTimeout+time.Second {
+		t.Fatal("heartbeat deadline fired late", waited)
+	}
+}
 func TestSerialV2RejectsBindingAndUnknownFields(t *testing.T) {
 	for _, kind := range []string{"sequence", "nonce", "unknown", "duplicate", "scope", "old-version", "sync-exec", "files"} {
 		t.Run(kind, func(t *testing.T) {

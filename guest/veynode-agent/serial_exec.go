@@ -13,6 +13,10 @@ import (
 const serialHeartbeatTimeout = 2 * time.Second
 const serialCleanupTimeout = 3 * time.Second
 
+// How often the watchdog looks for an asynchronous cleanup failure while a
+// command holds a reservation. With none, it sleeps until the heartbeat deadline.
+const serialCleanupWatch = 50 * time.Millisecond
+
 func exactKeys(m map[string]json.RawMessage, keys ...string) bool {
 	if len(m) != len(keys) {
 		return false
@@ -230,30 +234,45 @@ func serveSerialExec(s deadlineStream, manager *jobManager) (returned error) {
 			}
 		}
 	}()
+	// Wakes the watchdog once an operation may have reserved a command, so that
+	// command's cleanup is watched from then on rather than from the next deadline.
+	operated := make(chan struct{}, 1)
 	go func() {
 		defer ioWorkers.Done()
-		timer := time.NewTicker(50 * time.Millisecond)
+		timer := time.NewTimer(serialHeartbeatTimeout)
 		defer timer.Stop()
 		for {
 			select {
 			case <-done:
 				return
 			case <-timer.C:
-				manager.mu.Lock()
-				containmentFailed := manager.cleanupFailed
-				manager.mu.Unlock()
-				if containmentFailed {
-					trip(fmt.Errorf("serial asynchronous containment failed"))
-					return
-				}
-				heartbeatMu.Lock()
-				expired := time.Since(heartbeat) > serialHeartbeatTimeout
-				heartbeatMu.Unlock()
-				if expired {
-					trip(fmt.Errorf("serial heartbeat expired"))
-					return
-				}
+			case <-operated:
 			}
+			manager.mu.Lock()
+			containmentFailed := manager.cleanupFailed
+			// cleanupFailed only turns true while a command holds a reservation
+			// (jobs.go sets it before releasing one), so it needs watching only then.
+			watching := manager.active > 0
+			manager.mu.Unlock()
+			if containmentFailed {
+				trip(fmt.Errorf("serial asynchronous containment failed"))
+				return
+			}
+			heartbeatMu.Lock()
+			left := serialHeartbeatTimeout - time.Since(heartbeat)
+			heartbeatMu.Unlock()
+			if left < 0 {
+				trip(fmt.Errorf("serial heartbeat expired"))
+				return
+			}
+			// Sleep until the heartbeat could have expired (a newer heartbeat only
+			// moves that later; the next wake re-arms from it). A reserved command is
+			// checked every serialCleanupWatch for an asynchronous cleanup failure.
+			wait := left + time.Millisecond
+			if watching && wait > serialCleanupWatch {
+				wait = serialCleanupWatch
+			}
+			timer.Reset(wait)
 		}
 	}()
 	go func() {
@@ -319,6 +338,10 @@ func serveSerialExec(s deadlineStream, manager *jobManager) (returned error) {
 				// client may submit its next request as soon as the writer sends it.
 				<-lane
 				laneReleased = true
+				select {
+				case operated <- struct{}{}:
+				default:
+				}
 				enqueue(sequence, reply)
 				if reply.Error != nil && reply.Error.Code == "containment_failed" {
 					trip(fmt.Errorf("serial command containment failed"))

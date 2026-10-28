@@ -5,7 +5,10 @@ use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
     io::{Read, Write},
-    os::unix::net::UnixStream,
+    os::{
+        fd::{AsRawFd, RawFd},
+        unix::net::UnixStream,
+    },
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -44,6 +47,62 @@ fn wire(e: &Envelope) -> Result<Vec<u8>> {
     out.extend(b);
     Ok(out)
 }
+/// Blocks in poll(2) until a descriptor in `fds` is ready or `until` passes
+/// (never, when `None`). Callers re-check their own state and deadlines after.
+fn wait(fds: &mut [libc::pollfd], until: Option<Instant>) -> Result<()> {
+    let timeout = until.map_or(-1, |until| {
+        // Round up so a wake armed for a deadline never lands before it.
+        let left = until.saturating_duration_since(Instant::now()).as_nanos();
+        left.div_ceil(1_000_000).min(i32::MAX as u128) as i32
+    });
+    for p in fds.iter_mut() {
+        p.revents = 0;
+    }
+    if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) } < 0 {
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e.into());
+        }
+    }
+    Ok(())
+}
+fn interest(fd: RawFd, events: i16) -> libc::pollfd {
+    libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    }
+}
+/// Wakes the transport thread out of poll(2) when state it does not own changes:
+/// a queued task, pause or resume, a cancelled caller, or the owner's stop. The
+/// thread drains it before re-reading that state, so no wake is lost. Both ends
+/// live as long as the last holder, so a write never meets a closed peer.
+struct Waker(Option<(UnixStream, UnixStream)>);
+impl Waker {
+    fn new() -> Self {
+        let pair = UnixStream::pair().and_then(|(r, w)| {
+            r.set_nonblocking(true)?;
+            w.set_nonblocking(true)?;
+            Ok((r, w))
+        });
+        Self(pair.ok())
+    }
+    fn fd(&self) -> Option<RawFd> {
+        self.0.as_ref().map(|(r, _)| r.as_raw_fd())
+    }
+    fn wake(&self) {
+        if let Some((_, w)) = &self.0 {
+            // A full buffer (WouldBlock) already holds an undrained wake.
+            let _ = (&*w).write(&[1]);
+        }
+    }
+    fn drain(&self) {
+        if let Some((r, _)) = &self.0 {
+            let mut b = [0; 64];
+            while matches!((&*r).read(&mut b), Ok(n) if n > 0) {}
+        }
+    }
+}
 fn send_until(s: &mut UnixStream, e: &Envelope, deadline: Instant) -> Result<()> {
     let b = wire(e)?;
     let mut n = 0;
@@ -56,7 +115,7 @@ fn send_until(s: &mut UnixStream, e: &Envelope, deadline: Instant) -> Result<()>
             Ok(0) => bail!("serial execution write EOF"),
             Ok(x) => n += x,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(2))
+                wait(&mut [interest(s.as_raw_fd(), libc::POLLOUT)], Some(until))?
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e.into()),
@@ -98,6 +157,7 @@ pub struct Pending {
     stop: Arc<AtomicBool>,
     state: Arc<Mutex<&'static str>>,
     stream: Arc<Mutex<super::guest_transport::Lifetime>>,
+    wake: Arc<Waker>,
     done: bool,
 }
 impl Pending {
@@ -127,6 +187,7 @@ impl Drop for Pending {
         if !self.done {
             self.cancelled.store(true, Ordering::Release);
             self.stop.store(true, Ordering::Release);
+            self.wake.wake();
         }
     }
 }
@@ -136,6 +197,7 @@ pub struct Transport {
     stop: Arc<AtomicBool>,
     lane: Arc<AtomicBool>,
     stream: Arc<Mutex<super::guest_transport::Lifetime>>,
+    wake: Arc<Waker>,
     #[cfg(test)]
     iterations: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -158,6 +220,8 @@ impl Transport {
         let stopped = stop.clone();
         let stream = Arc::new(Mutex::new(super::guest_transport::Lifetime::default()));
         let saved = stream.clone();
+        let wake = Arc::new(Waker::new());
+        let woken = wake.clone();
         let path = path.to_owned();
         #[cfg(test)]
         let iterations = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -168,6 +232,7 @@ impl Transport {
                 if !hex(&host) || stopped.load(Ordering::Acquire) {
                     bail!("invalid serial execution incarnation")
                 }
+                let waker = woken.fd().context("serial execution waker unavailable")?;
                 // QEMU already listens before this call. No retry/reconnect after the first connect.
                 let mut s = super::guest_transport::connect_private(&path, &saved)?;
                 s.set_nonblocking(true)?;
@@ -217,8 +282,7 @@ impl Transport {
                 let mut pending = BTreeMap::<u64, Awaited>::new();
                 let mut bytes = Vec::new();
                 let mut next_heartbeat = Instant::now();
-                // A task taken off the channel by the idle wait below, dispatched next pass.
-                let mut carried: Option<Task> = None;
+                let socket = s.as_raw_fd();
                 loop {
                     #[cfg(test)]
                     counted.fetch_add(1, Ordering::Relaxed);
@@ -234,14 +298,13 @@ impl Transport {
                     }) {
                         bail!("serial execution response deadline; incarnation fenced")
                     }
-                    let task = match carried.take() {
-                        Some(t) => Some(t),
-                        None => match rx.try_recv() {
-                            Ok(t) => Some(t),
-                            Err(mpsc::TryRecvError::Empty) => None,
-                            Err(_) => bail!("serial execution owner closed"),
-                        },
+                    let task = match rx.try_recv() {
+                        Ok(t) => Some(t),
+                        Err(mpsc::TryRecvError::Empty) => None,
+                        Err(_) => bail!("serial execution owner closed"),
                     };
+                    // One task per pass; another may already be queued behind it.
+                    let dispatched = task.is_some();
                     let mut queue = Vec::new();
                     if let Some(task) = task {
                         if now >= task.deadline || task.cancelled.load(Ordering::Acquire) {
@@ -293,12 +356,10 @@ impl Transport {
                         }
                     }
                     let mut chunk = [0; 16384];
-                    let mut received = false;
                     loop {
                         match s.read(&mut chunk) {
                             Ok(0) => bail!("serial execution EOF"),
                             Ok(n) => {
-                                received = true;
                                 bytes.extend_from_slice(&chunk[..n]);
                                 if bytes.len() > 1048580 + 16384 {
                                     bail!("serial response buffer bound")
@@ -346,23 +407,25 @@ impl Transport {
                             let _ = task.reply.send(Ok(response));
                         }
                     }
-                    // Idle: nothing awaited, nothing buffered, nothing just read. The Guest only
-                    // speaks in reply to a request, so the socket carries nothing we must act on
-                    // except EOF or a protocol violation; both still fence, at most 50 ms later.
-                    // Block on the channel so a new task wakes the loop at once, bounded by the
-                    // next heartbeat so its schedule is unchanged, and by 50 ms so stop, EOF and
-                    // unsolicited bytes are still observed promptly.
-                    if !received && pending.is_empty() && bytes.is_empty() {
-                        let wait = next_heartbeat
-                            .saturating_duration_since(Instant::now())
-                            .min(Duration::from_millis(50));
-                        // Timeout and disconnect both fall through: the next pass re-checks stop
-                        // first and then reports a closed owner exactly as before.
-                        if let Ok(t) = rx.recv_timeout(wait) {
-                            carried = Some(t);
-                        }
-                    } else {
-                        thread::sleep(Duration::from_millis(2));
+                    // Sleep in poll(2) until the socket has bytes (a reply, EOF or a
+                    // violation, all acted on at once), a wake (task, pause, stop or a
+                    // cancelled caller), or the nearest deadline: a reply's budget, or the
+                    // next heartbeat when none is in flight. The Guest only speaks in reply
+                    // to a request, so no other event needs a wake.
+                    let mut until = pending.values().map(|p| p.deadline).min();
+                    if !pending.values().any(|p| p.method == "heartbeat") {
+                        until = Some(until.map_or(next_heartbeat, |u| u.min(next_heartbeat)));
+                    }
+                    if dispatched {
+                        until = Some(Instant::now());
+                    }
+                    let mut fds = [
+                        interest(socket, libc::POLLIN),
+                        interest(waker, libc::POLLIN),
+                    ];
+                    wait(&mut fds, until)?;
+                    if fds[1].revents != 0 {
+                        woken.drain();
                     }
                 }
             };
@@ -380,6 +443,7 @@ impl Transport {
             stop,
             lane: Arc::new(AtomicBool::new(false)),
             stream,
+            wake,
             #[cfg(test)]
             iterations,
         }
@@ -437,12 +501,14 @@ impl Transport {
             lane.store(false, Ordering::Release);
             bail!("serial execution queue unavailable")
         }
+        self.wake.wake();
         Ok(Pending {
             rx,
             cancelled,
             stop: self.stop.clone(),
             state: self.state.clone(),
             stream: self.stream.clone(),
+            wake: self.wake.clone(),
             done: false,
         })
     }
@@ -451,6 +517,7 @@ impl Drop for Transport {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         self.stream.lock().unwrap().stop();
+        self.wake.wake();
     }
 }
 fn validate_reply(method: &str, response: &Value) -> Result<()> {
@@ -513,6 +580,7 @@ mod tests {
             stop: stop.clone(),
             state: state.clone(),
             stream: lifetime.clone(),
+            wake: Arc::new(Waker::new()),
             done: false,
         };
         // Deliberately reproduce the interval before any worker epilogue runs.
@@ -674,16 +742,150 @@ mod tests {
         let before = t.iterations.load(Ordering::Relaxed);
         thread::sleep(Duration::from_millis(600));
         let passes = t.iterations.load(Ordering::Relaxed) - before;
-        // A 2 ms poll makes about 300 passes in 600 ms; a 50 ms idle wait makes about 12
-        // plus the few passes that carry one heartbeat exchange.
+        // A 2 ms poll makes about 300 passes in 600 ms and a 50 ms idle wait about 12;
+        // blocking until the next deadline leaves only the passes that carry one
+        // heartbeat exchange (send, then read its reply).
         assert!(passes > 0, "loop stopped running");
-        assert!(passes < 60, "idle loop spun: {passes} passes in 600 ms");
+        assert!(passes < 10, "idle loop spun: {passes} passes in 600 ms");
         assert_eq!(t.state(), "ready");
         let mut job = t
             .request(json!({"id":"poll","method":"exec_poll","job_id":"b".repeat(32)}))
             .unwrap();
         assert_eq!(poll(&mut job).unwrap()["id"], "poll");
         assert!(server.join().unwrap() >= 2, "heartbeat schedule slipped");
+    }
+    fn ready_transport(path: &Path) -> Transport {
+        let t = Transport::start(path, "c".repeat(64));
+        let until = Instant::now() + Duration::from_secs(2);
+        while t.state() == "starting" {
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(t.state(), "ready");
+        t
+    }
+    /// Answers heartbeats; reports and holds (never answers) every other request.
+    fn holding_guest(l: std::os::unix::net::UnixListener, held: mpsc::Sender<String>) {
+        let (mut s, _) = l.accept().unwrap();
+        let (g, h) = hello(&mut s);
+        // Ends at the transport's fence (EOF) or after 5 s of silence.
+        while let Ok(r) = initial(&mut s, Instant::now() + Duration::from_secs(5)) {
+            let method = r.request.as_ref().unwrap()["method"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            if method == "heartbeat" {
+                reply(&mut s, &g, &h, r, json!({"alive":true}));
+            } else {
+                let _ = held.send(method);
+            }
+        }
+    }
+    #[test]
+    fn a_queued_task_wakes_the_blocked_loop_before_the_next_heartbeat() {
+        let d = tempfile::Builder::new()
+            .prefix("v2wake-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = d.path().join("a.sock");
+        let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let (g, h) = hello(&mut s);
+            loop {
+                let r = initial(&mut s, Instant::now() + Duration::from_secs(2)).unwrap();
+                let method = r.request.as_ref().unwrap()["method"].as_str().unwrap();
+                let done = method == "exec_poll";
+                let result = if done {
+                    json!({"state":"running"})
+                } else {
+                    json!({"alive":true})
+                };
+                reply(&mut s, &g, &h, r, result);
+                if done {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(30));
+        });
+        let t = ready_transport(&path);
+        // The first heartbeat went out at ready; the loop now sleeps until ~500 ms.
+        thread::sleep(Duration::from_millis(100));
+        let asked = Instant::now();
+        let mut job = t
+            .request(json!({"id":"poll","method":"exec_poll","job_id":"b".repeat(32)}))
+            .unwrap();
+        assert_eq!(poll(&mut job).unwrap()["id"], "poll");
+        let took = asked.elapsed();
+        // Without a wake the task would wait for the heartbeat deadline (~400 ms).
+        assert!(
+            took < Duration::from_millis(200),
+            "task waited for a timer: {took:?}"
+        );
+        assert_eq!(t.state(), "ready");
+        server.join().unwrap();
+    }
+    #[test]
+    fn an_unanswered_heartbeat_fences_at_its_budget() {
+        let d = tempfile::Builder::new()
+            .prefix("v2silent-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = d.path().join("a.sock");
+        let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            hello(&mut s);
+            let r = initial(&mut s, Instant::now() + Duration::from_secs(2)).unwrap();
+            assert_eq!(r.request.as_ref().unwrap()["method"], "heartbeat");
+            // Never answer; hold the connection until the transport fences it.
+            let _ = initial(&mut s, Instant::now() + Duration::from_secs(5));
+        });
+        let t = ready_transport(&path);
+        let ready_at = Instant::now();
+        // The heartbeat sent at ready keeps its whole 1 s budget...
+        thread::sleep(Duration::from_millis(700));
+        assert_eq!(t.state(), "ready", "heartbeat fenced before its budget");
+        // ...and the blocked loop still wakes for that deadline.
+        while t.state() != "fenced" {
+            assert!(
+                ready_at.elapsed() < Duration::from_secs(2),
+                "heartbeat deadline never fired"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        server.join().unwrap();
+    }
+    #[test]
+    fn dropping_a_pending_request_fences_without_waiting_for_a_deadline() {
+        let d = tempfile::Builder::new()
+            .prefix("v2drop-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = d.path().join("a.sock");
+        let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let (held, received) = mpsc::channel();
+        let server = thread::spawn(move || holding_guest(l, held));
+        let t = ready_transport(&path);
+        thread::sleep(Duration::from_millis(100));
+        let job = t
+            .request(json!({"id":"poll","method":"exec_poll","job_id":"b".repeat(32)}))
+            .unwrap();
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "exec_poll"
+        );
+        let dropped = Instant::now();
+        drop(job);
+        // Its 1 s budget and the next heartbeat (~500 ms) are both far off.
+        while t.state() != "fenced" {
+            assert!(
+                dropped.elapsed() < Duration::from_millis(200),
+                "cancellation waited for a timer"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        server.join().unwrap();
     }
     #[test]
     fn heartbeat_requires_exact_proof() {
