@@ -565,7 +565,10 @@
   round trip byte-exact, no overwrite, not-found and bad names; desktop
   state, Start menu apps, launching Notepad, its UIA tree, `set_text`,
   `do`, window minimize/maximize/activate/move. No scheduled task or request
-  directory is left afterwards. Calls take 1.2 to 3.8 s. Non-ASCII text
+  directory is left afterwards. Calls took 1.2 to 3.8 s, each with its own SSH
+  connection; calls now share one connection per machine (OpenSSH
+  multiplexing), which is unit-tested but not yet timed on a live guest.
+  Non-ASCII text
   (`äöü é 你好 🙂`) passes both ways: exec argv and stdout, a missing
   program's error, a file's name and content, `set_text`, tree and find
   (before the scripts set UTF-8 console encoding, the SSH console's OEM code

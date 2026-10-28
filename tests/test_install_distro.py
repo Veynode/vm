@@ -43,6 +43,56 @@ class InstallDistroTests(unittest.TestCase):
         self.assertIn("C:\\ProgramData\\ssh\\administrators_authorized_keys 'ssh-ed25519 AAAAC3Nza+/x= veynodevm-test'", ssh)
         self.assertLess(len(ssh), 1024)  # FirstLogonCommands CommandLine limit
 
+    def windows_first_logon(self, **options):
+        import xml.etree.ElementTree as ET
+        with tempfile.TemporaryDirectory() as work:
+            fake = mock.patch.object(install_distro, "make_seed", lambda directory, label, files: (label, files))
+            self.addCleanup(fake.stop)
+            fake.start()
+            _, files = install_distro.windows_answer(work, 'veynode', 'pw', 'Windows 11 Pro', 'KEY', 'ssh-ed25519 K x', **options)
+        root = ET.fromstring(files['Autounattend.xml'])
+        u = '{urn:schemas-microsoft-com:unattend}'
+        logon = root.find(f'.//{u}FirstLogonCommands')
+        orders = [int(c.find(f'{u}Order').text) for c in logon]
+        self.assertEqual(orders, list(range(1, len(orders) + 1)))
+        return [c.find(f'{u}CommandLine').text for c in logon]
+
+    def test_windows_guest_tuning_runs_at_first_logon_unless_opted_out(self):
+        commands = self.windows_first_logon()
+        tuning = install_distro.GUEST_TUNING
+        start = commands.index(tuning[0])
+        self.assertEqual(commands[start:start + len(tuning)], tuning)
+        # The plan switches first, so the timeouts land on the active plan.
+        self.assertLess(start, commands.index('powercfg /change monitor-timeout-ac 0'))
+        joined = '\n'.join(tuning)
+        for service in ('SysMain', 'WSearch', 'DiagTrack'):
+            self.assertIn(f'Set-Service {service} -StartupType Disabled', joined)
+            self.assertIn(f'Stop-Service {service}', joined)
+        for setting in ('powercfg /setactive SCHEME_MIN',
+                        'VisualEffects /v VisualFXSetting /t REG_DWORD /d 2 /f',
+                        'Personalize /v EnableTransparency /t REG_DWORD /d 0 /f',
+                        'fsutil behavior set DisableDeleteNotify 0',
+                        'DeliveryOptimization /v DODownloadMode /t REG_DWORD /d 0 /f'):
+            self.assertIn(setting, joined)
+        self.assertNotIn('Defender', joined)
+        self.assertNotIn('WinDefend', joined)
+        self.assertTrue(all(len(c) < 1024 for c in commands))  # CommandLine limit
+        self.assertIn('OpenSSH.Server*', commands[-2])
+        self.assertTrue(commands[-1].startswith('shutdown /s'))
+
+        plain = self.windows_first_logon(guest_tuning=False)
+        self.assertEqual(plain, [c for c in commands if c not in tuning])
+        self.assertIn('powercfg /hibernate off', plain)
+
+    def test_windows_guest_tuning_is_on_by_default_with_an_opt_out_flag(self):
+        argv = ['install-distro.py', 'windows', '--name', 'w', '--iso', 'w.iso', '--drivers-iso', 'v.iso']
+        seen = []
+        with mock.patch.object(install_distro, 'install_windows', seen.append):
+            for extra in ([], ['--no-guest-tuning']):
+                with mock.patch('sys.argv', argv + extra):
+                    install_distro.main()
+        self.assertEqual([a.guest_tuning for a in seen], [True, False])
+
     def test_grub_command_lines_type_with_us_qcodes(self):
         line = 'linux /images/pxeboot/vmlinuz inst.stage2=hd:LABEL=Fedora-E-dvd-aarch64-44 ro\n'
         codes = [install_distro.qcodes(c) for c in line]

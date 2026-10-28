@@ -433,6 +433,10 @@ def driver_paths(drivers):
     return [f'{letter}:\\{driver}\\w11\\ARM64' for driver in drivers for letter in DRIVE_LETTERS]
 
 
+def powershell(script):
+    return f'powershell -NoProfile -ExecutionPolicy Bypass -Command "{script}"'
+
+
 def openssh_server(authorized_key):
     """PowerShell for FirstLogonCommands: Windows' OpenSSH Server (a Windows
     Update download), the key for administrators, PowerShell as the shell."""
@@ -446,10 +450,43 @@ def openssh_server(authorized_key):
         "New-ItemProperty -Path HKLM:\\SOFTWARE\\OpenSSH -Name DefaultShell -PropertyType String -Force "
         "-Value C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
     ])
-    return f'powershell -NoProfile -ExecutionPolicy Bypass -Command "{script}"'
+    return powershell(script)
 
 
-def windows_answer(work, user, password, edition, product_key, authorized_key=None):
+def disable_service(name):
+    return powershell(f'Set-Service {name} -StartupType Disabled -ErrorAction SilentlyContinue; '
+                      f'Stop-Service {name} -Force -ErrorAction SilentlyContinue')
+
+
+# Guest tuning usual for development and test VMs (--no-guest-tuning leaves
+# Windows' defaults). Each command is idempotent and runs at first logon as
+# the automatic-logon user, so HKCU is that user's. Windows Defender stays on.
+GUEST_TUNING = [
+    # High performance plan (powercfg's SCHEME_MIN alias). First, so the
+    # display and sleep timeouts below are set on the plan that is active.
+    'powercfg /setactive SCHEME_MIN',
+    # Prefetching (SysMain) and the search indexer (WSearch) spend the
+    # virtual disk and CPU on work a short-lived VM does not benefit from.
+    disable_service('SysMain'),
+    disable_service('WSearch'),
+    # Telemetry: the Connected User Experiences and Telemetry service.
+    disable_service('DiagTrack'),
+    # Delivery Optimization: HTTP downloads only, no peer-to-peer uploads.
+    'reg add HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\DeliveryOptimization /v DODownloadMode /t REG_DWORD /d 0 /f',
+    # Visual effects "Adjust for best performance": the setting, the effects
+    # mask it stands for and no minimize animation (they apply from the next
+    # logon). Font smoothing stays on so screenshots stay legible.
+    'reg add HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VisualEffects /v VisualFXSetting /t REG_DWORD /d 2 /f',
+    'reg add "HKCU\\Control Panel\\Desktop" /v UserPreferencesMask /t REG_BINARY /d 9012038010000000 /f',
+    'reg add "HKCU\\Control Panel\\Desktop\\WindowMetrics" /v MinAnimate /t REG_SZ /d 0 /f',
+    'reg add HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize /v EnableTransparency /t REG_DWORD /d 0 /f',
+    # TRIM (the default, made sure of): the host passes discard through
+    # virtio-blk, so freed blocks shrink the disk image.
+    'fsutil behavior set DisableDeleteNotify 0',
+]
+
+
+def windows_answer(work, user, password, edition, product_key, authorized_key=None, guest_tuning=True):
     component = lambda name: (f'<component name="{name}" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" '
                               'language="neutral" versionScope="nonSxS">')
     def commands(tag, element, lines):
@@ -469,6 +506,7 @@ def windows_answer(work, user, password, edition, product_key, authorized_key=No
         # Fallback for any virtio driver offline servicing did not install.
         *[f'cmd /c for %d in ({" ".join(DRIVE_LETTERS)}) do @if exist %d:\\{d}\\w11\\ARM64 pnputil /add-driver %d:\\{d}\\w11\\ARM64\\*.inf /install'
           for d in VIRTIO_DRIVERS],
+        *(GUEST_TUNING if guest_tuning else []),
         'powercfg /change monitor-timeout-ac 0',
         'powercfg /change standby-timeout-ac 0',
         # No Fast Startup: QEMU/HVF aborts (assert isv) resuming its hybrid
@@ -626,7 +664,7 @@ def install_windows(args):
         if not ssh_key.exists():
             subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', f'veynodevm-{args.name}', '-f', str(ssh_key)], check=True)
     authorized_key = ssh_key and pathlib.Path(f'{ssh_key}.pub').read_text()
-    seed = windows_answer(work, args.user, args.password, args.edition, key, authorized_key)
+    seed = windows_answer(work, args.user, args.password, args.edition, key, authorized_key, args.guest_tuning)
     create = ['machine', 'create', args.name, '--os', 'windows', '--iso', str(pathlib.Path(args.iso).expanduser().resolve()),
               '--disk-size', args.disk_size or '64G', '--memory', args.memory, '--cpus', str(args.cpus), '--monitor',
               '--attach', str(seed)]
@@ -761,6 +799,9 @@ def main():
     p.add_argument('--timeout-minutes', type=int, default=180)
     p.add_argument('--ssh-port', type=int, default=2222, help='host port forwarded to the guest OpenSSH Server (0: none)')
     p.add_argument('--ssh-key', help='private key whose .pub is authorized (default: generated in the work dir)')
+    p.add_argument('--no-guest-tuning', dest='guest_tuning', action='store_false',
+                   help="keep Windows' defaults: no High performance plan, SysMain/WSearch/DiagTrack stay on, "
+                        'visual effects, transparency and Delivery Optimization unchanged')
     p.add_argument('--work-dir')
     p.add_argument('--evidence', help='PNG path for the installed desktop screenshot')
     p = sub.add_parser('boot', help='start an installed machine and capture its desktop')

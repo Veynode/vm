@@ -1411,6 +1411,12 @@ code page (`tests/windows_scripts.rs`). The daemon needs a port forward to the G
 `veynodevm machine ssh-key NAME --user USER --key PRIVATE_KEY`
 (`machines/NAME/ssh`, 0600). Without either, calls fail and the error names
 the missing step; a stopped machine or an SSH failure says so too.
+Calls share one connection per machine (`ControlMaster=auto`,
+`ControlPersist=60s`, socket `state/ssh-mux/<hash>` in a 0700 directory, or
+no sharing when that path would not fit a Unix socket); the master ends 60 s
+after its last session or with the machine's QEMU process. A call the shared
+connection refuses (Windows OpenSSH's `MaxSessions` 10) runs again on a
+connection of its own; the web terminal never shares.
 `veynodevm machine display NAME WxH` is the one CLI user of that login besides MCP: it
 writes a temporary script to the guest's `%TEMP%` and runs it once as a scheduled task
 (`/it`, deleted afterwards) because display modes can only be changed from the

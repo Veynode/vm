@@ -8,6 +8,13 @@
 //!
 //! A machine's SSH login lives in `<home>/machines/<id>/ssh/`: `id_ed25519`,
 //! `known_hosts` and `user` (`veynodevm machine ssh-key` writes them).
+//!
+//! Calls share one SSH connection per machine (OpenSSH multiplexing, see
+//! [`control_path`]): the first call's `ssh` leaves a master in the
+//! background that later calls reuse for 60 s after the last one ends, so
+//! only the first call pays for the TCP and key exchange. The master's
+//! connection ends with the machine's QEMU process (its slirp `hostfwd`
+//! closes it), so a stopped machine leaves no master behind.
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use serde_json::{json, Value};
@@ -18,7 +25,7 @@ use std::{
     io::{Read, Write},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     time::{Duration, Instant},
 };
 
@@ -32,6 +39,10 @@ const CHUNK: usize = 32 * 1024;
 const MAX_TRANSFERS: usize = 16;
 const IDLE: Duration = Duration::from_secs(60);
 const LIFETIME: Duration = Duration::from_secs(300);
+/// Longest control socket path ssh can bind: macOS `sun_path` holds 104
+/// bytes with the NUL, and the master first binds `<path>.<16 random
+/// characters>`, then renames it into place.
+const MAX_CONTROL_PATH: usize = 104 - 1 - 17;
 
 /// The SSH login of one Windows machine.
 #[derive(Clone, Debug)]
@@ -41,6 +52,8 @@ pub struct Ssh {
     port: u16,
     key: PathBuf,
     known_hosts: PathBuf,
+    /// The connection master's socket; None when its path would not fit.
+    control: Option<PathBuf>,
 }
 
 /// The machine's SSH directory, for a daemon whose state directory is
@@ -50,6 +63,29 @@ pub fn ssh_dir(state_dir: &Path, id: &str) -> Result<PathBuf> {
         (Some(name), Some(home)) if name == "state" => Ok(home.join("machines").join(id).join("ssh")),
         _ => bail!("SSH is not set up for {id}: this daemon's state directory is not a VeynodeVM home's state directory, so it has no machines"),
     }
+}
+
+/// Where the connection master of one machine's login listens:
+/// `<state>/ssh-mux/<hash>` (0700), named by a hash of the machine, host port
+/// and user, because the machine directory can be too long for a Unix socket
+/// path. None when even this path would be too long or is not UTF-8: then
+/// every call makes its own connection.
+fn control_path(state_dir: &Path, id: &str, port: u16, user: &str) -> Option<PathBuf> {
+    let digest = hex(&Sha256::digest(format!("{id}\0{port}\0{user}")));
+    let path = state_dir.join("ssh-mux").join(&digest[..12]);
+    (path.to_str().is_some() && path.as_os_str().len() <= MAX_CONTROL_PATH).then_some(path)
+}
+
+/// A path as one ssh_config value: quoted, because VeynodeVM's default home
+/// (`~/Library/Application Support`) has a space, which would otherwise split
+/// it into two values, with `%` escaped from ssh's token expansion.
+pub(crate) fn config_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let escaped = text
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%");
+    format!("\"{escaped}\"")
 }
 
 impl Ssh {
@@ -78,27 +114,33 @@ impl Ssh {
         } else {
             forward.host_address
         };
+        let control = control_path(state_dir, id, forward.host_port, user)
+            .filter(|path| crate::home::private_dir(path.parent().unwrap()).is_ok());
         Ok(Self {
             user: user.into(),
             address,
             port: forward.host_port,
             key,
             known_hosts: dir.join("known_hosts"),
+            control,
         })
     }
 
-    fn command(&self, remote: &str) -> Command {
-        let mut command = self.base(false);
+    fn command(&self, remote: &str, mux: bool) -> Command {
+        let mut command = self.base(false, mux);
         command.arg(remote);
         command
     }
 
     /// An interactive login shell on a pseudo-terminal (the web UI terminal).
+    /// It connects on its own: a long-lived session would hold one of the
+    /// shared connection's sessions (Windows OpenSSH allows 10) for its
+    /// whole life, and one handshake per terminal costs nothing noticeable.
     pub fn terminal(&self) -> Command {
-        self.base(true)
+        self.base(true, false)
     }
 
-    fn base(&self, tty: bool) -> Command {
+    fn base(&self, tty: bool, mux: bool) -> Command {
         let mut command = Command::new("/usr/bin/ssh");
         if tty {
             command.arg("-tt");
@@ -108,84 +150,86 @@ impl Ssh {
             .arg(&self.key)
             .arg("-p")
             .arg(self.port.to_string())
-            .arg("-o")
-            .arg(format!("UserKnownHostsFile={}", self.known_hosts.display()))
-            .args([
-                "-o",
-                "IdentitiesOnly=yes",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=10",
-                "-o",
-                "LogLevel=ERROR",
-                "-o",
-                "ServerAliveInterval=15",
-            ])
+            .args(self.options(mux))
             .arg(format!("{}@{}", self.user, self.address));
         command
+    }
+
+    /// The `-o` options of ssh and scp; `mux` shares the machine's
+    /// connection master, starting it when there is none.
+    fn options(&self, mux: bool) -> Vec<String> {
+        let mut options = vec![
+            format!("UserKnownHostsFile={}", config_path(&self.known_hosts)),
+            "IdentitiesOnly=yes".into(),
+            "StrictHostKeyChecking=accept-new".into(),
+            "BatchMode=yes".into(),
+            "ConnectTimeout=10".into(),
+            "LogLevel=ERROR".into(),
+            "ServerAliveInterval=15".into(),
+        ];
+        if let (true, Some(path)) = (mux, &self.control) {
+            options.extend([
+                "ControlMaster=auto".into(),
+                format!("ControlPath={}", config_path(path)),
+                "ControlPersist=60s".into(),
+            ]);
+        }
+        options
+            .into_iter()
+            .flat_map(|option| ["-o".to_owned(), option])
+            .collect()
     }
 
     /// An SSH command running `remote` in the SSH user's shell with this
     /// process's stdio (the cua-driver link, `windows_driver.rs`).
     pub fn stdio(&self, remote: &str) -> Command {
-        self.command(remote)
+        self.command(remote, true)
     }
 
-    /// Copies a host file to `remote` (`C:/...`) in the Guest with scp.
-    pub fn copy(&self, local: &Path, remote: &str, timeout: Duration) -> Result<()> {
-        let mut child = Command::new("/usr/bin/scp")
+    fn scp(&self, local: &Path, remote: &str) -> Command {
+        let mut command = Command::new("/usr/bin/scp");
+        command
             .arg("-q")
             .arg("-i")
             .arg(&self.key)
             .arg("-P")
             .arg(self.port.to_string())
-            .arg("-o")
-            .arg(format!("UserKnownHostsFile={}", self.known_hosts.display()))
-            .args([
-                "-o",
-                "IdentitiesOnly=yes",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=10",
-                "-o",
-                "LogLevel=ERROR",
-            ])
+            .args(self.options(true))
             .arg(local)
-            .arg(format!("{}@{}:{remote}", self.user, self.address))
+            .arg(format!("{}@{}:{remote}", self.user, self.address));
+        command
+    }
+
+    /// Copies a host file to `remote` (`C:/...`) in the Guest with scp.
+    pub fn copy(&self, local: &Path, remote: &str, timeout: Duration) -> Result<()> {
+        let mut child = self
+            .scp(local, remote)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .context("cannot run scp")?;
-        let deadline = Instant::now() + timeout;
-        let status = loop {
-            if let Some(status) = child.try_wait()? {
-                break status;
-            }
-            if Instant::now() > deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!(
-                    "copying {} to the Windows guest took over {} s",
-                    local.display(),
-                    timeout.as_secs()
-                )
-            }
-            std::thread::sleep(Duration::from_millis(50));
+        // scp writes little to stderr, and only before it exits.
+        let mut stderr = child.stderr.take().unwrap();
+        let err = std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = stderr.read_to_string(&mut text);
+            text
+        });
+        let Some(status) = wait_timeout(&mut child, timeout)? else {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "copying {} to the Windows guest took over {} s",
+                local.display(),
+                timeout.as_secs()
+            )
         };
         if !status.success() {
-            let mut err = String::new();
-            let _ = child.stderr.take().unwrap().read_to_string(&mut err);
             bail!(
                 "copying {} to the Windows guest failed: {}",
                 local.display(),
-                err.trim()
+                err.join().unwrap_or_default().trim()
             )
         }
         Ok(())
@@ -199,8 +243,42 @@ impl Ssh {
         stdin: &[u8],
         timeout: Duration,
     ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
+        let started = Instant::now();
+        let (code, out, err) = self.run(script, stdin, timeout, true)?;
+        // The shared connection is at the server's MaxSessions (10 on
+        // Windows OpenSSH): the command never started, so run it on a
+        // connection of its own.
+        let (code, out, err) = if code == 255
+            && self.control.is_some()
+            && String::from_utf8_lossy(&err).contains("refused by peer")
+        {
+            self.run(
+                script,
+                stdin,
+                timeout.saturating_sub(started.elapsed()),
+                false,
+            )?
+        } else {
+            (code, out, err)
+        };
+        if code == 255 {
+            bail!(
+                "SSH to the Windows guest failed: {} (is the machine running, and its OpenSSH Server up?)",
+                String::from_utf8_lossy(&err).trim()
+            )
+        }
+        Ok((code, out, err))
+    }
+
+    fn run(
+        &self,
+        script: &str,
+        stdin: &[u8],
+        timeout: Duration,
+        mux: bool,
+    ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
         let mut child = self
-            .command(&encoded(script))
+            .command(&encoded(script), mux)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -221,34 +299,50 @@ impl Ssh {
             let _ = stderr.read_to_end(&mut bytes);
             bytes
         });
-        let deadline = Instant::now() + timeout;
-        let status = loop {
-            if let Some(status) = child.try_wait()? {
-                break status;
-            }
-            if Instant::now() > deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!(
-                    "the Windows guest did not answer over SSH within {} s",
-                    timeout.as_secs()
-                )
-            }
-            std::thread::sleep(Duration::from_millis(20));
+        let Some(status) = wait_timeout(&mut child, timeout)? else {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "the Windows guest did not answer over SSH within {} s",
+                timeout.as_secs()
+            )
         };
         let _ = writer.join();
         let (out, err) = (
             out.join().unwrap_or_default(),
             err.join().unwrap_or_default(),
         );
-        let code = status.code().unwrap_or(255);
-        if code == 255 {
-            bail!(
-                "SSH to the Windows guest failed: {} (is the machine running, and its OpenSSH Server up?)",
-                String::from_utf8_lossy(&err).trim()
-            )
+        Ok((status.code().unwrap_or(255), out, err))
+    }
+}
+
+/// Waits up to `timeout` for `child` to exit, without polling: a thread
+/// blocks in `waitid(WNOWAIT)`, which leaves the child unreaped, so its PID
+/// stays reserved and the caller can still kill it after a timeout (None);
+/// the caller then kills and reaps it, which ends that thread.
+fn wait_timeout(child: &mut Child, timeout: Duration) -> std::io::Result<Option<ExitStatus>> {
+    let pid = child.id() as libc::id_t;
+    let (exited, wait) = std::sync::mpsc::channel();
+    std::thread::spawn(move || loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc =
+            unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        if rc != 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
         }
-        Ok((code, out, err))
+        // Darwin can report a stopped child even with WEXITED alone.
+        if rc == 0
+            && ![libc::CLD_EXITED, libc::CLD_KILLED, libc::CLD_DUMPED].contains(&info.si_code)
+        {
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        let _ = exited.send(());
+        break;
+    });
+    match wait.recv_timeout(timeout) {
+        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => child.wait().map(Some),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
     }
 }
 
@@ -924,5 +1018,171 @@ mod tests {
         fs::write(ssh.join("user"), "a b").unwrap();
         assert!(Ssh::locate(&state, &config).is_err());
         assert!(ssh_dir(dir.path(), "win").is_err());
+    }
+
+    fn args(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn login(control: Option<PathBuf>) -> Ssh {
+        Ssh {
+            user: "veynode".into(),
+            address: std::net::Ipv4Addr::LOCALHOST,
+            port: 2222,
+            key: "/h/id_ed25519".into(),
+            known_hosts:
+                "/Users/u/Library/Application Support/VeynodeVM/machines/w%n/ssh/known_hosts".into(),
+            control,
+        }
+    }
+
+    #[test]
+    fn calls_share_one_connection_through_a_short_control_socket() {
+        let state = Path::new("/Users/u/Library/Application Support/VeynodeVM/state");
+        let path = control_path(state, "win", 2222, "veynode").unwrap();
+        assert_eq!(path.parent().unwrap(), state.join("ssh-mux"));
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(name.len() == 12 && name.bytes().all(|b| b.is_ascii_hexdigit()));
+        // Each machine, port and user has its own master.
+        assert_ne!(
+            Some(&path),
+            control_path(state, "win2", 2222, "veynode").as_ref()
+        );
+        assert_ne!(
+            Some(&path),
+            control_path(state, "win", 2223, "veynode").as_ref()
+        );
+        assert_ne!(
+            Some(&path),
+            control_path(state, "win", 2222, "admin").as_ref()
+        );
+        // The master binds `<path>.<16 characters>` in a 104-byte sun_path.
+        let fits = Path::new("/").join("s".repeat(MAX_CONTROL_PATH - 22));
+        assert_eq!(
+            control_path(&fits, "win", 2222, "veynode")
+                .unwrap()
+                .as_os_str()
+                .len(),
+            MAX_CONTROL_PATH
+        );
+        let long = Path::new("/").join("s".repeat(MAX_CONTROL_PATH - 21));
+        assert_eq!(control_path(&long, "win", 2222, "veynode"), None);
+
+        let quoted = format!("ControlPath=\"{}\"", path.display());
+        let shared = ["ControlMaster=auto", quoted.as_str(), "ControlPersist=60s"];
+        let ssh = login(Some(path.clone()));
+        let command = args(&ssh.command("Get-Date", true));
+        assert_eq!(
+            command,
+            [
+                "-i",
+                "/h/id_ed25519",
+                "-p",
+                "2222",
+                "-o",
+                // Quoted, or the space would split it; % is not a token.
+                "UserKnownHostsFile=\"/Users/u/Library/Application Support/VeynodeVM/machines/w%%n/ssh/known_hosts\"",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "LogLevel=ERROR",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                shared[0],
+                "-o",
+                shared[1],
+                "-o",
+                shared[2],
+                "veynode@127.0.0.1",
+                "Get-Date",
+            ]
+        );
+        assert_eq!(
+            args(&ssh.stdio("x")),
+            command[..command.len() - 1]
+                .iter()
+                .cloned()
+                .chain(["x".into()])
+                .collect::<Vec<_>>()
+        );
+        let scp = args(&ssh.scp(Path::new("/tmp/a b"), "C:/x"));
+        assert_eq!(&scp[..5], ["-q", "-i", "/h/id_ed25519", "-P", "2222"]);
+        assert!(shared.iter().all(|o| scp.iter().any(|a| a == o)), "{scp:?}");
+        assert_eq!(
+            &scp[scp.len() - 2..],
+            ["/tmp/a b", "veynode@127.0.0.1:C:/x"]
+        );
+        // The terminal, and every call when the path does not fit, connect alone.
+        let terminal = args(&ssh.terminal());
+        assert_eq!(terminal[0], "-tt");
+        assert!(!terminal.iter().any(|a| a.starts_with("Control")));
+        for command in [
+            args(&login(None).command("x", true)),
+            args(&login(None).scp(Path::new("/a"), "C:/a")),
+        ] {
+            assert!(
+                !command.iter().any(|a| a.starts_with("Control")),
+                "{command:?}"
+            );
+        }
+        assert_eq!(config_path(Path::new("/a\"b\\c")), "\"/a\\\"b\\\\c\"");
+    }
+
+    #[test]
+    fn locate_makes_the_control_directory_private_or_goes_without() {
+        use std::os::unix::fs::PermissionsExt;
+        // $TMPDIR can already be too long for a socket path; /tmp is not.
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let state = dir.path().join("state");
+        let ssh = dir.path().join("machines/win/ssh");
+        fs::create_dir_all(&ssh).unwrap();
+        fs::write(ssh.join("id_ed25519"), "key").unwrap();
+        fs::write(ssh.join("user"), "veynode").unwrap();
+        let mut config: crate::Config =
+            serde_json::from_value(json!({"id":"win","guest":"windows","cpus":1,"memory_mib":512}))
+                .unwrap();
+        config.ports = serde_json::from_value(json!([{"host_port":2222,"guest_port":22}])).unwrap();
+        let login = Ssh::locate(&state, &config).unwrap();
+        let path = control_path(&state, "win", 2222, "veynode").unwrap();
+        assert_eq!(login.control.as_ref(), Some(&path));
+        let mux = path.parent().unwrap();
+        assert_eq!(
+            fs::metadata(mux).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        // A directory others can read is not used.
+        fs::set_permissions(mux, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(Ssh::locate(&state, &config).unwrap().control, None);
+    }
+
+    #[test]
+    fn waits_block_until_exit_or_timeout() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 3"])
+            .spawn()
+            .unwrap();
+        let status = wait_timeout(&mut child, Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.code(), Some(3));
+        let mut child = Command::new("/bin/sleep").arg("10").spawn().unwrap();
+        let started = Instant::now();
+        assert!(wait_timeout(&mut child, Duration::from_millis(100))
+            .unwrap()
+            .is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // Still unreaped: the PID is ours to kill.
+        child.kill().unwrap();
+        assert!(child.wait().unwrap().code().is_none());
     }
 }

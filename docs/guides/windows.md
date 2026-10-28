@@ -9,3 +9,15 @@ scripts/install-distro.py windows --name win11 --iso ~/Downloads/Windows11_Clien
 ```
 
 The script writes an `Autounattend.xml` seed (Windows 11 Pro with the generic, non-activating key unless `--edition`/`--product-key` say otherwise; local administrator `veynode` with automatic logon), taps Enter for the CD's "Press any key" prompt, loads the virtio storage and network drivers in Setup and the rest offline, waits for the first logon to power off, ejects the media and boots the disk. See [known issues](../known-issues.md#windows-11-arm64-machines) for what is verified.
+
+The first logon also tunes the guest the way development and test VMs usually are (`--no-guest-tuning` keeps Windows' defaults); each step is an idempotent command in `FirstLogonCommands`, listed in `GUEST_TUNING` in the script:
+
+- the High performance power plan (`powercfg /setactive SCHEME_MIN`), before the display and sleep timeouts are turned off (always) and hibernation with it (always, for Fast Startup);
+- SysMain (prefetching), Windows Search (indexing) and DiagTrack (telemetry) disabled and stopped;
+- Delivery Optimization limited to HTTP downloads, no peer-to-peer (policy `DODownloadMode` 0);
+- for the automatic-logon user, visual effects set to "Adjust for best performance" (`VisualFXSetting` 2 with its effects mask and no minimize animation; font smoothing stays on, so screenshots stay legible) and transparency off; they take effect from the next logon;
+- TRIM enabled (`fsutil behavior set DisableDeleteNotify 0`, Windows' default), so blocks the guest frees are discarded through virtio-blk.
+
+Windows Defender is left as it is.
+
+The daemon reaches the guest over that SSH login. Calls to one machine share a single SSH connection (OpenSSH multiplexing): the first leaves a connection master in the background, with its socket in `<home>/state/ssh-mux` (0700), and later calls open a session on it instead of connecting and authenticating again. The master exits 60 s after its last session ends, or when the machine's QEMU process exits. If that socket path would exceed the 104-byte Unix socket limit (a very long home directory), every call connects on its own, as before. The web terminal always connects on its own.

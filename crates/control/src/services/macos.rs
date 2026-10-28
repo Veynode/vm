@@ -223,9 +223,10 @@ fn ssh_base(program: &str, guest: &dyn Guest) -> Result<Command> {
             "StrictHostKeyChecking=accept-new",
         ])
         .arg("-o")
+        // Quoted: an unquoted path splits at the space in "Application Support".
         .arg(format!(
             "UserKnownHostsFile={}",
-            dir.join("known_hosts").display()
+            crate::windows_guest::config_path(&dir.join("known_hosts"))
         ))
         .args([
             "-o",
