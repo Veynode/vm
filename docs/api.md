@@ -167,9 +167,11 @@ header of core's `apps/macos-runtime/native/screen-stream.swift`):
 - On QEMU the capabilities list inputs 17 and 18 (the viewer's width and height u16 BE): the size becomes the
   Guest's one monitor through its spice-vdagent (Linux on Xorg with `virtio-gpu-gl`). The capabilities always list
   19 (codec).
-- The newest viewer replaces the one before it.
-- The same `epoch` answers the same endpoint. A new one replaces it, with a new port and token, and cuts its viewers.
-  The endpoint ends when the machine stops.
+- Each client (its `hello` name) has its own endpoint and counts its own epochs, so core's viewer and the web UI's
+  never cut each other.
+- The newest viewer of an endpoint replaces the one before it.
+- The same `epoch` answers the client's same endpoint. A new one replaces it, with a new port and token, and cuts its
+  viewers. The endpoint ends when the machine stops.
 
 Each viewer opens `desktop.stream` on the daemon's own socket: QEMU's SPICE console, or on Apple Virtualization the
 Linux guest agent or macOS Screen Sharing.
@@ -177,7 +179,8 @@ Linux guest agent or macOS Screen Sharing.
 ### The sound endpoints
 
 `machine.sound` and `machine.microphone` start loopback TCP listeners with the screen endpoint's rules for the
-token, the newest viewer and `epoch`. After the token and a newline:
+token, the newest viewer and `epoch`, except that all clients share one endpoint of each (the broker plays sound to
+one client). After the token and a newline:
 
 - A sound viewer reads raw s16le 48 kHz stereo PCM (`channels` 2) for as long as it stays connected. The daemon
   converts the Guest's rate if it differs. A viewer that stops reading for 2 s is cut.

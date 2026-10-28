@@ -23,6 +23,9 @@ use std::{
 };
 use veynodevm_api::{refuse, ErrorCode};
 
+/// The client every viewer of these endpoints counts as: the broker plays
+/// sound to one client only, so all clients share one endpoint and epoch.
+const SHARED: &str = "";
 /// The endpoints' sample rate.
 const RATE: u32 = 48_000;
 /// 10 ms of 48 kHz mono s16le: one microphone frame to the broker.
@@ -34,6 +37,7 @@ pub fn sound(machine: &Machine, epoch: u64) -> Result<Value> {
     display::endpoint(
         &machine.name,
         "sound",
+        SHARED,
         epoch,
         json!({"format":"pcm","rate":RATE,"channels":2}),
         Arc::new(move |name, stream| hear(name, &socket, stream)),
@@ -46,6 +50,7 @@ pub fn microphone(machine: &Machine, epoch: u64) -> Result<Value> {
     display::endpoint(
         &machine.name,
         "microphone",
+        SHARED,
         epoch,
         json!({"format":"pcm","rate":RATE,"channels":1}),
         Arc::new(move |name, stream| speak(name, &socket, stream)),

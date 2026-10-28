@@ -17,7 +17,10 @@
 //! Virtualization guest agent / Screen Sharing encoder) and translates its
 //! records; the newest connection replaces the one before it. A new epoch
 //! replaces the endpoint and cuts every connection of the old one; it ends
-//! when the machine stops.
+//! when the machine stops. Display endpoints, their epochs and the
+//! newest-viewer rule are each client's own (its `hello` name): core's viewer
+//! and the web UI's do not cut each other, whatever epochs they count. Sound
+//! endpoints stay one per machine (`services::sound`).
 use super::util::random_hex;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -67,19 +70,22 @@ impl Endpoint {
     }
 }
 
-/// Endpoints by machine name and stream (`display`, `sound`, `microphone`).
-type Endpoints = HashMap<(String, &'static str), Endpoint>;
+/// Endpoints by machine name, stream (`display`, `sound`, `microphone`) and
+/// the client's `hello` name.
+type Key = (String, &'static str, String);
+type Endpoints = HashMap<Key, Endpoint>;
 static ENDPOINTS: Mutex<Option<Endpoints>> = Mutex::new(None);
 
 /// `machine.display`: the endpoint of `epoch`, started if it is new.
 /// `spice`: a QEMU machine, whose SPICE console gives the pointer shape,
 /// copied text and the monitor size.
-pub fn display(name: &str, epoch: u64, spice: bool) -> Result<Value> {
+pub fn display(name: &str, client: &str, epoch: u64, spice: bool) -> Result<Value> {
     // Held by the viewer whose encoder owns the desktop.
     let desktop = Arc::new(Mutex::new(()));
     endpoint(
         name,
         "display",
+        client,
         epoch,
         json!({"format":"stream"}),
         Arc::new(move |name, stream| serve(name, stream, &desktop, spice)),
@@ -93,12 +99,14 @@ pub fn capabilities(spice: bool) -> Vec<u8> {
     message(11, inputs)
 }
 
-/// The machine's endpoint of `stream` for `epoch`: the running one, or a new
-/// one (new port and token) that cuts the one before it. Each authorized
-/// viewer goes to `viewer`, the newest cutting the one before it.
+/// The machine's endpoint of `stream` for `client` and `epoch`: the running
+/// one, or a new one (new port and token) that cuts that client's one before
+/// it. Each authorized viewer goes to `viewer`, the newest cutting the one
+/// before it on the same endpoint.
 pub(super) fn endpoint(
     name: &str,
     stream: &'static str,
+    client: &str,
     epoch: u64,
     fields: Value,
     viewer: Viewer,
@@ -106,14 +114,11 @@ pub(super) fn endpoint(
     if !running(name) {
         return Err(refuse(ErrorCode::State, format!("{name} is not running")));
     }
-    let key = (name.to_owned(), stream);
+    let key = (name.to_owned(), stream, client.to_owned());
     let mut endpoints = ENDPOINTS.lock().unwrap();
     let endpoints = endpoints.get_or_insert_with(HashMap::new);
-    if let Some(current) = endpoints.get(&key) {
-        if current.epoch == epoch && !current.stopped.load(Ordering::SeqCst) {
-            return Ok(current.answer());
-        }
-        current.stop();
+    if let Some(answer) = reuse(endpoints, &key, epoch) {
+        return Ok(answer);
     }
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     listener.set_nonblocking(true)?;
@@ -126,15 +131,26 @@ pub(super) fn endpoint(
         active: Arc::new(Mutex::new(None)),
     };
     let answer = endpoint.answer();
-    let (name, token, stopped, active) = (
-        name.to_owned(),
+    let (token, stopped, active) = (
         endpoint.token.clone(),
         endpoint.stopped.clone(),
         endpoint.active.clone(),
     );
-    thread::spawn(move || listen(&name, stream, listener, &token, &stopped, &active, &viewer));
+    let listened = key.clone();
+    thread::spawn(move || listen(&listened, listener, &token, &stopped, &active, &viewer));
     endpoints.insert(key, endpoint);
     Ok(answer)
+}
+
+/// The answer of `key`'s endpoint when it runs for `epoch`; otherwise stops
+/// it, if any, for a new one. Other clients' endpoints are left alone.
+fn reuse(endpoints: &Endpoints, key: &Key, epoch: u64) -> Option<Value> {
+    let current = endpoints.get(key)?;
+    if current.epoch == epoch && !current.stopped.load(Ordering::SeqCst) {
+        return Some(current.answer());
+    }
+    current.stop();
+    None
 }
 
 /// Whether the daemon's VM `name` is up.
@@ -147,7 +163,7 @@ pub(super) fn running(name: &str) -> bool {
 /// Stops the machine's endpoints, if any run (stop, rm, rename).
 pub fn stop(name: &str) {
     if let Some(endpoints) = ENDPOINTS.lock().unwrap().as_mut() {
-        endpoints.retain(|(machine, _), endpoint| {
+        endpoints.retain(|(machine, ..), endpoint| {
             if machine == name {
                 endpoint.stop();
             }
@@ -868,14 +884,14 @@ fn serve(name: &str, stream: TcpStream, desktop: &Mutex<()>, spice: bool) -> Res
 
 /// Accepts viewers until the endpoint is stopped or the machine stops.
 fn listen(
-    name: &str,
-    stream_name: &'static str,
+    key: &Key,
     listener: TcpListener,
     token: &str,
     stopped: &AtomicBool,
     active: &Arc<Mutex<Option<TcpStream>>>,
     viewer: &Viewer,
 ) {
+    let (name, stream_name) = (key.0.as_str(), key.1);
     let mut checked = std::time::Instant::now();
     while !stopped.load(Ordering::SeqCst) {
         match listener.accept() {
@@ -917,12 +933,11 @@ fn listen(
             if !running(name) {
                 let mut endpoints = ENDPOINTS.lock().unwrap();
                 if let Some(map) = endpoints.as_mut() {
-                    let key = (name.to_owned(), stream_name);
                     if map
-                        .get(&key)
+                        .get(key)
                         .is_some_and(|e| std::ptr::eq(&*e.stopped, stopped))
                     {
-                        map.remove(&key);
+                        map.remove(key);
                     }
                 }
                 return;
@@ -1089,6 +1104,31 @@ mod tests {
             .ue(720)
             .bits(0, 1);
         assert_eq!(picture_size(&w.nal(&[0x42, 0x01]), true), Some((1280, 720)));
+    }
+
+    #[test]
+    fn each_client_keeps_its_own_epoch() {
+        let open = |epoch| Endpoint {
+            epoch,
+            port: 1,
+            token: String::new(),
+            fields: json!({}),
+            stopped: Arc::new(AtomicBool::new(false)),
+            active: Arc::new(Mutex::new(None)),
+        };
+        let key = |client: &str| ("m".to_owned(), "display", client.to_owned());
+        let mut endpoints = Endpoints::new();
+        endpoints.insert(key("core"), open(0));
+        endpoints.insert(key("web"), open(7));
+        // The same epoch answers the client's running endpoint.
+        assert_eq!(reuse(&endpoints, &key("core"), 0).unwrap()["epoch"], 0);
+        // Another client's larger epoch does not stop it; a new epoch of the
+        // client's own does.
+        assert!(reuse(&endpoints, &key("web"), 8).is_none());
+        assert!(endpoints[&key("web")].stopped.load(Ordering::SeqCst));
+        assert!(!endpoints[&key("core")].stopped.load(Ordering::SeqCst));
+        assert!(reuse(&endpoints, &key("cli"), 0).is_none());
+        assert!(reuse(&endpoints, &key("core"), 0).is_some());
     }
 
     #[test]

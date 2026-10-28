@@ -412,9 +412,14 @@ pub fn published(machine: &Machine, config: &Value) -> Vec<(u16, u16)> {
 /// `machine.display`, `machine.sound`, `machine.microphone`: the running
 /// machine's loopback endpoint of that stream for the viewer's `epoch`
 /// (`services::display`, `services::sound`).
-pub fn display(_: &Ctx, args: Value) -> Result<Value> {
+pub fn display(ctx: &Ctx, args: Value) -> Result<Value> {
     let (machine, epoch) = endpoint_args(&args)?;
-    super::display::display(&machine.name, epoch, machine.backend == "qemu-hvf")
+    super::display::display(
+        &machine.name,
+        &ctx.client,
+        epoch,
+        machine.backend == "qemu-hvf",
+    )
 }
 
 pub fn sound(_: &Ctx, args: Value) -> Result<Value> {
