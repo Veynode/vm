@@ -215,10 +215,19 @@ fn data_volume(whole: &str) -> Result<String> {
     bail!("the disk has no APFS Data volume")
 }
 
-/// Writes the relay into the macOS disk `disk` (raw, not running) for its
-/// login `user`, mounting under `work`. `Ok(false)` when the login's home
-/// is not this user's uid, so the machine keeps the vmnet address.
+/// Writes the runtime's relay into the macOS disk `disk` (raw, not running)
+/// for its login `user`, mounting under `work`. `Ok(false)` when the runtime
+/// has no relay or the login's home is not this user's uid, so the machine
+/// keeps the vmnet address.
 pub fn install(disk: &Path, user: &str, work: &Path) -> Result<bool> {
+    let Some(relay) = home::Runtime::load()?.macos_relay else {
+        return Ok(false);
+    };
+    let relay = fs::read(&relay).with_context(|| format!("reading {}", relay.display()))?;
+    install_bytes(disk, user, work, &relay)
+}
+
+fn install_bytes(disk: &Path, user: &str, work: &Path, relay: &[u8]) -> Result<bool> {
     if user.is_empty()
         || !user
             .bytes()
@@ -226,10 +235,6 @@ pub fn install(disk: &Path, user: &str, work: &Path) -> Result<bool> {
     {
         return Ok(false);
     }
-    let Some(relay) = home::Runtime::load()?.macos_relay else {
-        return Ok(false);
-    };
-    let relay = fs::read(&relay).with_context(|| format!("reading {}", relay.display()))?;
     let attached = plist_json(&run(Command::new("/usr/bin/hdiutil")
         .args([
             "attach",
@@ -257,7 +262,7 @@ pub fn install(disk: &Path, user: &str, work: &Path) -> Result<bool> {
             .args(["-t", "apfs", "-o", "nobrowse,owners"])
             .arg(format!("/dev/{volume}"))
             .arg(&mount))?;
-        let written = write_into(&mount, user, &relay);
+        let written = write_into(&mount, user, relay);
         let unmounted = run(Command::new("/sbin/umount").arg(&mount));
         let written = written?;
         unmounted?;
@@ -315,5 +320,123 @@ mod tests {
         assert!(ssh_answers(&path));
         server.join().unwrap();
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Detaches an attached image when the test ends, passing or not.
+    struct Detach(String);
+    impl Drop for Detach {
+        fn drop(&mut self) {
+            let _ = run(Command::new("/usr/bin/hdiutil").args(["detach", "-force", &self.0]));
+        }
+    }
+
+    fn attach(disk: &Path) -> String {
+        let attached = plist_json(
+            &run(Command::new("/usr/bin/hdiutil")
+                .args([
+                    "attach",
+                    "-imagekey",
+                    "diskimage-class=CRawDiskImage",
+                    "-nomount",
+                    "-plist",
+                ])
+                .arg(disk))
+            .unwrap(),
+        )
+        .unwrap();
+        attached["system-entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["dev-entry"].as_str()?.strip_prefix("/dev/"))
+            .find(|d| d.strip_prefix("disk").is_some_and(|n| !n.contains('s')))
+            .unwrap()
+            .to_owned()
+    }
+
+    /// The whole disk path on an APFS image with a Data volume, as a Tart
+    /// disk has: attach, find the volume, mount as this user, write, detach.
+    /// Uses `hdiutil` and `diskutil`; run with `--ignored`.
+    #[test]
+    #[ignore]
+    fn install_writes_into_an_apfs_data_volume() {
+        let dir = std::env::temp_dir().join(format!("relay-disk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        home::private_dir(&dir).unwrap();
+        let dmg = dir.join("t.dmg");
+        run(Command::new("/usr/bin/hdiutil")
+            .args([
+                "create", "-size", "128m", "-fs", "APFS", "-volname", "Sys", "-layout", "GPTSPUD",
+            ])
+            .arg(&dmg))
+        .unwrap();
+        run(Command::new("/usr/bin/hdiutil")
+            .args(["convert", "-format", "UDTO", "-o"])
+            .arg(dir.join("t"))
+            .arg(&dmg))
+        .unwrap();
+        let disk = dir.join("disk.img");
+        fs::rename(dir.join("t.cdr"), &disk).unwrap();
+        // A Data-role volume holding the login's home.
+        let whole = attach(&disk);
+        let _detach = Detach(whole.clone());
+        let list = plist_json(
+            &run(Command::new("/usr/sbin/diskutil").args(["apfs", "list", "-plist"])).unwrap(),
+        )
+        .unwrap();
+        let first = list["Containers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| {
+                c["PhysicalStores"][0]["DeviceIdentifier"]
+                    .as_str()
+                    .is_some_and(|d| d.starts_with(&format!("{whole}s")))
+            })
+            .unwrap()["Volumes"][0]["DeviceIdentifier"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        run(Command::new("/usr/sbin/diskutil").args(["apfs", "changeVolumeRole", &first, "D"]))
+            .unwrap();
+        let mount = dir.join("m");
+        home::private_dir(&mount).unwrap();
+        let volume = data_volume(&whole).unwrap();
+        run(Command::new("/sbin/mount")
+            .args(["-t", "apfs", "-o", "nobrowse,owners"])
+            .arg(format!("/dev/{volume}"))
+            .arg(&mount))
+        .unwrap();
+        fs::create_dir_all(mount.join("Users/admin/Library")).unwrap();
+        run(Command::new("/sbin/umount").arg(&mount)).unwrap();
+        drop(_detach);
+
+        let installed = install_bytes(&disk, "admin", &dir, b"relay");
+
+        let whole = attach(&disk);
+        let _detach = Detach(whole.clone());
+        let volume = data_volume(&whole).unwrap();
+        home::private_dir(&mount).unwrap();
+        run(Command::new("/sbin/mount")
+            .args(["-t", "apfs", "-o", "nobrowse,owners,rdonly"])
+            .arg(format!("/dev/{volume}"))
+            .arg(&mount))
+        .unwrap();
+        let program = mount.join("Users/admin").join(INSTALLED);
+        let bytes = fs::read(&program).ok();
+        let meta = fs::metadata(&program)
+            .map(|m| (m.uid(), m.mode() & 0o777))
+            .ok();
+        let plist = fs::read_to_string(
+            mount.join("Users/admin/Library/LaunchAgents/dev.veynode.relay.plist"),
+        )
+        .ok();
+        let _ = run(Command::new("/sbin/umount").arg(&mount));
+        drop(_detach);
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(installed.unwrap());
+        assert_eq!(bytes.as_deref(), Some(&b"relay"[..]));
+        assert_eq!(meta, Some((unsafe { libc::getuid() }, 0o755)));
+        assert!(plist.unwrap().contains(LABEL));
     }
 }
