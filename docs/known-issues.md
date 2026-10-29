@@ -472,6 +472,18 @@ interleaved rounds per variant, medians; the full rows are in
 - `efi_vars` files are backend specific: a QEMU store is a 64 MiB pflash
   image, a VZ store is created by Virtualization.framework. Moving a disk
   between backends needs a fresh `efi_vars` (fallback boot path).
+- A QEMU machine's `efi-vars.fd` names its boot disk by PCI slot, and QEMU
+  assigns slots in command-line order. Adding the balloon before the disk
+  (first 0.1.1 build) moved it from 00:05.0 to 00:06.0: edk2 put the new entry
+  after PXE and the EFI Shell, so 0.1.0 machines stopped at `Shell>`. A device
+  added later goes after every existing one (`qemu_uefi::trailing_devices`),
+  and on Linux UEFI machines the installer CD-ROM and the disk carry
+  `bootindex`, so the firmware boots them first wherever they sit and drops
+  stale entries. Checked 2026-10-29 on Debian 13: a machine created and booted
+  under 0.1.0, then booted by that build (stopped at the shell, its entries
+  rewritten), boots under the fix both from the rewritten and from its 0.1.0
+  `efi-vars.fd`, and a new machine boots. An installer ISO under `bootindex`
+  was covered by unit tests only.
 - Distributions with no agent: no `exec`, files or MCP guest services; the
   serial log (`<home>/machines/NAME/serial.log`) and the QMP monitor
   (`--monitor`) are the automation surface. QEMU UEFI machines use USB

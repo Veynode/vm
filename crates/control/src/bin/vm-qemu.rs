@@ -1665,6 +1665,8 @@ fn run() -> Result<bool> {
     }
     command.args(vm_control::qemu_extras::arguments(&config)?);
     command.args(vm_control::qemu_audio::arguments(&config));
+    // Last, so every device before them keeps the PCI slot a machine's firmware recorded.
+    command.args(vm_control::qemu_uefi::trailing_devices(&config));
     let mut child = QemuChild(
         command.spawn().context("starting QEMU/HVF runtime")?,
         guardian,

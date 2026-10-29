@@ -210,12 +210,13 @@ pub fn arguments(config: &Config, resources: &Path, monitor: Option<&Path>) -> R
         } else {
             "virtio-scsi-pci,id=veynode-scsi"
         };
-        args.extend([
-            "-device".into(),
-            controller.into(),
-            "-device".into(),
-            "scsi-cd,bus=veynode-scsi.0,drive=veynode-cdrom,id=veynode-cdrom-device".into(),
-        ]);
+        let mut cdrom =
+            String::from("scsi-cd,bus=veynode-scsi.0,drive=veynode-cdrom,id=veynode-cdrom-device");
+        if boot_order(config) {
+            // The installer first while it is attached, then the disk.
+            cdrom.push_str(",bootindex=0");
+        }
+        args.extend(["-device".into(), controller.into(), "-device".into(), cdrom]);
     }
     if windows(config) {
         // virtio-win ARM64: vioinput, Balloon, viorng, pvpanic. edk2 has no
@@ -235,9 +236,6 @@ pub fn arguments(config: &Config, resources: &Path, monitor: Option<&Path>) -> R
             ]
             .map(String::from),
         );
-    } else {
-        // Distribution kernels load virtio_balloon for it, as container-init does.
-        args.extend(["-device", BALLOON_DEVICE].map(String::from));
     }
     if let Some(path) = monitor {
         let path = path.to_str().context("monitor path must be UTF-8")?;
@@ -249,6 +247,28 @@ pub fn arguments(config: &Config, resources: &Path, monitor: Option<&Path>) -> R
 
 pub fn windows(config: &Config) -> bool {
     config.guest == "windows"
+}
+
+/// A Linux machine's disk and installer CD-ROM carry `bootindex`, so the
+/// firmware boots the disk wherever it sits on the PCI bus: with QEMU's boot
+/// order, edk2 puts the matching boot options first and drops stale ones (an
+/// earlier layout's slot, PXE) that would otherwise come before a new entry
+/// for the disk and end at the UEFI shell.
+fn boot_order(config: &Config) -> bool {
+    config.boot == BootMode::Uefi && !windows(config)
+}
+
+/// `-device` arguments that go after every other device. QEMU gives PCI
+/// devices slots in command-line order and a machine's firmware variables name
+/// its disk by slot, so a device added in a later release goes here, never
+/// before the disk: a Linux machine keeps the layout it was installed with
+/// (disk at 00:05.0, its seed after it).
+pub fn trailing_devices(config: &Config) -> Vec<String> {
+    if boot_order(config) {
+        // Distribution kernels load virtio_balloon for it, as container-init does.
+        return ["-device", BALLOON_DEVICE].map(String::from).to_vec();
+    }
+    Vec::new()
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,13 +289,17 @@ impl DiskBus {
 pub const DISK_IOTHREAD: &str = "veynode-disk-io";
 
 /// `-device` for the primary disk (drive `veynode-disk`). QEMU 10.0's `nvme`
-/// has no `iothread` property, so it stays on the main loop.
+/// has no `iothread` property, so it stays on the main loop. A Linux
+/// machine's disk boots first ([`boot_order`]).
 pub fn disk_device(config: &Config) -> &'static str {
-    match config.qemu_disk_bus {
-        DiskBus::Virtio => {
+    match (config.qemu_disk_bus, boot_order(config)) {
+        (DiskBus::Virtio, true) => {
+            "virtio-blk-pci,drive=veynode-disk,iothread=veynode-disk-io,id=veynode-disk-device,bootindex=1"
+        }
+        (DiskBus::Virtio, false) => {
             "virtio-blk-pci,drive=veynode-disk,iothread=veynode-disk-io,id=veynode-disk-device"
         }
-        DiskBus::Nvme => "nvme,drive=veynode-disk,serial=veynode-disk,id=veynode-disk-device",
+        (DiskBus::Nvme, _) => "nvme,drive=veynode-disk,serial=veynode-disk,id=veynode-disk-device",
     }
 }
 
@@ -474,6 +498,44 @@ mod tests {
         assert!(!args.contains("scsi-cd") && !args.contains("-qmp"));
     }
 
+    /// QEMU numbers PCI devices in command-line order and a machine's firmware
+    /// variables name its disk by that slot. Machines made by 0.1.0 have the
+    /// disk at 00:05.0 (NIC, display, xhci, virtio-serial before it); 0.1.1
+    /// first put the balloon before the disk, moved it to 00:06.0, and edk2 then
+    /// stopped at the UEFI shell. Only xhci (and an installer's virtio-scsi) may
+    /// come from `arguments`; new devices are `trailing_devices`.
+    #[test]
+    fn a_linux_machine_keeps_the_pci_layout_its_firmware_recorded() {
+        let (_temp, root) = private_dir();
+        let pci = |c: &Config| -> Vec<String> {
+            let args = arguments(c, Path::new("/res"), None).unwrap();
+            args.windows(2)
+                .filter(|w| w[0] == "-device" && !w[1].contains("bus="))
+                .map(|w| w[1].clone())
+                .collect()
+        };
+        let installed = config(&root, json!({"cdrom":null}));
+        assert_eq!(pci(&installed), ["qemu-xhci,id=veynode-xhci"]);
+        let installing = config(&root, json!({}));
+        assert_eq!(
+            pci(&installing),
+            [
+                "qemu-xhci,id=veynode-xhci",
+                "virtio-scsi-pci,id=veynode-scsi"
+            ]
+        );
+        let joined = arguments(&installing, Path::new("/res"), None)
+            .unwrap()
+            .join(" ");
+        assert!(joined.contains("id=veynode-cdrom-device,bootindex=0"));
+        assert!(disk_device(&installed).ends_with(",bootindex=1"));
+        assert_eq!(trailing_devices(&installed), ["-device", BALLOON_DEVICE]);
+        // The seed and other extra disks are never boot devices.
+        assert!(!extra_disk_devices(&installed, 0)
+            .concat()
+            .contains("bootindex"));
+    }
+
     #[test]
     fn windows_guests_get_usb_media_virtio_devices_and_ramfb() {
         let (_temp, root) = private_dir();
@@ -529,10 +591,13 @@ mod tests {
         )
         .validate()
         .is_err());
+        assert!(!disk_device(&c).contains("bootindex"));
+        assert!(!joined.contains("bootindex"));
+        assert!(trailing_devices(&c).is_empty());
         let linux = config(&root, json!({}));
         assert_eq!(
             disk_device(&linux),
-            "virtio-blk-pci,drive=veynode-disk,iothread=veynode-disk-io,id=veynode-disk-device"
+            "virtio-blk-pci,drive=veynode-disk,iothread=veynode-disk-io,id=veynode-disk-device,bootindex=1"
         );
         assert!(disk_device(&linux).contains(&format!(",iothread={DISK_IOTHREAD},")));
         assert_eq!(
@@ -545,7 +610,8 @@ mod tests {
         let joined = arguments(&linux, Path::new("/res"), None)
             .unwrap()
             .join(" ");
-        assert!(joined.contains(BALLOON_DEVICE));
+        assert!(!joined.contains("virtio-balloon"));
+        assert_eq!(trailing_devices(&linux), ["-device", BALLOON_DEVICE]);
         assert!(!joined.contains("virtio-rng-pci"));
         assert!(display_device(&linux)
             .unwrap()
