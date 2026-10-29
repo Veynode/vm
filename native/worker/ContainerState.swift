@@ -144,8 +144,102 @@ extension Runner {
                 if case .failure(let error) = result { fail("Restored container did not resume: \(error.localizedDescription)") }
                 emit(["event":"machine_state_restored","vm_id":self.config.id,"restore_ms":restored,"total_ms":milliseconds(since:start)])
                 self.reportState()
+                let queued = self.resumeQueue ?? []
+                self.resumeQueue = nil
+                queued.forEach { self.command($0) }
                 self.retireDisconnectedOwnerIfIdle()
             }
         }
+    }
+}
+
+// `pause` and `resume` (`veynodevm pause`, the daemon's idle pause): the vCPUs
+// stop and the Guest's memory stays resident. Commands that arrive while the
+// VM resumes wait for it (`resumeQueue`), so the daemon can send `resume`
+// followed by the request that woke it.
+extension Runner {
+    func pauseResume(_ object: [String:Any]) {
+        let id = object["id"] ?? NSNull()
+        let pause = object["method"] as? String == "pause"
+        func reject(_ code: String, _ message: String) { emit(["id":id,"error":["code":code,"message":message]]) }
+        guard Set(object.keys).isSubset(of:["id","method"]) else { reject("invalid_request","Expected only id and method"); return }
+        guard !installing, !snapshotBusy, snapshotCaptureID == nil else {
+            reject("invalid_state","VM is installing or holds a snapshot transaction"); return
+        }
+        func finish(_ result: Result<Void, Error>) {
+            reportState()
+            switch result {
+            case .failure(let error): reject("backend_error",error.localizedDescription)
+            case .success: emit(["id":id,"result":["state":stateName(vm.state)]])
+            }
+        }
+        if pause {
+            guard vm.state == .running, vm.canPause else { reject("invalid_state","VM is not running (state \(stateName(vm.state)))"); return }
+            vm.pause { result in finish(result) }
+        } else {
+            guard vm.state == .paused, vm.canResume else { reject("invalid_state","VM is not paused (state \(stateName(vm.state)))"); return }
+            resumeQueue = []
+            vm.resume { result in
+                let queued = self.resumeQueue ?? []
+                self.resumeQueue = nil
+                finish(result)
+                queued.forEach { self.command($0) }
+            }
+        }
+    }
+}
+
+// `hibernate` (the daemon's idle hibernation): saves RAM/CPU/device state to
+// `path`, stops the VM and exits, so the Guest's memory goes back to the
+// host. The disk is not cloned: nothing writes it until the daemon starts
+// this VM again with `--restore-machine-state path`, which resumes exactly
+// here. A failed save leaves the VM running (or paused, as it was) and
+// removes the partial file.
+extension Runner {
+    func hibernate(_ object: [String:Any]) {
+        let id = object["id"] ?? NSNull()
+        func reject(_ code: String, _ message: String) { emit(["id":id,"error":["code":code,"message":message]]) }
+        guard config.guest == "linux", config.machine_identifier_file != nil, config.mac_address != nil, linuxSnapshot == nil else {
+            reject("unsupported","Hibernation needs a Linux container with machine_identifier_file and mac_address"); return
+        }
+        guard Set(object.keys).isSubset(of:["id","method","path"]), let path = object["path"] as? String else {
+            reject("invalid_request","Expected path"); return
+        }
+        do { try newLeaf(path) } catch { reject("invalid_request",error.localizedDescription); return }
+        guard !installing, !snapshotBusy, snapshotCaptureID == nil,
+              (vm.state == .running && vm.canPause) || vm.state == .paused else {
+            reject("invalid_state","VM must be running or paused to hibernate (state \(stateName(vm.state)))"); return
+        }
+        snapshotBusy = true
+        let wasRunning = vm.state == .running
+        let start = DispatchTime.now()
+        func failed(_ error: Error) {
+            unlink(path)
+            func done() { snapshotBusy = false; reportState(); reject("hibernate_failed",error.localizedDescription) }
+            if wasRunning && vm.state == .paused && vm.canResume { vm.resume { _ in done() } } else { done() }
+        }
+        func save() {
+            vm.saveMachineStateTo(url:URL(fileURLWithPath:path)) { error in
+                if let error { failed(error); return }
+                let saved = milliseconds(since:start)
+                var size = stat()
+                _ = stat(path,&size)
+                self.vm.stop { error in
+                    if let error { failed(error); return }
+                    if let disk = self.lockedDiskDescriptor { _ = fcntl(disk,F_FULLFSYNC) }
+                    self.stopGuestStreamBridge {
+                        emit(["id":id,"result":["state":"hibernated","state_bytes":size.st_size,"save_ms":saved,"total_ms":milliseconds(since:start)]])
+                        self.reportState()
+                        exit(0)
+                    }
+                }
+            }
+        }
+        if wasRunning {
+            vm.pause { result in
+                if case .failure(let error) = result { failed(error); return }
+                save()
+            }
+        } else { save() }
     }
 }

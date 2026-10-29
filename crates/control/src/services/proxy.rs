@@ -4,7 +4,10 @@
 //! is a small detached helper (`vm-control __proxy <id>`) that listens on the
 //! requested host address and splices connections to `<guest-ip>:<port>`. It
 //! exits when the container's VM stops. QEMU containers use slirp hostfwd.
-use super::container::{self, Container};
+use super::{
+    container::{self, Container},
+    util::KeepAwake,
+};
 use anyhow::{Context, Result};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -16,7 +19,7 @@ use std::{
         unix::{fs::OpenOptionsExt, net::UnixStream, process::CommandExt},
     },
     process::{Child, Command, Stdio},
-    sync::mpsc,
+    sync::{mpsc, Arc},
     thread,
     time::{Duration, Instant},
 };
@@ -101,10 +104,13 @@ fn splice(mut from: TcpStream, mut to: TcpStream) {
 }
 
 /// One accepted connection: connects to `target` and splices both ways (this
-/// thread one way, a second thread the other).
-fn forward(client: TcpStream, target: SocketAddr) {
+/// thread one way, a second thread the other). The connection is activity of
+/// VM `vm`: it resumes the VM if the idle monitor paused it, and keeps it
+/// awake while open (`None` only in tests, which have no daemon to tell).
+fn forward(client: TcpStream, target: SocketAddr, vm: Option<String>) {
     let _ = client.set_nonblocking(false);
     let _ = client.set_nodelay(true);
+    let awake = vm.map(|vm| Arc::new(KeepAwake::new(&vm)));
     let upstream = match TcpStream::connect_timeout(&target, CONNECT) {
         Ok(upstream) => upstream,
         Err(e) => {
@@ -117,14 +123,19 @@ fn forward(client: TcpStream, target: SocketAddr) {
     let (Ok(client_back), Ok(upstream_back)) = (client.try_clone(), upstream.try_clone()) else {
         return;
     };
-    thread::spawn(move || splice(upstream_back, client_back));
+    let held = awake.clone();
+    thread::spawn(move || {
+        splice(upstream_back, client_back);
+        drop(held);
+    });
     splice(client, upstream);
+    drop(awake);
 }
 
 /// Accepts on `listener` until `stop`'s peer is dropped, forwarding each
-/// connection to `target` on its own thread. Blocks in `poll` between
-/// connections: no wakeups and no added latency.
-fn serve(listener: TcpListener, target: SocketAddr, stop: UnixStream) {
+/// connection to `target` on its own thread as activity of VM `vm`. Blocks in
+/// `poll` between connections: no wakeups and no added latency.
+fn serve(listener: TcpListener, target: SocketAddr, vm: Option<String>, stop: UnixStream) {
     if let Err(e) = listener.set_nonblocking(true) {
         eprintln!("listener for {target}: {e}");
         return;
@@ -161,7 +172,8 @@ fn serve(listener: TcpListener, target: SocketAddr, stop: UnixStream) {
         match listener.accept() {
             Ok((client, _)) => {
                 // Out of threads: the client is dropped (closed) and the loop backs off.
-                match thread::Builder::new().spawn(move || forward(client, target)) {
+                let vm = vm.clone();
+                match thread::Builder::new().spawn(move || forward(client, target, vm)) {
                     Ok(_) => failing = false,
                     Err(e) => back_off(&mut failing, target, "connection thread", &e),
                 }
@@ -192,9 +204,13 @@ fn back_off(failing: &mut bool, target: SocketAddr, what: &str, error: &dyn std:
 
 /// Starts [`serve`] on its own thread. Dropping the returned stream stops it
 /// and closes the listener.
-fn start_serving(listener: TcpListener, target: SocketAddr) -> Result<UnixStream> {
+fn start_serving(
+    listener: TcpListener,
+    target: SocketAddr,
+    vm: Option<String>,
+) -> Result<UnixStream> {
     let (keep, stop) = UnixStream::pair()?;
-    thread::spawn(move || serve(listener, target, stop));
+    thread::spawn(move || serve(listener, target, vm, stop));
     Ok(keep)
 }
 
@@ -392,7 +408,11 @@ pub fn run(id: &str) -> Result<()> {
     let mut keep = Vec::new();
     for (listener, guest_port) in listeners {
         let target = SocketAddr::new(guest, guest_port);
-        keep.push(start_serving(listener, target)?);
+        keep.push(start_serving(
+            listener,
+            target,
+            Some(container.vm_id.clone()),
+        )?);
     }
     // The engine also follows ports published by its inner containers
     // (`docker run -p`), always on host loopback.
@@ -459,7 +479,10 @@ pub fn run(id: &str) -> Result<()> {
             changed = true;
             let served = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
                 .map_err(anyhow::Error::from)
-                .and_then(|listener| start_serving(listener, SocketAddr::new(guest, port)));
+                .and_then(|listener| {
+                    let vm = Some(container.vm_id.clone());
+                    start_serving(listener, SocketAddr::new(guest, port), vm)
+                });
             match served {
                 Ok(stop) => {
                     dynamic.insert(port, Some(stop));
@@ -518,7 +541,7 @@ mod tests {
         });
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let published = listener.local_addr().unwrap();
-        let stop = start_serving(listener, target).unwrap();
+        let stop = start_serving(listener, target, None).unwrap();
         let mut client = TcpStream::connect(published).unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(10)))

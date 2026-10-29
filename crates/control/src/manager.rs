@@ -77,6 +77,8 @@ pub(crate) struct Manager {
     pub(crate) events: Arc<events::Log>,
     /// The daemon's background exit monitor, parked while no worker is alive.
     pub(crate) exit_monitor: Option<thread::Thread>,
+    /// Each VM's idle policy and the pause the daemon asked for (`idle`).
+    pub(crate) idle: BTreeMap<String, idle::Idle>,
 }
 /// Background reaping cadence while at least one worker is alive (unchanged).
 pub(crate) const EXIT_MONITOR_LIVE: Duration = Duration::from_millis(100);
@@ -358,6 +360,7 @@ impl Manager {
             running: BTreeMap::new(),
             events: Arc::new(events::Log::default()),
             exit_monitor: None,
+            idle: BTreeMap::new(),
         })
     }
     /// Everything `create` requires of a configuration beyond parsing it. `create`, `start` and the registry load use
@@ -580,6 +583,14 @@ impl Manager {
                     result["runtime"]["state"].clone()
                 };
                 result["pid"] = json!(runtime.child.id());
+                result["idle"] = self.idle_view(id, &result["state"]);
+            }
+        }
+        if result["state"] == "stopped" {
+            if let Some(path) = self.hibernated(id) {
+                result["state"] = json!("hibernated");
+                let bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                result["hibernation"] = json!({"path":path,"bytes":bytes});
             }
         }
         if let Some(reason) = self.invalid.get(id) {
@@ -611,6 +622,9 @@ impl Manager {
             {
                 bail!("VM is fenced by an active or unresolved snapshot operation")
             }
+        }
+        if let Some(value) = self.idle_dispatch(method, args, deferred)? {
+            return Ok(value);
         }
         let guest_shutdown = method == "shutdown" && shutdown_mode(args)? == "guest";
         if method == "session_end" {
@@ -737,6 +751,7 @@ impl Manager {
             self.running.remove(id);
             self.driver_links.lock().unwrap().remove(id);
             self.leases.forget(id);
+            self.idle.remove(id);
             // Disks are owned by the image store, not the registry; report them for collection.
             return Ok(json!({"deleted":true,"id":id,"disk":removed.disk,"disk_removed":false}));
         }
@@ -1014,6 +1029,9 @@ impl Manager {
                     bail!("VM process already active")
                 }
             }
+            let idle_after = idle::policy(args)?;
+            let hibernate_after = idle::hibernate_policy(args, &config)?;
+            let hibernation = self.hibernated(id);
             let assigned = self.assigned_memory_mib()?;
             self.memory.admit(assigned, config.memory_mib)?;
             let disk_identity = config.disk.as_deref().map(DiskIdentity::read).transpose()?;
@@ -1089,8 +1107,19 @@ impl Manager {
                 Some(_) => {
                     bail!("restore_machine_state cannot be combined with a snapshot restore")
                 }
+                // A hibernated VM resumes where it was.
+                None if restore_plan.is_none() => hibernation
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
                 None => None,
             };
+            let restoring = hibernation.is_some()
+                && restore_plan.is_none()
+                && args.get("restore_machine_state").is_none();
+            if let Some(path) = hibernation.as_ref().filter(|_| !restoring) {
+                // Another state replaces the disk the hibernated one belongs to.
+                fs::remove_file(path).context("discarding the hibernation file")?;
+            }
             snapshot_restore::append_start_arguments(
                 &mut command,
                 &start_args,
@@ -1283,6 +1312,7 @@ impl Manager {
             if let Some(plan) = &restore_plan {
                 plan.attach_worker(self.running.get_mut(id).unwrap())?;
             }
+            self.idle_started(id, args, idle_after, hibernate_after, restoring)?;
             return self.view(id);
         }
         if method == "force_stop" {

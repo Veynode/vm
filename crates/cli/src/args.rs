@@ -136,9 +136,44 @@ pub fn desktop_size(value: &str) -> Result<(u32, u32)> {
     Ok((w, h))
 }
 
+/// `--idle-pause`, `--idle-hibernate`: `off` or `0`, or a duration in seconds (`300`, `300s`),
+/// minutes (`5m`), hours (`2h`) or days (`1d`) → seconds, 0 for off.
+pub fn idle_seconds(value: &str) -> Result<u64> {
+    let lower = value.to_ascii_lowercase();
+    if lower == "off" {
+        return Ok(0);
+    }
+    let (digits, factor) = match lower.chars().last() {
+        Some('s') => (&lower[..lower.len() - 1], 1),
+        Some('m') => (&lower[..lower.len() - 1], 60),
+        Some('h') => (&lower[..lower.len() - 1], 3600),
+        Some('d') => (&lower[..lower.len() - 1], 86400),
+        _ => (lower.as_str(), 1),
+    };
+    let n: u64 = digits.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "invalid idle duration {value}: expected off or a duration like 300, 5m, 2h"
+        )
+    })?;
+    Ok(n * factor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn idle_durations() {
+        assert_eq!(idle_seconds("off").unwrap(), 0);
+        assert_eq!(idle_seconds("0").unwrap(), 0);
+        assert_eq!(idle_seconds("300").unwrap(), 300);
+        assert_eq!(idle_seconds("90s").unwrap(), 90);
+        assert_eq!(idle_seconds("5m").unwrap(), 300);
+        assert_eq!(idle_seconds("2H").unwrap(), 7200);
+        assert_eq!(idle_seconds("1d").unwrap(), 86400);
+        for bad in ["", "m", "5x", "-1", "five"] {
+            assert!(idle_seconds(bad).is_err(), "{bad}");
+        }
+    }
     #[test]
     fn desktop_size_is_bounded_and_even() {
         assert_eq!(desktop_size("1920x1080").unwrap(), (1920, 1080));

@@ -59,9 +59,8 @@ pub fn group(tool: &str) -> Option<&'static str> {
         | "container_fork"
         | "container_fork_rm" => Some("snapshots"),
         "vm_list" | "vm_status" | "vm_capabilities" | "vm_guest_info" | "vm_create"
-        | "vm_start" | "vm_shutdown" | "vm_force_stop" | "vm_show_window" | "vm_close_window" => {
-            Some("core")
-        }
+        | "vm_start" | "vm_shutdown" | "vm_force_stop" | "vm_show_window" | "vm_close_window"
+        | "vm_sleep" | "vm_keep_awake" => Some("core"),
         _ => None,
     };
     named.or_else(|| {

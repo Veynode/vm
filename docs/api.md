@@ -92,13 +92,14 @@ from an ISO (QEMU only).
 type Machine = {
   name: string; id: string; os: "linux" | "macos" | "windows";
   backend: "apple-virtualization" | "qemu-hvf";
-  state: "stopped" | "starting" | "running" | "stopping" | "failed";
+  state: "stopped" | "starting" | "running" | "paused" | "stopping" | "failed";
   source: { disk?: string; digest?: string; from?: string; iso?: string; driversIso?: string };
   cpus: number; memoryMiB: number; diskGiB: number;
   gpu: "virgl" | "venus" | "neptune" | null; macAddress: string | null;
   shares: { hostPath: string; tag: string; readOnly: boolean; guestPath: string | null }[];
   ports: { host: number; guest: number }[];
   createdAt: number; diskUsedBytes: number; icon?: string | null;
+  idlePauseS: number; // 0: no idle pause
 };
 ```
 
@@ -109,8 +110,9 @@ type Machine = {
 | `machine.create` | stream | `{name, os, cpus, memoryMiB, diskGiB?, shares?, ports?, gpu?, backend?, diskBus?, attach?}` and one source: `{disk}` (a raw or qcow2 Linux disk; see below), `{from}` (an OCI reference; macOS), `{iso, unattended?, driversIso?}` | `Machine`; `progress` events |
 | `machine.start` | stream | `{name, wait?}` | `Machine`; with `wait`, ends once the guest answers |
 | `machine.stop` | call | `{name, force?}` | `{name}` |
+| `machine.pause` / `machine.unpause` | call | `{name}` | `{name}` |
 | `machine.rm` | call | `{name, force?}` | `{name}` |
-| `machine.update` | call | `{name, cpus?, memoryMiB?, diskGiB?, ports?, gpu?, newMac?}` (stopped; disks only grow) | `{name}` |
+| `machine.update` | call | `{name, cpus?, memoryMiB?, diskGiB?, ports?, gpu?, newMac?, idlePauseS?}` (stopped, except `idlePauseS` alone; disks only grow) | `{name}` |
 | `machine.rename` | call | `{name, newName}` (stopped) | `Machine` |
 | `machine.clone` | call | `{name, newName}` (stopped; APFS clone, new identity) | `Machine` |
 | `machine.eject` | call | `{name}` | `{name}` |
@@ -199,14 +201,17 @@ camelCase like the rest of the API.
 
 | Method | Kind | Arguments | Result |
 |---|---|---|---|
-| `container.run` | stream | `{image, command?, entrypoint?, name?, detach?, autoRemove?, ports?, volumes?, env?, workdir?, user?, cpus?, memoryMiB?, diskGiB?, gpus?, desktop?, desktopSize?: [w, h], dns?, mtu?, init?, quiet?, tty?, stdin?}` (the `veynodevm run` flags; `volumes` host paths are absolute) | the row; `progress` events. The client attaches afterwards when not `detach` |
+| `container.run` | stream | `{image, command?, entrypoint?, name?, detach?, autoRemove?, ports?, volumes?, env?, workdir?, user?, cpus?, memoryMiB?, diskGiB?, gpus?, desktop?, desktopSize?: [w, h], dns?, mtu?, init?, quiet?, tty?, stdin?, idlePauseS?, idleHibernateS?}` (the `veynodevm run` flags; `volumes` host paths are absolute) | the row; `progress` events. The client attaches afterwards when not `detach` |
 | `container.ls` | call | `{all?}` | rows |
 | `container.inspect` | call | `{name}` | `{container, state, status, ip, exit_code, gpu, errors, vm, directory, disk_bytes, …}` |
 | `container.start` | call | `{name}` | row |
 | `container.stop` | call | `{name, timeoutS?}` | row |
+| `container.pause` / `container.unpause` | call | `{name}` | row (`state` `paused`, `status` `Up (Paused)`) |
+| `container.sleep` | call | `{name}` | row; hibernated if it can be, else paused; its next use wakes it |
+| `container.keepAwake` | call | `{name, seconds}` (0 ends it early, at most 86400) | row; no idle pause or hibernation until then |
 | `container.rm` | call | `{name, force?}` | `{id, name}` |
 | `container.rename` | call | `{name, newName}` | row |
-| `container.update` | call | `{name, restart?, changes: {cpus?, memoryMiB?, diskGiB?, gpus?, desktop?, desktopSize?, ports?, dns?, mtu?, newMac?}}` | `{id, name, backend, gpus, cpus, memory_mib, disk_bytes, ports, mac_address, …}` |
+| `container.update` | call | `{name, restart?, changes: {cpus?, memoryMiB?, diskGiB?, gpus?, desktop?, desktopSize?, ports?, dns?, mtu?, newMac?, idlePauseS?, idleHibernateS?}}` | `{id, name, backend, gpus, cpus, memory_mib, disk_bytes, ports, mac_address, …}` |
 | `container.icon` | call | `{name, icon?: string \| null}`; without `icon` it only answers | `{id, icon}` |
 | `container.logs` | stream | `{name, follow?}` | `{exitCode}`; the output on `stdout`/`stderr` |
 | `container.exec` | stream | `{name, argv, env?, user?, workdir?, timeoutMs?, stdin?, tty?, rows?, cols?}`: Linux with `stdin` or `tty`, a guest session (an empty `argv` is a shell) with input on `stdin` and `{"resize":{rows, cols}}` on `control`; Linux otherwise, a bounded guest job (default 30 s) whose output comes at its end; macOS, SSH with `stdin` streamed | `{exitCode, timedOut}` |
@@ -267,3 +272,36 @@ The daemon's VM-level methods keep their names and arguments: `list`, `create`, 
 `force_stop`, `delete`, `capabilities`, `events`, `exec`, `exec_start`, `exec_poll`, `exec_cancel`, the `file_*`,
 `screenshot`, `input_*`, `desktop_*`, `accessibility_*`, `snapshot_*`, `driver_rpc` and window methods. The MCP
 `vm_*` tools map to them one to one. They answer with codes like every other method once the client says `hello`.
+
+### Pause and idle pause
+
+`pause {id}` and `resume {id}` stop and restart a running VM's vCPUs (Apple `VZVirtualMachine.pause`, QEMU
+`stop`/`cont`); the Guest's memory stays in use. `start` takes `idle_pause_s` (0, or 60 to 604800), and
+`idle_policy {id, idle_pause_s}` changes it for a running VM: after that long without activity the daemon pauses the
+VM itself. Activity is any VM method other than `status`, `list`, `events`, `log_read`, `capabilities`,
+`control_lease` and the lifecycle methods; an open console window; Guest jobs still running; and `wake {id}`, the
+heartbeat long-lived streams send every 20 s. The next such method resumes a VM the daemon paused for idleness
+before it runs, and an Apple Linux Guest's clock is stepped to the host's (`clock_sync`). A VM paused with `pause`
+refuses other methods (`state`) until `resume`; `shutdown` resumes it first. `status` reports
+`idle: {idle_pause_s, idle_s, paused_by: "idle" | "request" | null}` while the VM runs, and `events` carries
+`idle_paused` and `resumed`. The `container.*`, `machine.*`, `terminal.open`, `desktop.stream` and `files.copy`
+streams hold their VM awake while open, and so does each connection through an Apple container's published ports.
+
+`idle_hibernate_s` (on `start` and `idle_policy`, same bounds; Apple Linux VMs with `machine_identifier_file` and
+`mac_address` only) hibernates the VM after that long without activity, whether it runs or the daemon paused it for
+idleness: the worker saves the machine state to `hibernate.vzstate` in the VM's disk directory and exits, which
+frees the Guest's memory. `status` then reports `hibernated` with `hibernation: {path, bytes}`, and `idle` carries
+`idle_hibernate_s`. `start`, `resume`, `wake` and every method that needs the Guest restore it from that file (the
+worker holds the request until the VM runs; the clock is stepped); the file is removed once the restored VM runs,
+or when its restore fails, and the next start boots afresh. `shutdown`, `force_stop` and `delete` discard it, as
+does a start with `restore_machine_state` or a snapshot restore. While the worker saves, methods that need the Guest
+wait (up to 300 s) and then restore it. `events` carries `hibernating`, `hibernate_failed`, `restoring`,
+`restored` and `hibernation_discarded`. A container's `state` is then `hibernated` and its `status` `Up (Hibernated)`.
+
+Before it pauses or hibernates a running Apple Linux VM, the daemon asks the guest agent's `activity` (one-minute
+load from `/proc/loadavg`): at 0.5 or more the Guest is busy, which counts as activity, so work started in the
+background is not frozen. A Guest that does not answer counts as quiet. Two methods let a client say what the monitor
+cannot see: `sleep {id}` does now what the idle monitor would (hibernates a VM that can be, pauses any other the way
+the monitor does, so its next use wakes it; refused while Guest jobs or a snapshot run), and `keep_awake {id,
+seconds}` (0 to 86400; 0 ends it) keeps it from both until then and wakes it if it sleeps; `idle.awake_for_s` shows
+what is left. MCP has them as `vm_sleep` and `vm_keep_awake` (lifecycle tools).

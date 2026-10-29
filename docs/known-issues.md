@@ -215,6 +215,89 @@ interleaved rounds per variant, medians; the full rows are in
   ~0.46 ms; an open connection's round trip is unchanged (~0.25 ms). QEMU
   publishes through its own `hostfwd` (~0.45 ms).
 
+## Pause and idle pause
+
+- `pause` and `--idle-pause` save CPU and power, not memory: the Guest's RAM
+  stays resident. On QEMU, free page reporting (and the Windows balloon)
+  returns only what the Guest freed before the pause; Apple Virtualization
+  returns none (`memory_reclaim` in the capabilities).
+- Idle is what the host sees: API and MCP calls on the VM, open console and
+  desktop viewers, terminals, exec and attach streams, running Guest jobs and
+  connections through an Apple container's or machine's published ports (a
+  paused Apple machine keeps its publisher). A batch job,
+  cron or download inside the Guest that nobody on the host is waiting for
+  does not count, and is frozen when the VM is paused; set `--idle-pause` only
+  where that is acceptable.
+- QEMU containers and machines publish ports with slirp `hostfwd`, which the
+  daemon does not see: traffic to them neither keeps the VM awake nor wakes
+  it, and a connection to a paused QEMU VM hangs until something else resumes
+  it.
+- After a resume the Guest's wall clock lags by the time spent paused. Apple
+  Linux Guests running the agent are stepped to the host clock
+  (`clock_sync`); QEMU Guests and macOS and Windows Guests keep the lag until
+  their own time sync corrects it. Open TCP connections to the outside may
+  have timed out.
+- The idle policy lives in the container or machine record and is handed to
+  the daemon at each start; VMs started through the VM layer alone have none
+  unless `start` or `idle_policy` sets it. The shared engine is never paused.
+- QEMU's serial execution transport fences itself (and stops QEMU) when the
+  Guest misses heartbeats; the worker suspends that check from just before
+  `stop` until `cont` succeeds, so a paused Guest's silence is not a fault.
+  While paused its thread sleeps until the resume wakes it.
+- Checked live once, 2026-10-28, with `alpine:3.20` containers and
+  `--idle-pause 60s` on both backends: the idle pause came 60-70 s after the
+  last activity; `exec` resumed a VM paused for idleness (Apple 1.3 s, QEMU
+  0.16 s end to end) and it paused again 66 s later; on Apple an HTTP request
+  through a published port resumed it and was answered (0.05 s), and the
+  Guest clock was stepped to the host's, while a QEMU Guest lagged by about
+  the time spent paused; `pause` refused `exec` until `unpause`, and `stop`
+  of a paused container worked (QEMU in 10 s, as when it is not paused).
+  Machines, macOS containers, desktops and the native console were not
+  checked, and the web UI has no pause buttons (it shows `Up (Paused)`).
+
+## Idle hibernation
+
+- `--idle-hibernate` frees the Guest's memory, but only for Apple
+  Virtualization Linux containers: VZ saves machine state only for VMs with a
+  fixed MAC and machine identifier, and QEMU cannot migrate with virgl or
+  Venus. macOS containers, machines and QEMU containers have `--idle-pause`
+  alone.
+- What wakes it is what keeps `--idle-pause` from pausing (see above); the
+  first use after hibernation waits for the restore, which costs about
+  1.2 s per GiB of Guest memory in use (the same as a warm checkpoint), and
+  the state file takes that much disk until the restore removes it.
+- A request that arrives while the worker is still saving waits for the save
+  (up to 300 s) and then restores the VM, so the first use after a fresh
+  hibernation pays for both.
+- The Guest's own work is judged by its one-minute load (`activity`, Apple
+  Linux Guests with a current agent): a background job that mostly waits on
+  the network (a slow download, a chat client) keeps the load low and is
+  frozen like an idle Guest. `keep_awake` (`veynodevm keep-awake`,
+  `vm_keep_awake`) covers what the load does not show.
+- The idle policy lives in the daemon's memory and the container record: a
+  daemon restart forgets it until the container's next start, but a
+  hibernated VM is still restored on its next use.
+- Saving needs the VM's disk to stay as it was: anything that replaces the
+  writable layer (a checkpoint rollback, a snapshot restore) discards the
+  hibernation, and the VM boots afresh.
+- Checked live once, 2026-10-29, with an `alpine:3.20` Apple container
+  (512 MiB) answering HTTP on a published port: with `--idle-hibernate 60s`
+  the worker saved a 33 MiB state and exited 60-70 s after the last
+  activity; an HTTP request through the port restored it and was answered
+  in 1.05 s, `exec` in 0.34 s, and the Guest clock matched the host's; with
+  `--idle-pause 60s --idle-hibernate 120s` it paused at 69 s and hibernated
+  at 129 s; `start` restored a hibernated container, and `stop` discarded
+  the state (1.2 s) so the next start booted afresh. Larger memory, desktops,
+  volumes and a daemon restart while hibernated were not checked.
+- Checked live once more, 2026-10-29, with a guest agent and worker built
+  from this tree: a container whose entrypoint spun the CPU for 150 s with
+  `--idle-hibernate 60s` was not hibernated until 287 s (load fallen, then a
+  quiet minute); `veynodevm sleep` hibernated it at once, an `exec` sent
+  during the save waited and ran in 0.64 s, and a second `sleep` right after
+  that restore hibernated it again; `keep-awake 150s` held it awake until it
+  hibernated at 217 s. `vm_sleep` and `vm_keep_awake` were not called
+  through an MCP client.
+
 ## Checkpoints, rollback and forks
 
 - Memory is saved only on Apple Virtualization, for containers created since

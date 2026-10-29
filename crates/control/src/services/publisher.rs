@@ -121,7 +121,10 @@ fn wait_lease(machine: &Published) -> Result<String> {
             return Ok(ip);
         }
         let state = vm_state(&machine.state_dir, &machine.name);
-        if !matches!(state.as_str(), "running" | "starting" | "created") {
+        if !matches!(
+            state.as_str(),
+            "running" | "paused" | "starting" | "created"
+        ) {
             bail!(
                 "{} stopped before it took a DHCP lease ({state})",
                 machine.name
@@ -184,7 +187,8 @@ fn run(
             match listener.accept() {
                 Ok((client, _)) => {
                     idle = false;
-                    relay(client, target.clone(), stopped.clone());
+                    let vm = Some(machine.name.clone());
+                    relay(client, target.clone(), stopped.clone(), vm);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(_) => {}
@@ -192,7 +196,11 @@ fn run(
         }
         if checked.elapsed() > Duration::from_secs(2) {
             checked = Instant::now();
-            if vm_state(&machine.state_dir, &machine.name) != "running" {
+            // A paused machine keeps its ports: a connection resumes it.
+            if !matches!(
+                vm_state(&machine.state_dir, &machine.name).as_str(),
+                "running" | "paused"
+            ) {
                 return Ok(());
             }
         }
@@ -203,19 +211,25 @@ fn run(
     Ok(())
 }
 
-fn relay(client: TcpStream, target: Target, stopped: Arc<AtomicBool>) {
+/// One accepted connection, carried on its own threads. It is activity of
+/// machine `vm`: it resumes the machine if the idle monitor paused it, and
+/// keeps it awake while open (`None` only in tests, which have no daemon).
+fn relay(client: TcpStream, target: Target, stopped: Arc<AtomicBool>, vm: Option<String>) {
     let _ = client.set_nonblocking(false);
-    thread::spawn(move || match target {
-        Target::Lease(address) => {
-            match TcpStream::connect_timeout(&address, Duration::from_secs(5)) {
+    thread::spawn(move || {
+        let _awake = vm.map(|vm| super::util::KeepAwake::new(&vm));
+        match target {
+            Target::Lease(address) => {
+                match TcpStream::connect_timeout(&address, Duration::from_secs(5)) {
+                    Ok(upstream) => carry(client, upstream, stopped),
+                    Err(_) => client.close(Shutdown::Both),
+                }
+            }
+            Target::Relay(socket, port) => match super::macos_relay::connect(&socket, port) {
                 Ok(upstream) => carry(client, upstream, stopped),
                 Err(_) => client.close(Shutdown::Both),
-            }
+            },
         }
-        Target::Relay(socket, port) => match super::macos_relay::connect(&socket, port) {
-            Ok(upstream) => carry(client, upstream, stopped),
-            Err(_) => client.close(Shutdown::Both),
-        },
     });
 }
 
@@ -281,7 +295,7 @@ mod tests {
         let relay_stopped = stopped.clone();
         thread::spawn(move || {
             let (client, _) = front.accept().unwrap();
-            relay(client, Target::Lease(target), relay_stopped);
+            relay(client, Target::Lease(target), relay_stopped, None);
         });
         let mut client = TcpStream::connect(address).unwrap();
         client.write_all(b"published").unwrap();
@@ -311,7 +325,7 @@ mod tests {
         let target = Target::Relay(socket, 8080);
         thread::spawn(move || {
             let (client, _) = front.accept().unwrap();
-            relay(client, target, relay_stopped);
+            relay(client, target, relay_stopped, None);
         });
         let mut client = TcpStream::connect(address).unwrap();
         client.write_all(b"published").unwrap();

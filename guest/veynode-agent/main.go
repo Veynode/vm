@@ -149,6 +149,8 @@ func handleWithManager(manager *jobManager, req request, allowExec bool, allowSh
 		return handleDriverRPC(req)
 	case "clock_sync":
 		return clockSync(req)
+	case "activity":
+		return activity(req)
 	case "text_input":
 		// Independent of execute/shutdown/files permission; the host applies the input permission.
 		return handleTextInput(req)

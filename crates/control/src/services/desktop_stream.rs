@@ -538,10 +538,7 @@ fn rate_worker(mut control: RateControl, commands: mpsc::Receiver<u64>, out: Out
 
 impl Session {
     fn start(name: &str, codec: &str, tracks: bool) -> Result<Self> {
-        let vm = match container::find(name) {
-            Ok(c) => c.vm_id,
-            Err(_) => super::machines::resolve(name),
-        };
+        let vm = super::util::vm_of(name);
         let status = daemon_call("status", json!({"id":vm}))?;
         if !matches!(status["state"].as_str(), Some("running")) {
             bail!("{name} is not running")
@@ -819,6 +816,7 @@ pub fn stream(_: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
 }
 
 fn run(name: &str, codec: &str, tracks: bool, io: &StreamIo) -> Result<i32> {
+    let _awake = super::util::KeepAwake::new(&super::util::vm_of(name));
     let out: Out = Arc::new(Mutex::new(Box::new(io.output())));
     let mut session = match Session::start(name, codec, tracks) {
         Ok(session) => session,

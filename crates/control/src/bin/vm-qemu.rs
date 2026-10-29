@@ -2089,6 +2089,29 @@ fn run() -> Result<bool> {
                 status_poll.disturbed(Instant::now());
                 request_powerdown(&mut qmp, &mut input, guest_exec.is_some()).map(|_|json!({"requested":true,"mechanism":"qmp-system-powerdown","completed":false,"requires_guest_power_button_support":true,"execution_quiescing":execution_shutdown.active(),"shutdown_timeout_seconds":if execution_shutdown.active(){json!(60)}else{Value::Null}}))
             },
+            // Idle pause and `veynodevm pause`: vCPUs stop, memory stays. Only a running VM pauses and only a
+            // paused one resumes, never one in prelaunch, a migration or a guest-panicked state.
+            Some(method @ ("pause" | "resume")) => {
+                let (from, command) = if method == "pause" { ("running", "stop") } else { ("paused", "cont") };
+                match qmp.call("query-status") {
+                    Ok(status) if status["status"] == from => {
+                        status_poll.disturbed(Instant::now());
+                        let to = if method == "pause" { "paused" } else { "running" };
+                        // The serial execution transport stops expecting heartbeats before the vCPUs stop,
+                        // and expects them again only once they run: a stopped Guest's silence would fence it.
+                        if method == "pause" { if let Some(exec) = &guest_exec { exec.set_paused(true) } }
+                        let result = qmp.call(command);
+                        if let Some(exec) = &guest_exec { exec.set_paused(if result.is_ok() { method == "pause" } else { method != "pause" }) }
+                        match result {
+                            // Published now, so the daemon's state is current when the reply arrives.
+                            Ok(_) => { state["state"] = json!(to); state["qmp_status"] = json!(to); emit(state.clone())?; Ok(json!({"state":to})) }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    Ok(status) => Err(anyhow::anyhow!("invalid_state: QEMU run state is {}", status["status"])),
+                    Err(error) => Err(error),
+                }
+            },
             Some("stop") => { emit(json!({"id":id,"result":{"requested":true,"forced":true}}))?; break },
             _ => Err(anyhow::anyhow!("unsupported QEMU worker operation")),
         };

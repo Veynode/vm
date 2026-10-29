@@ -3,7 +3,7 @@
 //! printed, which the web UI and MCP tools read.
 use super::{
     checkpoint, container, macos, pump, session,
-    util::{flag, only, opt_string, opt_u64, string},
+    util::{flag, only, opt_string, opt_u64, string, KeepAwake},
     with_progress,
 };
 use crate::api_server::{Ctx, StreamIo};
@@ -39,7 +39,7 @@ fn strings(args: &Value, field: &str) -> Result<Vec<String>> {
 /// A `container.ls` row.
 pub fn row(c: &container::Container) -> Value {
     let (state, status) = container::status_text(c);
-    json!({"id":c.id,"name":c.name,"image":c.image,"command":c.argv,"created_at":c.created_at,"state":state,"status":status,"ports":c.ports,"backend":c.backend,"gpus":c.gpus,"desktop":c.desktop,"desktop_size":c.desktop_size,"vm_id":c.vm_id,"icon":c.icon,"os":c.os,"engine":c.engine,"init":c.init,"cpus":c.cpus,"memory_mib":c.memory_mib,"tty":c.tty,"stdin":c.stdin,"auto_remove":c.auto_remove})
+    json!({"id":c.id,"name":c.name,"image":c.image,"command":c.argv,"created_at":c.created_at,"state":state,"status":status,"ports":c.ports,"backend":c.backend,"gpus":c.gpus,"desktop":c.desktop,"desktop_size":c.desktop_size,"vm_id":c.vm_id,"icon":c.icon,"os":c.os,"engine":c.engine,"init":c.init,"cpus":c.cpus,"memory_mib":c.memory_mib,"tty":c.tty,"stdin":c.stdin,"auto_remove":c.auto_remove,"idle_pause_s":c.idle_pause_s.unwrap_or(0),"idle_hibernate_s":c.idle_hibernate_s.unwrap_or(0)})
 }
 
 /// `container.run`: creates and starts a container. A macOS container with
@@ -48,6 +48,19 @@ pub fn row(c: &container::Container) -> Value {
 pub fn run(_: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
     let options: container::RunOptions = serde_json::from_value(args)
         .map_err(|e| refuse(ErrorCode::Invalid, format!("invalid run options: {e}")))?;
+    let mut options = options;
+    options.idle_pause_s = options
+        .idle_pause_s
+        .map(container::check_idle_pause)
+        .transpose()
+        .map_err(|e| refuse(ErrorCode::Invalid, e.to_string()))?
+        .flatten();
+    options.idle_hibernate_s = options
+        .idle_hibernate_s
+        .map(container::check_idle_hibernate)
+        .transpose()
+        .map_err(|e| refuse(ErrorCode::Invalid, e.to_string()))?
+        .flatten();
     with_progress(io, || {
         let c = container::create_and_start(&options)?;
         if c.os == "darwin" && options.detach {
@@ -100,6 +113,54 @@ pub fn stop(_: &Ctx, args: Value) -> Result<Value> {
     Ok(row(&c))
 }
 
+/// `container.pause`: stops the VM's vCPUs; its memory stays in use.
+pub fn pause(_: &Ctx, args: Value) -> Result<Value> {
+    only(&args, &["name"])?;
+    let c = find(&args)?;
+    if c.engine {
+        return Err(refuse(
+            ErrorCode::Unsupported,
+            format!("{} runs the shared engine; it cannot be paused", c.name),
+        ));
+    }
+    super::daemon_call("pause", json!({"id":c.vm_id}))?;
+    Ok(row(&c))
+}
+
+/// `container.sleep`: hibernates the container now if it can be, else
+/// pauses it; either way its next use wakes it.
+pub fn sleep(_: &Ctx, args: Value) -> Result<Value> {
+    only(&args, &["name"])?;
+    let c = find(&args)?;
+    if c.engine {
+        return Err(refuse(
+            ErrorCode::Unsupported,
+            format!("{} runs the shared engine; it cannot sleep", c.name),
+        ));
+    }
+    super::daemon_call("sleep", json!({"id":c.vm_id}))?;
+    Ok(row(&c))
+}
+
+/// `container.keepAwake`: no idle pause or hibernation for `seconds` (0
+/// ends it early); wakes the container if it sleeps.
+pub fn keep_awake(_: &Ctx, args: Value) -> Result<Value> {
+    only(&args, &["name", "seconds"])?;
+    let c = find(&args)?;
+    let seconds = opt_u64(&args, "seconds")?
+        .ok_or_else(|| refuse(ErrorCode::Invalid, "keepAwake requires seconds"))?;
+    super::daemon_call("keep_awake", json!({"id":c.vm_id,"seconds":seconds}))?;
+    Ok(row(&c))
+}
+
+/// `container.unpause`: resumes a paused container.
+pub fn unpause(_: &Ctx, args: Value) -> Result<Value> {
+    only(&args, &["name"])?;
+    let c = find(&args)?;
+    super::daemon_call("resume", json!({"id":c.vm_id}))?;
+    Ok(row(&c))
+}
+
 pub fn rm(_: &Ctx, args: Value) -> Result<Value> {
     let c = find(&args)?;
     container::remove(&c, flag(&args, "force")?)?;
@@ -116,10 +177,24 @@ pub fn update(_: &Ctx, args: Value) -> Result<Value> {
     let c = find(&args)?;
     let changes: container::Changes = serde_json::from_value(args["changes"].clone())
         .map_err(|e| refuse(ErrorCode::Invalid, format!("invalid changes: {e}")))?;
-    let c = container::update(&c, &changes, flag(&args, "restart")?)?;
+    if let Some(seconds) = changes.idle_pause_s {
+        container::check_idle_pause(seconds)
+            .map_err(|e| refuse(ErrorCode::Invalid, e.to_string()))?;
+    }
+    if let Some(seconds) = changes.idle_hibernate_s {
+        container::check_idle_hibernate(seconds)
+            .map_err(|e| refuse(ErrorCode::Invalid, e.to_string()))?;
+    }
+    let mut c = container::update(&c, &changes, flag(&args, "restart")?)?;
+    if let Some(seconds) = changes.idle_pause_s {
+        container::set_idle_pause(&mut c, seconds)?;
+    }
+    if let Some(seconds) = changes.idle_hibernate_s {
+        container::set_idle_hibernate(&mut c, seconds)?;
+    }
     let (_, disk_bytes, _) = container::disk(&c)?;
     Ok(
-        json!({"id":c.id,"name":c.name,"backend":c.backend,"gpus":c.gpus,"desktop":c.desktop,"desktop_size":c.desktop_size,"cpus":c.cpus,"memory_mib":c.memory_mib,"disk_bytes":disk_bytes,"ports":c.ports,"mac_address":c.mac_address}),
+        json!({"id":c.id,"name":c.name,"backend":c.backend,"gpus":c.gpus,"desktop":c.desktop,"desktop_size":c.desktop_size,"cpus":c.cpus,"memory_mib":c.memory_mib,"disk_bytes":disk_bytes,"ports":c.ports,"mac_address":c.mac_address,"idle_pause_s":c.idle_pause_s.unwrap_or(0),"idle_hibernate_s":c.idle_hibernate_s.unwrap_or(0)}),
     )
 }
 
@@ -150,6 +225,7 @@ pub fn icon(_: &Ctx, args: Value) -> Result<Value> {
 /// container, the command over SSH, with the client's stdin when `stdin`.
 pub fn exec(_: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
     let c = find(&args)?;
+    let _awake = KeepAwake::new(&c.vm_id);
     let argv = strings(&args, "argv")?;
     let (tty, stdin) = (flag(&args, "tty")?, flag(&args, "stdin")?);
     if c.os != "darwin" && (tty || stdin) {
@@ -221,6 +297,7 @@ fn size(args: &Value) -> Option<(u16, u16)> {
 /// none) and the console's `errors`; `left` when the client went first.
 pub fn attach(_: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
     let c = find(&args)?;
+    let _awake = KeepAwake::new(&c.vm_id);
     if c.os == "darwin" {
         let command = with_progress(io, || macos::logs_command(&c, true))?;
         let code = pump::run(command, false, io)?;
@@ -329,6 +406,7 @@ pub fn logs(_: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
 /// `container.cp`: one path between the host and a macOS container.
 pub fn cp(_: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
     let c = find(&args)?;
+    let _awake = KeepAwake::new(&c.vm_id);
     let host = Path::new(string(&args, "hostPath")?);
     if !host.is_absolute() {
         return Err(refuse(ErrorCode::Invalid, "hostPath must be absolute"));

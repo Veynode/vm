@@ -124,6 +124,15 @@ pub struct Container {
     /// default (`run --desktop-size`, `update --desktop-size`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desktop_size: Option<(u32, u32)>,
+    /// `run --idle-pause`, `update --idle-pause`: the daemon pauses the VM
+    /// after this many seconds without activity (`crate::idle`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_pause_s: Option<u64>,
+    /// `run --idle-hibernate`, `update --idle-hibernate`: the daemon saves
+    /// the VM's machine state and stops its worker after this many seconds
+    /// without activity; the next use restores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_hibernate_s: Option<u64>,
 }
 
 /// `container.run`'s arguments, the `veynodevm run` flags.
@@ -158,6 +167,12 @@ pub struct RunOptions {
     pub quiet: bool,
     pub tty: bool,
     pub stdin: bool,
+    /// `--idle-pause`: seconds without activity before the VM is paused.
+    #[serde(rename = "idlePauseS")]
+    pub idle_pause_s: Option<u64>,
+    /// `--idle-hibernate`: seconds without activity before the VM is hibernated.
+    #[serde(rename = "idleHibernateS")]
+    pub idle_hibernate_s: Option<u64>,
 }
 
 /// `--init systemd` boots the image's `/sbin/init` as PID 1 instead of its
@@ -420,6 +435,11 @@ pub fn status_text(container: &Container) -> (String, String) {
     if container.os == "darwin" {
         let text = if active(&state) { "Up" } else { "Exited" };
         return (state, text.to_owned());
+    }
+    match state.as_str() {
+        "paused" => return (state, "Up (Paused)".to_owned()),
+        "hibernated" => return (state, "Up (Hibernated)".to_owned()),
+        _ => {}
     }
     let console = read_console(container);
     let text = if active(&state) {
@@ -798,10 +818,15 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
             fork_of: None,
             icon: None,
             desktop_size: options.desktop.then_some(options.desktop_size).flatten(),
+            idle_pause_s: options.idle_pause_s,
+            idle_hibernate_s: options.idle_hibernate_s,
         };
+        if container.idle_hibernate_s.is_some() {
+            check_hibernatable(&container)?;
+        }
         save(&container)?;
         daemon_call("create", vm)?;
-        if let Err(e) = daemon_call("start", json!({"id":vm_id})) {
+        if let Err(e) = daemon_call("start", start_request(&container)) {
             let _ = daemon_call("delete", json!({"id":vm_id,"confirm":vm_id}));
             return Err(e);
         }
@@ -926,6 +951,12 @@ pub struct Changes {
     pub dns: Option<Vec<String>>,
     pub mtu: Option<u16>,
     pub new_mac: bool,
+    /// Seconds; 0 turns the idle pause off. Applies without a restart.
+    #[serde(rename = "idlePauseS")]
+    pub idle_pause_s: Option<u64>,
+    /// Seconds; 0 turns the idle hibernation off. Applies without a restart.
+    #[serde(rename = "idleHibernateS")]
+    pub idle_hibernate_s: Option<u64>,
 }
 
 /// The disk holding a container's writable layer (a macOS container's whole
@@ -1343,7 +1374,13 @@ pub fn start(container: &Container) -> Result<()> {
 /// `start`, or with `machine_state` resume a saved machine state instead of
 /// booting (`checkpoint`): the run continues, so the console is kept.
 pub fn start_from(container: &Container, machine_state: Option<&Path>) -> Result<()> {
-    if active(&vm_state(container)) {
+    let state = vm_state(container);
+    if state == "hibernated" && machine_state.is_none() {
+        // The daemon restores it; its console and port publisher carry on.
+        daemon_call("start", start_request(container))?;
+        return Ok(());
+    }
+    if active(&state) {
         bail!("container {} is already running", container.name)
     }
     let dir = container_dir(&container.id)?;
@@ -1356,7 +1393,7 @@ pub fn start_from(container: &Container, machine_state: Option<&Path>) -> Result
         let config_disk = dir.join("config.img");
         replace_config_disk(&config_disk, &read_config_disk(&config_disk)?)?;
     }
-    let mut request = json!({"id":container.vm_id});
+    let mut request = start_request(container);
     if let Some(path) = machine_state {
         request["restore_machine_state"] = json!(path);
     }
@@ -1378,6 +1415,71 @@ fn systemd_poweroff() -> Vec<String> {
     ["systemctl", "--no-block", "poweroff"]
         .map(str::to_owned)
         .to_vec()
+}
+
+/// The daemon's `start` for a container: its VM and idle policies.
+pub fn start_request(container: &Container) -> Value {
+    json!({
+        "id": container.vm_id,
+        "idle_pause_s": container.idle_pause_s.unwrap_or(0),
+        "idle_hibernate_s": container.idle_hibernate_s.unwrap_or(0),
+    })
+}
+
+/// Checks an idle hibernation in seconds (0 is off) the way the daemon will.
+pub fn check_idle_hibernate(seconds: u64) -> Result<Option<u64>> {
+    crate::idle::seconds(&json!({ "idle_hibernate_s": seconds }), "idle_hibernate_s")?;
+    Ok((seconds > 0).then_some(seconds))
+}
+
+/// Only an Apple Virtualization Linux container (fixed MAC and machine
+/// identifier) can save and restore its machine state.
+fn check_hibernatable(container: &Container) -> Result<()> {
+    if container.backend != "apple-virtualization"
+        || container.os == "darwin"
+        || container.mac_address.is_none()
+    {
+        bail!("--idle-hibernate needs an Apple Virtualization Linux container; use --idle-pause")
+    }
+    Ok(())
+}
+
+/// `update --idle-hibernate`: records the policy and, while the container
+/// runs, hands it to the daemon.
+pub fn set_idle_hibernate(container: &mut Container, seconds: u64) -> Result<()> {
+    let after = check_idle_hibernate(seconds)?;
+    if after.is_some() {
+        check_hibernatable(container)?;
+    }
+    container.idle_hibernate_s = after;
+    save(container)?;
+    if active(&vm_state(container)) {
+        daemon_call(
+            "idle_policy",
+            json!({"id":container.vm_id,"idle_hibernate_s":seconds}),
+        )?;
+    }
+    Ok(())
+}
+
+/// Checks an idle pause in seconds (0 is off) the way the daemon will.
+pub fn check_idle_pause(seconds: u64) -> Result<Option<u64>> {
+    crate::idle::policy(&json!({ "idle_pause_s": seconds }))?;
+    Ok((seconds > 0).then_some(seconds))
+}
+
+/// `update --idle-pause`: records the policy and, while the container runs,
+/// hands it to the daemon.
+pub fn set_idle_pause(container: &mut Container, seconds: u64) -> Result<()> {
+    container.idle_pause_s = check_idle_pause(seconds)?;
+    save(container)?;
+    if active(&vm_state(container)) {
+        daemon_call(
+            "idle_policy",
+            json!({"id":container.vm_id,"idle_pause_s":seconds}),
+        )?;
+    }
+    Ok(())
 }
 
 /// `stop` without `-t`: a whole distribution needs longer than one process.

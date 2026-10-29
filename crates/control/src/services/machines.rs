@@ -68,6 +68,10 @@ pub struct Machine {
     /// install); never shown as a published port.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_port: Option<u16>,
+    /// `machine update --idle-pause`: the daemon pauses the VM after this
+    /// many seconds without activity (`crate::idle`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_pause_s: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -379,6 +383,7 @@ fn render(machine: &Machine, raw: &str, status: Option<Value>, used: u64) -> Val
         "createdAt": machine.created_at,
         "diskUsedBytes": used,
         "icon": machine.icon,
+        "idlePauseS": machine.idle_pause_s.unwrap_or(0),
         "vmState": raw,
         "record": machine,
         "vm": status,
@@ -721,6 +726,7 @@ pub fn create(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
             digest,
             ports,
             ssh_port,
+            idle_pause_s: None,
         };
         save(&machine)?;
         if let Some(prepared) = install {
@@ -849,7 +855,10 @@ pub fn start(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
         return Err(state_error(format!("{name} is running")));
     }
     io.progress("Starting")?;
-    ctx.vm("start", json!({"id":name}))?;
+    ctx.vm(
+        "start",
+        json!({"id":name,"idle_pause_s":machine.idle_pause_s.unwrap_or(0)}),
+    )?;
     if !machine.ports.is_empty() && machine.backend != "qemu-hvf" {
         let config = ctx.vm("status", json!({"id":name}))?["config"].clone();
         let published = super::publisher::Published {
@@ -921,6 +930,22 @@ fn windows_ready(ctx: &Ctx, name: &str, io: &StreamIo) -> Result<()> {
         }
         std::thread::sleep(Duration::from_secs(3));
     }
+}
+
+/// `machine.pause`: stops the VM's vCPUs; its memory stays in use.
+pub fn pause(ctx: &Ctx, args: Value) -> Result<Value> {
+    let name = name_arg(&args)?;
+    load(&name)?;
+    ctx.vm("pause", json!({"id":name}))?;
+    Ok(json!({ "name": name }))
+}
+
+/// `machine.unpause`: resumes a paused machine.
+pub fn unpause(ctx: &Ctx, args: Value) -> Result<Value> {
+    let name = name_arg(&args)?;
+    load(&name)?;
+    ctx.vm("resume", json!({"id":name}))?;
+    Ok(json!({ "name": name }))
 }
 
 pub fn stop(ctx: &Ctx, args: Value) -> Result<Value> {
@@ -1133,8 +1158,23 @@ pub fn grown_disk(current: u64, requested: Option<u64>) -> Result<Option<u64>> {
 
 pub fn update(ctx: &Ctx, args: Value) -> Result<Value> {
     let name = name_arg(&args)?;
-    let changes = Changes::from_args(&args)?;
     let mut machine = load(&name)?;
+    // The idle pause needs no restart: it is recorded, and a running VM gets it now.
+    if let Some(seconds) = opt_u64(&args, "idlePauseS")? {
+        machine.idle_pause_s =
+            super::container::check_idle_pause(seconds).map_err(|e| invalid(e.to_string()))?;
+        save(&machine)?;
+        if running(&vm_state(ctx, &name)) {
+            ctx.vm("idle_policy", json!({"id":name,"idle_pause_s":seconds}))?;
+        }
+        if args
+            .as_object()
+            .is_some_and(|a| a.keys().all(|k| k == "name" || k == "idlePauseS"))
+        {
+            return Ok(json!({ "name": name }));
+        }
+    }
+    let changes = Changes::from_args(&args)?;
     let old = stopped_config(ctx, &name, "changing its hardware")?;
     let mut config = old.clone();
     edit_config(&mut config, &machine, &changes)?;
@@ -1508,6 +1548,7 @@ pub fn endpoints(ctx: &Ctx, args: Value) -> Result<Value> {
 pub fn exec(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
     let name = name_arg(&args)?;
     let machine = load(&name)?;
+    let _awake = util::KeepAwake::new(&name);
     let status = ctx.vm("status", json!({"id":name}))?;
     if !running(status["state"].as_str().unwrap_or("unknown")) {
         return Err(state_error(format!("{name} is not running")));
@@ -1673,6 +1714,7 @@ mod tests {
             digest: None,
             ports: Vec::new(),
             ssh_port: None,
+            idle_pause_s: None,
         }
     }
 

@@ -41,8 +41,16 @@ pub(crate) fn tools_with_input(lifecycle: bool, execute: bool, files: bool, inpu
                 "vm_close_window",
                 "Close native console while keeping VM running.",
             ),
+            (
+                "vm_sleep",
+                "Free the VM's resources now, when you are done with it for a while: an Apple Linux VM with a fixed MAC and machine identifier is hibernated (memory saved to disk, worker stopped), any other is paused. Any later call on the VM wakes it first, so no explicit wake is needed. Refused while Guest jobs run.",
+            ),
+            (
+                "vm_keep_awake",
+                "Keep the VM from its idle pause or hibernation for seconds (0 ends it early, max 86400), e.g. while a build or server you started in the background runs; wakes the VM if it sleeps.",
+            ),
         ] {
-            let schema=if name=="vm_shutdown" {json!({"type":"object","properties":{"id":{"type":"string"},"mode":{"type":"string","enum":["backend","guest"],"default":"backend"}},"required":["id"],"additionalProperties":false})}else{id.clone()};
+            let schema=if name=="vm_shutdown" {json!({"type":"object","properties":{"id":{"type":"string"},"mode":{"type":"string","enum":["backend","guest"],"default":"backend"}},"required":["id"],"additionalProperties":false})}else if name=="vm_keep_awake" {json!({"type":"object","properties":{"id":{"type":"string"},"seconds":{"type":"integer","minimum":0,"maximum":86400}},"required":["id","seconds"],"additionalProperties":false})}else{id.clone()};
             tools.push(json!({"name":name,"description":description,"inputSchema":schema}));
         }
         tools.push(json!({"name":"vm_force_stop","description":"Kill VM process. Can lose guest data. Requires explicit confirmation equal to VM id.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"confirm":{"type":"string"}},"required":["id","confirm"],"additionalProperties":false}}));

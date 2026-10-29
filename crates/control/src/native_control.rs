@@ -50,6 +50,10 @@ impl Session {
     fn rpc(&self, method: &str, arguments: Value) -> Result<Value> {
         let (rx, number, pending) = {
             let mut m = self.manager.lock().unwrap();
+            m.native_activity(
+                &self.attach.id,
+                matches!(method, "native_begin" | "native_event"),
+            );
             let run = self.bound(&mut m)?;
             let number = run.next;
             run.next = run

@@ -769,6 +769,11 @@ pub fn create_and_start(
             "audio": true,
             "shares": volumes.iter().enumerate().map(|(i, v)| json!({"tag":format!("v{i}"),"path":v.host,"read_only":v.read_only})).collect::<Vec<_>>(),
         });
+        if options.idle_hibernate_s.is_some() {
+            bail!(
+                "--idle-hibernate needs an Apple Virtualization Linux container; use --idle-pause"
+            )
+        }
         let container = Container {
             id: id.clone(),
             name,
@@ -803,11 +808,13 @@ pub fn create_and_start(
             init: None,
             tty: false,
             stdin: false,
+            idle_pause_s: options.idle_pause_s,
+            idle_hibernate_s: None,
         };
         container::save(&container)?;
         daemon_call("create", vm)?;
-        if let Err(e) =
-            daemon_call("start", json!({"id":vm_id})).and_then(|_| wait_started(&container))
+        if let Err(e) = daemon_call("start", container::start_request(&container))
+            .and_then(|_| wait_started(&container))
         {
             let _ = daemon_call("force_stop", json!({"id":vm_id,"confirm":vm_id}));
             let _ = daemon_call("delete", json!({"id":vm_id,"confirm":vm_id}));
@@ -1233,6 +1240,7 @@ pub fn create_machine(ctx: &Ctx, args: &Value, io: &StreamIo) -> Result<Value> {
             digest: None,
             ports: machines::record_ports(&spec.ports),
             ssh_port: None,
+            idle_pause_s: None,
         };
         machines::save(&machine)?;
         Ok(machines::view(ctx, &machine))

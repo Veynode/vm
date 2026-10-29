@@ -10,6 +10,54 @@ use std::{
 };
 use veynodevm_api::{refuse, ErrorCode};
 
+/// While alive, tells the daemon every 20 s that the VM is in use (`wake`),
+/// so its idle pause waits: what a long-lived stream holds. The first `wake`
+/// resumes a VM the idle monitor paused before the stream reaches its Guest.
+pub struct KeepAwake {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: std::thread::Thread,
+}
+
+impl KeepAwake {
+    const BEAT: std::time::Duration = std::time::Duration::from_secs(20);
+
+    pub fn new(vm: &str) -> Self {
+        use std::sync::atomic::Ordering;
+        let wake = {
+            let vm = vm.to_owned();
+            move || super::daemon_call("wake", serde_json::json!({ "id": vm }))
+        };
+        let _ = wake();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let running = stop.clone();
+        let thread = std::thread::spawn(move || loop {
+            std::thread::park_timeout(Self::BEAT);
+            if running.load(Ordering::SeqCst) {
+                return;
+            }
+            let _ = wake();
+        })
+        .thread()
+        .clone();
+        Self { stop, thread }
+    }
+}
+
+impl Drop for KeepAwake {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.thread.unpark();
+    }
+}
+
+/// The daemon VM of a container or machine name.
+pub fn vm_of(name: &str) -> String {
+    match super::container::find(name) {
+        Ok(c) => c.vm_id,
+        Err(_) => super::machines::resolve(name),
+    }
+}
+
 pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

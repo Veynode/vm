@@ -72,6 +72,12 @@ pub fn save_command(config: &Config, args: &Value, command: &mut Value) -> Resul
     Ok(())
 }
 
+/// Where an idle-hibernated VM keeps its machine state (`idle.rs`): one
+/// file in its disk directory, restored and removed by its next start.
+pub fn hibernation_path(config: &Config) -> Result<PathBuf> {
+    Ok(eligible(config)?.join("hibernate.vzstate"))
+}
+
 pub fn restore_path(config: &Config, value: &Value) -> Result<String> {
     let path = inside(config, value, "restore_machine_state")?;
     if !path.symlink_metadata().is_ok_and(|m| m.is_file()) {
