@@ -19,7 +19,8 @@ A release directory for the standalone product and for Veynode core's plugin (no
 published). `--qemu-runtime` ships the QEMU/GPU runtime this Mac uses (the [GPU runtime](#gpu-runtime) below, with
 `.local/bin/VeynodeQEMUConsole.app`) under `libexec/qemu/` and its licences under `LICENSES/`; `--archive` also
 writes `OUTPUT.tar.gz` and its SHA-256. Its helpers, `native/.build/vm-apple` and `.local/bin/veynode-guest` come from
-[the desktop helpers](#desktop-helpers), `scripts/build-native.sh` and the guest agent's `go build`.
+[the desktop helpers](#desktop-helpers), `scripts/build-native.sh` and the guest agent's `go build`; the macOS guest's
+port relay from `native/tools/build-macos-relay.sh`.
 
 ```sh
 cargo build --release -p veynodevm -p vm-control -p veynodevm-mcp -p vm-media-local
@@ -41,6 +42,7 @@ encoder and register it (QEMU desktops use the console helper below):
 ./native/tools/build-vz-desktop-stream.sh   # → .local/bin/vz-desktop-stream
 ./native/tools/build-vm-vision.sh           # → .local/bin/vm-vision (vm_screen_text, scaled screenshots, observe)
 ./native/tools/build-vm-macos-desktop.sh    # → .local/bin/vm-macos-desktop (macOS desktop/accessibility tools)
+./native/tools/build-macos-relay.sh         # → .local/bin/veynode-macos-relay (macOS machines' vsock port relay)
 python3 scripts/install-dev-runtime.py
 ```
 

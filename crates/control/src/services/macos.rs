@@ -69,7 +69,15 @@ pub trait Guest: Sync {
     /// Where commands run, and the `KEY=VALUE`s they get.
     fn workdir(&self) -> &str;
     fn env(&self) -> &[String];
+    /// The socket of its port relay ([`super::macos_relay`]), through which
+    /// SSH reaches it instead of its vmnet address.
+    fn relay(&self) -> Option<&Path> {
+        None
+    }
 }
+
+/// The host name SSH is given for a Guest reached through its relay.
+const RELAYED: &str = "veynode-guest";
 
 impl Guest for Container {
     fn name(&self) -> &str {
@@ -168,6 +176,9 @@ pub fn lease_ip(leases: &str, mac: &str) -> Option<String> {
 }
 
 pub fn guest_ip(guest: &dyn Guest, timeout: Duration) -> Result<String> {
+    if guest.relay().is_some() {
+        return Ok(RELAYED.into());
+    }
     let mac = guest.mac_address().context("guest has no MAC address")?;
     let deadline = Instant::now() + timeout;
     loop {
@@ -236,6 +247,12 @@ fn ssh_base(program: &str, guest: &dyn Guest) -> Result<Command> {
             "-o",
             "ServerAliveInterval=15",
         ]);
+    if let Some(socket) = guest.relay() {
+        command.arg("-o").arg(format!(
+            "ProxyCommand={}",
+            super::macos_relay::proxy_command(socket)?
+        ));
+    }
     Ok(command)
 }
 
@@ -252,9 +269,19 @@ fn quote(word: &str) -> String {
 }
 
 fn wait_for_ssh(guest: &dyn Guest, ip: &str, deadline: Instant) -> Result<()> {
-    let address: SocketAddr = format!("{ip}:22").parse()?;
+    let address: Option<SocketAddr> = match guest.relay() {
+        Some(_) => None,
+        None => Some(format!("{ip}:22").parse()?),
+    };
     loop {
-        if TcpStream::connect_timeout(&address, Duration::from_secs(2)).is_ok() {
+        let answers = match (guest.relay(), &address) {
+            (Some(socket), _) => super::macos_relay::ssh_answers(socket),
+            (None, Some(address)) => {
+                TcpStream::connect_timeout(address, Duration::from_secs(2)).is_ok()
+            }
+            (None, None) => false,
+        };
+        if answers {
             return Ok(());
         }
         if !is_active(guest) {
@@ -911,6 +938,7 @@ pub struct MachineGuest {
     shares: Vec<(String, PathBuf)>,
     workdir: String,
     env: Vec<String>,
+    relay: Option<PathBuf>,
 }
 
 impl MachineGuest {
@@ -929,6 +957,7 @@ impl MachineGuest {
             shares,
             workdir: String::new(),
             env: Vec::new(),
+            relay: super::macos_relay::of(config),
         })
     }
 }
@@ -957,6 +986,9 @@ impl Guest for MachineGuest {
     }
     fn env(&self) -> &[String] {
         &self.env
+    }
+    fn relay(&self) -> Option<&Path> {
+        self.relay.as_deref()
     }
 }
 
@@ -1082,8 +1114,9 @@ fn machine_vm(
     cpus: u64,
     memory_mib: u64,
     shares: &[(String, PathBuf, bool)],
+    relay: Option<&Path>,
 ) -> Value {
-    json!({
+    let mut vm = json!({
         "backend": "apple-virtualization",
         "id": name,
         "guest": "macos",
@@ -1097,7 +1130,11 @@ fn machine_vm(
         "height": 1080,
         "audio": true,
         "shares": shares.iter().map(|(tag, path, read_only)| json!({"tag":tag,"path":path,"read_only":read_only})).collect::<Vec<_>>(),
-    })
+    });
+    if let Some(relay) = relay {
+        vm["guest_ports_socket"] = json!(relay);
+    }
+    vm
 }
 
 /// `machine.create` with `from`: a persistent macOS machine from a Tart
@@ -1167,10 +1204,19 @@ pub fn create_machine(ctx: &Ctx, args: &Value, io: &StreamIo) -> Result<Value> {
         write_login(&dir, &spec.user, &image_password())?;
         fs::write(dir.join("setup"), &setup)?;
         fs::write(dir.join("grant"), "")?;
+        io.progress("Installing the port relay")?;
+        let relay = install_relay(&dir, &spec.user);
         io.progress("Registering the machine")?;
         ctx.vm(
             "create",
-            machine_vm(&spec.name, &dir, cpus, memory_mib, &spec.shares),
+            machine_vm(
+                &spec.name,
+                &dir,
+                cpus,
+                memory_mib,
+                &spec.shares,
+                relay.as_deref(),
+            ),
         )?;
         let machine = Machine {
             name: spec.name.clone(),
@@ -1198,6 +1244,22 @@ pub fn create_machine(ctx: &Ctx, args: &Value, io: &StreamIo) -> Result<Value> {
         machines::cleanup_files(&dir);
     }
     result
+}
+
+/// The relay socket of the macOS machine in `dir`, once its disk has the
+/// relay ([`super::macos_relay::install`]); `None` keeps the vmnet address.
+fn install_relay(dir: &Path, user: &str) -> Option<PathBuf> {
+    match super::macos_relay::install(&dir.join("disk.img"), user, dir) {
+        Ok(true) => Some(super::macos_relay::socket(&random_hex(8))),
+        Ok(false) => None,
+        Err(error) => {
+            crate::log_line(&format!(
+                "{}: no port relay, the Guest is reached at its vmnet address: {error:#}",
+                dir.display()
+            ));
+            None
+        }
+    }
 }
 
 /// A cloned macOS machine's files beyond its disk, in `to`: the worker
@@ -1231,6 +1293,10 @@ fn clone_identity(
     fs::write(to.join("setup"), pending + &rename)?;
     config["machine_identity_dir"] = json!(identity);
     config["screen_sharing_login"] = json!(to.join("login"));
+    // The disk carries the relay; the clone listens on a socket of its own.
+    if super::macos_relay::of(config).is_some() {
+        config["guest_ports_socket"] = json!(super::macos_relay::socket(&random_hex(8)));
+    }
     Ok(())
 }
 
@@ -1374,6 +1440,11 @@ mod tests {
             4,
             8192,
             &[("code".into(), "/src".into(), false)],
+            Some(Path::new("/private/tmp/veynodevm-501/r.sock")),
+        );
+        assert_eq!(
+            vm["guest_ports_socket"],
+            "/private/tmp/veynodevm-501/r.sock"
         );
         assert_eq!(vm["id"], "mac");
         assert_eq!(vm["guest"], "macos");

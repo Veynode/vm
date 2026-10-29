@@ -72,6 +72,8 @@ struct Config: Decodable {
     var screen_sharing_login: String?
     var machine_identifier_file: String?
     var audio: Bool?
+    /// macOS Guests with the port relay: the Unix socket the daemon reaches it on (GuestPorts.swift).
+    var guest_ports_socket: String?
 }
 struct ExtraDisk: Decodable { let path: String; let read_only: Bool }
 struct Share: Decodable { let tag: String; let path: String; var read_only: Bool? }
@@ -236,8 +238,17 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
     var diskLock: Int32?
     lazy var screenSharing: ScreenSharingGuest? = {
         guard config.guest == "macos", let mac = config.mac_address, let login = config.screen_sharing_login else { return nil }
-        return ScreenSharingGuest(mac: mac, loginFile: login)
+        let sharing = ScreenSharingGuest(mac: mac, loginFile: login)
+        if config.guest_ports_socket != nil {
+            sharing.relay = { [weak self] in try guestRelayConnect(device: { self?.socketDevice() }, header: "5900\n") }
+        }
+        return sharing
     }()
+    var guestPorts: GuestPorts?
+    /// The running VM's virtio socket device; main queue only.
+    func socketDevice() -> VZVirtioSocketDevice? {
+        vm.state == .running ? vm.socketDevices.first as? VZVirtioSocketDevice : nil
+    }
     var linuxSnapshot: LinuxSnapshotContext?
     let snapshotRestore: LinuxSnapshotRestore?
     var machineStateRestore: String?
@@ -485,6 +496,10 @@ final class Runner: NSObject, VZVirtualMachineDelegate, NSWindowDelegate, NSAppl
             vm = VZVirtualMachine(configuration:configuration)
             vm.delegate = self
             if config.window ?? false { showWindow() }
+            if config.guest == "macos", let path = config.guest_ports_socket {
+                let ports = try GuestPorts(path: path, device: { [weak self] in self?.socketDevice() })
+                guestPorts = ports; ports.start()
+            }
             readCommands()
             if restore != nil {
                 installing = true

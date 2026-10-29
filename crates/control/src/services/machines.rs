@@ -857,6 +857,7 @@ pub fn start(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
             name: name.clone(),
             mac_address: config["mac_address"].as_str().map(str::to_owned),
             ports: machine.ports.iter().map(|p| (p.host, p.guest)).collect(),
+            relay: super::macos_relay::of(&config),
         };
         if let Err(error) = super::publisher::start(published) {
             let _ = ctx.vm("force_stop", json!({"id":name,"confirm":name}));

@@ -120,6 +120,10 @@ pub struct Runtime {
     /// copies into Windows and macOS Guests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cua_driver: Option<PathBuf>,
+    /// The macOS Guest's vsock port relay (`native/tools/build-macos-relay.sh`),
+    /// which `machine.create` writes into a macOS machine's disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub macos_relay: Option<PathBuf>,
 }
 
 impl Runtime {
@@ -191,6 +195,7 @@ impl Runtime {
         self.vision = self.vision.take().or(other.vision);
         self.macos_desktop = self.macos_desktop.take().or(other.macos_desktop);
         self.cua_driver = self.cua_driver.take().or(other.cua_driver);
+        self.macos_relay = self.macos_relay.take().or(other.macos_relay);
     }
 
     fn load_registered() -> Result<Self> {
@@ -249,6 +254,7 @@ impl Runtime {
         paths.extend(self.vision.as_deref());
         paths.extend(self.macos_desktop.as_deref());
         paths.extend(self.cua_driver.as_deref());
+        paths.extend(self.macos_relay.as_deref());
         for p in paths {
             if !p.is_absolute() {
                 bail!("runtime paths must be absolute: {}", p.display())
