@@ -486,6 +486,14 @@ GUEST_TUNING = [
 ]
 
 
+# virtio-win's balloon service: it sends Windows' memory statistics, from which the
+# host inflates the balloon over memory Windows does not need (vm-qemu,
+# crates/control/src/qemu_balloon.rs). Installed from the driver CD into a fixed
+# directory, as an automatic service with no window or prompt.
+BALLOON_SERVICE = ('cmd /c for %d in (' + ' '.join(DRIVE_LETTERS) + r') do @if exist %d:\Balloon\w11\ARM64\blnsvr.exe '
+                   r'(mkdir "C:\Program Files\Balloon" 2>nul & copy /y %d:\Balloon\w11\ARM64\blnsvr.exe '
+                   r'"C:\Program Files\Balloon\" >nul & "C:\Program Files\Balloon\blnsvr.exe" -i)')
+
 NGEN = r'C:\Windows\Microsoft.NET\FrameworkArm64\v4.0.30319\ngen.exe executeQueuedItems /nologo'
 
 
@@ -509,6 +517,7 @@ def windows_answer(work, user, password, edition, product_key, authorized_key=No
         # Fallback for any virtio driver offline servicing did not install.
         *[f'cmd /c for %d in ({" ".join(DRIVE_LETTERS)}) do @if exist %d:\\{d}\\w11\\ARM64 pnputil /add-driver %d:\\{d}\\w11\\ARM64\\*.inf /install'
           for d in VIRTIO_DRIVERS],
+        BALLOON_SERVICE,
         *(GUEST_TUNING if guest_tuning else []),
         # Compile the queued .NET Framework assemblies for ARM64 now (~30 s),
         # not whenever Windows next idles: until then every Windows PowerShell

@@ -20,6 +20,7 @@ pub mod mcp_events;
 mod native_control;
 pub mod native_input;
 pub mod qemu_audio;
+pub mod qemu_balloon;
 pub mod qemu_disk;
 pub mod qemu_driver_channel;
 pub mod qemu_extras;

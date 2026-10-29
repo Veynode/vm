@@ -140,10 +140,11 @@ fn assert_control_features_pair(backend: Backend, guest: &str) {
         }
     }
     assert_eq!(cells["clipboard"]["status"], "unsupported");
-    // Only QEMU Linux returns Guest memory (free page reporting); a balloon device alone does not.
+    // Only QEMU returns Guest memory (Linux by free page reporting, Windows by the
+    // daemon's balloon); a balloon device alone does not.
     assert_eq!(
         cells["balloon"]["status"],
-        if backend == Backend::QemuHvf && guest == "linux" {
+        if backend == Backend::QemuHvf && guest != "macos" {
             "implemented_unverified"
         } else {
             "unsupported"

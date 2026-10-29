@@ -286,6 +286,8 @@ pub(crate) fn base_control_features(backend: Backend, guest: &str) -> Value {
         ] {
             out[name] = unverified_older(&older, name);
         }
+        out["memory_reclaim"] = st("implemented_unverified", "the QEMU worker inflates the balloon while the Guest's memory sits unused and deflates it on paging or low memory, from the statistics of virtio-win's BalloonService (installed at first logon); live on one machine");
+        out["balloon"] = out["memory_reclaim"].clone();
         return out;
     }
     out["snapshot"] = if backend == Backend::AppleVirtualization && guest == "linux" {
@@ -344,11 +346,7 @@ pub(crate) fn base_control_features(backend: Backend, guest: &str) -> Value {
         out["screenshot"] = yes("QEMU capture registered by the daemon operator; refused with an explicit unsupported error otherwise", "vm-archive/docs-evidence/spice-screenshot.md");
         out["pointer_key_input"] = yes("registered QEMU persistent console; absolute click, drag, wheel and physical key codes on an unscaled single-display Xorg desktop", "vm-archive/docs-evidence/control-input.md");
         out["unicode_text_input"] = st("implemented_unverified", "vm_input_text: qemu_guest_exec, Guest service --allow-text-input, X11 with XTEST (no Wayland); full requirements and limits under product_capabilities.unicode_text_input");
-        out["memory_reclaim"] = if guest == "windows" {
-            no("not supported: virtio-win's balloon driver negotiates only the stats queue, not free page reporting, and nothing inflates the balloon")
-        } else {
-            st("implemented_unverified", "free page reporting: a Guest kernel that loads virtio_balloon hands back the memory it frees, and the QEMU loader returns it to macOS; measured on QEMU containers, not on a registered machine")
-        };
+        out["memory_reclaim"] = st("implemented_unverified", "free page reporting: a Guest kernel that loads virtio_balloon hands back the memory it frees, and the QEMU loader returns it to macOS; measured on QEMU containers, not on a registered machine");
         out["shared_folders"] =
             no("not implemented: configuration validation refuses shared_dir for QEMU");
         out["guest_shutdown"] = no("not implemented: the daemon refuses vm_shutdown mode guest for QEMU with an explicit unsupported error; mode backend is the QMP power-button request");

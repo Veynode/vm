@@ -1809,6 +1809,13 @@ fn run() -> Result<bool> {
     let mut native_input = native_input_worker::NativeInput::default();
     let mut execution_shutdown = ExecutionShutdown::default();
     let mut guardian_heartbeat = Instant::now() - Duration::from_secs(1);
+    // The policy, and whether QEMU polls the Guest for statistics yet.
+    let mut balloon = vm_control::qemu_uefi::windows(&config).then(|| {
+        (
+            vm_control::qemu_balloon::Policy::new(config.memory_mib << 20, Instant::now()),
+            false,
+        )
+    });
     loop {
         if config.qemu_guest_exec {
             let mut parent = libc::pollfd {
@@ -1946,6 +1953,11 @@ fn run() -> Result<bool> {
             capture.is_none(),
             emit,
         )?;
+        if let Some((policy, polling)) = &mut balloon {
+            if capture.is_none() && policy.due(Instant::now()) {
+                balloon_step(&mut qmp, policy, polling, state["state"] == "running");
+            }
+        }
         if let Some(exec) = &guest_exec {
             // Lets the daemon refuse execution while the transport is not ready. A local read,
             // so it keeps its own cadence instead of waiting for the next QMP status query.
@@ -2121,6 +2133,47 @@ fn run() -> Result<bool> {
 /// (execution, Guest request, screenshot), held input awaiting timed release, or a normal
 /// shutdown in progress, the original 50 ms step is kept. Otherwise nothing is in flight and
 /// those observations may be up to 100 ms later than before; all have multi-second deadlines.
+/// One step of the Windows balloon policy (`vm_control::qemu_balloon`). Its QMP calls fail only for this step:
+/// before the Guest's driver loads the balloon is inactive, and without its service there are no statistics.
+fn balloon_step(
+    qmp: &mut Qmp,
+    policy: &mut vm_control::qemu_balloon::Policy,
+    polling: &mut bool,
+    running: bool,
+) {
+    use vm_control::qemu_balloon::{guest_stats, DEVICE_PATH, INTERVAL};
+    let stats = running
+        .then(|| {
+            // Once: setting it again restarts QEMU's timer.
+            if !*polling {
+                qmp.arguments(
+                    "qom-set",
+                    json!({"path":DEVICE_PATH,"property":"guest-stats-polling-interval","value":INTERVAL.as_secs()}),
+                )
+                .ok()?;
+                *polling = true;
+            }
+            qmp.arguments(
+                "qom-get",
+                json!({"path":DEVICE_PATH,"property":"guest-stats"}),
+            )
+            .ok()
+        })
+        .flatten()
+        .as_ref()
+        .and_then(guest_stats);
+    let Some(actual) = qmp
+        .call("query-balloon")
+        .ok()
+        .and_then(|b| b["actual"].as_u64())
+    else {
+        policy.decide(Instant::now(), false, 0, None);
+        return;
+    };
+    if let Some(target) = policy.decide(Instant::now(), running, actual, stats) {
+        let _ = qmp.arguments("balloon", json!({"value":target}));
+    }
+}
 fn request_wait(in_flight: bool) -> Duration {
     Duration::from_millis(if in_flight { 50 } else { 150 })
 }

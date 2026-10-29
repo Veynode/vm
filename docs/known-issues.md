@@ -108,8 +108,22 @@ interleaved rounds per variant, medians; the full rows are in
   at 1,022 MB instead of 1,817 MB, and after five 900 MB write/hash/delete rounds
   it held 1,181 MB instead of 2,473 MB; the data that stayed hashed the same and
   the Guest logged no errors. Windows' virtio-win balloon negotiates only the
-  stats queue, so Windows returns nothing by itself; inflating its balloon by
-  hand (QMP `balloon`, 8 → 3 GiB) does free the memory through the same path.
+  stats queue, so Windows returns nothing by itself; instead the QEMU worker
+  drives its balloon (`crates/control/src/qemu_balloon.rs`) from the statistics
+  virtio-win's `BalloonService` (`blnsvr.exe`) sends every second. It inflates
+  1 GiB at a time while the Guest's available memory is above a reserve (an
+  eighth of RAM, 512 MiB–2 GiB) and its pagefile has been quiet for 30 s, never
+  below a quarter of RAM (at least 2 GiB), and gives everything back at once
+  when the Guest writes to its pagefile (other than the 30–110 MB it writes to
+  make room right after a step), runs low, or stops sending statistics for
+  15 s. New installs register `BalloonService` at first logon; an existing
+  machine needs `blnsvr.exe -i` from the virtio-win ISO, and without it the
+  balloon is never touched. An idle 8 GiB Windows 11 settled at 3 GiB within a
+  minute and the host freed ~4.3 GB. The cost is a burst larger than the
+  reserve: Windows trims to its pagefile faster than the balloon deflates
+  (~1.5 GB/s), so writing 4 GiB in one go from the settled state took 4.6 s and
+  wrote ~5 GB to the pagefile (the data was intact). Reading statistics costs
+  `blnsvr` ~47 ms of CPU a minute.
   Apple Virtualization has no free page reporting, and its balloon stays
   unloaded (see the blacklist below).
 - An idle QEMU container's own memory, beyond its Guest's: ~150 MB of QEMU

@@ -244,7 +244,7 @@ pub fn arguments(config: &Config, resources: &Path, monitor: Option<&Path>) -> R
     Ok(args)
 }
 
-fn windows(config: &Config) -> bool {
+pub fn windows(config: &Config) -> bool {
     config.guest == "windows"
 }
 
