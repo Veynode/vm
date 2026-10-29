@@ -328,7 +328,7 @@ pub(crate) fn base_control_features(backend: Backend, guest: &str) -> Value {
         out["window_metadata"] = unverified("window_metadata");
         out["accessibility_metadata"] = unverified("accessibility_metadata");
         out["application_tools"] = unverified("application_tools");
-        out["memory_reclaim"] = no("not supported: a virtio balloon device is attached but nothing drives it; measured 2026-10-12, a 512 MiB balloon target raised the host footprint by 933 MiB");
+        out["memory_reclaim"] = no("not supported: a virtio balloon device is attached but nothing drives it; measured 2026-10-12, a 512 MiB balloon target raised the host footprint by 933 MiB; on 2026-10-29 a 2 GiB inflation freed nothing on the host");
         out["shared_folders"] = st("implemented_unverified", "shared_dir at registration attaches one read-only virtiofs share tagged veynode; no real-Guest record of a Linux Guest mounting it through this daemon");
         out["guest_shutdown"] = yes("vm_shutdown mode guest; Guest service running as root with shutdown enabled; request acceptance is not completion", "vm-archive/docs-evidence/apple-linux-normal-shutdown.json");
     } else {

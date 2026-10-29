@@ -131,8 +131,28 @@ interleaved rounds per variant, medians; the full rows are in
   (~1.5 GB/s), so writing 4 GiB in one go from the settled state took 4.6 s and
   wrote ~5 GB to the pagefile (the data was intact). Reading statistics costs
   `blnsvr` ~47 ms of CPU a minute.
-  Apple Virtualization has no free page reporting, and its balloon stays
-  unloaded (see the blacklist below).
+  Apple Virtualization has no free page reporting, and its balloon gives the
+  host nothing back: in a 4 GiB Alpine container (`virtio_balloon` loaded by
+  hand), lowering `targetVirtualMachineMemorySize` by 2 GiB took the memory
+  from the Guest, but the `com.apple.Virtualization.VirtualMachine` process
+  stayed at 2.6–2.7 GB (2026-10-29). Guest RAM lives in that process, so the
+  balloon stays unloaded (see the blacklist below). macOS 27's
+  `VZCustomVirtioDevice` opens a way, tried only in a throwaway worker (not in
+  the tree): a virtio balloon of our own (device 5,
+  `VIRTIO_BALLOON_F_MUST_TELL_HOST`) maps Guest RAM into the worker with
+  `guestMemoryMapping(atPhysicalAddress:length:)` and, once all four 4 KiB
+  Guest pages of a 16 KiB host page are inflated, marks it
+  `MADV_FREE_REUSABLE` (`MADV_FREE_REUSE` before deflating it).
+  `MADV_DONTNEED`, `MADV_FREE` and `MADV_ZERO` free nothing in that shared
+  mapping. A 2 GiB inflation gave back 2047 MiB as whole host pages, and six
+  inflate/deflate rounds each followed by 2.5 GB of tmpfs churn kept hashed
+  data intact with no Guest errors. But macOS takes reusable pages back only
+  when it needs memory: with 3 GiB inflated the Virtualization process held
+  3,359 MB for 30 s and 2,762 MB at 45 s. Free page reporting can't be built
+  on this API, which hands a device copies of the Guest's writable buffers,
+  not their addresses. Shipping it would need macOS 27, a host policy like
+  the Windows one, and a run on the distribution images whose memory the
+  blacklisted balloon and RNG corrupted.
 - An idle QEMU container's own memory, beyond its Guest's: ~150 MB of QEMU
   heap holds the boot images it keeps for a reset (the 64 MiB edk2 image, the
   kernel and the initramfs), and the firmware is copied once more into its
