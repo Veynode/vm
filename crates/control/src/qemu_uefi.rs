@@ -235,6 +235,9 @@ pub fn arguments(config: &Config, resources: &Path, monitor: Option<&Path>) -> R
             ]
             .map(String::from),
         );
+    } else {
+        // Distribution kernels load virtio_balloon for it, as container-init does.
+        args.extend(["-device", BALLOON_DEVICE].map(String::from));
     }
     if let Some(path) = monitor {
         let path = path.to_str().context("monitor path must be UTF-8")?;
@@ -539,10 +542,11 @@ mod tests {
                 "virtio-blk-pci,drive=veynode-extra0,id=veynode-extra0-device"
             ]
         );
-        assert!(!arguments(&linux, Path::new("/res"), None)
+        let joined = arguments(&linux, Path::new("/res"), None)
             .unwrap()
-            .join(" ")
-            .contains("virtio-balloon"));
+            .join(" ");
+        assert!(joined.contains(BALLOON_DEVICE));
+        assert!(!joined.contains("virtio-rng-pci"));
         assert!(display_device(&linux)
             .unwrap()
             .starts_with("virtio-gpu-gl-pci"));

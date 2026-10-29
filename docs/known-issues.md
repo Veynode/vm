@@ -114,7 +114,15 @@ interleaved rounds per variant, medians; the full rows are in
   virgl`, writing 1.2 GB to tmpfs and deleting 1 GB of it left the QEMU process
   at 1,022 MB instead of 1,817 MB, and after five 900 MB write/hash/delete rounds
   it held 1,181 MB instead of 2,473 MB; the data that stayed hashed the same and
-  the Guest logged no errors. Windows' virtio-win balloon negotiates only the
+  the Guest logged no errors. Linux machines get the same balloon (since
+  2026-10-29; before that only Windows machines had one), and a distribution's
+  udev loads `virtio_balloon`. A 6 GiB Fedora 44 Workstation machine with
+  `--gpus virgl`, its GNOME session idle: writing 2.5 GB to tmpfs took the QEMU
+  process to 7.18 GB, and 15 s after deleting it the process held 4.79 GB
+  (7.17 GB without the balloon); it came back to ~4.75 GB after each of three
+  2 GB write/hash/delete rounds, with the data intact and no Guest errors. Right
+  after boot, before the desktop session, it held 1.5 GB instead of 4.7 GB.
+  Windows' virtio-win balloon negotiates only the
   stats queue, so Windows returns nothing by itself; instead the QEMU worker
   drives its balloon (`crates/control/src/qemu_balloon.rs`) from the statistics
   virtio-win's `BalloonService` (`blnsvr.exe`) sends every second. It inflates
@@ -779,7 +787,9 @@ Virtualization (llvmpipe) and on QEMU with `--gpus virgl` (GLX renderer
   lost Xorg to a guest kernel oops (`docs/computer-use.md`, phase 0). On
   QEMU, container-init loads `virtio_balloon` itself for free page reporting
   (a blacklist stops only udev's autoload); that was run on Alpine
-  containers, not yet on a distribution desktop image.
+  containers, not yet on a distribution desktop image in a container. A
+  Fedora 44 Workstation machine on QEMU (udev loads `virtio_balloon`, no
+  `virtio_rng`) stayed clean through the reclaim runs above.
 - The image's network stack keeps the address container-init obtained: udev
   renames `eth0` (to `enp0s1` on both backends) and NetworkManager
   shows it as "connected (externally)". DNS comes from `--dns`/runtime.json
