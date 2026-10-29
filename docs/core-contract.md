@@ -17,7 +17,7 @@ daemon. Core runs `bin/veynodevm daemon start` from the unpacked directory and n
 registration. The daemon finds its pieces through `share/runtime.json`, relative to itself, and a `daemon start` from
 a newer version's directory moves the LaunchAgent onto it, restarting the daemon, which stops the machines it runs.
 
-The runtime is UTM 5.0.5's QEMU and the frameworks it loads (virglrenderer, libepoxy, ANGLE, GLib and the rest),
+The runtime is UTM 5.0.8's QEMU and the frameworks it loads (virglrenderer, libepoxy, ANGLE, GLib and the rest),
 the SPICE server with VeynodeVM's reconnect fix, QEMU's firmware and the native console app, re-signed with the
 release's identity; `LICENSES/NOTICE` lists each component's version, source and licence. Venus and Neptune are not
 in it (their registration pins the unsigned bytes), so `hello.runtime.gpu` reports `virgl` only, and a Windows
@@ -70,7 +70,7 @@ What changed for core when this merged onto the split:
 - `machine.exec` and `files.copy` on a Linux cloud-image machine run over SSH, with no 30 s or 64 KiB limit.
 - Windows `unattended` needs `driversIso` and no longer `attach`.
 - Windows `unattended` with `gpu` `neptune` installs UTM's viogpu3d driver at the first logon. The daemon downloads
-  UTM's guest tools 0.1.273 (Neptune wire format 1, pinned size and SHA-256) into `<home>/downloads` and attaches
+  UTM's guest tools 0.1.274 (Neptune wire format 2, pinned size and SHA-256; 0.1.273 with format 1 until the runtime moved to UTM 5.0.8) into `<home>/downloads` and attaches
   them; nothing is shipped.
 - `machine.display` on QEMU sends the pointer shape (2) after input 5 and copied text (3) after input 6, and lists
   inputs 17 and 18 (the viewer's size, sent to the Guest as its monitor) in its capabilities (11).

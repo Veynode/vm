@@ -6,7 +6,7 @@ Never rewrites the app. Builds with at most two compiler jobs. Saves baseline
 before applying the project-owned fresh-client patch; not a release build.
 """
 import json,os,pathlib,shutil,subprocess,sys
-ROOT=pathlib.Path(__file__).resolve().parents[1];BASE=ROOT/'.local/spice-reconnect-build';BASE.mkdir(exist_ok=True);RUNTIME=BASE/'runtime';RUNTIME.mkdir(exist_ok=True);PATCHES=ROOT/'.local/runtime/utm/UTM-5.0.5/patches';FW=ROOT/'.local/runtime/utm/UTM.app/Contents/Frameworks'
+ROOT=pathlib.Path(__file__).resolve().parents[1];BASE=ROOT/'.local/spice-reconnect-build';BASE.mkdir(exist_ok=True);RUNTIME=BASE/'runtime';RUNTIME.mkdir(exist_ok=True);PATCHES=ROOT/'.local/runtime/utm/UTM-5.0.8/patches';FW=ROOT/'.local/runtime/utm/UTM.app/Contents/Frameworks'
 def run(args,cwd=ROOT):subprocess.run([str(x) for x in args],cwd=cwd,check=True)
 run([sys.executable,ROOT/'runtime/prepare-spice-reconnect-build.py'])
 server=BASE/'spice-0.14.3'

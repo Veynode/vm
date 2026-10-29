@@ -4,11 +4,11 @@
 Roles: loader, host_library and render_server from
 runtime/linux-vulkan-build-host-runtime.py; spice_library from
 runtime/build-spice-reconnect-server.py; qemu_library, icd and firmware from the
-pinned UTM 5.0.5 app. Every role must match crates/control/src/qemu_venus_catalog.json.
+pinned UTM 5.0.8 app. Every role must match crates/control/src/qemu_venus_catalog.json.
 
 --repin rewrites the catalog hashes of the four locally built roles to this
 machine's build (compiler output is not reproducible across toolchains). It never
-re-pins vendor roles or frameworks: those must still match UTM 5.0.5. A re-pin is
+re-pins vendor roles or frameworks: those must still match UTM 5.0.8. A re-pin is
 a review decision; commit it only after inspecting the build logs and manifests.
 """
 import argparse, hashlib, json, os, pathlib, sys
@@ -49,7 +49,7 @@ def main():
     vendor = [n for n in roles if n not in BUILT and actual[n] != catalog['roles'][n]]
     stale = [f for f, h in catalog['frameworks'].items() if sha(frameworks / f) != h]
     if vendor or stale:
-        raise SystemExit(f'UTM 5.0.5 vendor pins do not match: {vendor + stale}')
+        raise SystemExit(f'UTM 5.0.8 vendor pins do not match: {vendor + stale}')
     changed = {n: (catalog['roles'][n], actual[n]) for n in BUILT if actual[n] != catalog['roles'][n]}
     if changed and not args.repin:
         raise SystemExit('built roles differ from the reviewed catalog (use --repin after review): ' + ', '.join(changed))

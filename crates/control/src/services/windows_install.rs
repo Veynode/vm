@@ -48,14 +48,14 @@ const VIRTIO_DRIVERS: [&str; 8] = [
     "vioinput",
     "pvpanic",
 ];
-/// UTM's guest tools 0.1.273, the release whose viogpu3d speaks Neptune wire
-/// format 1, as UTM 5.0.5's runtime does (0.1.274 speaks 2 and fails;
-/// docs/known-issues.md). Downloaded from UTM's QEMU release, not shipped.
+/// UTM's guest tools 0.1.274, the release whose viogpu3d speaks Neptune wire
+/// format 2, as UTM 5.0.8's runtime does (0.1.273 speaks 1).
+/// Downloaded from UTM's QEMU release, not shipped.
 pub const GUEST_TOOLS: veynodevm_oci::download::Pinned = veynodevm_oci::download::Pinned {
     url:
-        "https://github.com/utmapp/qemu/releases/download/v10.0.12-utm/utm-guest-tools-0.1.273.iso",
-    size: 140_195_840,
-    sha256: "7d2c0343e92358ad5e65078b08ec1dad873eb91b3c154aef60531bf6c2f04601",
+        "https://github.com/utmapp/qemu/releases/download/v10.0.12-utm/utm-guest-tools-0.1.274.iso",
+    size: 143_898_624,
+    sha256: "ab6add47a4ed992f5920f14e96f68d60566e6f731e2cf816c3d38ab2b78f407a",
 };
 /// The Neptune driver's directory on the guest tools CD-ROM.
 const NEPTUNE_DRIVER: &str = "Drivers\\viogpu3d\\w11\\ARM64";
@@ -63,7 +63,7 @@ const NEPTUNE_DRIVER: &str = "Drivers\\viogpu3d\\w11\\ARM64";
 /// [`GUEST_TOOLS`] in the home's download cache, fetched the first time.
 pub fn guest_tools() -> Result<PathBuf> {
     let path =
-        home::private_dir(&home::root()?.join("downloads"))?.join("utm-guest-tools-0.1.273.iso");
+        home::private_dir(&home::root()?.join("downloads"))?.join("utm-guest-tools-0.1.274.iso");
     veynodevm_oci::download::fetch(&GUEST_TOOLS, &path, &mut |m| progress(m))?;
     Ok(path)
 }

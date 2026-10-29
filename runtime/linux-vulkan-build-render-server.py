@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import tarfile
 ROOT = Path(__file__).resolve().parents[1]
-INPUTS = {'virglrenderer.tar.gz': '47f2c2fd490486a133467c24edf1682bafb832111ca7c98a0f4448ad60f5293e',
+INPUTS = {'virglrenderer.tar.gz': '92a96c668a2ddc8a7e6846586554c4d45cba11cbf75557a39169ca58d71c81d2',
           'libepoxy.tar.gz': '0f99f3f4313b8e74efe18cea61874b07c8a9f9e504d1aa496ca4d7825e70c39d',
           'eglplatform.h': '25b5391655effcf363a38fa00c3154f356a3eab3d35dc067847875513cf1e441',
           'khrplatform.h': '7b1e01aaa7ad8f6fc34b5c7bdf79ebf5189bb09e2c4d2e79fc5d350623d11e83'}

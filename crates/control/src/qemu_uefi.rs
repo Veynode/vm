@@ -298,7 +298,7 @@ pub fn extra_disk_devices(config: &Config, index: usize) -> Vec<String> {
 /// display driver use (plain `ramfb` is not a PCI device, so SPICE refuses it).
 pub fn display_device(config: &Config) -> Result<String> {
     if windows(config) {
-        // UTM 5.0.5's default Windows GPU (`UTMQemuConfiguration+Arguments.swift`):
+        // UTM 5.0.8's default Windows GPU (`UTMQemuConfiguration+Arguments.swift`):
         // the same device with Venus and Neptune on.
         return Ok(if config.qemu_graphics_profile.neptune() {
             "virtio-ramfb-gl,hostmem=8G,blob=on,venus=on,neptune=on".into()

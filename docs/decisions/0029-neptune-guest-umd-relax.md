@@ -1,6 +1,8 @@
 # Ship a Neptune guest UMD with a shorter reply wait
 
 Status: **proposed**, 2026-10-28. Not implemented in the installer; see "Open questions".
+Update 2026-10-29: the runtime moved to UTM 5.0.8 and the installer to guest tools 0.1.274 (Neptune wire format 2).
+The measurements and `scripts/neptune-umd-patch.py` below are for 0.1.273's UMDs; 0.1.274's have not been examined.
 
 ## Context
 

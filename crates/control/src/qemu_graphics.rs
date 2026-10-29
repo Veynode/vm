@@ -20,7 +20,7 @@ pub enum Profile {
     #[default]
     Virgl,
     VenusMoltenvkExperimental,
-    /// Windows D3D through UTM 5.0.5's Neptune (virglrenderer) and DXMT
+    /// Windows D3D through UTM 5.0.8's Neptune (virglrenderer) and DXMT
     /// (`dxmt-native.framework` in the registered UTM runtime); the guest needs
     /// UTM's viogpu3d driver (utm-guest-tools 0.1.274).
     NeptuneDxmtExperimental,
@@ -143,7 +143,7 @@ pub fn host_api_constraints(profile: Profile) -> Value {
 }
 
 fn catalog_geometry_constraint(approved: &Catalog) -> Value {
-    const DRIVER_SHA: &str = "b96a76813884c04ebe7f13ddf4c4b305234224117a0688a56b81a398fc1641dd";
+    const DRIVER_SHA: &str = "ba5aaa1d356261cf3cb2f9d89cc8f1c9f1bd56adac5e85833d8083d4bbb0b26f";
     if approved
         .frameworks
         .get("MoltenVK.framework/Versions/A/MoltenVK")
@@ -332,7 +332,7 @@ pub struct Neptune {
     /// UTM's own `QEMURenderServer` is App-Sandbox-signed and traps at launch
     /// unless UTM's sandboxed QEMUHelper is its parent, so this is the reviewed
     /// Venus registration's server: built from the virglrenderer commit UTM
-    /// 5.0.5 ships (482f9d8b, Neptune wire format 1) with `-Dneptune=true`.
+    /// 5.0.8 ships (451505ad, Neptune wire format 2) with `-Dneptune=true`.
     pub render_server: PathBuf,
     /// UTM's MoltenVK ICD for the Venus side of the device (its default
     /// Vulkan driver); the guest driver package also ships a Venus ICD.
@@ -362,7 +362,7 @@ impl Neptune {
         Ok(neptune)
     }
 
-    /// The environment UTM 5.0.5 gives QEMU for its DXMT DirectX driver
+    /// The environment UTM 5.0.8 gives QEMU for its DXMT DirectX driver
     /// (`Services/UTMQemuSystem.m`; QEMUHelper sets the render server).
     /// DXMT writes `<exe>_dxmt.log` (an empty exe name for QEMU) into `log_dir`
     /// instead of the worker's current directory; its messages also go to stderr.

@@ -6,7 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "../native/tools/qemu-ram-reclaim.h"
+#include "qemu-ram-reclaim.h"
 extern char **environ;
 static int verified(void *qemu, void *handle, const char *symbol, const char *needle) {
     void *expected = dlsym(handle, symbol), *bound = dlsym(qemu, symbol);

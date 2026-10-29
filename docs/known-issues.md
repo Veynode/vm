@@ -82,7 +82,7 @@ interleaved rounds per variant, medians; the full rows are in
   item every 100 ms), the once-a-second vmstat fold, proactive compaction and
   the soft-lockup watchdog were the largest timed wakeups left. Containers
   created before keep their command line.
-- Most of the rest is the pinned runtime's interrupt controller. UTM 5.0.5's
+- Most of the rest was the runtime's interrupt controller. UTM 5.0.5's
   QEMU 10.0.12 emulates the GIC, so every Guest timer interrupt and IPI exits
   to QEMU, and a Guest that wakes every 10 ms costs ~174% of a host core
   (headless Alpine kernel, 3 rounds; the same in a container). UTM 5.0.8
@@ -93,10 +93,17 @@ interleaved rounds per variant, medians; the full rows are in
   container's QEMU uses ~0.5% of a core instead of ~1.0%, and `exec true` takes
   ~5 ms instead of ~8 ms (p50). The idle Windows 11 desktop (2 rounds, 6 minutes
   to settle): QEMU ~5–8% instead of ~10–12%, `machine exec` unchanged
-  (~250 ms). A Windows installed on 5.0.8 (GICv3) boots on 5.0.5. The runtime
-  is still pinned to 5.0.5: moving the pin also moves the Venus registration,
-  the Neptune wire format, DXMT, the SPICE build and the release licences
-  (decisions 0001, 0026, 0029).
+  (~250 ms). A Windows installed on 5.0.5 boots on 5.0.8 and the other way
+  round. The runtime is pinned to 5.0.8 since 2026-10-29
+  (`runtime/fetch-utm.sh`): the same QEMU 10.0.12 with UTM's in-kernel GICv3
+  patches, virglrenderer `451505ad` (Neptune wire format 2), MoltenVK
+  `0790efd5`, DXMT `66e27f37`, CocoaSpice `d8d29fc8`, and one more SPICE
+  server patch (a sound fix). Rebuilt on it and checked live the same day: a
+  `--gpus virgl` container (`+virgl +context_init`, 2 capsets, free page
+  reporting returning memory as on 5.0.5), a `--gpus venus` container
+  (`vulkaninfo`: "Virtio-GPU Venus (Apple M3 Pro)", Mesa 26.1.6 venus), the
+  Windows 11 machine on Basic Display, and Neptune D3D11 with guest tools
+  0.1.274 (pixel test passed; see the Windows GPU entry).
 - Memory the Guest frees goes back to macOS on QEMU. Linux containers get a
   virtio balloon with free page reporting (never inflated), and the agent
   loads `virtio_balloon` for it. QEMU discards a reported range with
@@ -442,28 +449,38 @@ interleaved rounds per variant, medians; the full rows are in
   "Setting device address of a display device: Not a PCI device"), Windows
   Basic Display at 800x600 as observed.
 - **GPU (`--gpus neptune`, experimental): D3D11 is hardware-accelerated.** The
-  `neptune-dxmt-experimental` profile matches UTM 5.0.5's default Triton
+  `neptune-dxmt-experimental` profile matches UTM 5.0.5's and 5.0.8's default Triton
   arguments (`Configuration/UTMQemuConfiguration+Arguments.swift`):
   `virtio-ramfb-gl,hostmem=8G,blob=on,venus=on,neptune=on`, `-accel
   hvf,ipa-granule-size=4096`, SPICE `gl=es` with ANGLE on Metal,
   `VK_DRIVER_FILES` at UTM's MoltenVK ICD, and `NPT_BACKEND=dxmt` with the
   `NPT_*_LIBRARY_PATH` variables at `dxmt-native.framework`. The render
   server is the reviewed Venus registration's `virgl_render_server` (built
-  from virglrenderer `482f9d8b`, the commit UTM 5.0.5 ships, with Neptune);
+  from the virglrenderer commit the pinned UTM ships, with Neptune: `482f9d8b`
+  for 5.0.5, `451505ad` for 5.0.8);
   UTM's own `QEMURenderServer` is App-Sandbox-signed and traps in
   `_libsecinit_appsandbox` outside UTM's QEMUHelper, so it is not used.
   Findings from `win11v` (M3 Pro, macOS 27, 4 vCPUs, 8 GiB), 2026-10-26:
-  - **Driver version must match the host.** Guest tools 0.1.274 (the file
-    UTM's "latest" link points to) speak Neptune wire format 2; the UTM 5.0.5
-    runtime speaks format 1 (`neptune: virtgpu: wire format mismatch
-    host=0x00000001 guest=0x00000002`). Use **0.1.273**
-    (`.local/iso/utm-guest-tools-0.1.273.iso`, SHA-256 `7d2c0343…c2f04601`
-    from GitHub's asset digest, viogpu3d DriverVer 08/30/2026).
+  - **Driver version must match the host.** Guest tools 0.1.274 speak Neptune
+    wire format 2, which the pinned UTM 5.0.8 runtime speaks; 0.1.273 speaks
+    format 1, which UTM 5.0.5 spoke (`neptune: virtgpu: wire format mismatch
+    host=0x00000001 guest=0x00000002`). The installer pins **0.1.274**
+    (143,898,624 bytes, SHA-256 `ab6add47…b78f407a`). A machine installed
+    with 0.1.273 needs viogpu3d from 0.1.274 (`pnputil /add-driver
+    viogpu3d.inf /install`) before D3D works on 5.0.8; done that way on a
+    clone of the test machine on 2026-10-29, the pixel test passed (host log:
+    `renderer ready (wire=0x00000002 …)`). `d3d11-bench`, p50 of 3 rounds:
+    64x64 `fill` waiting every frame 1.63–1.64 ms, 1080p `fill` waiting every
+    frame 3.56–3.63 ms and every 4 frames 1.78–1.98 ms, `draws` 2000 waiting
+    every 4 frames 1.41–1.76 ms and every frame 2.10–2.16 ms; close to the
+    5.0.5 stock column below (not measured side by side).
+    `scripts/neptune-umd-patch.py` (decision 0029) still accepts only the
+    0.1.273 UMD builds.
   - **Licence.** The owner states Neptune is MIT, and the driver repositories
     (`virtio-win/kvm-guest-drivers-windows`, UTM's fork) carry a BSD 3-Clause
     `LICENSE` (checked 2026-10-27; not legal advice). VeynodeVM ships no
     guest tools: an unattended Neptune install has the daemon download
-    0.1.273 from UTM's release (pinned size and SHA-256) and run `pnputil`
+    0.1.274 from UTM's release (pinned size and SHA-256) and run `pnputil`
     at the first logon. Its `viogpu3d.cat` is signed through Microsoft's
     hardware program (Windows Hardware Compatibility Publisher), so it
     installs without a prompt or test signing.
@@ -888,9 +905,13 @@ Virtualization (llvmpipe) and on QEMU with `--gpus virgl` (GLX renderer
     locally (`runtime/linux-vulkan-build-host-runtime.py`,
     `runtime/build-spice-reconnect-server.py`, Python 3.12 with meson 1.12.1
     and PyYAML); Apple clang output is not reproducible across toolchains, so
-    the catalog hashes for those four roles were re-pinned on 2026-10-25 to an
-    Apple clang 21 build. Vendor roles and the 27 framework pins still match
-    UTM 5.0.5.
+    the catalog hashes for those four roles were re-pinned to an Apple clang
+    21 build (2026-10-25 for 5.0.5, 2026-10-29 for 5.0.8). Vendor roles and
+    the 27 framework pins match UTM 5.0.8. The geometry-shader answer in
+    `qemu_graphics.rs` is bound to the MoltenVK binary; queried again on
+    5.0.8's (`vkGetPhysicalDeviceFeatures`/`Properties` through UTM's Vulkan
+    loader, 2026-10-29), it reports `geometryShader` true with all five
+    geometry limits 0, as 5.0.5's did, and the pin moved to it.
   - Shared engine (`engine start --gpus venus`): `docker run --device
     veynodevm.dev/gpu=all` and compose `devices: [veynodevm.dev/gpu=all]`
     report the Venus device, and the triangle oracle passes inside a docker

@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 OUTPUT="$2"
 [[ ! -e "$OUTPUT" && ! -L "$OUTPUT" ]] || { echo 'Refusing existing app' >&2;exit 2; }
 BASE="$ROOT/.local/runtime/utm"
-HEADERS="$BASE/CocoaSpice-127033fa3e59cd49678f49ed54f8adfc060afb56/Sources/CocoaSpice/ExternalHeaders"
+HEADERS="$BASE/CocoaSpice-d8d29fc810047a3ddcebb351cdadc8fe4b4f308d/Sources/CocoaSpice/ExternalHeaders"
 FRAMEWORKS="$BASE/UTM.app/Contents/Frameworks"
 [[ -d "$HEADERS" && -d "$FRAMEWORKS" ]] || { echo 'Run runtime/fetch-utm.sh and runtime/fetch-cocoaspice.sh first (or runtime/build-qemu-console.sh)' >&2; exit 1; }
 mkdir -p "$(dirname "$OUTPUT")"

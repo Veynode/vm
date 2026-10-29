@@ -2,6 +2,8 @@
 
 Status: **open, release-blocking**, evidence checked 2026-10-08 (Australia/Adelaide).
 
+Update 2026-10-29: the runtime pin moved to UTM 5.0.8, whose Neptune speaks wire format 2, so the installer now pins guest tools 0.1.274; D3D11 passed the pixel test on it ([known issues](../known-issues.md#windows-11-arm64-machines)). The 5.0.5 / 0.1.273 notes below stay as they were measured.
+
 Update 2026-10-26: Windows 11 ARM64 now installs and boots as a VeynodeVM QEMU/HVF machine (`machine create --os windows`, see [known issues](../known-issues.md#windows-11-arm64-machines)) with a basic `virtio-ramfb` display and no GPU acceleration. That is the CPU/installation baseline only; this GPU gate is unchanged.
 
 Update 2026-10-26 (Triton attempt, not passing): `machine create --os windows --gpus neptune` selects the `neptune-dxmt-experimental` QEMU profile, UTM 5.0.5's device (`virtio-ramfb-gl,hostmem=8G,blob=on,neptune=on`) with `NPT_BACKEND=dxmt`, the three `NPT_*_LIBRARY_PATH` variables pointing at `dxmt-native.framework`, and `RENDER_SERVER_EXEC_PATH` pointing at UTM's `QEMURenderServer`. The guest driver came from UTM's guest tools 0.1.274 (`Drivers/viogpu3d/w11/ARM64`, SHA-256 of the ISO `ab6add47a4ed992f5920f14e96f68d60566e6f731e2cf816c3d38ab2b78f407a`). In one disposable install, the driver bound as "Red Hat VirtIO GPU 3D controller" but did not work: Code 43 without the render server, and a boot hang with it. The acceptance test (Triton driver working, not Basic Display, plus a D3D11 pixel check) has **not** passed. Details and the recovery step are in [known issues](../known-issues.md#windows-11-arm64-machines). D3DMetal (`NPT_CAPSET_D3D12`) was not tried, because of its redistribution terms.

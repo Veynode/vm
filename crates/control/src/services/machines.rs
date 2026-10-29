@@ -119,7 +119,7 @@ pub fn gpu_profile(value: &str, windows: bool) -> Result<&'static str> {
     Ok(match (windows, value) {
         (false, "all" | "virgl" | "gl") => "virgl",
         (false, "venus" | "vulkan") => "venus-moltenvk-experimental",
-        // UTM 5.0.5 Neptune + DXMT; the guest needs UTM's viogpu3d driver.
+        // UTM 5.0.8 Neptune + DXMT; the guest needs UTM's viogpu3d driver.
         (true, "all" | "neptune" | "dxmt" | "d3d") => "neptune-dxmt-experimental",
         (false, "neptune" | "dxmt" | "d3d") => {
             return Err(invalid(format!("gpu {value} needs a Windows guest")))

@@ -1,12 +1,12 @@
 #!/bin/sh
-# Fetch the pinned CocoaSpice source (SPICE client headers matching UTM 5.0.5's
+# Fetch the pinned CocoaSpice source (SPICE client headers matching UTM 5.0.8's
 # frameworks) into .local/runtime/utm. Verified by hash; nothing is built here.
 set -eu
 cd "$(dirname "$0")/.."
 base="$PWD/.local/runtime/utm"
-revision=127033fa3e59cd49678f49ed54f8adfc060afb56
-archive="$base/cocoaspice.tar.gz"
-expected=4e9f787d6edc21287f5648570ecd7fca07640c559b00c269503798f592783373
+revision=d8d29fc810047a3ddcebb351cdadc8fe4b4f308d
+archive="$base/cocoaspice-$revision.tar.gz"
+expected=13af3b3fa4e6ba9711f5c4942d513c6ab484d7f142aa801e26d72585be180cc4
 mkdir -p "$base"
 if ! test -f "$archive"; then
   curl -fL --retry 2 "https://codeload.github.com/utmapp/CocoaSpice/tar.gz/$revision" -o "$archive.part"

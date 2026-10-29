@@ -49,7 +49,7 @@ python3 scripts/install-dev-runtime.py
 To get the GPU runtime (development only; redistribution is not yet reviewed):
 
 ```sh
-./runtime/fetch-utm.sh        # pinned UTM 5.0.5 → .local/runtime/utm (verified by hash)
+./runtime/fetch-utm.sh        # pinned UTM 5.0.8 and its source patches/ → .local/runtime/utm (verified by hash)
 ./runtime/build-utm-loader.sh
 python3.12 runtime/linux-vulkan-build-host-runtime.py --output-dir "$PWD/.local/runtime/venus/host"   # Venus only
 python3.12 runtime/build-spice-reconnect-server.py
@@ -65,4 +65,6 @@ That pair gives QEMU containers the persistent console (screenshots) and the `ve
 Check the helper offline with `native/console/test.sh "$PWD/.local/bin/VeynodeQEMUConsole.app"`;
 restart the daemon after rebuilding it.
 
-The Venus build scripts need meson 1.12.1 and PyYAML on PATH (a Python 3.12 venv works) and UTM's source `patches/` in `.local/runtime/utm/UTM-5.0.5`.
+The Venus build scripts need meson 1.12.1 and PyYAML on PATH (a Python 3.12 venv works) and UTM's source `patches/` in `.local/runtime/utm/UTM-5.0.8` (`fetch-utm.sh` extracts them).
+
+Moving to a new pin: `fetch-utm.sh` refuses an existing `.local/runtime/utm/UTM.app` of another version, so move it aside first, then rebuild everything above (the loaders, the Venus host runtime, the SPICE library from a fresh `.local/spice-reconnect-build`, the console) and run `register-venus.py --repin`.

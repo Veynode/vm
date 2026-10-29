@@ -13,17 +13,17 @@ import shutil
 import subprocess
 import tarfile
 ROOT = Path(__file__).resolve().parents[1]
-INPUTS = {'virglrenderer.tar.gz': '47f2c2fd490486a133467c24edf1682bafb832111ca7c98a0f4448ad60f5293e',
+INPUTS = {'virglrenderer.tar.gz': '92a96c668a2ddc8a7e6846586554c4d45cba11cbf75557a39169ca58d71c81d2',
           'libepoxy.tar.gz': '0f99f3f4313b8e74efe18cea61874b07c8a9f9e504d1aa496ca4d7825e70c39d',
           'eglplatform.h': '25b5391655effcf363a38fa00c3154f356a3eab3d35dc067847875513cf1e441',
           'khrplatform.h': '7b1e01aaa7ad8f6fc34b5c7bdf79ebf5189bb09e2c4d2e79fc5d350623d11e83'}
 
 PROXY_SHA = '305a3347cdef1a321830472d30be6caf7ce3ab5dbbf7e13ac0500daec3b4bf2e'
 FRAMEWORKS = {
- 'epoxy.0': '935573bab19780b7beb442bceb57b6ef2e2268b7f47ee366a8dbf6822b46fd03',
- 'vulkan.1': '8bc36ef7302ef74ccba2b7a5eab49b0c1b8fe09c52a825ccf808971103cbdb4e',
- 'virglrenderer.1': 'cdbe4531e7c4c4befb4316ed5a8e3a33dd27383d2f8e94c4a6a4cad4192c81c3',
- 'MoltenVK': 'b96a76813884c04ebe7f13ddf4c4b305234224117a0688a56b81a398fc1641dd',
+ 'epoxy.0': 'e0e23f0943b43dd975eaf02d1884338e53c418dd420ca709e56cd6b57ee8bcde',
+ 'vulkan.1': 'fa5eb7539ca3c399e05a5ed93214bcd1cc00bf60eab5e8890564bd305438fe41',
+ 'virglrenderer.1': '091551234b618c11eac168b91b2a64166330cb73555e83ef649c891e0870dc82',
+ 'MoltenVK': 'ba5aaa1d356261cf3cb2f9d89cc8f1c9f1bd56adac5e85833d8083d4bbb0b26f',
 }
 
 def patch_proxy(data):
@@ -86,7 +86,7 @@ def main():
     loader_source=ROOT/'runtime/linux-vulkan-host-loader.c'
     shutil.copyfile(loader_source,out/'loader.c')
     loader=out/'probe-loader'
-    run(['clang','-Wall','-Wextra','-Werror',out/'loader.c','-Wl,-rpath,'+str(frameworks),'-o',loader])
+    run(['clang','-Wall','-Wextra','-Werror','-I',ROOT/'native/tools',out/'loader.c','-Wl,-rpath,'+str(frameworks),'-o',loader])
     entitlements=out/'hypervisor.plist'
     entitlements.write_text('<?xml version="1.0"?><plist version="1.0"><dict><key>com.apple.security.hypervisor</key><true/></dict></plist>')
     run(['codesign','--force','--sign','-','--entitlements',entitlements,loader])

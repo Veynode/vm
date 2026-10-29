@@ -67,6 +67,9 @@ That cannot be released as is ([license gate](../../licenses/README.md)):
 ## Component inventory
 
 The pins below are UTM 5.0.5's (`patches/sources` in its source archive), the ones the live GPU evidence used.
+Update 2026-10-29: development moved to UTM 5.0.8, which changes virglrenderer to `451505ad`, Mesa to `eed3e1d9`,
+MoltenVK to `0790efd5`, DXMT to `66e27f37` and D3DMetal to `fd09f2ed`, adds UTM's in-kernel GICv3 patches to QEMU
+10.0.12 and one patch to SPICE 0.14.3; the other pins are unchanged.
 "Licence" is what the upstream project declares. The review confirms it against the files in each source archive.
 **Ships** is the proposal for 1.0.
 

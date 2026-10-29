@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build UTM's DXMT (the commit UTM 5.0.5 ships) for the host, optionally with
+# Build UTM's DXMT (the commit UTM 5.0.8 ships) for the host, optionally with
 # runtime/dxmt-gpu-completed-event.patch, into .local/runtime/dxmt/<variant>/.
 #   runtime/build-dxmt-native.sh [stock|event]
 # Needs Homebrew llvm@15, meson and ninja, and Xcode's Metal Toolchain
@@ -11,7 +11,7 @@ cd "$(dirname "$0")/.."
 variant=${1:-event}
 case $variant in stock|event) ;; *) echo "usage: $0 [stock|event]" >&2; exit 2 ;; esac
 repo=https://github.com/utmapp/dxmt.git
-commit=bcdcf6da89af6c9fedeb2fc92b4367b23d5d6ed6
+commit=66e27f3759ff79e41a791ec40e2a70ef6d0c964c
 llvm=$(brew --prefix llvm@15)
 patch="$PWD/runtime/dxmt-gpu-completed-event.patch"
 out="$PWD/.local/runtime/dxmt/$variant"

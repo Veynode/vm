@@ -25,7 +25,7 @@ unpacks it and uses the daemon and CLI over API 1 (docs/api.md):
 
 Nothing is built, downloaded, notarized or published here; signing is ad hoc
 unless --sign names an identity. The QEMU/GPU runtime is included only with
---qemu-runtime, as this Mac uses it today: UTM 5.0.5's binaries
+--qemu-runtime, as this Mac uses it today: UTM 5.0.8's binaries
 (runtime/fetch-utm.sh), the SPICE reconnect build
 (runtime/build-spice-reconnect-server.py) and the console app
 (runtime/build-qemu-console.sh). Venus and Neptune are left out: their
@@ -73,11 +73,11 @@ LGPL = 'licenses/LGPL-2.1.txt'
 APACHE = 'LICENSE'
 # Every framework the runtime may carry: component, version or commit,
 # source, SPDX licence, and the licence text in this checkout
-# (licenses/runtime/README.md says where each came from). UTM 5.0.5's pins (patches/sources in its
+# (licenses/runtime/README.md says where each came from). UTM 5.0.8's pins (patches/sources in its
 # source archive; docs/decisions/0026-gpu-runtime-source-build.md).
 COMPONENTS = {
     'qemu-aarch64-softmmu': ('QEMU (UTM fork)', '10.0.12-utm', 'https://github.com/utmapp/qemu/releases/download/v10.0.12-utm/qemu-10.0.12-utm.tar.xz', 'GPL-2.0-only', GPL),
-    'virglrenderer.1': ('virglrenderer (UTM fork)', '482f9d8b8c2d2288efa10a027116216909d2c226', 'https://github.com/utmapp/virglrenderer', 'MIT', 'licenses/runtime/virglrenderer.txt'),
+    'virglrenderer.1': ('virglrenderer (UTM fork)', '451505ad0aa449290f2c0672da6877d57ee770e5', 'https://github.com/utmapp/virglrenderer', 'MIT', 'licenses/runtime/virglrenderer.txt'),
     'epoxy.0': ('libepoxy (UTM fork)', 'bf98587477fe68d07b93319ece7b40a7d0e2eabe', 'https://github.com/utmapp/libepoxy', 'MIT', 'licenses/runtime/libepoxy.txt'),
     'EGL': ('ANGLE (UTM WebKit fork, Source/ThirdParty/ANGLE)', 'ed78ab6e1a37f4f11583a0bd038f22ec91f3ff10', 'https://github.com/utmapp/WebKit', 'BSD-3-Clause', 'licenses/runtime/angle.txt'),
     'GLESv2': ('ANGLE (UTM WebKit fork, Source/ThirdParty/ANGLE)', 'ed78ab6e1a37f4f11583a0bd038f22ec91f3ff10', 'https://github.com/utmapp/WebKit', 'BSD-3-Clause', 'licenses/runtime/angle.txt'),
@@ -120,8 +120,8 @@ OWN_RUNTIME = [
      'GPL-2.0-only AND BSD-2-Clause-Patent (EDK2, see share/edk2-licenses.txt)', GPL),
     ('QEMU loader (probe-loader; native/tools/spice-reconnect-loader.c)', 'this release',
      'https://github.com/Veynode/vm', 'GPL-2.0-or-later', GPL),
-    ('UTM (the frameworks above are its 5.0.5 release build)', '5.0.5',
-     'https://github.com/utmapp/UTM/releases/tag/v5.0.5', 'Apache-2.0', APACHE),
+    ('UTM (the frameworks above are its 5.0.8 release build)', '5.0.8',
+     'https://github.com/utmapp/UTM/releases/tag/v5.0.8', 'Apache-2.0', APACHE),
 ]
 
 INSTALL = '''#!/usr/bin/env python3
@@ -278,7 +278,7 @@ def notice(names):
     and licence; texts alongside."""
     lines = ['VeynodeVM QEMU/GPU runtime', '==========================', '',
              'libexec/qemu/ carries the third-party software below, unmodified unless',
-             'stated, as UTM 5.0.5 built it. Each licence text is in this directory;',
+             'stated, as UTM 5.0.8 built it. Each licence text is in this directory;',
              'the corresponding source is at the URL given, and the patches and build',
              'recipes of the parts VeynodeVM changed are in its source repository',
              '(https://github.com/Veynode/vm: runtime/, native/tools/,',

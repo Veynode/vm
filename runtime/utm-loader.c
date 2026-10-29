@@ -1,10 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /* Development-only CLI adapter for the pinned official UTM QEMU dylib.
  * Does not patch/re-sign upstream binaries or relax macOS security settings.
- * Calling convention follows UTM v5.0.5 QEMULauncher/Bootstrap.c. */
+ * Calling convention follows UTM v5.0.8 QEMULauncher/Bootstrap.c. */
 #include <dlfcn.h>
 #include <stdio.h>
-#include "../native/tools/qemu-ram-reclaim.h"
+#include "qemu-ram-reclaim.h"
 extern char **environ;
 int main(int argc, char **argv) {
     if (argc < 3) {

@@ -17,7 +17,7 @@ def main():
  guest_source=ROOT/('scripts/linux-input-coordinates.c' if a.coordinates else 'scripts/linux-input-oracle.c')
  output=a.output.resolve();output.parent.mkdir(parents=True,exist_ok=True)
  if output.exists():raise SystemExit('Refusing evidence overwrite')
- headers=BASE/'CocoaSpice-127033fa3e59cd49678f49ed54f8adfc060afb56/Sources/CocoaSpice/ExternalHeaders';frameworks=BASE/'UTM.app/Contents/Frameworks';binary=BASE/('spice-coordinate-probe' if a.coordinates else 'spice-input-probe')
+ headers=BASE/'CocoaSpice-d8d29fc810047a3ddcebb351cdadc8fe4b4f308d/Sources/CocoaSpice/ExternalHeaders';frameworks=BASE/'UTM.app/Contents/Frameworks';binary=BASE/('spice-coordinate-probe' if a.coordinates else 'spice-input-probe')
  subprocess.run(['clang','-Wall','-Wextra',*[f'-I{headers/s}' for s in ['', 'glib-2.0','spice-client-glib-2.0','spice-1']],f'-F{frameworks}',f'-Wl,-rpath,{frameworks}','-framework','spice-client-glib-2.0.8','-framework','glib-2.0.0','-framework','gobject-2.0.0','-framework','gio-2.0.0',str(host_source),'-o',str(binary)],check=True)
  fixture=load(ROOT/'scripts/qemu-linux-desktop-probe.py','input_fixture')
  modloop=ROOT/'.local/media/alpine-3.24.2/modloop-virt';version='6.18.52-0-virt'

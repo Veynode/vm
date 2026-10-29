@@ -29,7 +29,7 @@ clang -fobjc-arc -Wall -Wextra -framework Foundation "$ROOT/native/console/Displ
 codesign --verify --strict "$APP"
 "$APP/Contents/MacOS/spice-console" --probe-capabilities > "$TEMP/display.json"
 BASE="$ROOT/.local/runtime/utm"
-HEADERS="$BASE/CocoaSpice-127033fa3e59cd49678f49ed54f8adfc060afb56/Sources/CocoaSpice/ExternalHeaders"
+HEADERS="$BASE/CocoaSpice-d8d29fc810047a3ddcebb351cdadc8fe4b4f308d/Sources/CocoaSpice/ExternalHeaders"
 FRAMEWORKS="$BASE/UTM.app/Contents/Frameworks"
 clang -fobjc-arc -Wall -Wextra -Wno-unused-parameter \
  -I"$HEADERS" -I"$HEADERS/glib-2.0" -I"$HEADERS/spice-client-glib-2.0" -I"$HEADERS/spice-1" \

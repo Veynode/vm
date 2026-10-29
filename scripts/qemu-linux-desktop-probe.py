@@ -204,7 +204,7 @@ poweroff -f
     if not args.xrender_probe and not (BASE / 'spice-capture').is_file():
         raise SystemExit('Run runtime/build-spice-capture.sh first')
     result = {'timestamp_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
-              'backend': 'UTM 5.0.5 QEMU 10.0.12 HVF virtio-gpu-gl ANGLE Metal',
+              'backend': 'UTM 5.0.8 QEMU 10.0.12 HVF virtio-gpu-gl ANGLE Metal',
               'kernel_sha256': digest(MEDIA / 'Image'), 'rootfs_sha256': ROOTFS_SHA,
               'ram_mib': 1536, 'vcpus': 2, 'xorg_accel': args.xorg_accel,
               'xorg_extension_override': '-GL_EXT_gpu_shader4' if args.xorg_disable_shader4 else None,
