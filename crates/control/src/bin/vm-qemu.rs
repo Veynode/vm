@@ -1811,6 +1811,8 @@ fn run() -> Result<bool> {
     let mut native_input = native_input_worker::NativeInput::default();
     let mut execution_shutdown = ExecutionShutdown::default();
     let mut guardian_heartbeat = Instant::now() - Duration::from_secs(1);
+    // Whether the host asked the Guest to power off (`shutdown`).
+    let mut host_powerdown = false;
     // The policy, and whether QEMU polls the Guest for statistics yet.
     let mut balloon = vm_control::qemu_uefi::windows(&config).then(|| {
         (
@@ -1842,7 +1844,7 @@ fn run() -> Result<bool> {
                 return Ok(true);
             }
             emit(
-                json!({"event":"state","state":if status.success(){"stopped"}else{"crashed"},"exit_code":status.code(),"guest_ready":null,"vm_id":config.id,"qmp_run_state":status_poll.summary()}),
+                json!({"event":"state","state":if status.success(){"stopped"}else{"crashed"},"reason":exit_reason(status.success(), host_powerdown),"exit_code":status.code(),"guest_ready":null,"vm_id":config.id,"qmp_run_state":status_poll.summary()}),
             )?;
             if !status.success() {
                 bail!("QEMU process crashed: {status}")
@@ -1940,7 +1942,7 @@ fn run() -> Result<bool> {
                 return Ok(true);
             }
             emit(
-                json!({"event":"state","state":if status.success(){"stopped"}else{"crashed"},"exit_code":status.code(),"guest_ready":null,"vm_id":config.id,"qmp_run_state":status_poll.summary()}),
+                json!({"event":"state","state":if status.success(){"stopped"}else{"crashed"},"reason":exit_reason(status.success(), host_powerdown),"exit_code":status.code(),"guest_ready":null,"vm_id":config.id,"qmp_run_state":status_poll.summary()}),
             )?;
             if !status.success() {
                 bail!("QEMU process crashed: {status}")
@@ -2084,6 +2086,7 @@ fn run() -> Result<bool> {
             }
             Some("status") => qmp.call("query-status").map(|status|json!({"qmp_status":status,"qmp_run_state":status_poll.summary(),"guest_ready":null,"vm_id":config.id,"disk_provenance":state.get("disk_provenance"),"guest_integration_state":guest.as_ref().map(|g|g.state()).unwrap_or_else(||guest_exec.as_ref().unwrap().state())})),
             Some("shutdown") => {
+                host_powerdown = true;
                 if guest_exec.is_some() {
                     execution_shutdown.begin(Instant::now());
                 }
@@ -2199,6 +2202,15 @@ fn balloon_step(
         let _ = qmp.arguments("balloon", json!({"value":target}));
     }
 }
+/// Why QEMU exited, in the worker's last state: `guest-shutdown` only when
+/// the Guest powered itself off, which an unattended install waits for.
+fn exit_reason(success: bool, host_powerdown: bool) -> Value {
+    match (success, host_powerdown) {
+        (false, _) => Value::Null,
+        (true, false) => json!("guest-shutdown"),
+        (true, true) => json!("host-powerdown"),
+    }
+}
 fn request_wait(in_flight: bool) -> Duration {
     Duration::from_millis(if in_flight { 50 } else { 150 })
 }
@@ -2277,6 +2289,12 @@ mod tests {
             "expected",
             Instant::now() + Duration::from_secs(1),
         )
+    }
+    #[test]
+    fn only_a_guest_power_off_is_a_guest_shutdown() {
+        assert_eq!(exit_reason(true, false), "guest-shutdown");
+        assert_eq!(exit_reason(true, true), "host-powerdown");
+        assert!(exit_reason(false, false).is_null());
     }
     #[test]
     fn idle_request_wait_is_longer_but_in_flight_work_keeps_the_original_step() {

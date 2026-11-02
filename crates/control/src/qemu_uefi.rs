@@ -233,6 +233,10 @@ pub fn arguments(config: &Config, resources: &Path, monitor: Option<&Path>) -> R
                 "virtio-rng-pci,id=veynode-rng",
                 "-device",
                 "pvpanic-pci,id=veynode-pvpanic",
+                // A Windows panic ends QEMU with a failure: a crash, never
+                // the power-off that ends an unattended install.
+                "-action",
+                "panic=exit-failure",
             ]
             .map(String::from),
         );
@@ -557,6 +561,7 @@ mod tests {
             assert!(joined.contains(device), "{device}");
         }
         assert!(joined.contains("virtio-balloon-pci,id=veynode-balloon,free-page-reporting=on"));
+        assert!(joined.contains("-action panic=exit-failure"));
         let nvme = config(&root, json!({"guest":"windows","qemu_disk_bus":"nvme"}));
         nvme.validate().unwrap();
         assert!(disk_device(&nvme).starts_with("nvme,drive=veynode-disk,"));
