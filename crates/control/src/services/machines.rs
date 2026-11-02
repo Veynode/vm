@@ -690,6 +690,10 @@ pub fn create(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
     }
     home::private_dir(&dir)?;
     let unattended = flag(&args, "unattended")?;
+    let id = util::random_hex(6);
+    // Set once `machine.json` names this create's `id`: from then on the
+    // name may be removed and taken by another create while this one runs.
+    let mut registered = false;
     let result = super::with_progress(io, || -> Result<Value> {
         let target = dir.join("disk.raw");
         let mut digest = None;
@@ -732,7 +736,6 @@ pub fn create(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
                 disk_gib
             }
         };
-        let id = util::random_hex(6);
         // The daemon logs in to a cloud image's guest (its seed) and to an
         // unattended Windows install (its answer file) over SSH; on QEMU
         // through a private loopback forward.
@@ -785,7 +788,7 @@ pub fn create(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
             os: if spec.windows { "windows" } else { "linux" }.into(),
             iso: spec.iso.clone(),
             disk_gib,
-            id,
+            id: id.clone(),
             created_at: util::now(),
             icon: None,
             disk_source: disk.clone(),
@@ -797,8 +800,21 @@ pub fn create(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
             idle_pause_s: None,
         };
         save(&machine)?;
+        registered = true;
         if let Some(prepared) = install {
-            super::windows_install::install(&name)?;
+            // Ends the install when its client goes (a Stop, a restart) or
+            // the machine is no longer this create's.
+            let check = || -> Result<()> {
+                if io.closed() {
+                    bail!("the install was cancelled")
+                }
+                if !created_by(&name, &id) {
+                    bail!("{name} was removed during the install")
+                }
+                Ok(())
+            };
+            super::windows_install::install(&name, &check)?;
+            check()?;
             eject(ctx, json!({"name":name}))?;
             write_login(
                 &dir,
@@ -809,7 +825,9 @@ pub fn create(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
         }
         Ok(view(ctx, &load(&name)?))
     });
-    if result.is_err() {
+    // A machine removed and created again under this name is not this
+    // create's to clean up.
+    if result.is_err() && (!registered || created_by(&name, &id)) {
         if running(&vm_state(ctx, &name)) {
             let _ = ctx.vm("force_stop", json!({"id":name,"confirm":name}));
             wait_stopped(ctx, &name, Duration::from_secs(20));
@@ -820,6 +838,11 @@ pub fn create(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
         cleanup_files(&dir);
     }
     result
+}
+
+/// Whether the machine `name` is still the one a create registered as `id`.
+pub(crate) fn created_by(name: &str, id: &str) -> bool {
+    load(name).is_ok_and(|machine| machine.id == id)
 }
 
 /// A cloud image's NoCloud seed (`seed.iso` in `dir`): host name, the login

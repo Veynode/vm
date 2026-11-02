@@ -50,8 +50,8 @@ pub(crate) struct Running {
 pub(crate) fn replace_runtime_state(current: &mut Value, mut next: Value) {
     // A Windows guest's reboot is a new QEMU under the same worker: how far an
     // unattended install is, for the host that watches it.
-    let resets = current["guest_resets"].as_u64().unwrap_or(0)
-        + u64::from(next["reason"] == "guest-reset");
+    let resets =
+        current["guest_resets"].as_u64().unwrap_or(0) + u64::from(next["reason"] == "guest-reset");
     next["guest_resets"] = resets.into();
     for field in [
         "disk_provenance",

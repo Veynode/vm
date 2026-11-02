@@ -409,11 +409,42 @@ fn call(method: &str, args: Value) -> Result<Value> {
     crate::call(&home::state_dir()?, method, args)
 }
 
-fn vm_state(name: &str) -> String {
-    call("status", json!({"id":name}))
-        .ok()
-        .and_then(|v| v["state"].as_str().map(str::to_owned))
-        .unwrap_or_else(|| "missing".into())
+/// The machine's daemon status; `None` once it is not registered.
+fn status(name: &str) -> Option<Value> {
+    call("status", json!({"id":name})).ok()
+}
+
+/// More reboots than an install makes: Setup restarts three or four times
+/// and the first logon none, so twice that is Setup starting over.
+const MAX_GUEST_RESETS: u64 = 8;
+
+/// Where the install stands by the machine's `status`: `Ok(true)` once the
+/// Guest powered itself off, `Ok(false)` while it runs, else why it failed.
+/// Only the Guest's own power-off ends an install: a host stop, a removal,
+/// a crash or a Windows panic (QEMU exits with a failure) do not.
+fn install_state(name: &str, status: Option<&Value>) -> Result<bool> {
+    let Some(status) = status else {
+        bail!("{name} was removed during the install")
+    };
+    let runtime = &status["runtime"];
+    let resets = runtime["guest_resets"].as_u64().unwrap_or(0);
+    if resets > MAX_GUEST_RESETS {
+        bail!("Windows Setup restarted {resets} times without finishing. Check that the ISO is Windows 11 for ARM64")
+    }
+    match status["state"].as_str().unwrap_or_default() {
+        "stopped" if runtime["reason"] == "guest-shutdown" => Ok(true),
+        "stopped" => bail!("{name} was stopped before Windows Setup finished"),
+        "crashed" => bail!("{name} crashed during the install"),
+        "paused" => match runtime["qmp_status"].as_str().unwrap_or_default() {
+            "prelaunch" => Ok(false),
+            "io-error" => {
+                bail!("{name} could not write its disk: the Mac's disk is full. Free space and create it again")
+            }
+            other => bail!("{name} stopped running during the install ({other})"),
+        },
+        "starting" | "running" | "stopping" | "unavailable" => Ok(false),
+        other => bail!("{name} is {other} during the install"),
+    }
 }
 
 /// New bytes of the machine's serial log, from where it stood at `new`.
@@ -444,13 +475,14 @@ impl Serial {
         String::from_utf8_lossy(&text).into_owned()
     }
 
-    fn wait_for(&self, needle: &str, timeout: Duration, name: &str) -> Result<()> {
+    fn wait_for(&self, needle: &str, timeout: Duration, name: &str, check: Check) -> Result<()> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if self.read().contains(needle) {
                 return Ok(());
             }
-            if matches!(vm_state(name).as_str(), "stopped" | "crashed") {
+            check()?;
+            if install_state(name, status(name).as_ref())? {
                 bail!("{name} stopped while waiting for {needle:?}")
             }
             thread::sleep(Duration::from_secs(1));
@@ -459,13 +491,22 @@ impl Serial {
     }
 }
 
+/// Called between polls: an error ends the install (the client went away,
+/// or the machine is no longer this install's).
+pub type Check<'a> = &'a dyn Fn() -> Result<()>;
+
 /// Windows' CD boot loader waits a few seconds for a key, else falls
 /// through to the next boot entry. Its prompt is drawn only on the screen,
 /// so tap Enter from the moment edk2 starts the first boot entry (the CD).
 /// Stop soon: a late Enter lands on Setup's focused Cancel button.
-fn press_any_key(name: &str, serial: &Serial) -> Result<()> {
+fn press_any_key(name: &str, serial: &Serial, check: Check) -> Result<()> {
     progress("waiting for edk2 to start the installer CD (serial console)");
-    serial.wait_for("BdsDxe: starting Boot", Duration::from_secs(300), name)?;
+    serial.wait_for(
+        "BdsDxe: starting Boot",
+        Duration::from_secs(300),
+        name,
+        check,
+    )?;
     progress("pressing Enter for \"Press any key to boot from CD or DVD\"");
     let mut qmp = Qmp::connect(name)?;
     let deadline = Instant::now() + Duration::from_secs(8);
@@ -476,55 +517,76 @@ fn press_any_key(name: &str, serial: &Serial) -> Result<()> {
     Ok(())
 }
 
-/// Program counters of every vCPU (HMP `info registers -a`).
-fn vcpu_pcs(name: &str) -> Result<Vec<String>> {
-    let out = Qmp::connect(name)?.call(
+/// What the hang check compares: every vCPU's program counter (HMP `info
+/// registers -a`) and the bytes written to every drive (`query-blockstats`).
+#[derive(Debug, PartialEq)]
+struct Activity {
+    pcs: Vec<String>,
+    written: u64,
+}
+
+fn activity(name: &str) -> Result<Activity> {
+    let mut qmp = Qmp::connect(name)?;
+    let registers = qmp.call(
         "human-monitor-command",
         json!({"command-line":"info registers -a"}),
     )?;
-    Ok(out
+    let pcs = registers
         .as_str()
         .unwrap_or_default()
         .lines()
         .filter_map(|line| line.split_once("PC="))
         .filter_map(|(_, rest)| rest.split_whitespace().next().map(str::to_owned))
-        .collect())
+        .collect();
+    let written = qmp
+        .call("query-blockstats", json!({}))?
+        .as_array()
+        .map_or(0, |drives| {
+            drives
+                .iter()
+                .filter_map(|drive| drive["stats"]["wr_bytes"].as_u64())
+                .sum()
+        });
+    Ok(Activity { pcs, written })
 }
 
-/// Waits for the Guest to power off, ending early when no vCPU program
-/// counter moves across two samples two minutes apart (a firmware or kernel
-/// spin, as seen with a corrupt UEFI variable store).
-fn wait_installed(name: &str, timeout: Duration) -> Result<()> {
+/// Waits for the Guest to power off, ending early when neither a vCPU
+/// program counter nor the bytes written to disk move across two samples
+/// two minutes apart (a firmware or kernel spin, as seen with a corrupt UEFI
+/// variable store; an idle vCPU waits at one PC, but Setup keeps writing).
+fn wait_installed(name: &str, timeout: Duration, check: Check) -> Result<()> {
     let deadline = Instant::now() + timeout;
     let mut next_sample = Instant::now();
-    let (mut pcs, mut still) = (None, 0);
+    let (mut last, mut still) = (None, 0);
     let started = Instant::now();
     while Instant::now() < deadline {
-        let state = vm_state(name);
-        match state.as_str() {
-            "stopped" => return Ok(()),
-            "crashed" => bail!("the Windows installer VM crashed"),
-            _ => {}
+        check()?;
+        let status = status(name);
+        if install_state(name, status.as_ref())? {
+            return Ok(());
         }
         if Instant::now() >= next_sample {
             next_sample = Instant::now() + Duration::from_secs(120);
             // The monitor is briefly unavailable across a reset.
-            let now = vcpu_pcs(name).ok().filter(|p| !p.is_empty());
-            still = if now.is_some() && now == pcs {
+            let now = activity(name).ok().filter(|a| !a.pcs.is_empty());
+            still = if now.is_some() && now == last {
                 still + 1
             } else {
                 0
             };
-            pcs = now;
+            last = now;
             if still >= 2 {
                 bail!(
-                    "{name} looks hung: vCPU program counters {:?} unchanged for {} minutes",
-                    pcs.unwrap_or_default(),
+                    "{name} looks hung: vCPU program counters {:?} and disk writes unchanged for {} minutes",
+                    last.map(|a| a.pcs).unwrap_or_default(),
                     still * 2
                 )
             }
             progress(&format!(
-                "Windows Setup: {state}, {} minutes",
+                "Windows Setup: {}, {} minutes",
+                status
+                    .as_ref()
+                    .map_or("", |s| s["state"].as_str().unwrap_or_default()),
                 started.elapsed().as_secs() / 60
             ));
         }
@@ -534,6 +596,111 @@ fn wait_installed(name: &str, timeout: Duration) -> Result<()> {
         "{name} did not finish installing within {} minutes",
         timeout.as_secs() / 60
     )
+}
+
+/// Up to `count` last lines of `bytes`, printable and at most 200
+/// characters each.
+fn last_lines(bytes: &[u8], count: usize) -> Vec<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut lines: Vec<String> = text
+        .lines()
+        .map(|line| {
+            line.chars()
+                .filter(|c| !c.is_control())
+                .take(200)
+                .collect::<String>()
+                .trim()
+                .to_owned()
+        })
+        .filter(|line| !line.is_empty())
+        .collect();
+    lines.drain(..lines.len().saturating_sub(count));
+    lines
+}
+
+fn file_tail(path: &Path) -> Vec<String> {
+    let Ok(mut file) = fs::File::open(path) else {
+        return Vec::new();
+    };
+    let length = file.metadata().map_or(0, |m| m.len());
+    let mut bytes = Vec::new();
+    if file
+        .seek(SeekFrom::Start(length.saturating_sub(16 << 10)))
+        .is_err()
+        || file.read_to_end(&mut bytes).is_err()
+    {
+        return Vec::new();
+    }
+    last_lines(&bytes, 6)
+}
+
+/// The newest QEMU stderr log of the machine (`<name>-<pid>.stderr.log`,
+/// one per QEMU process) in the daemon's state directory.
+fn newest_stderr_log(name: &str) -> Option<PathBuf> {
+    fs::read_dir(home::state_dir().ok()?)
+        .ok()?
+        .flatten()
+        .filter(|entry| {
+            entry.file_name().to_str().is_some_and(|file| {
+                file.strip_prefix(name)
+                    .and_then(|rest| rest.strip_prefix('-'))
+                    .and_then(|rest| rest.strip_suffix(".stderr.log"))
+                    .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+            })
+        })
+        .max_by_key(|entry| entry.metadata().and_then(|m| m.modified()).ok())
+        .map(|entry| entry.path())
+}
+
+/// `error` with the last lines QEMU and the serial console wrote: a failed
+/// create removes both logs.
+fn with_logs(error: anyhow::Error, name: &str, serial: &Path) -> anyhow::Error {
+    let mut message = format!("{error:#}");
+    for (label, lines) in [
+        (
+            "QEMU",
+            newest_stderr_log(name)
+                .map(|p| file_tail(&p))
+                .unwrap_or_default(),
+        ),
+        ("serial console", file_tail(serial)),
+    ] {
+        if !lines.is_empty() {
+            message.push_str(&format!("\n{label}:\n  {}", lines.join("\n  ")));
+        }
+    }
+    anyhow::anyhow!(message)
+}
+
+/// Keeps the Mac from idle sleep while it lives: `caffeinate -i`, which also
+/// ends with the daemon.
+struct Awake(Option<std::process::Child>);
+
+impl Awake {
+    fn new() -> Self {
+        let child = Command::new("/usr/bin/caffeinate")
+            .args(["-i", "-w"])
+            .arg(std::process::id().to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if let Err(error) = &child {
+            crate::log_line(&format!(
+                "windows install: caffeinate did not start: {error}"
+            ));
+        }
+        Self(child.ok())
+    }
+}
+
+impl Drop for Awake {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 /// The install's key pair and answer-file image, in `work` (private), for
@@ -581,15 +748,19 @@ pub fn prepare(name: &str, work: &Path, neptune: bool) -> Result<Prepared> {
 
 /// Installs a registered machine from its ISO with the prepared answer
 /// file: Setup runs unattended and the first logon powers it off. The
-/// machine is left stopped. A failure leaves it for inspection.
-pub fn install(name: &str) -> Result<()> {
+/// machine is left stopped. `check` runs between polls and ends the install
+/// with its error. The Mac does not idle-sleep meanwhile.
+pub fn install(name: &str, check: Check) -> Result<()> {
     let serial = Serial::new(name)?;
+    let _awake = Awake::new();
     let started = Instant::now();
     progress("starting the Windows installer");
     call("start", json!({"id":name}))?;
-    press_any_key(name, &serial)?;
-    progress("Windows Setup runs unattended; the first logon powers the machine off");
-    wait_installed(name, Duration::from_secs(180 * 60))?;
+    let installed = press_any_key(name, &serial, check).and_then(|()| {
+        progress("Windows Setup runs unattended; the first logon powers the machine off");
+        wait_installed(name, Duration::from_secs(180 * 60), check)
+    });
+    installed.map_err(|error| with_logs(error, name, &serial.path))?;
     progress(&format!(
         "installed in {} minutes",
         started.elapsed().as_secs() / 60
@@ -637,6 +808,47 @@ mod tests {
         assert!(
             xml.find("Add-WindowsCapability").unwrap() < xml.find("Start-Service sshd").unwrap()
         );
+    }
+
+    #[test]
+    fn only_the_guest_s_own_power_off_ends_an_install() {
+        let state = |state: &str, runtime: Value| {
+            install_state("w", Some(&json!({"state":state,"runtime":runtime})))
+        };
+        let failure = |result: Result<bool>| result.unwrap_err().to_string();
+        assert!(state("stopped", json!({"reason":"guest-shutdown"})).unwrap());
+        assert!(!state("running", json!({"guest_resets":3})).unwrap());
+        assert!(!state("starting", json!({"reason":"guest-reset"})).unwrap());
+        assert!(!state("paused", json!({"qmp_status":"prelaunch"})).unwrap());
+        for runtime in [
+            json!({"reason":"host-powerdown"}),
+            json!({"reason":"force_stopped"}),
+            json!({"reason":"supervisor_disconnected_or_stop"}),
+            json!({}),
+        ] {
+            assert!(failure(state("stopped", runtime)).contains("stopped before"));
+        }
+        assert!(failure(state("crashed", json!({}))).contains("crashed"));
+        assert!(failure(state("paused", json!({"qmp_status":"io-error"}))).contains("disk is full"));
+        assert!(
+            failure(state("paused", json!({"qmp_status":"paused"}))).contains("stopped running")
+        );
+        assert!(failure(state("missing", json!({}))).contains("missing"));
+        assert!(failure(install_state("w", None)).contains("removed"));
+        assert!(!state("running", json!({"guest_resets":MAX_GUEST_RESETS})).unwrap());
+        assert!(failure(state(
+            "running",
+            json!({"guest_resets":MAX_GUEST_RESETS + 1})
+        ))
+        .contains("restarted 9 times"));
+    }
+
+    #[test]
+    fn an_error_keeps_the_last_printable_lines_of_a_log() {
+        let log = b"one\n\x1b[2Jtwo\r\n\n  three  \nfour\n";
+        assert_eq!(last_lines(log, 3), ["[2Jtwo", "three", "four"]);
+        assert_eq!(last_lines(b"", 3), Vec::<String>::new());
+        assert_eq!(last_lines(&[b'x'; 500], 1)[0].len(), 200);
     }
 
     #[test]

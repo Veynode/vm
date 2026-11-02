@@ -288,3 +288,19 @@ fn refusals_carry_the_codes_the_plugin_maps() {
     );
     client.call("machine.rm", json!({"name":"twice"})).unwrap();
 }
+
+/// An install's create owns the name only while `machine.json` carries its id.
+#[test]
+fn a_create_owns_only_the_machine_it_registered() {
+    let client = daemon();
+    let (created, _) = stream(
+        &client,
+        "machine.create",
+        json!({"name":"owned","os":"linux","diskGiB":4}),
+    );
+    let id = created.unwrap()["id"].as_str().unwrap().to_owned();
+    assert!(crate::services::machines::created_by("owned", &id));
+    assert!(!crate::services::machines::created_by("owned", "another"));
+    client.call("machine.rm", json!({"name":"owned"})).unwrap();
+    assert!(!crate::services::machines::created_by("owned", &id));
+}
