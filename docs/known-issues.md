@@ -541,9 +541,9 @@ interleaved rounds per variant, medians; the full rows are in
   `windows-virtio-devices.png`. Not exercised: vioscsi with a virtio-scsi
   disk, viosock, viofs (needs virtiofsd and WinFsp), viomem, and anything
   over virtio-serial: **qemu-guest-agent has no ARM64 Windows build** in
-  virtio-win (x86/x64 MSIs only), so there is no guest agent. Display stays
-  on Basic Display unless the Neptune profile below is used; viogpudo is
-  never installed. `--disk-bus nvme` keeps the inbox NVMe driver as an
+  virtio-win (x86/x64 MSIs only), so there is no guest agent. Without the Neptune
+  profile below the install adds viogpudo (1280x800, hardware pointer)
+  instead of leaving Basic Display. `--disk-bus nvme` keeps the inbox NVMe driver as an
   alternative (the first install used it).
 - **Windows `vm_screenshot` over 2 MiB (fixed in the native console).** A
   photographic Windows desktop (Neptune 1280x1024) encodes to 2.6 MB of PNG,
@@ -573,8 +573,9 @@ interleaved rounds per variant, medians; the full rows are in
 - Devices: the ISO and seed images are USB CD-ROMs (`usb-bot` + `scsi-cd`),
   because Setup reads the answer file before any virtio driver is loaded.
   The display is UTM's `virtio-ramfb` (plain `ramfb` makes SPICE log
-  "Setting device address of a display device: Not a PCI device"), Windows
-  Basic Display at 800x600 as observed.
+  "Setting device address of a display device: Not a PCI device"), with
+  viogpudo at 1280x800 (Basic Display, 800x600, before viogpudo was
+  installed by default).
 - **GPU (`--gpus neptune`, experimental): D3D11 is hardware-accelerated.** The
   `neptune-dxmt-experimental` profile matches UTM 5.0.5's and 5.0.8's default Triton
   arguments (`Configuration/UTMQemuConfiguration+Arguments.swift`):

@@ -5,7 +5,8 @@
 //! VEYNODEWIN. TPM, Secure Boot, RAM and storage checks are bypassed
 //! (LabConfig) because the machine has no TPM and no Secure Boot keys. The
 //! virtio-win ARM64 drivers load in Windows PE, so Setup sees the virtio-blk
-//! disk, and are injected into the installed system. The first logon turns
+//! disk, and are injected into the installed system, with viogpudo for the
+//! display unless the machine uses Neptune. The first logon turns
 //! Fast Startup off, installs OpenSSH Server with this machine's key for the
 //! administrator, and powers the machine off: that ends the install, and
 //! `machine.create` ends with the machine stopped.
@@ -39,9 +40,9 @@ const EDITION: &str = "Windows 11 Pro";
 /// Microsoft's generic key for the edition: it installs, it does not activate.
 const PRODUCT_KEY: &str = "VK7JG-NPHTM-C97JM-9MPGT-3V66T";
 
-/// virtio-win ARM64 driver directories (virtio-win 0.1.302 layout). viogpudo
-/// is left out (virtio-ramfb stays on Basic Display), as are
-/// viosock/viofs/viomem (no vhost-vsock, virtiofsd or virtio-mem on this host).
+/// virtio-win ARM64 driver directories (virtio-win 0.1.302 layout).
+/// viosock/viofs/viomem are left out (no vhost-vsock, virtiofsd or
+/// virtio-mem on this host); the display driver is [`DISPLAY_DRIVER`].
 const VIRTIO_DRIVERS: [&str; 8] = [
     "viostor",
     "vioscsi",
@@ -52,6 +53,11 @@ const VIRTIO_DRIVERS: [&str; 8] = [
     "vioinput",
     "pvpanic",
 ];
+/// virtio-win's display-only driver for `virtio-ramfb` without Neptune:
+/// 1280x800 and a hardware pointer the viewer draws itself, where Basic
+/// Display gives 800x600 with the pointer painted into the picture. Neptune
+/// machines get viogpu3d instead.
+const DISPLAY_DRIVER: &str = "viogpudo";
 /// UTM's guest tools 0.1.274, the release whose viogpu3d speaks Neptune wire
 /// format 2, as UTM 5.0.8's runtime does (0.1.273 speaks 1).
 /// Downloaded from UTM's QEMU release, not shipped.
@@ -212,7 +218,11 @@ pub fn answer(
         .map(String::from)
         .collect::<Vec<_>>()
         .join(" ");
-    let mut first_logon: Vec<String> = VIRTIO_DRIVERS
+    let mut drivers = VIRTIO_DRIVERS.to_vec();
+    if !neptune {
+        drivers.push(DISPLAY_DRIVER);
+    }
+    let mut first_logon: Vec<String> = drivers
         .iter()
         // Fallback for any virtio driver offline servicing did not install.
         .map(|d| {
@@ -302,7 +312,7 @@ pub fn answer(
         component("Microsoft-Windows-Setup"),
         commands("RunSynchronous", "RunSynchronousCommand", &labconfig),
         component("Microsoft-Windows-PnpCustomizationsNonWinPE"),
-        paths(&VIRTIO_DRIVERS),
+        paths(&drivers),
         component("Microsoft-Windows-Shell-Setup"),
         component("Microsoft-Windows-Deployment"),
         commands("RunSynchronous", "RunSynchronousCommand", &specialize),
@@ -803,6 +813,10 @@ mod tests {
         let last = xml.rfind("<Order>").unwrap();
         assert!(xml[last..].contains("shutdown /s /t 20"));
         assert!(!xml.contains("viogpu3d"));
+        // Without Neptune the display-only driver is injected, with a
+        // first-logon fallback.
+        assert!(xml.contains("<Path>D:\\viogpudo\\w11\\ARM64</Path>"));
+        assert!(xml.contains("@if exist %d:\\viogpudo\\w11\\ARM64 pnputil /add-driver"));
         // Installed from the seed, with Windows Update only as the fallback.
         assert!(xml.find("OpenSSH.msi").unwrap() < xml.find("Add-WindowsCapability").unwrap());
         assert!(
@@ -869,5 +883,6 @@ mod tests {
             .unwrap();
         assert!(xml.find("powercfg /hibernate off").unwrap() < driver);
         assert!(driver < xml.find("administrators_authorized_keys").unwrap());
+        assert!(!xml.contains("viogpudo"));
     }
 }
