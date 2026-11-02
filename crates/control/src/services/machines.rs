@@ -550,6 +550,11 @@ fn create_spec(ctx: &Ctx, args: &Value) -> Result<(Spec, u64, Option<PathBuf>)> 
             "an unattended Windows install needs driversIso (virtio-win 0.1.302 or later, ARM64)",
         ));
     }
+    if flag(args, "unattended")? && iso.is_none() {
+        return Err(invalid(
+            "an unattended Windows install needs iso (Windows 11, ARM64)",
+        ));
+    }
     let shares = match &args["shares"] {
         Value::Null => Vec::new(),
         Value::Array(shares) if windows && !shares.is_empty() => {
@@ -588,26 +593,89 @@ fn create_spec(ctx: &Ctx, args: &Value) -> Result<(Spec, u64, Option<PathBuf>)> 
     if !(256..=1 << 20).contains(&memory_mib) {
         return Err(invalid("memoryMiB must be 256 through 1048576"));
     }
-    Ok((
-        Spec {
-            name,
-            qemu,
-            windows,
-            gpu_profile,
-            iso,
-            cpus: cpus as u32,
-            memory_mib,
-            monitor,
-            attach,
-            nvme,
-            publish,
-            shares,
-            // A known address lets `machine.endpoints` find the guest's lease.
-            mac_address: (!qemu).then(util::random_mac),
-        },
-        disk_gib,
-        disk,
-    ))
+    if windows && disk_gib < 40 {
+        return Err(invalid("Windows needs diskGiB 40 or more"));
+    }
+    if windows && memory_mib < 4096 {
+        return Err(invalid("Windows needs memoryMiB 4096 or more"));
+    }
+    let spec = Spec {
+        name,
+        qemu,
+        windows,
+        gpu_profile,
+        iso,
+        cpus: cpus as u32,
+        memory_mib,
+        monitor,
+        attach,
+        nvme,
+        publish,
+        shares,
+        // A known address lets `machine.endpoints` find the guest's lease.
+        mac_address: (!qemu).then(util::random_mac),
+    };
+    let free = home::machines_dir()
+        .ok()
+        .and_then(|dir| available_bytes(&dir));
+    host_preflight(ctx, &spec, free)?;
+    Ok((spec, disk_gib, disk))
+}
+
+/// What a Windows install writes to its new disk.
+const WINDOWS_INSTALL_BYTES: u64 = 25 << 30;
+
+/// What the Mac needs for `spec`, checked before any download: the QEMU
+/// UEFI firmware, the Neptune runtime for its GPU, and room for Windows.
+fn host_preflight(ctx: &Ctx, spec: &Spec, free_bytes: Option<u64>) -> Result<()> {
+    use crate::qemu_uefi::{CODE_FILE, VARS_TEMPLATE_FILE};
+    if spec.qemu {
+        for file in [CODE_FILE, VARS_TEMPLATE_FILE] {
+            if !ctx
+                .qemu_resources
+                .as_ref()
+                .is_some_and(|dir| dir.join(file).is_file())
+            {
+                return Err(refuse(
+                    ErrorCode::Unsupported,
+                    format!("the QEMU runtime has no UEFI firmware {file}: run scripts/install-dev-runtime.py --qemu"),
+                ));
+            }
+        }
+    }
+    if spec.gpu_profile == Some("neptune-dxmt-experimental") {
+        let gpu = ctx.runtime.gpu.as_ref();
+        if !gpu.is_some_and(|g| g.neptune) {
+            let reason = gpu
+                .and_then(|g| g.reason.get("neptune"))
+                .map_or("no Neptune runtime".to_owned(), String::clone);
+            return Err(refuse(
+                ErrorCode::Unsupported,
+                format!("gpu neptune is not available on this Mac: {reason}"),
+            ));
+        }
+    }
+    if spec.windows {
+        if let Some(free) = free_bytes.filter(|free| *free < WINDOWS_INSTALL_BYTES) {
+            return Err(refuse(
+                ErrorCode::State,
+                format!(
+                    "the Mac has {} GiB free; installing Windows needs {} GiB",
+                    free >> 30,
+                    WINDOWS_INSTALL_BYTES >> 30
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Bytes free for an unprivileged writer on `path`'s volume.
+fn available_bytes(path: &Path) -> Option<u64> {
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    (unsafe { libc::statvfs(c.as_ptr(), &mut s) } == 0)
+        .then(|| s.f_bavail as u64 * s.f_frsize as u64)
 }
 
 pub fn create(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
@@ -1744,6 +1812,46 @@ mod tests {
             ssh_port: None,
             idle_pause_s: None,
         }
+    }
+
+    #[test]
+    fn a_machine_the_mac_cannot_run_is_refused_before_any_download() {
+        let resources = tempfile::tempdir().unwrap();
+        let ctx = |neptune: bool| Ctx {
+            state_dir: PathBuf::new(),
+            runtime: veynodevm_api::Runtime {
+                apple_virtualization: true,
+                qemu: true,
+                gpu: Some(veynodevm_api::Gpu {
+                    virgl: true,
+                    neptune,
+                    reason: [("neptune".to_owned(), "no dxmt".to_owned())].into(),
+                    ..Default::default()
+                }),
+            },
+            qemu_resources: Some(resources.path().to_owned()),
+            client: String::new(),
+        };
+        let spec = |windows: bool, gpu_profile: Option<&'static str>| Spec {
+            windows,
+            gpu_profile,
+            ..spec(true)
+        };
+        let refused = |ctx: &Ctx, spec: &Spec, free: Option<u64>| {
+            host_preflight(ctx, spec, free).unwrap_err().to_string()
+        };
+        // No UEFI firmware, then no variable store template.
+        assert!(refused(&ctx(true), &spec(true, None), None).contains("edk2-aarch64-code.fd"));
+        fs::write(resources.path().join("edk2-aarch64-code.fd"), b"").unwrap();
+        assert!(refused(&ctx(true), &spec(true, None), None).contains("edk2-arm-vars.fd"));
+        fs::write(resources.path().join("edk2-arm-vars.fd"), b"").unwrap();
+        let neptune = spec(true, Some("neptune-dxmt-experimental"));
+        assert!(refused(&ctx(false), &neptune, None).contains("no dxmt"));
+        host_preflight(&ctx(true), &neptune, None).unwrap();
+        assert!(refused(&ctx(true), &spec(true, None), Some(10 << 30)).contains("10 GiB free"));
+        host_preflight(&ctx(true), &spec(true, None), Some(30 << 30)).unwrap();
+        // A Linux machine needs no room for Windows.
+        host_preflight(&ctx(false), &spec(false, None), Some(1 << 30)).unwrap();
     }
 
     /// The view keeps the `Machine` shape core's plugin reads

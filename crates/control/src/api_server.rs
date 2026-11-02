@@ -98,6 +98,8 @@ pub struct Ctx {
     /// The daemon's state directory, where its socket is.
     pub state_dir: std::path::PathBuf,
     pub runtime: Runtime,
+    /// The registered QEMU data directory (its UEFI firmware).
+    pub qemu_resources: Option<std::path::PathBuf>,
     /// The client's `hello` name.
     pub client: String,
 }
@@ -249,6 +251,7 @@ pub(crate) fn serve(
     let ctx = Ctx {
         state_dir,
         runtime,
+        qemu_resources: qemu.map(|q| q.resources),
         client,
     };
     write_line(&mut stream, &json!({ "result": hello }))?;
