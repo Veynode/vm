@@ -129,19 +129,41 @@ impl Channel {
             bail!("driver_rpc request exceeds 1 MiB")
         }
         line.push(b'\n');
-        let mut connection = self.connection.lock().unwrap();
-        if connection
-            .as_ref()
-            .is_none_or(|c| c.generation <= self.closed.load(Ordering::Acquire))
-        {
-            *connection = Some(self.connect()?);
-        }
-        let current = connection.as_mut().unwrap();
         let (tx, rx) = mpsc::sync_channel(1);
-        self.waiters
-            .lock()
-            .unwrap()
-            .insert(id, (current.generation, tx));
+        let mut connection = self.connection.lock().unwrap();
+        let mut retry = true;
+        loop {
+            let reused = connection
+                .as_ref()
+                .is_some_and(|c| c.generation > self.closed.load(Ordering::Acquire));
+            if !reused {
+                *connection = Some(self.connect()?);
+            }
+            let current = connection.as_mut().unwrap();
+            self.waiters
+                .lock()
+                .unwrap()
+                .insert(id, (current.generation, tx.clone()));
+            let sent = current
+                .stream
+                .set_write_timeout(Some(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .max(Duration::from_millis(1)),
+                ))
+                .and_then(|()| current.stream.write_all(&line));
+            let Err(error) = sent else { break };
+            self.waiters.lock().unwrap().remove(&id);
+            // A partial frame leaves the stream out of step: drop it, and the calls on it.
+            let broken = connection.take().unwrap();
+            let _ = broken.stream.shutdown(std::net::Shutdown::Both);
+            // A kept connection the peer closed before its reader saw the end: the
+            // frame reached no one, so it goes once more on a new connection.
+            if !(reused && retry && peer_closed(&error)) {
+                return Err(error).context("writing to the driver port");
+            }
+            retry = false;
+        }
         let pending = Pending {
             rx,
             id,
@@ -150,17 +172,6 @@ impl Channel {
             waiters: self.waiters.clone(),
             done: false,
         };
-        current.stream.set_write_timeout(Some(
-            deadline
-                .saturating_duration_since(Instant::now())
-                .max(Duration::from_millis(1)),
-        ))?;
-        if let Err(error) = current.stream.write_all(&line) {
-            // A partial frame leaves the stream out of step: drop it, and the calls on it.
-            let broken = connection.take().unwrap();
-            let _ = broken.stream.shutdown(std::net::Shutdown::Both);
-            return Err(error).context("writing to the driver port");
-        }
         Ok(pending)
     }
 
@@ -184,6 +195,14 @@ impl Drop for Channel {
             let _ = connection.stream.shutdown(std::net::Shutdown::Both);
         }
     }
+}
+
+/// A write or socket option error that means the peer has gone (macOS says EINVAL
+/// for a socket option on a socket its peer reset).
+fn peer_closed(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{BrokenPipe, ConnectionReset, NotConnected};
+    matches!(error.kind(), BrokenPipe | ConnectionReset | NotConnected)
+        || error.raw_os_error() == Some(libc::EINVAL)
 }
 
 fn read_replies(stream: UnixStream, generation: u64, waiters: Waiters, closed: Arc<AtomicU64>) {
@@ -242,6 +261,43 @@ mod tests {
         let path = dir.path().join("driver.sock");
         let listener = UnixListener::bind(&path).unwrap();
         (dir, path, listener)
+    }
+
+    #[test]
+    fn a_kept_connection_the_peer_closed_is_replaced_and_the_call_sent_again() {
+        let (_dir, path, listener) = listener();
+        let channel = Channel::new(&path);
+        // A connection whose peer is gone and whose reader has not said so yet.
+        let (stale, peer) = UnixStream::pair().unwrap();
+        drop(peer);
+        *channel.connection.lock().unwrap() = Some(Connection {
+            stream: stale,
+            generation: 1,
+        });
+        channel.next.lock().unwrap().1 = 1;
+        let guest = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream).read_line(&mut line).unwrap();
+            let frame: Value = serde_json::from_str(&line).unwrap();
+            writeln!(
+                writer,
+                "{}",
+                json!({"jsonrpc":"2.0","id":frame["id"],"result":{}})
+            )
+            .unwrap();
+        });
+        let reply = channel
+            .request(
+                json!({"jsonrpc":"2.0","id":"a","method":"tools/list"}),
+                Duration::from_secs(2),
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(reply["id"], "a");
+        guest.join().unwrap();
     }
 
     #[test]
