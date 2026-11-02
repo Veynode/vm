@@ -87,6 +87,66 @@ pub fn record_ports(ports: &[(u16, u16)]) -> Vec<Port> {
         .collect()
 }
 
+/// One published port of a machine: a TCP one on the host's loopback unless
+/// it is `udp`, or `lan`, which publishes it on every address of the host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Forward {
+    pub host: u16,
+    pub guest: u16,
+    pub udp: bool,
+    pub lan: bool,
+}
+
+impl Forward {
+    pub fn tcp(host: u16, guest: u16) -> Self {
+        Forward {
+            host,
+            guest,
+            udp: false,
+            lan: false,
+        }
+    }
+
+    /// The host address it is published on.
+    pub fn address(&self) -> &'static str {
+        if self.lan {
+            "0.0.0.0"
+        } else {
+            "127.0.0.1"
+        }
+    }
+
+    /// How `machine.inspect` and `machine.endpoints` show it: `protocol` and
+    /// `address` only where they are not a TCP port's on the loopback.
+    fn view(&self, address: bool) -> Value {
+        let mut view = json!({"host":self.host,"guest":self.guest});
+        if address || self.lan {
+            view["address"] = json!(self.address());
+        }
+        if self.udp {
+            view["protocol"] = json!("udp");
+        }
+        view
+    }
+}
+
+/// The ports an Apple Virtualization machine publishes: its publisher serves
+/// TCP on the loopback only.
+pub fn loopback_tcp(ports: &[Forward]) -> Result<Vec<(u16, u16)>> {
+    ports
+        .iter()
+        .map(|port| {
+            if port.udp || port.lan {
+                Err(invalid(
+                    "UDP ports and ports on every address need the QEMU backend",
+                ))
+            } else {
+                Ok((port.host, port.guest))
+            }
+        })
+        .collect()
+}
+
 fn linux() -> String {
     "linux".into()
 }
@@ -103,8 +163,9 @@ pub struct Spec {
     pub monitor: bool,
     pub attach: Vec<PathBuf>,
     pub nvme: bool,
-    /// QEMU user-network TCP forwards, 127.0.0.1:HOST → guest GUEST.
-    pub publish: Vec<(u16, u16)>,
+    /// QEMU user-network forwards, 127.0.0.1:HOST (or every address, `lan`)
+    /// → guest GUEST.
+    pub publish: Vec<Forward>,
     /// virtiofs shares: tag, host path, read-only.
     pub shares: Vec<(String, PathBuf, bool)>,
     pub mac_address: Option<String>,
@@ -211,15 +272,21 @@ pub fn vm_config(spec: &Spec, dir: &Path) -> Value {
     vm
 }
 
-fn ports_config(ports: &[(u16, u16)]) -> Value {
+fn ports_config(ports: &[Forward]) -> Value {
     json!(ports
         .iter()
-        .map(|(host, guest)| json!({"host_address":"127.0.0.1","host_port":host,"guest_port":guest,"protocol":"tcp"}))
+        .map(|port| json!({
+            "host_address":port.address(),
+            "host_port":port.host,
+            "guest_port":port.guest,
+            "protocol":if port.udp {"udp"} else {"tcp"},
+        }))
         .collect::<Vec<_>>())
 }
 
-/// `[{host, guest}]` TCP ports.
-pub fn parse_ports(value: &Value) -> Result<Vec<(u16, u16)>> {
+/// `[{host, guest, protocol?, address?}]`: TCP unless `protocol` is `udp`,
+/// on the host's loopback unless `address` is `0.0.0.0`.
+pub fn parse_ports(value: &Value) -> Result<Vec<Forward>> {
     let Some(items) = value.as_array() else {
         return Err(invalid("ports must be an array of {host, guest}"));
     };
@@ -231,9 +298,26 @@ pub fn parse_ports(value: &Value) -> Result<Vec<(u16, u16)>> {
                     .as_u64()
                     .filter(|n| (1..=65535).contains(n))
                     .map(|n| n as u16)
-                    .ok_or_else(|| invalid(format!("ports[].{name} must be a TCP port")))
+                    .ok_or_else(|| invalid(format!("ports[].{name} must be a port")))
             };
-            Ok((field("host")?, field("guest")?))
+            let udp = match &port["protocol"] {
+                Value::Null => false,
+                Value::String(p) if p == "tcp" => false,
+                Value::String(p) if p == "udp" => true,
+                _ => return Err(invalid("ports[].protocol accepts tcp|udp")),
+            };
+            let lan = match &port["address"] {
+                Value::Null => false,
+                Value::String(a) if a == "127.0.0.1" => false,
+                Value::String(a) if a == "0.0.0.0" => true,
+                _ => return Err(invalid("ports[].address accepts 127.0.0.1|0.0.0.0")),
+            };
+            Ok(Forward {
+                host: field("host")?,
+                guest: field("guest")?,
+                udp,
+                lan,
+            })
         })
         .collect()
 }
@@ -357,8 +441,8 @@ fn render(machine: &Machine, raw: &str, status: Option<Value>, used: u64) -> Val
         })
         .unwrap_or_default();
     let ports: Vec<Value> = published(machine, &config)
-        .into_iter()
-        .map(|(host, guest)| json!({"host":host,"guest":guest}))
+        .iter()
+        .map(|port| port.view(false))
         .collect();
     json!({
         "name": machine.name,
@@ -390,29 +474,32 @@ fn render(machine: &Machine, raw: &str, status: Option<Value>, used: u64) -> Val
     })
 }
 
-/// The machine's published ports, `(host, guest)`: an Apple Virtualization
-/// machine's from its record, a QEMU machine's from its forwards, without
-/// the guest agent's session port and the daemon's SSH forward.
-pub fn published(machine: &Machine, config: &Value) -> Vec<(u16, u16)> {
+/// The machine's published ports: an Apple Virtualization machine's from
+/// its record, a QEMU machine's from its forwards, without the guest agent's
+/// session port and the daemon's SSH forward.
+pub fn published(machine: &Machine, config: &Value) -> Vec<Forward> {
     if machine.backend != "qemu-hvf" {
-        return machine.ports.iter().map(|p| (p.host, p.guest)).collect();
+        return machine
+            .ports
+            .iter()
+            .map(|p| Forward::tcp(p.host, p.guest))
+            .collect();
     }
     config["ports"]
         .as_array()
         .map(|ports| {
             ports
                 .iter()
-                .filter(|p| p["guest_port"] != crate::services::SESSION_PORT)
-                .filter(|p| {
-                    machine.ssh_port.is_none()
-                        || p["host_port"].as_u64() != machine.ssh_port.map(u64::from)
-                })
                 .filter_map(|p| {
-                    Some((
-                        p["host_port"].as_u64()? as u16,
-                        p["guest_port"].as_u64()? as u16,
-                    ))
+                    Some(Forward {
+                        host: p["host_port"].as_u64()? as u16,
+                        guest: p["guest_port"].as_u64()? as u16,
+                        udp: p["protocol"] == "udp",
+                        lan: p["host_address"] == "0.0.0.0",
+                    })
                 })
+                .filter(|p| p.udp || p.guest != crate::services::SESSION_PORT)
+                .filter(|p| p.udp || machine.ssh_port != Some(p.host))
                 .collect()
         })
         .unwrap_or_default()
@@ -516,6 +603,9 @@ fn create_spec(ctx: &Ctx, args: &Value) -> Result<(Spec, u64, Option<PathBuf>)> 
         Value::Null => Vec::new(),
         ports => parse_ports(ports)?,
     };
+    if !qemu {
+        loopback_tcp(&publish)?;
+    }
     let existing = |field: &str, path: &str| {
         fs::canonicalize(path).map_err(|_| invalid(format!("{field} not found: {path}")))
     };
@@ -742,7 +832,7 @@ pub fn create(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
         let login = (disk.is_some() && !spec.windows) || unattended;
         let ssh_port = if login && spec.qemu {
             let port = super::machine_guest::unused_port()?;
-            spec.publish.push((port, 22));
+            spec.publish.push(Forward::tcp(port, 22));
             Some(port)
         } else {
             None
@@ -773,7 +863,7 @@ pub fn create(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
         let ports = if spec.qemu {
             Vec::new()
         } else {
-            record_ports(&std::mem::take(&mut spec.publish))
+            record_ports(&loopback_tcp(&std::mem::take(&mut spec.publish))?)
         };
         io.progress("Registering the machine")?;
         ctx.vm("create", vm_config(&spec, &dir))?;
@@ -1149,7 +1239,7 @@ pub struct Changes {
     /// `Some(None)` removes the GPU.
     pub gpus: Option<Option<String>>,
     /// `Some(empty)` clears the forwards.
-    pub publish: Option<Vec<(u16, u16)>>,
+    pub publish: Option<Vec<Forward>>,
     pub mac_address: Option<String>,
     /// The QEMU sound card.
     pub audio: Option<bool>,
@@ -1248,7 +1338,7 @@ pub fn edit_config(config: &mut Value, machine: &Machine, changes: &Changes) -> 
             // The daemon's own SSH forward stays.
             let mut ports = ports.clone();
             if let Some(ssh) = machine.ssh_port {
-                ports.push((ssh, 22));
+                ports.push(Forward::tcp(ssh, 22));
             }
             if ports.is_empty() {
                 fields.remove("ports");
@@ -1302,7 +1392,7 @@ pub fn update(ctx: &Ctx, args: Value) -> Result<Value> {
         reregister(ctx, &name, old, config)?;
     }
     if let (Some(ports), false) = (&changes.publish, machine.backend == "qemu-hvf") {
-        machine.ports = record_ports(ports);
+        machine.ports = record_ports(&loopback_tcp(ports)?);
         save(&machine)?;
     }
     if let Some(gib) = grow {
@@ -1440,7 +1530,7 @@ pub fn clone(ctx: &Ctx, args: Value) -> Result<Value> {
             fields.insert("mac_address".into(), json!(util::random_mac()));
             fields.remove("ports");
             if let Some(port) = ssh_port {
-                fields.insert("ports".into(), ports_config(&[(port, 22)]));
+                fields.insert("ports".into(), ports_config(&[Forward::tcp(port, 22)]));
             }
         }
         // A cloud image's copy is a new cloud-init instance: it takes a new
@@ -1653,8 +1743,8 @@ pub fn endpoints(ctx: &Ctx, args: Value) -> Result<Value> {
         (address, host)
     };
     let ports: Vec<Value> = published(&machine, config)
-        .into_iter()
-        .map(|(host, guest)| json!({"host":host,"guest":guest,"address":"127.0.0.1"}))
+        .iter()
+        .map(|port| port.view(true))
         .collect();
     Ok(json!({"address":address,"hostAddress":host,"ports":ports}))
 }
@@ -1907,6 +1997,29 @@ mod tests {
         }
     }
 
+    /// A UDP port on every address is shown as one, and a UDP port whose
+    /// number is the SSH forward's is not taken for it.
+    #[test]
+    fn udp_ports_on_every_address_are_shown_as_such() {
+        let mut m = machine("qemu-hvf", "windows");
+        m.ssh_port = Some(40022);
+        let status = json!({"config":{"cpus":4,"memory_mib":4096,"ports":[
+            {"host_address":"127.0.0.1","host_port":40022,"guest_port":22,"protocol":"tcp"},
+            {"host_address":"127.0.0.1","host_port":18080,"guest_port":8443,"protocol":"tcp"},
+            {"host_address":"0.0.0.0","host_port":40022,"guest_port":58130,"protocol":"udp"}]}});
+        let view = render(&m, "running", Some(status), 0);
+        assert_eq!(
+            view["ports"],
+            json!([{"host":18080,"guest":8443},
+                {"host":40022,"guest":58130,"address":"0.0.0.0","protocol":"udp"}])
+        );
+        let tcp = Forward::tcp(18080, 8443);
+        assert_eq!(
+            tcp.view(true),
+            json!({"host":18080,"guest":8443,"address":"127.0.0.1"})
+        );
+    }
+
     fn edited(machine: &Machine, changes: Changes) -> Result<Value> {
         let mut config = json!({"id":"m","cpus":4,"memory_mib":4096,
             "qemu_graphics_profile":"virgl","ports":[{"host_port":1,"guest_port":1}]});
@@ -1958,7 +2071,7 @@ mod tests {
             &linux,
             Changes {
                 gpus: Some(Some("venus".into())),
-                publish: Some(vec![(2222, 22), (8080, 80)]),
+                publish: Some(vec![Forward::tcp(2222, 22), Forward::tcp(8080, 80)]),
                 ..Default::default()
             },
         )
@@ -2118,7 +2231,27 @@ mod tests {
     fn ports_and_states() {
         assert_eq!(
             parse_ports(&json!([{"host":2222,"guest":22}])).unwrap(),
-            vec![(2222, 22)]
+            vec![Forward::tcp(2222, 22)]
+        );
+        let wireguard = Forward {
+            host: 58130,
+            guest: 58130,
+            udp: true,
+            lan: true,
+        };
+        assert_eq!(
+            parse_ports(
+                &json!([{"host":58130,"guest":58130,"protocol":"udp","address":"0.0.0.0"}])
+            )
+            .unwrap(),
+            vec![wireguard]
+        );
+        assert!(parse_ports(&json!([{"host":1,"guest":1,"protocol":"sctp"}])).is_err());
+        assert!(parse_ports(&json!([{"host":1,"guest":1,"address":"10.0.0.1"}])).is_err());
+        assert!(loopback_tcp(&[wireguard]).is_err());
+        assert_eq!(
+            ports_config(&[wireguard]),
+            json!([{"host_address":"0.0.0.0","host_port":58130,"guest_port":58130,"protocol":"udp"}])
         );
         assert!(parse_ports(&json!([{"host":2222}])).is_err());
         assert!(parse_ports(&json!("2222:22")).is_err());

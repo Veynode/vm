@@ -97,7 +97,7 @@ type Machine = {
   cpus: number; memoryMiB: number; diskGiB: number;
   gpu: "virgl" | "venus" | "neptune" | null; macAddress: string | null;
   shares: { hostPath: string; tag: string; readOnly: boolean; guestPath: string | null }[];
-  ports: { host: number; guest: number }[];
+  ports: { host: number; guest: number; address?: "0.0.0.0"; protocol?: "udp" }[];
   createdAt: number; diskUsedBytes: number; icon?: string | null;
   idlePauseS: number; // 0: no idle pause
 };
@@ -121,7 +121,7 @@ type Machine = {
 | `machine.resolution` | call | `{name, width, height}` (a running Windows machine, through its login) | `{name, width, height}` |
 | `machine.display` | call | `{name, epoch}` (running) | `{format:"stream", address, port, token, epoch}`; see [the screen endpoint](#the-screen-endpoint) |
 | `machine.sound`, `machine.microphone` | call | `{name, epoch}` (a running QEMU machine) | `{format:"pcm", rate:48000, channels, address, port, token, epoch}`; see [the sound endpoints](#the-sound-endpoints) |
-| `machine.endpoints` | call | `{name}` | `{address: string\|null, hostAddress: string\|null, ports: {host, guest, address}[]}` |
+| `machine.endpoints` | call | `{name}` | `{address: string\|null, hostAddress: string\|null, ports: {host, guest, address, protocol?}[]}` |
 | `machine.exec` | stream | `{name, argv, user?, env?: ["K=V"], cwd?, stdin: bool, tty?: bool}` | `{exitCode}`; output on `stdout`/`stderr`, input on `stdin`, signals on `control` |
 
 - **Linux disk images.** `disk` is an upstream cloud image (Ubuntu 24.04 or Debian 13 arm64, raw or qcow2). The
@@ -129,9 +129,10 @@ type Machine = {
   disk and its GPT to `diskGiB`; `source.digest` is the image's sha256. A NoCloud seed (`seed.iso`) gives the guest
   the login `veynode` with the home's key, passwordless `sudo`, the hostname, the shares at `/mnt/TAG` and the
   guest agent. `machine.clone` writes a new seed, so the clone gets a new hostname and machine-id.
-- **Ports.** On QEMU, `ports` are user-mode forwards on 127.0.0.1. On Apple Virtualization the daemon publishes them
-  from 127.0.0.1 to the guest's lease address while the machine runs. `machine.endpoints` lists both with
-  `address` 127.0.0.1.
+- **Ports.** Each is `{host, guest, protocol?, address?}`. On QEMU, `ports` are user-mode forwards on 127.0.0.1;
+  `protocol: "udp"` makes a UDP one and `address: "0.0.0.0"` publishes it on every address of the Mac. On Apple
+  Virtualization the daemon publishes TCP ones from 127.0.0.1 to the guest's lease address while the machine runs,
+  and refuses the others. `machine.endpoints` lists each with its `address`, and `protocol` for a UDP one.
 - **Windows.** `{iso, unattended: true, driversIso}` installs Windows 11 ARM64 without a person: the daemon writes the
   answer file seed, presses the ISO's key prompt, waits for the install (up to 3 hours) and ejects the media. The
   machine has the login `veynode` with its own key and OpenSSH, and is left stopped. Windows needs `diskGiB` 40 and

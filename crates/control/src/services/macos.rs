@@ -1109,7 +1109,7 @@ fn machine_spec(args: &Value) -> Result<MachineSpec> {
         shares,
         ports: match &args["ports"] {
             Value::Null => Vec::new(),
-            ports => machines::parse_ports(ports)?,
+            ports => machines::loopback_tcp(&machines::parse_ports(ports)?)?,
         },
     })
 }
