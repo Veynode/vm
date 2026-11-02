@@ -5,7 +5,8 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
     io::{Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -26,7 +27,28 @@ pub fn fetch(pinned: &Pinned, dest: &Path, progress: &mut dyn FnMut(&str)) -> Re
     if let Some(dir) = dest.parent() {
         fs::create_dir_all(dir)?;
     }
-    let part = dest.with_extension("part");
+    let part = part_path(dest);
+    let fetched = download(pinned, &part, progress).and_then(|()| Ok(fs::rename(&part, dest)?));
+    if fetched.is_err() {
+        let _ = fs::remove_file(&part);
+    }
+    fetched
+}
+
+/// A download's own partial file beside `dest`: two fetches of one file, in
+/// one daemon or two, never write to the same one.
+fn part_path(dest: &Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let mut name = dest.file_name().unwrap_or_default().to_owned();
+    name.push(format!(
+        ".{}-{}.part",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    dest.with_file_name(name)
+}
+
+fn download(pinned: &Pinned, part: &Path, progress: &mut dyn FnMut(&str)) -> Result<()> {
     progress(&format!(
         "Downloading {} ({} MB)",
         pinned.url,
@@ -36,12 +58,13 @@ pub fn fetch(pinned: &Pinned, dest: &Path, progress: &mut dyn FnMut(&str)) -> Re
         .timeout_connect(Duration::from_secs(20))
         .timeout_read(Duration::from_secs(120))
         .user_agent("veynodevm/0.1")
+        .try_proxy_from_env(true)
         .build()
         .get(pinned.url)
         .call()
         .with_context(|| format!("downloading {}", pinned.url))?;
     let mut body = response.into_reader().take(pinned.size + 1);
-    let mut out = File::create(&part)?;
+    let mut out = File::create(part)?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1 << 20];
     let (mut total, mut reported) = (0u64, 0u64);
@@ -65,7 +88,6 @@ pub fn fetch(pinned: &Pinned, dest: &Path, progress: &mut dyn FnMut(&str)) -> Re
     out.sync_all()?;
     let digest = format!("{:x}", hasher.finalize());
     if total != pinned.size || digest != pinned.sha256 {
-        let _ = fs::remove_file(&part);
         bail!(
             "{} is not the pinned file: {total} bytes, sha256 {digest} (expected {} bytes, {})",
             pinned.url,
@@ -73,7 +95,6 @@ pub fn fetch(pinned: &Pinned, dest: &Path, progress: &mut dyn FnMut(&str)) -> Re
             pinned.sha256
         );
     }
-    fs::rename(&part, dest)?;
     Ok(())
 }
 
@@ -110,6 +131,18 @@ mod tests {
         };
         // A mismatch fetches again; nothing listens on port 9.
         assert!(fetch(&bad, &dest, &mut |_| {}).is_err());
+        // The failed fetch leaves no partial file behind.
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn every_fetch_writes_its_own_partial_file() {
+        let dest = Path::new("/d/OpenSSH.msi");
+        let (a, b) = (part_path(dest), part_path(dest));
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), Some(Path::new("/d")));
+        let name = a.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("OpenSSH.msi.") && name.ends_with(".part"));
     }
 }
