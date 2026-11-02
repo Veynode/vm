@@ -737,10 +737,7 @@ pub fn create(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
                 super::windows_install::USER,
                 Some(&fs::read(&prepared.key)?),
             )?;
-            for file in ["id_ed25519", "id_ed25519.pub", "seed.iso"] {
-                let _ = fs::remove_file(dir.join("install").join(file));
-            }
-            let _ = fs::remove_dir(dir.join("install"));
+            let _ = fs::remove_dir_all(dir.join("install"));
         }
         Ok(view(ctx, &load(&name)?))
     });
@@ -813,7 +810,36 @@ fn write_login(dir: &Path, user: &str, key: Option<&[u8]>) -> Result<()> {
 }
 
 /// Remove only the files a machine owns, then its directory (never recursive).
+/// Whether `file`, in the daemon's state directory, is the registration or a
+/// run's log of the machine `id`: `<id>.json`, `<id>-<pid>.stderr.log`.
+fn state_file_of(file: &str, id: &str) -> bool {
+    let Some(rest) = file.strip_prefix(id) else {
+        return false;
+    };
+    rest == ".json"
+        || rest.strip_prefix('-').is_some_and(|run| {
+            run.split_once('.').is_some_and(|(pid, log)| {
+                pid.bytes().all(|byte| byte.is_ascii_digit())
+                    && (log == "stderr.log" || log == "console.log")
+            })
+        })
+}
+
 pub fn cleanup_files(dir: &Path) {
+    if let (Some(id), Ok(state)) = (
+        dir.file_name().and_then(|n| n.to_str()),
+        crate::home::state_dir(),
+    ) {
+        for entry in fs::read_dir(state).into_iter().flatten().flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|file| state_file_of(file, id))
+            {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
     for file in [
         "disk.raw",
         "disk.img",
@@ -832,7 +858,9 @@ pub fn cleanup_files(dir: &Path) {
     ] {
         let _ = fs::remove_file(dir.join(file));
     }
-    for sub in ["ssh", "machine", "install"] {
+    // The key, the answer file and the seed: all of it the daemon's own.
+    let _ = fs::remove_dir_all(dir.join("install"));
+    for sub in ["ssh", "machine"] {
         if let Ok(entries) = fs::read_dir(dir.join(sub)) {
             for entry in entries.flatten() {
                 let _ = fs::remove_file(entry.path());
@@ -1925,6 +1953,22 @@ mod tests {
         let config: crate::Config = serde_json::from_value(a).unwrap();
         assert_eq!(config.shares.len(), 1);
         assert_eq!(config.mac_address.as_deref(), Some("02:00:00:00:00:01"));
+    }
+
+    #[test]
+    fn a_machine_owns_only_its_own_state_files() {
+        for file in ["a.json", "a-12.stderr.log", "a-12.console.log"] {
+            assert!(state_file_of(file, "a"), "{file}");
+        }
+        for file in [
+            "ab.json",
+            "a-b.json",
+            "a-b-12.stderr.log",
+            "a-12.json",
+            "a-12.other.log",
+        ] {
+            assert!(!state_file_of(file, "a"), "{file}");
+        }
     }
 
     #[test]

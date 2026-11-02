@@ -6,9 +6,13 @@
 //! (LabConfig) because the machine has no TPM and no Secure Boot keys. The
 //! virtio-win ARM64 drivers load in Windows PE, so Setup sees the virtio-blk
 //! disk, and are injected into the installed system. The first logon turns
-//! Fast Startup off, installs Windows' OpenSSH Server with this machine's
-//! key for the administrator, and powers the machine off: that ends the
-//! install, and `machine.create` ends with the machine stopped.
+//! Fast Startup off, installs OpenSSH Server with this machine's key for the
+//! administrator, and powers the machine off: that ends the install, and
+//! `machine.create` ends with the machine stopped.
+//!
+//! OpenSSH comes from the seed ([`OPENSSH`], which the daemon downloads once):
+//! Windows' own optional capability is a Windows Update download that takes
+//! ten of an install's twenty-five minutes, and stays the fallback.
 //!
 //! With `gpu` `neptune`, the first logon also installs viogpu3d, the Neptune
 //! guest driver, from UTM's guest tools ([`GUEST_TOOLS`]), which the daemon
@@ -68,6 +72,24 @@ pub fn guest_tools() -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Microsoft's Win32-OpenSSH installer for ARM64, the source of Windows' own
+/// capability. Downloaded from its release, not shipped.
+pub const OPENSSH: veynodevm_oci::download::Pinned = veynodevm_oci::download::Pinned {
+    url: "https://github.com/PowerShell/Win32-OpenSSH/releases/download/10.0.0.0p2-Preview/OpenSSH-ARM64-v10.0.0.0.msi",
+    size: 6_295_552,
+    sha256: "7a17d0e22d004fb47ca4bfd8fef926fa305de4ebf70a6f3c7a29c39aabef0023",
+};
+/// [`OPENSSH`]'s name on the seed.
+const OPENSSH_MSI: &str = "OpenSSH.msi";
+
+/// [`OPENSSH`] in the home's download cache, fetched the first time.
+fn openssh() -> Result<PathBuf> {
+    let path =
+        home::private_dir(&home::root()?.join("downloads"))?.join("OpenSSH-ARM64-v10.0.0.0.msi");
+    veynodevm_oci::download::fetch(&OPENSSH, &path, &mut |m| progress(m))?;
+    Ok(path)
+}
+
 /// Windows PE and Setup letter CD-ROMs from D:, in an order we don't control.
 const DRIVE_LETTERS: &str = "DEFGHIJK";
 
@@ -90,12 +112,25 @@ fn driver_paths(drivers: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// PowerShell for FirstLogonCommands: Windows' OpenSSH Server (a Windows
-/// Update download), the key for administrators, PowerShell as the shell.
-fn openssh_server(authorized_key: &str) -> String {
+/// PowerShell for FirstLogonCommands: OpenSSH Server from the seed, or from
+/// Windows Update if that did not install it. A command line holds 1024
+/// characters, so setting it up is [`openssh_setup`]'s.
+fn openssh_install() -> String {
+    let script = [
+        format!(
+            "$msi = Get-PSDrive -PSProvider FileSystem | ForEach-Object {{ Join-Path $_.Root '{OPENSSH_MSI}' }} | Where-Object {{ Test-Path $_ }} | Select-Object -First 1"
+        ),
+        "if ($msi) { Start-Process msiexec -Wait -ArgumentList '/i',$msi,'/qn','ADDLOCAL=Server' }".to_owned(),
+        "if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) { Get-WindowsCapability -Online -Name 'OpenSSH.Server*' | Add-WindowsCapability -Online }".to_owned(),
+    ]
+    .join("; ");
+    format!("powershell -NoProfile -ExecutionPolicy Bypass -Command \"{script}\"")
+}
+
+/// The service, the key for administrators, PowerShell as the shell.
+fn openssh_setup(authorized_key: &str) -> String {
     let keys = "C:\\ProgramData\\ssh\\administrators_authorized_keys";
     let script = [
-        "Get-WindowsCapability -Online -Name 'OpenSSH.Server*' | Add-WindowsCapability -Online".to_owned(),
         "Set-Service sshd -StartupType Automatic".to_owned(),
         "Start-Service sshd".to_owned(),
         "New-NetFirewallRule -Name veynode-sshd -DisplayName 'OpenSSH (VeynodeVM)' -Protocol TCP -LocalPort 22 -Action Allow".to_owned(),
@@ -195,7 +230,8 @@ pub fn answer(
         ));
     }
     first_logon.extend([
-        openssh_server(authorized_key),
+        openssh_install(),
+        openssh_setup(authorized_key),
         // Powering off tells the host the install is complete.
         "shutdown /s /t 20 /c \"VeynodeVM install complete\"".to_owned(),
     ]);
@@ -273,7 +309,7 @@ pub fn answer(
 }
 
 /// An ISO 9660 + Joliet image labelled `label` holding `files`.
-fn make_seed(work: &Path, label: &str, files: &[(&str, &str)]) -> Result<PathBuf> {
+fn make_seed(work: &Path, label: &str, files: &[(&str, &[u8])]) -> Result<PathBuf> {
     let source = work.join(format!("{}-files", label.to_lowercase()));
     if source.exists() {
         fs::remove_dir_all(&source)?;
@@ -303,6 +339,7 @@ fn make_seed(work: &Path, label: &str, files: &[(&str, &str)]) -> Result<PathBuf
     if !status.success() {
         bail!("hdiutil makehybrid failed ({status})")
     }
+    fs::remove_dir_all(&source)?;
     fs::set_permissions(&image, fs::Permissions::from_mode(0o600))?;
     Ok(image)
 }
@@ -520,7 +557,12 @@ pub fn prepare(name: &str, work: &Path, neptune: bool) -> Result<Prepared> {
     }
     let authorized = fs::read_to_string(key.with_extension("pub"))?;
     let xml = answer(USER, PASSWORD, EDITION, PRODUCT_KEY, &authorized, neptune);
-    let seed = make_seed(&work, "VEYNODEWIN", &[("Autounattend.xml", &xml)])?;
+    let msi = fs::read(openssh()?)?;
+    let seed = make_seed(
+        &work,
+        "VEYNODEWIN",
+        &[("Autounattend.xml", xml.as_bytes()), (OPENSSH_MSI, &msi)],
+    )?;
     Ok(Prepared { key, seed })
 }
 
@@ -569,6 +611,21 @@ mod tests {
         let last = xml.rfind("<Order>").unwrap();
         assert!(xml[last..].contains("shutdown /s /t 20"));
         assert!(!xml.contains("viogpu3d"));
+        // Installed from the seed, with Windows Update only as the fallback.
+        assert!(xml.find("OpenSSH.msi").unwrap() < xml.find("Add-WindowsCapability").unwrap());
+        assert!(
+            xml.find("Add-WindowsCapability").unwrap() < xml.find("Start-Service sshd").unwrap()
+        );
+    }
+
+    #[test]
+    fn every_first_logon_command_fits_a_command_line() {
+        let key = format!(
+            "ssh-ed25519 {} veynodevm-{}",
+            "A".repeat(68),
+            "n".repeat(70)
+        );
+        assert!(openssh_install().len() <= 1024 && openssh_setup(&key).len() <= 1024);
     }
 
     #[test]
