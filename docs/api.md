@@ -134,7 +134,9 @@ type Machine = {
   `address` 127.0.0.1.
 - **Windows.** `{iso, unattended: true, driversIso}` installs Windows 11 ARM64 without a person: the daemon writes the
   answer file seed, presses the ISO's key prompt, waits for the install (up to 3 hours) and ejects the media. The
-  machine has the login `veynode` with its own key and OpenSSH, and is left stopped.
+  machine has the login `veynode` with its own key and OpenSSH, and is left stopped. Windows needs `diskGiB` 40 and
+  `memoryMiB` 4096 or more and 25 GiB free on the Mac. Only the guest's own power-off ends the install: a stop, a
+  crash, a full disk, a reboot loop or the client going away fails `machine.create` and removes the machine.
 - **exec on Linux disk images** runs over SSH as `veynode` (the lease address on Apple Virtualization, a private
   loopback forward on QEMU), with no time or output limit. `user` `root` runs it through `sudo -n`; `cwd`, `env`,
   stdin and signals pass through, and the command gets a hang-up when the client goes. `machine.start` with `wait`
