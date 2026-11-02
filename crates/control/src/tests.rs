@@ -2263,6 +2263,21 @@ fn guest_metal_device_alert_is_absent_for_other_backend_guest_pairs() {
     }
 }
 #[test]
+fn guest_resets_are_counted_across_a_guest_s_new_processes() {
+    let mut state = json!({"state":"running","backend_pid":1});
+    for expected in 1..=2 {
+        replace_runtime_state(
+            &mut state,
+            json!({"event":"state","state":"starting","reason":"guest-reset"}),
+        );
+        replace_runtime_state(
+            &mut state,
+            json!({"event":"state","state":"running","backend_pid":2}),
+        );
+        assert_eq!(state["guest_resets"], expected);
+    }
+}
+#[test]
 fn guest_metal_device_alert_survives_state_events_and_failed_queries() {
     let mut fixture = FilePipeFixture::macos();
     let info = json!({"id":"info","result":{"graphics":{"status":"unavailable","reason":"no_metal_device"}}});
