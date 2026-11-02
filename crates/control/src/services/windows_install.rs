@@ -135,7 +135,11 @@ fn openssh_setup(authorized_key: &str) -> String {
         "Start-Service sshd".to_owned(),
         "New-NetFirewallRule -Name veynode-sshd -DisplayName 'OpenSSH (VeynodeVM)' -Protocol TCP -LocalPort 22 -Action Allow".to_owned(),
         format!("Set-Content -Encoding ascii {keys} '{}'", authorized_key.trim()),
-        format!("icacls {keys} /inheritance:r /grant Administrators:F /grant SYSTEM:F"),
+        // SIDs: the group names are translated in other Windows languages.
+        format!("icacls {keys} /inheritance:r /grant *S-1-5-32-544:F /grant *S-1-5-18:F"),
+        // The key may not exist yet; New-Item -Force would empty one that does.
+        "if (-not (Test-Path HKLM:\\SOFTWARE\\OpenSSH)) { New-Item HKLM:\\SOFTWARE\\OpenSSH | Out-Null }"
+            .to_owned(),
         "New-ItemProperty -Path HKLM:\\SOFTWARE\\OpenSSH -Name DefaultShell -PropertyType String -Force \
          -Value C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
             .to_owned(),
@@ -557,12 +561,21 @@ pub fn prepare(name: &str, work: &Path, neptune: bool) -> Result<Prepared> {
     }
     let authorized = fs::read_to_string(key.with_extension("pub"))?;
     let xml = answer(USER, PASSWORD, EDITION, PRODUCT_KEY, &authorized, neptune);
-    let msi = fs::read(openssh()?)?;
-    let seed = make_seed(
-        &work,
-        "VEYNODEWIN",
-        &[("Autounattend.xml", xml.as_bytes()), (OPENSSH_MSI, &msi)],
-    )?;
+    // Without the installer the first logon falls back to Windows Update.
+    let msi = match openssh().and_then(|path| Ok(fs::read(path)?)) {
+        Ok(msi) => Some(msi),
+        Err(error) => {
+            crate::log_line(&format!(
+                "windows install: no OpenSSH installer on the seed, Windows Update installs it: {error:#}"
+            ));
+            None
+        }
+    };
+    let mut files: Vec<(&str, &[u8])> = vec![("Autounattend.xml", xml.as_bytes())];
+    if let Some(msi) = &msi {
+        files.push((OPENSSH_MSI, msi));
+    }
+    let seed = make_seed(&work, "VEYNODEWIN", &files)?;
     Ok(Prepared { key, seed })
 }
 
@@ -604,6 +617,14 @@ mod tests {
         assert!(xml.contains("/v BypassTPMCheck /t REG_DWORD"));
         assert!(xml.contains("powercfg /hibernate off"));
         assert!(xml.contains("Set-Content -Encoding ascii C:\\ProgramData\\ssh\\administrators_authorized_keys 'ssh-ed25519 AAAA key'"));
+        // Group SIDs, not names a translated Windows does not have.
+        assert!(xml.contains("/grant *S-1-5-32-544:F /grant *S-1-5-18:F"));
+        assert!(!xml.contains("Administrators:F"));
+        // The DefaultShell key exists before its value is set.
+        assert!(
+            xml.find("New-Item HKLM:\\SOFTWARE\\OpenSSH").unwrap()
+                < xml.find("New-ItemProperty").unwrap()
+        );
         // Windows PE gets the storage and network drivers on every CD letter.
         assert!(xml.contains("wcm:keyValue=\"24\"><Path>K:\\NetKVM\\w11\\ARM64</Path>"));
         assert!(!xml.contains("wcm:keyValue=\"25\"><Path>D:\\viostor"));
