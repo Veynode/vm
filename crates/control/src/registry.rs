@@ -328,3 +328,45 @@ pub(crate) fn write_vm_config(dir: &Path, path: &Path, config: &Config) -> Resul
     }
     atomic_json(path, config)
 }
+
+/// Worker runs whose logs a VM keeps in the state directory: `<id>-<pid>.stderr.log` and `<id>-<pid>.console.log`,
+/// one pair per worker start. Older runs' logs go when the VM starts again.
+pub(crate) const KEPT_RUN_LOGS: usize = 5;
+
+/// Removes the logs of all but the newest `keep` worker runs of VM `id` (by modification time).
+pub(crate) fn prune_run_logs(dir: &Path, id: &str, keep: usize) {
+    let mut runs: BTreeMap<String, (std::time::SystemTime, Vec<PathBuf>)> = BTreeMap::new();
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some((pid, log)) = name
+            .strip_prefix(id)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .and_then(|run| run.split_once('.'))
+        else {
+            continue;
+        };
+        if pid.is_empty()
+            || !pid.bytes().all(|b| b.is_ascii_digit())
+            || !matches!(log, "stderr.log" | "console.log")
+        {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        let run = runs
+            .entry(pid.to_owned())
+            .or_insert((std::time::SystemTime::UNIX_EPOCH, Vec::new()));
+        run.0 = run.0.max(modified);
+        run.1.push(entry.path());
+    }
+    let mut runs: Vec<_> = runs.into_values().collect();
+    runs.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, files) in runs.into_iter().skip(keep) {
+        for file in files {
+            let _ = fs::remove_file(file);
+        }
+    }
+}

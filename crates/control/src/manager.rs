@@ -1067,6 +1067,7 @@ impl Manager {
                 write_vm_config(&self.dir, &path, &config)?;
                 path
             };
+            prune_run_logs(&self.dir, id, KEPT_RUN_LOGS);
             let mut command = match config.backend {
                 Backend::AppleVirtualization => Command::new(&self.backend),
                 Backend::QemuHvf => backend::require_registration(&self.qemu)?.command(),

@@ -454,3 +454,50 @@ fn registry_schema_fifo_is_refused_promptly_and_descriptor_is_pinned() {
     assert_eq!(read_state_file(file, &path, 21).unwrap(), b"1\n");
     assert!(check_registry_schema(temp.path()).is_err());
 }
+
+#[test]
+fn only_the_newest_runs_logs_of_a_vm_are_kept() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    let base = std::time::SystemTime::now() - std::time::Duration::from_secs(1000);
+    for pid in 1..=8u64 {
+        for log in ["stderr.log", "console.log"] {
+            let path = dir.join(format!("vm-{pid}.{log}"));
+            fs::write(&path, b"log").unwrap();
+            let file = File::options().write(true).open(&path).unwrap();
+            file.set_modified(base + std::time::Duration::from_secs(pid * 10))
+                .unwrap();
+        }
+    }
+    // Another VM's logs, a VM named like a prefix and the VM's own files stay.
+    for other in [
+        "vm-b-1.stderr.log",
+        "vmx-1.stderr.log",
+        "vm.json",
+        "vm-x.stderr.log",
+    ] {
+        fs::write(dir.join(other), b"keep").unwrap();
+    }
+    prune_run_logs(dir, "vm", 3);
+    let mut left: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().into_string().unwrap())
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        [
+            "vm-6.console.log",
+            "vm-6.stderr.log",
+            "vm-7.console.log",
+            "vm-7.stderr.log",
+            "vm-8.console.log",
+            "vm-8.stderr.log",
+            "vm-b-1.stderr.log",
+            "vm-x.stderr.log",
+            "vm.json",
+            "vmx-1.stderr.log",
+        ]
+    );
+}
