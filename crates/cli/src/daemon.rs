@@ -115,7 +115,9 @@ pub fn running() -> bool {
     daemon_call("capabilities", json!({})).is_ok()
 }
 
-fn wait(up: bool) -> Result<()> {
+/// Waits for the daemon to be up (`up`) or gone. `since`: the length of its
+/// log when a start began, so only what that start wrote is quoted.
+fn wait(up: bool, since: u64) -> Result<()> {
     // The first start of a newly unpacked release probes its console helper
     // while macOS assesses it (vm_control::backend's probe deadline).
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -125,11 +127,26 @@ fn wait(up: bool) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+    let log = home::root()?.join("daemon.log");
+    // A daemon that cannot start says why as its last line (launchd starts it
+    // again and again): the caller gets that, not only the timeout.
+    let said = last_line(&log, since)
+        .map(|line| format!(": {line}"))
+        .unwrap_or_default();
     bail!(
-        "daemon did not {} in time; see {}",
+        "daemon did not {} in time{said}; see {}",
         if up { "start" } else { "stop" },
-        home::root()?.join("daemon.log").display()
+        log.display()
     )
+}
+
+/// The last line written to `path` after its first `since` bytes that says
+/// something, at most 400 characters.
+fn last_line(path: &std::path::Path, since: u64) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(bytes.get(since as usize..)?);
+    let line = text.lines().rev().find(|line| !line.trim().is_empty())?;
+    Some(line.trim().chars().take(400).collect())
 }
 
 pub fn command(rest: &[String], json_output: bool) -> Result<i32> {
@@ -212,7 +229,8 @@ pub fn command(rest: &[String], json_output: bool) -> Result<i32> {
             let _ = Command::new("launchctl")
                 .args(["bootout", &format!("gui/{uid}/{label}")])
                 .output();
-            wait(false)?;
+            wait(false, u64::MAX)?;
+            let since = std::fs::metadata(root.join("daemon.log")).map_or(0, |m| m.len());
             let status = Command::new("launchctl")
                 .args(["bootstrap", &format!("gui/{uid}")])
                 .arg(&path)
@@ -220,7 +238,7 @@ pub fn command(rest: &[String], json_output: bool) -> Result<i32> {
             if !status.success() {
                 bail!("launchctl bootstrap failed")
             }
-            wait(true)?;
+            wait(true, since)?;
             println!("daemon started ({label})");
             Ok(0)
         }
@@ -231,7 +249,7 @@ pub fn command(rest: &[String], json_output: bool) -> Result<i32> {
             if !output.status.success() && running() {
                 bail!("daemon is running outside launchd; stop that process directly")
             }
-            wait(false)?;
+            wait(false, u64::MAX)?;
             println!("daemon stopped");
             Ok(0)
         }
