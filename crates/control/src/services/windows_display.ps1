@@ -1,4 +1,4 @@
-param([int]$W,[int]$H)
+param([int]$W,[int]$H,[string]$Out)
 Add-Type @"
 using System;using System.Runtime.InteropServices;
 public class D{
@@ -17,4 +17,4 @@ $d=New-Object D+DM;$d.dmSize=[int][Runtime.InteropServices.Marshal]::SizeOf($d)
 [void][D]::EnumDisplaySettings($null,-1,[ref]$d)
 $d.dmPelsWidth=$W;$d.dmPelsHeight=$H;$d.dmFields=0x180000
 $r=[D]::ChangeDisplaySettings([ref]$d,1)
-"result=$r now=$($d.dmPelsWidth)x$($d.dmPelsHeight)"
+[IO.File]::WriteAllText($Out,"result=$r now=$($d.dmPelsWidth)x$($d.dmPelsHeight)")

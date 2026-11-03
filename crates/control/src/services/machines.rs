@@ -1653,7 +1653,7 @@ pub fn ssh_key(_: &Ctx, args: Value) -> Result<Value> {
 }
 
 /// The guest-side script: ChangeDisplaySettings with CDS_UPDATEREGISTRY, which only
-/// takes effect on the interactive desktop, so `display` runs it as a one-shot task.
+/// takes effect on the interactive desktop, so `resolution` runs it as a one-shot task.
 const DISPLAY_SCRIPT: &str = include_str!("windows_display.ps1");
 
 pub fn base64(bytes: &[u8]) -> String {
@@ -1682,13 +1682,23 @@ pub fn resolution(ctx: &Ctx, args: Value) -> Result<Value> {
     if !(640..=3840).contains(&w) || !(480..=2160).contains(&h) {
         return Err(invalid("size must be between 640x480 and 3840x2160"));
     }
+    // The SSH login is an administrator while the desktop belongs to the
+    // logged-on user (a standard user since the install split them), so the
+    // task runs with that user's interactive token, from a directory only
+    // SYSTEM, administrators and that user can open, hidden as session.ps1's is.
     let script = format!(
-        "$ErrorActionPreference='Stop'; $f=Join-Path $env:TEMP 'veynode-display.ps1'; $o=Join-Path $env:TEMP 'veynode-display.out'; \
+        "$ErrorActionPreference='Stop'; $u=(Get-CimInstance Win32_ComputerSystem).UserName; \
+         if(-not $u){{throw 'no user is logged on to the Windows desktop'}}; \
+         $d=Join-Path $env:ProgramData 'VeynodeVM\\display'; New-Item -ItemType Directory -Force $d | Out-Null; \
+         icacls.exe $d /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' ($u+':(OI)(CI)F') | Out-Null; \
+         $f=Join-Path $d 'display.ps1'; $o=Join-Path $d 'display.out'; \
          [IO.File]::WriteAllBytes($f,[Convert]::FromBase64String('{}')); Remove-Item $o -ErrorAction SilentlyContinue; \
-         schtasks /create /tn VeynodeDisplay /tr ('cmd /c powershell -NoProfile -ExecutionPolicy Bypass -File ' + $f + ' -W {w} -H {h} > ' + $o + ' 2>&1') /sc once /st 00:00 /it /ru $env:USERNAME /f | Out-Null; \
-         schtasks /run /tn VeynodeDisplay | Out-Null; \
-         for($i=0;$i -lt 80 -and -not ((Test-Path $o) -and (Get-Item $o).Length -gt 0);$i++){{Start-Sleep -Milliseconds 250}}; Get-Content $o; \
-         schtasks /delete /tn VeynodeDisplay /f | Out-Null",
+         $a=New-ScheduledTaskAction -Execute ($env:SystemRoot+'\\System32\\conhost.exe') -Argument ('--headless powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"'+$f+'\" -W {w} -H {h} -Out \"'+$o+'\"'); \
+         $p=New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive; \
+         Register-ScheduledTask -TaskName VeynodeDisplay -Action $a -Principal $p -Force | Out-Null; \
+         try {{ Start-ScheduledTask -TaskName VeynodeDisplay; \
+         for($i=0;$i -lt 80 -and -not ((Test-Path $o) -and (Get-Item $o).Length -gt 0);$i++){{Start-Sleep -Milliseconds 250}}; Get-Content $o }} \
+         finally {{ Unregister-ScheduledTask -TaskName VeynodeDisplay -Confirm:$false; Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue }}",
         base64(DISPLAY_SCRIPT.as_bytes())
     );
     let reply = ctx.vm(
