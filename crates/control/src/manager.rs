@@ -62,6 +62,9 @@ pub(crate) struct Manager {
     /// Registered VMs that failed the creation checks at registry load, with the reason. Such an entry stays in the
     /// registry as it is, is listed as `invalid` and is refused by `start`; nothing here ever removes it.
     pub(crate) invalid: BTreeMap<String, String>,
+    /// What the daemon turned off or set aside at its start so that it could start (a missing runtime piece, a
+    /// damaged registry), in plain words; `hello` reports them as `runtime.notices`.
+    pub(crate) notices: Vec<String>,
     pub(crate) jobs: Arc<Mutex<jobs::Jobs>>,
     pub(crate) file_sessions: FileSessionRoutes,
     /// Staged transfers of Windows guests, which go over SSH, not a worker.
@@ -329,12 +332,9 @@ impl Manager {
     }
     pub(crate) fn load(dir: PathBuf, backend: PathBuf, memory: MemoryBudget) -> Result<Self> {
         check_registry_schema(&dir)?;
-        let registry = dir.join("registry.json");
-        let configs = read_registry(&registry)?;
-        for (id, cfg) in &configs {
-            if *id != cfg.id {
-                bail!("registry identity mismatch")
-            }
+        let (configs, damaged) = load_registry(&dir)?;
+        if let Some(note) = &damaged {
+            log_line(&format!("vm-control: {note}"));
         }
         let snapshot_ops = snapshot_control::Operations::open(&dir)?;
         Ok(Self {
@@ -350,6 +350,7 @@ impl Manager {
             native_connections: BTreeMap::new(),
             configs,
             invalid: BTreeMap::new(),
+            notices: damaged.into_iter().collect(),
             jobs: Arc::new(Mutex::new(jobs::Jobs::default())),
             file_sessions: BTreeMap::new(),
             windows_files: Arc::default(),

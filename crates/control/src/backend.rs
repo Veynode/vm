@@ -27,6 +27,11 @@ impl QemuRegistration {
         self.console_broker.is_some() || self.screenshot_helper.is_some()
     }
     pub fn validate(&self) -> Result<()> {
+        self.validate_core()?;
+        self.validate_venus()
+    }
+    /// Everything but the Venus runtime: what QEMU machines cannot run without.
+    pub fn validate_core(&self) -> Result<()> {
         if self.console_broker.is_some() != self.console_helper.is_some() {
             bail!("QEMU console broker and native helper must be registered together")
         }
@@ -38,12 +43,22 @@ impl QemuRegistration {
             .chain(self.console_helper.iter())
         {
             if !path.is_absolute() || !path.is_file() {
-                bail!("QEMU runtime paths must be existing absolute files")
+                bail!(
+                    "the QEMU runtime file {} is missing or not an absolute path",
+                    path.display()
+                )
             }
         }
         if !self.resources.is_absolute() || !self.resources.is_dir() {
-            bail!("QEMU resources must be an existing absolute directory")
+            bail!(
+                "the QEMU resources folder {} is missing or not an absolute path",
+                self.resources.display()
+            )
         }
+        Ok(())
+    }
+    /// The registered Venus runtime, which Venus and Neptune GPUs need.
+    pub fn validate_venus(&self) -> Result<()> {
         // Its files, not this host: a release package carries the runtime to
         // every Mac, and Venus and Neptune report when the host lacks macOS 26.
         if let Some(path) = &self.venus_runtime {

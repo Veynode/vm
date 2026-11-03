@@ -305,25 +305,79 @@ fn registry_config_writer_refuses_protected_paths_with_typed_error() {
 }
 
 #[test]
-fn registry_duplicate_keys_fail_closed_with_the_key_and_no_rewrite() {
+fn registry_duplicate_keys_fail_the_strict_read_and_are_left_out_at_daemon_start() {
     let temp = tempfile::tempdir().unwrap();
     // Escaped spellings are the same decoded member name. The first definition is invalid at creation.
     for second in [r#""vm""#, r#""\u0076m""#] {
         let bytes = format!(
-            r#"{{"vm":{{"id":"vm","guest":"linux","cpus":0,"memory_mib":512}},{second}:{{"id":"vm","guest":"linux","cpus":1,"memory_mib":512}}}}"#
+            r#"{{"vm":{{"id":"vm","guest":"linux","cpus":0,"memory_mib":512}},{second}:{{"id":"vm","guest":"linux","cpus":1,"memory_mib":512}},"ok":{{"id":"ok","guest":"linux","cpus":1,"memory_mib":512}}}}"#
         );
-        fs::write(temp.path().join("registry.json"), &bytes).unwrap();
-        let error = load_registry(temp.path()).err().unwrap();
+        let path = temp.path().join("registry.json");
+        fs::write(&path, &bytes).unwrap();
+        let error = read_registry(&path).unwrap_err();
         assert!(
             matches!(error.downcast_ref::<RegistryError>(), Some(RegistryError::DuplicateKey(key)) if key == "vm"),
             "{error:#}"
         );
-        assert!(error.to_string().contains("vm"));
-        assert_eq!(
-            fs::read(temp.path().join("registry.json")).unwrap(),
-            bytes.as_bytes()
+        // Neither definition of the repeated key is served; the rest is, and the file stays as it was.
+        let mut manager = load_registry(temp.path()).unwrap();
+        let listed = call(&mut manager, "list", json!({})).unwrap();
+        let ids: Vec<_> = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|vm| vm["config"]["id"].clone())
+            .collect();
+        assert_eq!(ids, [json!("ok")]);
+        assert!(
+            manager.notices[0].contains("\"vm\""),
+            "{:?}",
+            manager.notices
         );
+        assert_eq!(fs::read(&path).unwrap(), bytes.as_bytes());
     }
+}
+
+#[test]
+fn a_damaged_registry_is_copied_aside_and_its_valid_entries_are_served() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("registry.json");
+    let bytes = br#"{"good":{"id":"good","guest":"linux","cpus":1,"memory_mib":512},
+        "other":{"id":"elsewhere","guest":"linux","cpus":1,"memory_mib":512},
+        "broken":{"id":"broken","cpus":"two"}}"#;
+    fs::write(&path, bytes).unwrap();
+    let backups = || {
+        fs::read_dir(temp.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".bad"))
+            .collect::<Vec<_>>()
+    };
+    let mut manager = load_registry(temp.path()).unwrap();
+    let listed = call(&mut manager, "list", json!({})).unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["config"]["id"], "good");
+    let notice = &manager.notices[0];
+    assert!(
+        notice.contains("1 VMs kept")
+            && notice.contains("\"other\"")
+            && notice.contains("\"broken\""),
+        "{notice}"
+    );
+    let saved = backups();
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    assert_eq!(fs::read(temp.path().join(&saved[0])).unwrap(), bytes);
+    // Started again on the same file: one copy still.
+    load_registry(temp.path()).unwrap();
+    assert_eq!(backups(), saved);
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+
+    // Not JSON at all: the daemon starts with no VMs.
+    fs::write(&path, b"{\"good\": {").unwrap();
+    let mut manager = load_registry(temp.path()).unwrap();
+    assert_eq!(call(&mut manager, "list", json!({})).unwrap(), json!([]));
+    assert_eq!(backups().len(), 2);
 }
 
 #[test]

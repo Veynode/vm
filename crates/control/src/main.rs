@@ -129,32 +129,60 @@ fn run() -> Result<()> {
     match action.as_str() {
         "daemon" => {
             // Explicit flags override the locally registered runtime.json.
-            let runtime = vm_control::home::Runtime::load()?;
+            // What runtime.json names is optional except the Apple
+            // Virtualization worker: a missing piece turns its feature off
+            // (said in `hello`) instead of stopping the daemon.
+            let (runtime, mut notices) = vm_control::home::Runtime::load_with_notes()?;
             let memory_budget_mib = memory_budget_mib.or(runtime.memory_budget_mib);
             let backend = backend
                 .or(runtime.backend)
-                .context("daemon requires --backend or runtime.json \"backend\" pointing to the vm-apple executable")?
-                .canonicalize()
-                .context("backend executable not found")?;
+                .context("no Apple Virtualization worker: pass --backend or name \"backend\" (the vm-apple executable) in runtime.json")?;
+            let backend = backend.canonicalize().with_context(|| {
+                format!(
+                    "the Apple Virtualization worker {} does not exist",
+                    backend.display()
+                )
+            })?;
             if qemu_options.is_empty() {
                 if let Some(q) = runtime.qemu {
-                    for (flag, path) in [
-                        ("--qemu-worker", Some(q.worker)),
-                        ("--qemu-launcher", Some(q.launcher)),
-                        ("--qemu-library", Some(q.library)),
-                        ("--qemu-resources", Some(q.resources)),
-                        ("--qemu-spice-library", q.spice_library),
-                        ("--qemu-screenshot-helper", q.screenshot_helper),
-                        ("--qemu-console-broker", q.console_broker),
-                        ("--qemu-console-helper", q.console_helper),
-                        ("--qemu-venus-runtime", q.venus_runtime),
-                    ] {
-                        if let Some(path) = path {
-                            let path = path
-                                .canonicalize()
-                                .with_context(|| format!("runtime.json {flag} path not found"))?;
-                            qemu_options.insert(flag.to_owned(), path);
+                    let required = [
+                        ("--qemu-worker", q.worker),
+                        ("--qemu-launcher", q.launcher),
+                        ("--qemu-library", q.library),
+                        ("--qemu-resources", q.resources),
+                    ];
+                    let missing: Vec<String> = required
+                        .iter()
+                        .filter(|(_, path)| path.canonicalize().is_err())
+                        .map(|(_, path)| path.display().to_string())
+                        .collect();
+                    if missing.is_empty() {
+                        for (flag, path) in required {
+                            qemu_options.insert(flag.to_owned(), path.canonicalize()?);
                         }
+                        for (flag, path) in [
+                            ("--qemu-spice-library", q.spice_library),
+                            ("--qemu-screenshot-helper", q.screenshot_helper),
+                            ("--qemu-console-broker", q.console_broker),
+                            ("--qemu-console-helper", q.console_helper),
+                            ("--qemu-venus-runtime", q.venus_runtime),
+                        ] {
+                            let Some(path) = path else { continue };
+                            match path.canonicalize() {
+                                Ok(path) => {
+                                    qemu_options.insert(flag.to_owned(), path);
+                                }
+                                Err(_) => notices.push(format!(
+                                    "{} is missing; QEMU runs without it",
+                                    path.display()
+                                )),
+                            }
+                        }
+                    } else {
+                        notices.push(format!(
+                            "QEMU machines are off: the QEMU runtime is missing {}",
+                            missing.join(", ")
+                        ));
                     }
                 }
             }
@@ -188,6 +216,7 @@ fn run() -> Result<()> {
                 memory_budget_mib,
                 qemu,
                 worker_key_event_log_dir,
+                notices,
             )
         }
         "mcp" => vm_control::mcp_serve(

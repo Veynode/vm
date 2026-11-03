@@ -358,7 +358,7 @@ impl Registration {
             None => catalog(),
         };
         if self.schema != approved.schema || self.profile_revision != approved.profile_revision {
-            bail!("unsupported Venus runtime profile revision")
+            bail!("the Venus GPU runtime is a revision this daemon does not support")
         }
         let roles = [
             ("loader", &self.loader),
@@ -372,7 +372,7 @@ impl Registration {
         for (name, artifact) in roles {
             // The manifest cannot authorize a substitute renderer or unpatched PGID owner.
             if approved.roles.get(name) != Some(&artifact.sha256) {
-                bail!("unreviewed Venus runtime artifact")
+                bail!("the Venus GPU runtime's {name} is not the reviewed build")
             }
             hash_file(&artifact.path, &artifact.sha256)
                 .with_context(|| format!("Venus {name} validation"))?;
@@ -381,7 +381,7 @@ impl Registration {
             || Some(self.spice_library.path.as_path()) != spice
             || resources.join("edk2-aarch64-code.fd").canonicalize()? != self.firmware.path
         {
-            bail!("Venus registration does not match local QEMU/SPICE/firmware registration")
+            bail!("the Venus GPU runtime belongs to another QEMU runtime than the registered one")
         }
         if !self.frameworks_dir.is_absolute()
             || self.frameworks_dir.canonicalize()? != self.frameworks_dir

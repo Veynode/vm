@@ -1951,6 +1951,7 @@ mod tests {
                     reason: [("neptune".to_owned(), "no dxmt".to_owned())].into(),
                     ..Default::default()
                 }),
+                ..Default::default()
             },
             qemu_resources: Some(resources.path().to_owned()),
             client: String::new(),

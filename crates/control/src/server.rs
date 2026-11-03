@@ -10,7 +10,7 @@ pub fn serve_with_qemu(
     memory_budget_mib: Option<u64>,
     qemu: Option<QemuRegistration>,
 ) -> Result<()> {
-    serve_with_worker_key_event_log(dir, backend, memory_budget_mib, qemu, None)
+    serve_with_worker_key_event_log(dir, backend, memory_budget_mib, qemu, None, Vec::new())
 }
 pub fn serve_with_worker_key_event_log(
     dir: PathBuf,
@@ -18,14 +18,14 @@ pub fn serve_with_worker_key_event_log(
     memory_budget_mib: Option<u64>,
     qemu: Option<QemuRegistration>,
     worker_key_event_log_dir: Option<PathBuf>,
+    notices: Vec<String>,
 ) -> Result<()> {
     let _log_drain = LogDrain;
     let worker_key_event_log_dir = worker_key_event_log_dir
         .map(|path| validate_worker_key_event_log_dir(&path))
         .transpose()?;
-    if let Some(registration) = &qemu {
-        registration.validate()?;
-    }
+    let mut notices = notices;
+    let qemu = qemu.and_then(|registration| usable_qemu(registration, &mut notices));
     let memory = MemoryBudget::detect(memory_budget_mib)?;
     private_dir(&dir)?;
     // Snapshot state is opened component by component without following symlinks.
@@ -52,10 +52,22 @@ pub fn serve_with_worker_key_event_log(
         .as_ref()
         .and_then(|q| q.console_broker.as_ref().zip(q.console_helper.as_ref()))
     {
-        Some((broker, helper)) => backend::probe_broker_window(broker, helper)?,
+        Some((broker, helper)) => match backend::probe_broker_window(broker, helper) {
+            Ok(window) => window,
+            Err(error) => {
+                notices.push(format!(
+                    "QEMU machine windows are off: the console helper did not answer its check ({error:#})"
+                ));
+                json!({"native_window":false,"display_only":true,"input_enabled":false})
+            }
+        },
         None => json!({"native_window":false,"display_only":true,"input_enabled":false}),
     };
     manager.qemu = qemu;
+    for notice in &notices {
+        log_line(&format!("vm-control: {notice}"));
+    }
+    manager.notices.extend(notices);
     manager.validate_registry();
     let manager = Arc::new(Mutex::new(manager));
     spawn_exit_monitor(&manager);
@@ -77,6 +89,31 @@ pub fn serve_with_worker_key_event_log(
         });
     }
     Ok(())
+}
+/// The QEMU registration the daemon can serve: a broken one turns QEMU, its
+/// console or its Venus GPUs off, with a notice, instead of stopping the
+/// daemon and the machines of the other backend.
+pub(crate) fn usable_qemu(
+    mut registration: QemuRegistration,
+    notices: &mut Vec<String>,
+) -> Option<QemuRegistration> {
+    if registration.console_broker.is_some() != registration.console_helper.is_some() {
+        notices.push(
+            "QEMU machine windows and screenshots through the console are off: the console needs both its broker and its helper".into(),
+        );
+        registration.console_broker = None;
+        registration.console_helper = None;
+    }
+    if let Err(error) = registration.validate_core() {
+        notices.push(format!("QEMU machines are off: {error:#}"));
+        return None;
+    }
+    if let Err(error) = registration.validate_venus() {
+        // Kept registered: a Venus or Neptune start checks it again and
+        // refuses with the reason; virgl and no GPU never read it.
+        notices.push(format!("Venus and Neptune GPUs are off: {error:#}"));
+    }
+    Some(registration)
 }
 /// Effective uid of the process at the other end of a connected `control.sock` stream, as recorded by the kernel.
 pub(crate) fn peer_euid(stream: &UnixStream) -> Result<libc::uid_t> {
@@ -284,4 +321,79 @@ pub(crate) fn call_reply(
         }));
     }
     Ok(Ok(reply.get_mut("result").map_or(Value::Null, Value::take)))
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    fn registration(root: &Path) -> QemuRegistration {
+        let file = |name: &str| {
+            let path = root.join(name);
+            fs::write(&path, b"fixture").unwrap();
+            path
+        };
+        let resources = root.join("share");
+        fs::create_dir_all(&resources).unwrap();
+        QemuRegistration {
+            worker: file("vm-qemu"),
+            launcher: file("launcher"),
+            library: file("qemu.dylib"),
+            resources,
+            spice_library: None,
+            screenshot_helper: None,
+            console_broker: None,
+            console_helper: None,
+            venus_runtime: None,
+        }
+    }
+
+    #[test]
+    fn a_broken_qemu_registration_turns_its_feature_off_instead_of_the_daemon() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut notices = Vec::new();
+        assert!(usable_qemu(registration(&root), &mut notices).is_some());
+        assert!(notices.is_empty());
+
+        // QEMU itself gone: QEMU off, the daemon serves the rest.
+        let gone = QemuRegistration {
+            worker: root.join("gone/vm-qemu"),
+            ..registration(&root)
+        };
+        assert!(usable_qemu(gone, &mut notices).is_none());
+        assert!(
+            notices[0].starts_with("QEMU machines are off") && notices[0].contains("gone/vm-qemu"),
+            "{notices:?}"
+        );
+
+        // A console broker without its helper: the console is off, QEMU is not.
+        let mut notices = Vec::new();
+        let half = QemuRegistration {
+            console_broker: Some(root.join("vm-qemu")),
+            ..registration(&root)
+        };
+        let usable = usable_qemu(half, &mut notices).unwrap();
+        assert!(usable.console_broker.is_none() && usable.console_helper.is_none());
+        assert_eq!(notices.len(), 1);
+
+        // A Venus runtime that does not check out: Venus and Neptune off, the
+        // registration kept so a GPU start refuses with the reason.
+        let mut notices = Vec::new();
+        let venus = root.join("venus.json");
+        fs::write(&venus, b"{}").unwrap();
+        let usable = usable_qemu(
+            QemuRegistration {
+                venus_runtime: Some(venus.clone()),
+                ..registration(&root)
+            },
+            &mut notices,
+        )
+        .unwrap();
+        assert_eq!(usable.venus_runtime, Some(venus));
+        assert!(
+            notices[0].starts_with("Venus and Neptune GPUs are off"),
+            "{notices:?}"
+        );
+    }
 }

@@ -104,11 +104,15 @@ pub(crate) fn read_state_file(file: File, path: &Path, limit: usize) -> Result<V
     }
     Ok(bytes)
 }
+/// The registry, refused whole when it is not valid (`load_registry` is the daemon's tolerant reading).
+#[cfg(test)]
 pub(crate) fn read_registry(path: &Path) -> Result<BTreeMap<String, Config>> {
     let Some(file) = open_state_file(path)? else {
         return Ok(BTreeMap::new());
     };
-    let bytes = read_state_file(file, path, 16 * MAX_MESSAGE)?;
+    parse_registry(&read_state_file(file, path, 16 * MAX_MESSAGE)?)
+}
+fn parse_registry(bytes: &[u8]) -> Result<BTreeMap<String, Config>> {
     struct RegistryVisitor<'a> {
         duplicate: &'a mut Option<String>,
     }
@@ -133,7 +137,7 @@ pub(crate) fn read_registry(path: &Path) -> Result<BTreeMap<String, Config>> {
         }
     }
     let mut duplicate = None;
-    let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let result = serde::Deserializer::deserialize_map(
         &mut deserializer,
         RegistryVisitor {
@@ -147,7 +151,119 @@ pub(crate) fn read_registry(path: &Path) -> Result<BTreeMap<String, Config>> {
     deserializer
         .end()
         .context("invalid registry; preserving original")?;
+    for (id, config) in &configs {
+        if *id != config.id {
+            bail!(
+                "registry entry {id:?} names another VM id ({:?})",
+                config.id
+            )
+        }
+    }
     Ok(configs)
+}
+
+/// The registry as the daemon starts with it. A file that is not a valid registry does not stop the daemon: it is
+/// copied aside once per content (`registry.json.<hash>.bad`, beside it), the entries in it that are valid on their own
+/// are served, and the note says what was left out. `registry.json` itself is not rewritten here; the next change to
+/// the registry writes the served entries. An unreadable file (not a regular file, over the size limit) still refuses
+/// the start.
+pub(crate) fn load_registry(dir: &Path) -> Result<(BTreeMap<String, Config>, Option<String>)> {
+    let path = dir.join("registry.json");
+    let Some(file) = open_state_file(&path)? else {
+        return Ok((BTreeMap::new(), None));
+    };
+    let bytes = read_state_file(file, &path, 16 * MAX_MESSAGE)?;
+    let error = match parse_registry(&bytes) {
+        Ok(configs) => return Ok((configs, None)),
+        Err(error) => error,
+    };
+    let (configs, left_out) = salvage_registry(&bytes);
+    let hash = bytes.iter().fold(0xcbf29ce484222325u64, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
+    });
+    let backup = dir.join(format!("registry.json.{hash:016x}.bad"));
+    let saved = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&backup)
+    {
+        Ok(mut file) => file.write_all(&bytes).and_then(|()| file.sync_all()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    };
+    let copy = match saved {
+        Ok(()) => format!("a copy of the file is {}", backup.display()),
+        Err(e) => format!("copying it to {} failed ({e})", backup.display()),
+    };
+    let left_out = if left_out.is_empty() {
+        "nothing was left out".to_owned()
+    } else {
+        format!("left out: {}", left_out.join(", "))
+    };
+    let reason = format!("{error:#}");
+    let reason = reason.trim_end_matches("; preserving original");
+    let note = format!(
+        "the VM registry was damaged ({reason}); {} VMs kept, {left_out}; {copy}",
+        configs.len()
+    );
+    Ok((configs, Some(note)))
+}
+
+/// The entries of a damaged registry that are valid on their own: a key given more than once, an entry that is not a
+/// VM configuration or names another id is left out (its id in the second list). Nothing, when the file is not a
+/// JSON object.
+fn salvage_registry(bytes: &[u8]) -> (BTreeMap<String, Config>, Vec<String>) {
+    let Ok(entries) = serde_json::from_slice::<Entries>(bytes) else {
+        return (BTreeMap::new(), vec!["the whole file".to_owned()]);
+    };
+    let mut counts = BTreeMap::<&str, usize>::new();
+    for (id, _) in &entries.0 {
+        *counts.entry(id).or_default() += 1;
+    }
+    let mut configs = BTreeMap::new();
+    let mut left_out = Vec::new();
+    for (id, value) in &entries.0 {
+        let config = (counts[id.as_str()] == 1)
+            .then(|| serde_json::from_value::<Config>(value.clone()).ok())
+            .flatten()
+            .filter(|config| config.id == *id);
+        match config {
+            Some(config) => {
+                configs.insert(id.clone(), config);
+            }
+            None if !left_out.contains(&format!("{id:?}")) => left_out.push(format!("{id:?}")),
+            None => {}
+        }
+    }
+    (configs, left_out)
+}
+
+/// A JSON object's members in order, repeated keys included.
+struct Entries(Vec<(String, Value)>);
+impl<'de> Deserialize<'de> for Entries {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct Members;
+        impl<'de> serde::de::Visitor<'de> for Members {
+            type Value = Entries;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a JSON object")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> std::result::Result<Entries, M::Error> {
+                let mut entries = Vec::new();
+                while let Some(entry) = map.next_entry::<String, Value>()? {
+                    entries.push(entry);
+                }
+                Ok(Entries(entries))
+            }
+        }
+        deserializer.deserialize_map(Members)
+    }
 }
 
 pub use veynodevm_api::validate_id;

@@ -28,6 +28,11 @@ The daemon's interface for every client: the `veynodevm` CLI, the MCP server, th
 and in `reason` why one cannot. The daemon checks the runtime's files once and answers from that check while their
 sizes and modification times stay the same; `machine.start` checks again.
 
+`runtime.notices`, present when not empty, says in plain words what the daemon turned off or set aside so that it
+could start: a registered runtime path that is gone (the bundled one is used), a QEMU runtime, console helper or Venus
+runtime that failed its check (that feature is off; the rest runs), or a damaged `registry.json` (copied aside as
+`registry.json.<hash>.bad` in the state directory; its valid entries are served). Show them to the person.
+
 `methods` lists every method this daemon serves. A daemon that does not serve the asked `api` answers
 `{"error":"…","code":"version"}` and closes. A daemon older than API 1 answers `hello` itself with an error and no
 code; the bundled clients (`veynodevm-api`, `web/daemon.mjs`) report both as `version` and say to restart the

@@ -127,11 +127,16 @@ fn hello_answer(runtime: Runtime) -> Hello {
     }
 }
 
-fn runtime(apple_virtualization: bool, qemu: Option<&QemuRegistration>) -> Runtime {
+fn runtime(
+    apple_virtualization: bool,
+    qemu: Option<&QemuRegistration>,
+    notices: Vec<String>,
+) -> Runtime {
     Runtime {
         apple_virtualization,
         qemu: qemu.is_some(),
         gpu: qemu.map(gpu_cached),
+        notices,
     }
 }
 
@@ -237,16 +242,17 @@ pub(crate) fn serve(
         .chars()
         .take(128)
         .collect::<String>();
-    let (state_dir, apple_virtualization, qemu) = {
+    let (state_dir, apple_virtualization, qemu, notices) = {
         let manager = manager.lock().unwrap();
         (
             manager.dir.clone(),
             manager.backend.is_file(),
             manager.qemu.clone(),
+            manager.notices.clone(),
         )
     };
     // Outside the lock: a GPU check that misses its cache takes seconds.
-    let runtime = runtime(apple_virtualization, qemu.as_ref());
+    let runtime = runtime(apple_virtualization, qemu.as_ref(), notices);
     let hello = hello_answer(runtime.clone());
     let ctx = Ctx {
         state_dir,
