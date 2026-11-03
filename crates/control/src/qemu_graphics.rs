@@ -372,7 +372,7 @@ impl Registration {
         for (name, artifact) in roles {
             // The manifest cannot authorize a substitute renderer or unpatched PGID owner.
             if approved.roles.get(name) != Some(&artifact.sha256) {
-                bail!("the Venus GPU runtime's {name} is not the reviewed build")
+                bail!("the Venus GPU runtime's {name} is an unreviewed build")
             }
             hash_file(&artifact.path, &artifact.sha256)
                 .with_context(|| format!("Venus {name} validation"))?;

@@ -136,7 +136,7 @@ fn run() -> Result<()> {
             let memory_budget_mib = memory_budget_mib.or(runtime.memory_budget_mib);
             let backend = backend
                 .or(runtime.backend)
-                .context("no Apple Virtualization worker: pass --backend or name \"backend\" (the vm-apple executable) in runtime.json")?;
+                .context("no Apple Virtualization worker: the daemon requires --backend or \"backend\" (the vm-apple executable) in runtime.json")?;
             let backend = backend.canonicalize().with_context(|| {
                 format!(
                     "the Apple Virtualization worker {} does not exist",

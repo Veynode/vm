@@ -363,7 +363,7 @@ pub(crate) fn prune_run_logs(dir: &Path, id: &str, keep: usize) {
         run.1.push(entry.path());
     }
     let mut runs: Vec<_> = runs.into_values().collect();
-    runs.sort_by(|a, b| b.0.cmp(&a.0));
+    runs.sort_by_key(|run| std::cmp::Reverse(run.0));
     for (_, files) in runs.into_iter().skip(keep) {
         for file in files {
             let _ = fs::remove_file(file);
