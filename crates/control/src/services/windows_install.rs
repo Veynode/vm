@@ -160,6 +160,26 @@ fn openssh_setup(authorized_key: &str) -> String {
     format!("powershell -NoProfile -ExecutionPolicy Bypass -Command \"{script}\"")
 }
 
+/// Keeps the clock right. The guest has no clock of its own that Windows
+/// reads, so each boot resumes from the time of the last shutdown, and a
+/// machine in no domain leaves Windows Time stopped (a sync a week): sessions,
+/// certificates and HTTPS read it. Windows Time starts with Windows, asks
+/// every 15 minutes, and may step the clock however far it is off.
+fn time_sync() -> String {
+    let client = "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\W32Time";
+    let script = [
+        "Set-Service w32time -StartupType Automatic".to_owned(),
+        "Start-Service w32time".to_owned(),
+        format!("Set-ItemProperty {client}\\TimeProviders\\NtpClient -Name SpecialPollInterval -Value 900"),
+        format!("Set-ItemProperty {client}\\Config -Name MaxPosPhaseCorrection -Value 0xFFFFFFFF"),
+        format!("Set-ItemProperty {client}\\Config -Name MaxNegPhaseCorrection -Value 0xFFFFFFFF"),
+        "w32tm /config /manualpeerlist:'time.apple.com,0x9 time.windows.com,0x9' /syncfromflags:manual /update | Out-Null".to_owned(),
+        "w32tm /resync /force | Out-Null".to_owned(),
+    ]
+    .join("; ");
+    format!("powershell -NoProfile -ExecutionPolicy Bypass -Command \"{script}\"")
+}
+
 /// Makes [`ADMIN`] and leaves `user` a standard user. Run last, from the
 /// first sign-in, which still has the administrator's rights it gives up.
 fn accounts(user: &str) -> String {
@@ -271,6 +291,7 @@ pub fn answer(
     first_logon.extend([
         openssh_install(),
         openssh_setup(authorized_key),
+        time_sync(),
         accounts(user),
         // Powering off tells the host the install is complete.
         "shutdown /s /t 20 /c \"VeynodeVM install complete\"".to_owned(),
@@ -847,6 +868,10 @@ mod tests {
         );
         assert!(!xml.contains("veynode-admin</Name>"));
         assert!(accounts(USER).len() <= 1024);
+        // The clock is kept by Windows Time from the first boot on.
+        assert!(xml.contains("Set-Service w32time -StartupType Automatic"));
+        assert!(xml.contains("SpecialPollInterval -Value 900"));
+        assert!(time_sync().len() <= 1024);
         // The last first-logon command powers the machine off.
         let last = xml.rfind("<Order>").unwrap();
         assert!(xml[last..].contains("shutdown /s /t 20"));
