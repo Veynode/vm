@@ -38,8 +38,9 @@ class InstallDistroTests(unittest.TestCase):
         self.assertTrue(any('NetKVM\\w11\\ARM64\\*.inf' in c for c in commands))
         self.assertIn('powercfg /hibernate off', commands)
         self.assertTrue(commands[-1].startswith('shutdown /s'))
-        ssh = commands[-2]
+        ssh = commands[-3]
         self.assertIn("OpenSSH.Server*", ssh)
+        self.assertLess(len(commands[-2]), 1024)
         self.assertIn("C:\\ProgramData\\ssh\\administrators_authorized_keys 'ssh-ed25519 AAAAC3Nza+/x= veynodevm-test'", ssh)
         self.assertLess(len(ssh), 1024)  # FirstLogonCommands CommandLine limit
 
@@ -77,7 +78,10 @@ class InstallDistroTests(unittest.TestCase):
         self.assertNotIn('Defender', joined)
         self.assertNotIn('WinDefend', joined)
         self.assertTrue(all(len(c) < 1024 for c in commands))  # CommandLine limit
-        self.assertIn('OpenSSH.Server*', commands[-2])
+        self.assertIn('OpenSSH.Server*', commands[-3])
+        # The host's key-only administrator, and the logon user left standard.
+        self.assertIn('New-LocalUser -Name veynode-admin', commands[-2])
+        self.assertIn('Remove-LocalGroupMember -SID S-1-5-32-544', commands[-2])
         self.assertTrue(commands[-1].startswith('shutdown /s'))
 
         plain = self.windows_first_logon(guest_tuning=False)

@@ -127,7 +127,11 @@ fn create_args(rest: &[String]) -> Result<Value> {
             args.insert(field.into(), json!(value));
         }
     }
-    for (flag, field) in [("iso", "iso"), ("disk", "disk"), ("drivers-iso", "driversIso")] {
+    for (flag, field) in [
+        ("iso", "iso"),
+        ("disk", "disk"),
+        ("drivers-iso", "driversIso"),
+    ] {
         if let Some(path) = p.value(flag) {
             args.insert(field.into(), json!(absolute(path)?));
         }
