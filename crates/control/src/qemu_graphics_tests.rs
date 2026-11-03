@@ -426,3 +426,119 @@ fn registration_cannot_supply_its_own_compiled_source_qemu_policy() {
         json!("/attacker/VeynodeQEMUDevelopment.framework/Versions/A/VeynodeQEMUDevelopment");
     assert!(serde_json::from_value::<Registration>(value).is_err());
 }
+
+/// A release package's own runtime: relative registration, MANIFEST.json pins.
+fn package_fixture() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let package = dir.path().canonicalize().unwrap();
+    let files: [(&str, &[u8]); 8] = [
+        ("venus/probe-loader", b"loader @executable_path/../Frameworks\0"),
+        ("venus/libvirglrenderer.1.dylib", b"host @loader_path/../Frameworks\0"),
+        ("venus/virgl_render_server", b"server @executable_path/../Frameworks\0"),
+        ("Frameworks/qemu-aarch64-softmmu.framework/Versions/A/qemu-aarch64-softmmu", b"qemu"),
+        ("Frameworks/libspice-server-fixed.dylib", b"spice"),
+        ("Frameworks/MoltenVK.framework/Versions/A/MoltenVK", b"moltenvk"),
+        ("Resources/vulkan/icd.d/MoltenVK_icd.json", br#"{"ICD":{"library_path":"../../../Frameworks/MoltenVK.framework/Versions/Current/MoltenVK","is_portability_driver":true}}"#),
+        ("share/edk2-aarch64-code.fd", b"firmware"),
+    ];
+    let mut manifest = vec![];
+    for (path, bytes) in files {
+        let full = package.join("libexec/qemu").join(path);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(&full, bytes).unwrap();
+        manifest.push(json!({"path": format!("libexec/qemu/{path}"), "sha256": format!("{:x}", Sha256::digest(bytes))}));
+    }
+    symlink(
+        "A",
+        package.join("libexec/qemu/Frameworks/MoltenVK.framework/Versions/Current"),
+    )
+    .unwrap();
+    manifest.push(json!({"path": "libexec/qemu/Frameworks/MoltenVK.framework/Versions/Current/MoltenVK", "sha256": format!("{:x}", Sha256::digest(b"moltenvk"))}));
+    fs::write(
+        package.join("MANIFEST.json"),
+        serde_json::to_vec(&json!({"files": manifest})).unwrap(),
+    )
+    .unwrap();
+    let sha = |p: &str| {
+        format!(
+            "{:x}",
+            Sha256::digest(fs::read(package.join("libexec/qemu").join(p)).unwrap())
+        )
+    };
+    let artifact = |p: &str| json!({"path": format!("../{p}"), "sha256": sha(p)});
+    let registration = package.join("libexec/qemu/venus/registration.json");
+    fs::write(&registration, serde_json::to_vec(&json!({
+        "schema": 1, "profile_revision": "owned-group-v1", "frameworks_dir": "../Frameworks",
+        "loader": artifact("venus/probe-loader"),
+        "host_library": artifact("venus/libvirglrenderer.1.dylib"),
+        "render_server": artifact("venus/virgl_render_server"),
+        "qemu_library": artifact("Frameworks/qemu-aarch64-softmmu.framework/Versions/A/qemu-aarch64-softmmu"),
+        "spice_library": artifact("Frameworks/libspice-server-fixed.dylib"),
+        "icd": artifact("Resources/vulkan/icd.d/MoltenVK_icd.json"),
+        "firmware": artifact("share/edk2-aarch64-code.fd"),
+    })).unwrap()).unwrap();
+    fs::set_permissions(&registration, fs::Permissions::from_mode(0o600)).unwrap();
+    (dir, package)
+}
+
+#[test]
+fn package_runtime_is_admitted_by_its_own_manifest_only() {
+    let (_dir, package) = package_fixture();
+    let runtime = package.join("libexec/qemu");
+    let reg = Registration::load(&runtime.join("venus/registration.json")).unwrap();
+    assert_eq!(reg.frameworks_dir, runtime.join("Frameworks"));
+    let qemu =
+        runtime.join("Frameworks/qemu-aarch64-softmmu.framework/Versions/A/qemu-aarch64-softmmu");
+    let spice = runtime.join("Frameworks/libspice-server-fixed.dylib");
+    let validate = |package: Option<&Path>| {
+        reg.validate_in(&qemu, &runtime.join("share"), Some(&spice), package)
+    };
+    validate(Some(&package)).unwrap();
+    // Another binary's package, or none: the compiled catalog refuses it.
+    assert!(validate(None)
+        .unwrap_err()
+        .to_string()
+        .contains("unreviewed"));
+    assert!(validate(Some(Path::new("/elsewhere"))).is_err());
+    // A framework file that differs from the manifest.
+    fs::write(
+        runtime.join("Frameworks/MoltenVK.framework/Versions/A/MoltenVK"),
+        b"other",
+    )
+    .unwrap();
+    assert!(validate(Some(&package)).is_err());
+    fs::write(
+        runtime.join("Frameworks/MoltenVK.framework/Versions/A/MoltenVK"),
+        b"moltenvk",
+    )
+    .unwrap();
+    validate(Some(&package)).unwrap();
+    // A renderer outside the package has no manifest entry.
+    let mut outside = reg.clone();
+    outside.render_server.path = package.join("virgl_render_server");
+    fs::copy(
+        runtime.join("venus/virgl_render_server"),
+        &outside.render_server.path,
+    )
+    .unwrap();
+    assert!(outside
+        .validate_in(&qemu, &runtime.join("share"), Some(&spice), Some(&package))
+        .is_err());
+    // The package's run path, not an absolute one, is what a packaged loader carries.
+    fs::write(runtime.join("venus/probe-loader"), b"loader /abs\0").unwrap();
+    let mut manifest: Value =
+        serde_json::from_slice(&fs::read(package.join("MANIFEST.json")).unwrap()).unwrap();
+    manifest["files"][0]["sha256"] = json!(format!("{:x}", Sha256::digest(b"loader /abs\0")));
+    fs::write(
+        package.join("MANIFEST.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let mut moved = reg.clone();
+    moved.loader.sha256 = format!("{:x}", Sha256::digest(b"loader /abs\0"));
+    assert!(moved
+        .validate_in(&qemu, &runtime.join("share"), Some(&spice), Some(&package))
+        .unwrap_err()
+        .to_string()
+        .contains("rpath"));
+}

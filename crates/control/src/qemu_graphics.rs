@@ -133,6 +133,82 @@ fn catalog() -> Catalog {
     serde_json::from_str(include_str!("qemu_venus_catalog.json")).expect("compiled Venus catalog")
 }
 
+/// Where a release package keeps its QEMU/GPU runtime, relative to the
+/// package (scripts/package-release.py).
+const BUNDLED_RUNTIME: &str = "libexec/qemu";
+
+/// The release package this binary runs from: `bin/..`.
+fn own_package() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+    Some(exe.parent()?.parent()?.to_path_buf())
+}
+
+#[derive(Deserialize)]
+struct PackageManifest {
+    files: Vec<PackageFile>,
+}
+#[derive(Deserialize)]
+struct PackageFile {
+    path: PathBuf,
+    sha256: String,
+}
+
+impl Registration {
+    /// The package's own GPU runtime is built and signed with the package, so
+    /// no compiled hash can name it: its MANIFEST.json, beside the binary
+    /// validating it, pins every role and every file under Frameworks
+    /// instead. A role outside the package has no entry and is refused.
+    fn bundled_catalog(&self, package: &Path) -> Result<Catalog> {
+        let mut bytes = Vec::new();
+        safe_file(&package.join("MANIFEST.json"), 16 * 1024 * 1024, false)?
+            .take(16 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)?;
+        let manifest: PackageManifest =
+            serde_json::from_slice(&bytes).context("invalid package MANIFEST.json")?;
+        let hashes: BTreeMap<PathBuf, String> = manifest
+            .files
+            .into_iter()
+            .map(|f| (package.join(f.path), f.sha256))
+            .collect();
+        let compiled = catalog();
+        let mut roles = BTreeMap::new();
+        for (name, artifact) in [
+            ("loader", &self.loader),
+            ("host_library", &self.host_library),
+            ("render_server", &self.render_server),
+            ("qemu_library", &self.qemu_library),
+            ("spice_library", &self.spice_library),
+            ("icd", &self.icd),
+            ("firmware", &self.firmware),
+        ] {
+            let sha = hashes
+                .get(&artifact.path)
+                .context("packaged GPU runtime file missing from MANIFEST.json")?;
+            roles.insert(name.to_owned(), sha.clone());
+        }
+        // A framework's symlinks (Versions/Current, its top-level name) list
+        // their target's bytes again; the target itself is hashed.
+        let frameworks: BTreeMap<String, String> = hashes
+            .iter()
+            .filter_map(|(path, sha)| {
+                let relative = path.strip_prefix(&self.frameworks_dir).ok()?;
+                let alias = path.canonicalize().is_ok_and(|c| &c != path);
+                (!alias).then(|| (relative.to_string_lossy().into_owned(), sha.clone()))
+            })
+            .collect();
+        if frameworks.is_empty() {
+            bail!("package MANIFEST.json lists no GPU runtime frameworks")
+        }
+        Ok(Catalog {
+            schema: compiled.schema,
+            profile_revision: compiled.profile_revision,
+            roles,
+            frameworks,
+            source_qemu_library: None,
+        })
+    }
+}
+
 /// Observed host constraints for the exact compiled catalog, not live Guest API support.
 /// A catalog replacement requires its own real query instead of inheriting this result.
 pub fn host_api_constraints(profile: Profile) -> Value {
@@ -233,11 +309,54 @@ impl Registration {
         if bytes.len() > 64 * 1024 {
             bail!("Venus registration size bound")
         }
-        let value: Self = serde_json::from_slice(&bytes).context("invalid Venus registration")?;
+        let mut value: Self =
+            serde_json::from_slice(&bytes).context("invalid Venus registration")?;
+        // A release package's registration names its files relative to itself.
+        let dir = path
+            .parent()
+            .context("Venus registration has no directory")?;
+        let resolve = |p: &mut PathBuf| -> Result<()> {
+            if p.is_relative() {
+                *p = dir
+                    .join(&*p)
+                    .canonicalize()
+                    .with_context(|| format!("Venus runtime file {} missing", p.display()))?;
+            }
+            Ok(())
+        };
+        resolve(&mut value.frameworks_dir)?;
+        for artifact in [
+            &mut value.loader,
+            &mut value.host_library,
+            &mut value.render_server,
+            &mut value.qemu_library,
+            &mut value.spice_library,
+            &mut value.icd,
+            &mut value.firmware,
+        ] {
+            resolve(&mut artifact.path)?;
+        }
         Ok(value)
     }
     pub fn validate(&self, qemu: &Path, resources: &Path, spice: Option<&Path>) -> Result<()> {
-        let approved = catalog();
+        self.validate_in(qemu, resources, spice, own_package().as_deref())
+    }
+    /// `package`: the release package this process runs from. Its own GPU
+    /// runtime is admitted by the package's MANIFEST.json, any other by the
+    /// compiled catalog.
+    fn validate_in(
+        &self,
+        qemu: &Path,
+        resources: &Path,
+        spice: Option<&Path>,
+        package: Option<&Path>,
+    ) -> Result<()> {
+        let package =
+            package.filter(|p| self.frameworks_dir == p.join(BUNDLED_RUNTIME).join("Frameworks"));
+        let approved = match package {
+            Some(package) => self.bundled_catalog(package)?,
+            None => catalog(),
+        };
         if self.schema != approved.schema || self.profile_revision != approved.profile_revision {
             bail!("unsupported Venus runtime profile revision")
         }
@@ -273,15 +392,28 @@ impl Registration {
             hash_file(&self.frameworks_dir.join(relative), expected)?;
         }
         qemu_dependency_layout(&approved, &self.frameworks_dir, &self.qemu_library.path)?;
-        // Reviewed loader/server/host image have this fixed absolute LC_RPATH.
+        // Reviewed loader/server/host image have this fixed absolute LC_RPATH;
+        // a package's have the run path from their directory beside Frameworks.
         // Their exact binary hashes above prevent a different Mach-O layout being admitted.
-        let mut rpath = self.frameworks_dir.as_os_str().as_encoded_bytes().to_vec();
-        rpath.push(0);
-        let mut rpath_artifacts = vec![&self.loader, &self.host_library, &self.render_server];
+        let mut absolute = self.frameworks_dir.as_os_str().as_encoded_bytes().to_vec();
+        absolute.push(0);
+        let mut rpath_artifacts = vec![
+            (&self.loader, "@executable_path"),
+            (&self.host_library, "@loader_path"),
+            (&self.render_server, "@executable_path"),
+        ];
         if approved.source_qemu_library.is_some() {
-            rpath_artifacts.push(&self.qemu_library);
+            rpath_artifacts.push((&self.qemu_library, "@loader_path"));
         }
-        for artifact in rpath_artifacts {
+        for (artifact, origin) in rpath_artifacts {
+            let rpath = if package.is_some() {
+                if artifact.path.parent().and_then(Path::parent) != self.frameworks_dir.parent() {
+                    bail!("packaged GPU runtime file outside its runtime directory")
+                }
+                format!("{origin}/../Frameworks\0").into_bytes()
+            } else {
+                absolute.clone()
+            };
             let mut bytes = Vec::new();
             safe_file(&artifact.path, 128 * 1024 * 1024, false)?
                 .take(128 * 1024 * 1024 + 1)

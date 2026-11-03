@@ -105,6 +105,24 @@ class PackageReleaseTest(unittest.TestCase):
         runtime = release.shipped_runtime({}, False, True)['qemu']
         self.assertEqual(runtime['launcher'], '../libexec/qemu/probe-loader')
         self.assertEqual(runtime['library'], '../libexec/qemu/Frameworks/' + release.QEMU_LIBRARY)
+        self.assertEqual(runtime['venus_runtime'], '../libexec/qemu/venus/registration.json')
+
+    def test_the_venus_registration_is_relative_private_and_signed(self):
+        qemu = pathlib.Path(self.temp.name) / 'libexec/qemu'
+        for path in ('venus/probe-loader', 'venus/libvirglrenderer.1.dylib', 'venus/virgl_render_server',
+                     'Frameworks/' + release.QEMU_LIBRARY, 'Frameworks/' + release.SPICE_LIBRARY,
+                     release.ICD, 'share/edk2-aarch64-code.fd'):
+            touch(qemu / path)
+        release.write_registration(qemu)
+        path = qemu / 'venus/registration.json'
+        registration = json.loads(path.read_text())
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual((registration['schema'], registration['profile_revision']), (1, 'owned-group-v1'))
+        self.assertEqual(registration['frameworks_dir'], '../Frameworks')
+        self.assertEqual(registration['render_server']['path'], 'virgl_render_server')
+        self.assertEqual(registration['icd']['path'], '../Resources/vulkan/icd.d/MoltenVK_icd.json')
+        self.assertEqual(registration['loader']['sha256'], release.digest(qemu / 'venus/probe-loader'))
+        self.assertNotIn('Venus', ' '.join(release.RUNTIME_EXCLUDED))
 
     def test_the_runtime_notice_names_every_framework(self):
         text, texts = release.notice(['qemu-aarch64-softmmu.framework', 'glib-2.0.0.framework', 'gio-2.0.0.framework'])

@@ -10,3 +10,5 @@ pins), `pixman.txt`, `libjpeg-turbo.txt` (`LICENSE.md` and `README.ijg`) and `op
 build's sources). Copied from a later release of the same project, whose licence text is unchanged: `zstd.txt`
 (1.5.7) and `opus.txt` (1.6.1; its copyright years run to 2023). Written from the upstream project's declared licence,
 not copied from the pinned source, and to be checked against it: `libffi.txt`, `angle.txt` and `libslirp.txt`.
+Copied from the source `runtime/build-gpu-drivers.sh` builds: `dxmt.txt` (DXMT's `LICENSE` at `66e27f37`; the LGPL text
+is [../LGPL-2.1.txt](../LGPL-2.1.txt)) and `llvm.txt` (`llvm/LICENSE.TXT` of LLVM 15.0.7, linked into DXMT).

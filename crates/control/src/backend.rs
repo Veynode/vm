@@ -44,8 +44,14 @@ impl QemuRegistration {
         if !self.resources.is_absolute() || !self.resources.is_dir() {
             bail!("QEMU resources must be an existing absolute directory")
         }
-        if self.venus_runtime.is_some() {
-            self.require_profile(crate::qemu_graphics::Profile::VenusMoltenvkExperimental)?;
+        // Its files, not this host: a release package carries the runtime to
+        // every Mac, and Venus and Neptune report when the host lacks macOS 26.
+        if let Some(path) = &self.venus_runtime {
+            crate::qemu_graphics::Registration::load(path)?.validate(
+                &self.library,
+                &self.resources,
+                self.spice_library.as_deref(),
+            )?;
         }
         Ok(())
     }

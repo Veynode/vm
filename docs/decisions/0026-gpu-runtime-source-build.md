@@ -1,6 +1,6 @@
 # 0026 — GPU runtime: build from source, ship as a separate signed artifact with its corresponding source
 
-Date: 2026-10-27. Status: **accepted direction**; nothing is implemented yet. The QEMU/HVF GPU backend (`--gpus virgl`,
+Date: 2026-10-27. Status: **accepted direction**; partly implemented (below). The QEMU/HVF GPU backend (`--gpus virgl`,
 `--gpus venus`) is a 1.0 requirement. This decision does not replace the legal review: it names what the release must
 contain so that review has something complete to look at. [licenses/experimental-runtime.json](../../licenses/experimental-runtime.json)
 stays `blocked` until a reviewed manifest from this pipeline replaces it.
@@ -131,6 +131,18 @@ phodav, json-glib, Opus and usbredir.
 D3DMetal and `d3dmetal-native`: these are proprietary and we have no redistribution grant. The following are not
 used on macOS 1.0 paths: DXMT, swtpm and libtpms, KosmicKrisp (`vulkan_kosmickrisp`), the 27 other QEMU targets,
 `qemu-img`, libgcrypt, libgpg-error, libpng, `spice-client-glib`'s GStreamer plugins, and the decompiled iOS Hypervisor.
+
+## Progress
+
+2026-11-03: the release package (`scripts/package-release.py --qemu-runtime`) carries Venus and Neptune. Built from
+source here: the render server, host library and loader (`runtime/linux-vulkan-build-host-runtime.py`, virglrenderer
+`451505ad`), MoltenVK `0790efd5` and DXMT `66e27f37` with LLVM 15.0.7 (`runtime/build-gpu-drivers.sh`). QEMU and the
+other frameworks are still UTM 5.0.8's binaries. The Registration validator in
+[qemu_graphics.rs](../../crates/control/src/qemu_graphics.rs) keeps its compiled hash and absolute-rpath pins for a
+locally registered runtime; the runtime inside the daemon's own package is admitted by that package's `MANIFEST.json`
+and relative run paths instead, since signing changes the bytes. Not done: CI, a separate runtime artifact, its source
+archive and SBOM, and the legal review; [licenses/experimental-runtime.json](../../licenses/experimental-runtime.json)
+stays `blocked`.
 
 ## Consequences
 

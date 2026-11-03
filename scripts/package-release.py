@@ -16,8 +16,10 @@ unpacks it and uses the daemon and CLI over API 1 (docs/api.md):
                   needs no registration (`bin/veynodevm daemon start`)
     libexec/qemu/ the QEMU/GPU runtime (with --qemu-runtime): the QEMU loader,
                   UTM's QEMU and the frameworks it loads, the SPICE server
-                  with VeynodeVM's reconnect fix, QEMU's firmware and the
-                  native console app
+                  with VeynodeVM's reconnect fix, QEMU's firmware, the
+                  native console app, and Venus and Neptune's GPU runtime
+                  (venus/: render server, host library and loader, with its
+                  registration; MoltenVK and DXMT in Frameworks/)
     LICENSES/     the runtime's licences and NOTICE (with --qemu-runtime)
     web/          the web UI server and its built app (with --web)
     install.py    registers this directory in <home>/runtime.json
@@ -27,9 +29,12 @@ Nothing is built, downloaded, notarized or published here; signing is ad hoc
 unless --sign names an identity. The QEMU/GPU runtime is included only with
 --qemu-runtime, as this Mac uses it today: UTM 5.0.8's binaries
 (runtime/fetch-utm.sh), the SPICE reconnect build
-(runtime/build-spice-reconnect-server.py) and the console app
-(runtime/build-qemu-console.sh). Venus and Neptune are left out: their
-registration pins the unsigned bytes (runtime/register-venus.py).
+(runtime/build-spice-reconnect-server.py), the console app
+(runtime/build-qemu-console.sh), the Venus host runtime and render server
+(runtime/linux-vulkan-build-host-runtime.py) and MoltenVK and DXMT built from
+source (runtime/build-gpu-drivers.sh). The daemon admits that GPU runtime by
+this directory's MANIFEST.json (crates/control/src/qemu_graphics.rs), since
+signing changes the bytes the compiled Venus catalog pins.
 """
 import argparse
 import hashlib
@@ -51,8 +56,7 @@ BOOT = {'kernel': 'Image', 'initrd': 'initramfs.gz', 'modloop': 'modloop'}
 WEB = ('server.mjs', 'auth.mjs', 'daemon.mjs', 'desktop.mjs', 'terminal.mjs')
 EXCLUDED = ['QEMU/GPU runtime (UTM, virglrenderer, Venus): redistribution not reviewed',
             'cua-driver: third-party binaries fetched with runtime/fetch-cua-driver.sh, not reviewed for redistribution']
-RUNTIME_EXCLUDED = ['Venus and Neptune (virgl_render_server, MoltenVK, DXMT): their registration pins unsigned bytes',
-                    'D3DMetal: proprietary, no redistribution grant',
+RUNTIME_EXCLUDED = ['D3DMetal: proprietary, no redistribution grant',
                     'cua-driver: third-party binaries fetched with runtime/fetch-cua-driver.sh, not reviewed for redistribution']
 
 # The QEMU/GPU runtime, as the development home registers it today
@@ -66,6 +70,13 @@ OPENED = ('EGL.framework/Versions/Current/EGL', 'GLESv2.framework/Versions/Curre
 # Replaced by libspice-server-fixed.dylib, which takes its install name; the
 # loader refuses to start when two SPICE servers are loaded.
 REPLACED = ('spice-server.1.framework',)
+# Venus and Neptune: the render server, host library and loader from
+# runtime/linux-vulkan-build-host-runtime.py, in libexec/qemu/venus/ beside
+# Frameworks/, and the drivers from runtime/build-gpu-drivers.sh.
+VENUS = {'probe-loader': 'probe-loader', 'libvirglrenderer.1.dylib': 'build/src/libvirglrenderer.1.dylib',
+         'virgl_render_server': 'build/server/virgl_render_server'}
+DRIVERS = ('MoltenVK.framework', 'dxmt-native.framework')
+ICD = 'Resources/vulkan/icd.d/MoltenVK_icd.json'
 # The QEMU process: HVF, QEMU's code generator, the Guest's microphone.
 LOADER_ENTITLEMENTS = ('com.apple.security.hypervisor', 'com.apple.security.cs.allow-jit',
                        'com.apple.security.device.audio-input')
@@ -103,6 +114,10 @@ COMPONENTS = {
     'json-glib-1.0.0': ('json-glib', '1.10.0', 'https://download.gnome.org/sources/json-glib/1.10/json-glib-1.10.0.tar.xz', 'LGPL-2.1-or-later', LGPL),
     'soup-3.0.0': ('libsoup', '3.6.0', 'https://download.gnome.org/sources/libsoup/3.6/libsoup-3.6.0.tar.xz', 'LGPL-2.0-or-later', LGPL),
     'phodav-3.0.0': ('phodav', '3.0', 'https://download.gnome.org/sources/phodav/3.0/phodav-3.0.tar.xz', 'LGPL-2.1-or-later', LGPL),
+    'MoltenVK': ('MoltenVK (UTM fork), built from source with the SPIRV-Cross, SPIRV-Tools and headers its ExternalRevisions pin',
+                 '0790efd55b6b302e19487e5654f7fc30f0bdf3df', 'https://github.com/utmapp/MoltenVK', 'Apache-2.0', APACHE),
+    'dxmt-native': ('DXMT (UTM fork), built from source with LLVM 15.0.7 linked in', '66e27f3759ff79e41a791ec40e2a70ef6d0c964c',
+                    'https://github.com/utmapp/dxmt', 'LGPL-2.1-or-later', 'licenses/runtime/dxmt.txt'),
     'opus.0': ('Opus', '1.3', 'https://archive.mozilla.org/pub/opus/opus-1.3.tar.gz', 'BSD-3-Clause', 'licenses/runtime/opus.txt'),
     'gstreamer-1.0.0': ('GStreamer', '1.19.1', 'https://gstreamer.freedesktop.org/src/gstreamer/gstreamer-1.19.1.tar.xz', 'LGPL-2.0-or-later', LGPL),
     'gstbase-1.0.0': ('GStreamer', '1.19.1', 'https://gstreamer.freedesktop.org/src/gstreamer/gstreamer-1.19.1.tar.xz', 'LGPL-2.0-or-later', LGPL),
@@ -121,7 +136,15 @@ OWN_RUNTIME = [
      'GPL-2.0-only AND BSD-2-Clause-Patent (EDK2, see share/edk2-licenses.txt)', GPL),
     ('QEMU loader (probe-loader; native/tools/spice-reconnect-loader.c)', 'this release',
      'https://github.com/Veynode/vm', 'GPL-2.0-or-later', GPL),
-    ('UTM (the frameworks above are its 5.0.8 release build)', '5.0.8',
+    ('virglrenderer render server and host library (venus/), with VeynodeVM\'s owned-group patch '
+     '(runtime/linux-vulkan-build-host-runtime.py)', '451505ad0aa449290f2c0672da6877d57ee770e5',
+     'https://github.com/utmapp/virglrenderer', 'MIT', 'licenses/runtime/virglrenderer.txt'),
+    ('Venus host loader (venus/probe-loader; runtime/linux-vulkan-host-loader.c)', 'this release',
+     'https://github.com/Veynode/vm', 'GPL-2.0-or-later', GPL),
+    ('LLVM (linked into dxmt-native), with UTM 5.0.8\'s patches/llvm-project-15.0.7.src.patch', '15.0.7',
+     'https://github.com/llvm/llvm-project/releases/download/llvmorg-15.0.7/llvm-project-15.0.7.src.tar.xz',
+     'Apache-2.0 WITH LLVM-exception', 'licenses/runtime/llvm.txt'),
+    ('UTM (the other frameworks above are its 5.0.8 release build)', '5.0.8',
      'https://github.com/utmapp/UTM/releases/tag/v5.0.8', 'Apache-2.0', APACHE),
 ]
 
@@ -229,6 +252,7 @@ def shipped_runtime(helpers, web, qemu):
             'spice_library': f'../libexec/qemu/Frameworks/{SPICE_LIBRARY}',
             'console_broker': '../bin/vm-console',
             'console_helper': f'../libexec/qemu/{CONSOLE_APP}/Contents/MacOS/spice-console',
+            'venus_runtime': '../libexec/qemu/venus/registration.json',
         }
     return runtime
 
@@ -261,7 +285,7 @@ def frameworks(utm, seeds):
     return sorted(found)
 
 
-def runtime_inputs(utm, spice, console):
+def runtime_inputs(utm, spice, console, venus, drivers):
     """The QEMU/GPU runtime's pieces and what is missing of them."""
     pieces = {
         'loader': spice / 'probe-loader',
@@ -269,6 +293,9 @@ def runtime_inputs(utm, spice, console):
         'console': console,
         'qemu': utm / 'Contents/Frameworks' / QEMU_LIBRARY,
         'share': utm / 'Contents/Resources/qemu',
+        **{f'venus/{name}': venus / built for name, built in VENUS.items()},
+        **{name: drivers / name for name in DRIVERS},
+        'icd': drivers / 'MoltenVK_icd.json',
     }
     missing = [str(path) for path in pieces.values() if not path.exists()]
     return pieces, missing
@@ -279,7 +306,7 @@ def notice(names):
     and licence; texts alongside."""
     lines = ['VeynodeVM QEMU/GPU runtime', '==========================', '',
              'libexec/qemu/ carries the third-party software below, unmodified unless',
-             'stated, as UTM 5.0.8 built it. Each licence text is in this directory;',
+             'stated, as UTM 5.0.8 built it or built from source where stated. Each licence text is in this directory;',
              'the corresponding source is at the URL given, and the patches and build',
              'recipes of the parts VeynodeVM changed are in its source repository',
              '(https://github.com/Veynode/vm: runtime/, native/tools/,',
@@ -316,37 +343,77 @@ def package_runtime(root, out, pieces, utm, identity, dry):
     """Copies the QEMU/GPU runtime into libexec/qemu, points its run paths
     inside the release, signs it and writes LICENSES/."""
     qemu = out / 'libexec/qemu'
-    names = frameworks(utm, [pieces['qemu'], pieces['spice'], pieces['console'] / 'Contents/MacOS/spice-console'])
+    venus = {name: qemu / 'venus' / name for name in VENUS}
+    names = frameworks(utm, [pieces['qemu'], pieces['spice'], pieces['console'] / 'Contents/MacOS/spice-console',
+                             *(pieces[f'venus/{name}'] for name in VENUS)])
     for name in names:
         shutil.copytree(utm / 'Contents/Frameworks' / name, qemu / 'Frameworks' / name, symlinks=True)
+    for name in DRIVERS:
+        shutil.copytree(pieces[name], qemu / 'Frameworks' / name, symlinks=True)
     copy(pieces['spice'], qemu / 'Frameworks' / SPICE_LIBRARY)
     copy(pieces['loader'], qemu / 'probe-loader')
+    for name, dest in venus.items():
+        copy(pieces[f'venus/{name}'], dest)
+    copy(pieces['icd'], qemu / ICD)
     shutil.copytree(pieces['share'], qemu / 'share', symlinks=False)
     shutil.copytree(pieces['console'], qemu / CONSOLE_APP, symlinks=True)
-    # Run paths into the release instead of the build's absolute ones.
+    # Run paths into the release instead of the build's absolute ones; the
+    # daemon admits venus/ only with these (qemu_graphics::Registration).
     for binary, rpath in ((qemu / 'probe-loader', '@executable_path/Frameworks'),
                           (qemu / 'Frameworks' / SPICE_LIBRARY, '@loader_path'),
-                          (qemu / CONSOLE_APP / 'Contents/MacOS/spice-console', '@executable_path/../../../Frameworks')):
+                          (qemu / CONSOLE_APP / 'Contents/MacOS/spice-console', '@executable_path/../../../Frameworks'),
+                          (venus['probe-loader'], '@executable_path/../Frameworks'),
+                          (venus['libvirglrenderer.1.dylib'], '@loader_path/../Frameworks'),
+                          (venus['virgl_render_server'], '@executable_path/../Frameworks')):
         for old in rpaths(binary):
             run(['install_name_tool', '-delete_rpath', old, str(binary)], dry)
         run(['install_name_tool', '-add_rpath', rpath, str(binary)], dry)
     # Inside out: the frameworks and the SPICE server before what loads them,
     # all with one Team ID so the hardened loader's library validation passes.
-    for name in names:
+    for name in (*names, *DRIVERS):
         sign(identity, qemu / 'Frameworks' / name, dry=dry)
     sign(identity, qemu / 'Frameworks' / SPICE_LIBRARY, dry=dry)
+    sign(identity, venus['libvirglrenderer.1.dylib'], dry=dry)
+    sign(identity, venus['virgl_render_server'], dry=dry)
     plist = out / 'libexec/qemu/probe-loader.entitlements'
     plist.write_text(entitlements_plist(LOADER_ENTITLEMENTS))
     sign(identity, qemu / 'probe-loader', plist, dry)
+    sign(identity, venus['probe-loader'], plist, dry)
     plist.unlink()
     sign(identity, qemu / CONSOLE_APP, dry=dry)
-    text, texts = notice(names)
+    if not dry:
+        write_registration(qemu)
+    text, texts = notice([*names, *DRIVERS])
     licenses = out / 'LICENSES'
     licenses.mkdir()
     (licenses / 'NOTICE').write_text(text)
     for source, name in texts.items():
         shutil.copy2(root / source, licenses / name)
-    return names
+    return [*names, *DRIVERS]
+
+
+def write_registration(qemu):
+    """venus/registration.json: the Venus runtime's roles as signed, relative
+    to venus/; private, as the daemon requires of a registration."""
+    roles = {
+        'loader': 'probe-loader',
+        'host_library': 'libvirglrenderer.1.dylib',
+        'render_server': 'virgl_render_server',
+        'qemu_library': f'../Frameworks/{QEMU_LIBRARY}',
+        'spice_library': f'../Frameworks/{SPICE_LIBRARY}',
+        'icd': f'../{ICD}',
+        'firmware': '../share/edk2-aarch64-code.fd',
+    }
+    catalog = json.loads((ROOT / 'crates/control/src/qemu_venus_catalog.json').read_text())
+    registration = {
+        'schema': catalog['schema'],
+        'profile_revision': catalog['profile_revision'],
+        'frameworks_dir': '../Frameworks',
+        **{role: {'path': path, 'sha256': digest(qemu / 'venus' / path)} for role, path in roles.items()},
+    }
+    path = qemu / 'venus/registration.json'
+    path.write_text(json.dumps(registration, indent=2) + '\n')
+    os.chmod(path, 0o600)
 
 
 def info_plist(version):
@@ -420,8 +487,8 @@ def run(argv, dry):
 
 
 def package(root, out, profile, identity, web, version, commit, dry=False, boot=None, runtime=None):
-    """`runtime`: (UTM.app, SPICE reconnect runtime dir, console app) to ship
-    the QEMU/GPU runtime."""
+    """`runtime`: (UTM.app, SPICE reconnect runtime dir, console app, Venus
+    host runtime dir, GPU drivers dir) to ship the QEMU/GPU runtime."""
     files, helpers, missing = inputs(root, profile, web, boot)
     if runtime:
         pieces, absent = runtime_inputs(*runtime)
@@ -447,7 +514,8 @@ def package(root, out, profile, identity, web, version, commit, dry=False, boot=
     run(['codesign', '--verify', '--strict', '--deep', str(out / 'VeynodeVM.app')], dry)
     shipped = package_runtime(root, out, pieces, runtime[0], identity, dry) if runtime else None
     if runtime:
-        for path in (out / 'libexec/qemu/probe-loader', out / 'libexec/qemu' / CONSOLE_APP):
+        for path in (out / 'libexec/qemu/probe-loader', out / 'libexec/qemu' / CONSOLE_APP,
+                     *(out / 'libexec/qemu/venus' / name for name in VENUS)):
             run(['codesign', '--verify', '--strict', str(path)], dry)
     record = manifest(out, version, commit, profile, identity, helpers, web, shipped)
     (out / 'MANIFEST.json').write_text(json.dumps(record, indent=2) + '\n')
@@ -491,10 +559,15 @@ def main():
     parser.add_argument('--spice-runtime', type=Path, default=ROOT / '.local/spice-reconnect-build/runtime',
                         help='probe-loader and libspice-server-fixed.dylib (runtime/build-spice-reconnect-server.py)')
     parser.add_argument('--console-app', type=Path, default=ROOT / '.local/bin' / CONSOLE_APP, help='the native console app (runtime/build-qemu-console.sh)')
+    parser.add_argument('--venus-host', type=Path, default=ROOT / '.local/runtime/venus/host',
+                        help='the Venus host runtime and render server (runtime/linux-vulkan-build-host-runtime.py)')
+    parser.add_argument('--gpu-drivers', type=Path, default=ROOT / '.local/runtime/gpu-drivers',
+                        help='MoltenVK and DXMT built from source (runtime/build-gpu-drivers.sh)')
     parser.add_argument('--archive', action='store_true', help='also write OUTPUT.tar.gz and OUTPUT.tar.gz.sha256')
     parser.add_argument('--dry-run', action='store_true', help='list the inputs and what is missing; copy and sign nothing')
     args = parser.parse_args()
-    runtime = (args.utm, args.spice_runtime, args.console_app) if args.qemu_runtime else None
+    runtime = ((args.utm, args.spice_runtime, args.console_app, args.venus_host, args.gpu_drivers)
+               if args.qemu_runtime else None)
     if not args.output.is_absolute() or args.output.exists():
         raise SystemExit('--output must be an absolute path that does not exist yet')
     if args.dry_run:
