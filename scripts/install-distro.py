@@ -446,9 +446,33 @@ def openssh_server(authorized_key):
         'Set-Service sshd -StartupType Automatic', 'Start-Service sshd',
         "New-NetFirewallRule -Name veynode-sshd -DisplayName 'OpenSSH (VeynodeVM)' -Protocol TCP -LocalPort 22 -Action Allow",
         f"Set-Content -Encoding ascii {keys} '{authorized_key.strip()}'",
-        f'icacls {keys} /inheritance:r /grant Administrators:F /grant SYSTEM:F',
+        # SIDs: the group names are translated in other Windows languages.
+        f'icacls {keys} /inheritance:r /grant *S-1-5-32-544:F /grant *S-1-5-18:F',
         "New-ItemProperty -Path HKLM:\\SOFTWARE\\OpenSSH -Name DefaultShell -PropertyType String -Force "
         "-Value C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    ])
+    return powershell(script)
+
+
+# The administrator the host logs in as over SSH, by key only (the engine's
+# windows_install::ADMIN): its password is random, made in the guest and kept
+# nowhere, and it is hidden from the sign-in screen.
+ADMIN = 'veynode-admin'
+
+
+def admin_accounts(user):
+    """PowerShell for the last FirstLogonCommand: makes ADMIN and leaves the
+    automatic-logon user a standard user (group SIDs, not translated names)."""
+    script = '; '.join([
+        '$bytes = New-Object byte[] 24',
+        '[Security.Cryptography.RNGCryptoServiceProvider]::new().GetBytes($bytes)',
+        "$secret = ConvertTo-SecureString ([Convert]::ToBase64String($bytes) + 'aA1!') -AsPlainText -Force",
+        f'New-LocalUser -Name {ADMIN} -Password $secret -PasswordNeverExpires -AccountNeverExpires | Out-Null',
+        f'Add-LocalGroupMember -SID S-1-5-32-544 -Member {ADMIN}',
+        "reg add 'HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\SpecialAccounts\\UserList'"
+        f' /v {ADMIN} /t REG_DWORD /d 0 /f | Out-Null',
+        f"Add-LocalGroupMember -SID S-1-5-32-545 -Member '{user}' -ErrorAction SilentlyContinue",
+        f"Remove-LocalGroupMember -SID S-1-5-32-544 -Member '{user}'",
     ])
     return powershell(script)
 
@@ -529,7 +553,7 @@ def windows_answer(work, user, password, edition, product_key, authorized_key=No
         # No Fast Startup: QEMU/HVF aborts (assert isv) resuming its hybrid
         # shutdown image once the Neptune GPU driver is installed.
         'powercfg /hibernate off',
-        *([openssh_server(authorized_key)] if authorized_key else []),
+        *([openssh_server(authorized_key), admin_accounts(user)] if authorized_key else []),
         # Powering off tells the host the install is complete.
         'shutdown /s /t 20 /c "VeynodeVM install complete"',
     ]
@@ -703,13 +727,13 @@ def install_windows(args):
     boot_windows(args.name, args.evidence, work)
     if ssh_key:
         ssh = ['ssh', '-i', str(ssh_key), '-p', str(args.ssh_port), '-o', f'UserKnownHostsFile={work / "known_hosts"}',
-               '-o', 'StrictHostKeyChecking=accept-new', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', f'{args.user}@127.0.0.1']
+               '-o', 'StrictHostKeyChecking=accept-new', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', f'{ADMIN}@127.0.0.1']
         result = subprocess.run([*ssh, '(Get-CimInstance Win32_OperatingSystem).Caption'], capture_output=True, text=True)
         if result.returncode:
             raise SystemExit(f'ssh into {args.name} failed: {result.stderr.strip()}')
         log(f'ssh: {result.stdout.strip()}; connect with: {" ".join(ssh)}')
         # The daemon's vm_exec, file and desktop tools log in with this key.
-        veynodevm('machine', 'ssh-key', args.name, '--user', args.user, '--key', str(ssh_key))
+        veynodevm('machine', 'ssh-key', args.name, '--user', ADMIN, '--key', str(ssh_key))
 
 
 def boot_windows(name, evidence, work, settle=240):
