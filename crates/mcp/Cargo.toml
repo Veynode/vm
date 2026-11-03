@@ -1,6 +1,6 @@
 [package]
 name = "veynodevm-mcp"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "Apache-2.0"
 description = "VeynodeVM's MCP adapters: the HTTPS endpoint (vm-mcp-http) and the protocol tables the daemon's MCP server shares"
