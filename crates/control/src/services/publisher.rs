@@ -77,8 +77,12 @@ pub fn start(machine: Published) -> Result<()> {
     }
     let mut listeners = Vec::new();
     for (host, guest) in &machine.ports {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, *host))
-            .with_context(|| format!("bind 127.0.0.1:{host}"))?;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, *host)).with_context(|| {
+            format!(
+                "host port {host} of {} is in use by another program",
+                machine.name
+            )
+        })?;
         listener.set_nonblocking(true)?;
         listeners.push((listener, *guest));
     }

@@ -114,7 +114,7 @@ type Machine = {
 | `machine.ls` | call | `{}` | `Machine[]` sorted by name |
 | `machine.inspect` | call | `{name}` | `Machine` |
 | `machine.create` | stream | `{name, os, cpus, memoryMiB, diskGiB?, shares?, ports?, gpu?, backend?, diskBus?, attach?}` and one source: `{disk}` (a raw or qcow2 Linux disk; see below), `{from}` (an OCI reference; macOS), `{iso, unattended?, driversIso?}` | `Machine`; `progress` events |
-| `machine.start` | stream | `{name, wait?}` | `Machine`; with `wait`, ends once the guest answers |
+| `machine.start` | stream | `{name, wait?}` | `Machine`, with `movedPorts` when a host port moved (see Ports); with `wait`, ends once the guest answers |
 | `machine.stop` | call | `{name, force?}` | `{name}` |
 | `machine.pause` / `machine.unpause` | call | `{name}` | `{name}` |
 | `machine.rm` | call | `{name, force?}` | `{name}` |
@@ -142,7 +142,10 @@ type Machine = {
 - **Ports.** Each is `{host, guest, protocol?, address?}`. On QEMU, `ports` are user-mode forwards on 127.0.0.1;
   `protocol: "udp"` makes a UDP one and `address: "0.0.0.0"` publishes it on every address of the Mac. On Apple
   Virtualization the daemon publishes TCP ones from 127.0.0.1 to the guest's lease address while the machine runs,
-  and refuses the others. `machine.endpoints` lists each with its `address`, and `protocol` for a UDP one.
+  and refuses the others. `machine.endpoints` lists each with its `address`, and `protocol` for a UDP one. A host port
+  another program holds when the machine starts moves to a free port, which the machine keeps: the start's answer has
+  `ports` as they now are and `movedPorts: {guest, protocol?, address?, from, to}[]`, and a `progress` event says so.
+  Read ports from that answer or `machine.inspect`, not from what was asked at create.
 - **Windows.** `{iso, unattended: true, driversIso}` installs Windows 11 ARM64 without a person: the daemon writes the
   answer file seed, presses the ISO's key prompt, waits for the install (up to 3 hours) and ejects the media. The
   machine has the login `veynode` with its own key and OpenSSH, and is left stopped. Windows needs `diskGiB` 40 and

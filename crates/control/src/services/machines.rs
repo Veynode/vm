@@ -1125,9 +1125,16 @@ pub fn cleanup_files(dir: &Path) {
 
 pub fn start(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
     let name = name_arg(&args)?;
-    let machine = load(&name)?;
+    let mut machine = load(&name)?;
     if running(&vm_state(ctx, &name)) {
         return Err(state_error(format!("{name} is running")));
+    }
+    let moved = move_taken_ports(ctx, &mut machine)?;
+    for port in &moved {
+        io.progress(&format!(
+            "Host port {} is in use by another program; using {}",
+            port["from"], port["to"]
+        ))?;
     }
     io.progress("Starting")?;
     ctx.vm(
@@ -1172,7 +1179,144 @@ pub fn start(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
             windows_ready(ctx, &name, io)?;
         }
     }
-    Ok(view(ctx, &machine))
+    let mut answer = view(ctx, &machine);
+    if !moved.is_empty() {
+        answer["movedPorts"] = Value::Array(moved);
+    }
+    Ok(answer)
+}
+
+/// Host ports are chosen once and kept, so another program can take one
+/// while the machine is stopped. Before a start, each forward whose host port
+/// is taken moves to a free port, which the machine keeps from then on (its
+/// record, or its daemon configuration on QEMU). The answer lists each move
+/// as `{guest, protocol?, address?, from, to}`.
+pub(crate) fn move_taken_ports(ctx: &Ctx, machine: &mut Machine) -> Result<Vec<Value>> {
+    if machine.backend != "qemu-hvf" {
+        if machine.ports.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The machine's own publisher lets its ports go within a few seconds
+        // of the machine stopping.
+        if super::publisher::running(&machine.name) {
+            super::publisher::stop(&machine.name);
+            let until = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < until
+                && machine
+                    .ports
+                    .iter()
+                    .any(|p| port_taken(&Forward::tcp(p.host, p.guest)))
+            {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        let mut forwards: Vec<Forward> = machine
+            .ports
+            .iter()
+            .map(|p| Forward::tcp(p.host, p.guest))
+            .collect();
+        let moved = move_taken(&mut forwards)?;
+        if !moved.is_empty() {
+            machine.ports = forwards
+                .iter()
+                .map(|f| Port {
+                    host: f.host,
+                    guest: f.guest,
+                })
+                .collect();
+            save(machine)?;
+        }
+        return Ok(moved);
+    }
+    let old = ctx.vm("status", json!({"id":machine.name}))?["config"].clone();
+    let Some(ports) = old["ports"].as_array() else {
+        return Ok(Vec::new());
+    };
+    let mut forwards: Vec<Forward> = ports
+        .iter()
+        .filter_map(|p| {
+            Some(Forward {
+                host: p["host_port"].as_u64()?.try_into().ok()?,
+                guest: p["guest_port"].as_u64()?.try_into().ok()?,
+                udp: p["protocol"] == "udp",
+                lan: p["host_address"] == "0.0.0.0",
+            })
+        })
+        .collect();
+    let before = forwards.clone();
+    let moved = move_taken(&mut forwards)?;
+    if moved.is_empty() {
+        return Ok(moved);
+    }
+    let mut new = old.clone();
+    for (port, forward) in new["ports"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+        .zip(&forwards)
+    {
+        port["host_port"] = json!(forward.host);
+    }
+    reregister(ctx, &machine.name, old, new)?;
+    if let Some(ssh) = machine.ssh_port {
+        if let Some(i) = before.iter().position(|f| !f.udp && f.host == ssh) {
+            machine.ssh_port = Some(forwards[i].host);
+        }
+    }
+    save(machine)?;
+    Ok(moved)
+}
+
+/// Whether another socket holds the forward's host port.
+fn port_taken(port: &Forward) -> bool {
+    let ip: std::net::IpAddr = port.address().parse().expect("a literal address");
+    if port.udp {
+        std::net::UdpSocket::bind((ip, port.host)).is_err()
+    } else {
+        std::net::TcpListener::bind((ip, port.host)).is_err()
+    }
+}
+
+/// Moves each forward whose host port is taken to a free port of its kind,
+/// never one another forward of the list uses.
+fn move_taken(forwards: &mut [Forward]) -> Result<Vec<Value>> {
+    let mut moved = Vec::new();
+    for i in 0..forwards.len() {
+        let port = forwards[i];
+        if !port_taken(&port) {
+            continue;
+        }
+        let ip: std::net::IpAddr = port.address().parse().expect("a literal address");
+        let to = (0..32)
+            .find_map(|_| {
+                let free = if port.udp {
+                    std::net::UdpSocket::bind((ip, 0))
+                        .and_then(|s| s.local_addr())
+                        .ok()?
+                } else {
+                    std::net::TcpListener::bind((ip, 0))
+                        .and_then(|s| s.local_addr())
+                        .ok()?
+                }
+                .port();
+                (!forwards.iter().any(|f| f.udp == port.udp && f.host == free)).then_some(free)
+            })
+            .with_context(|| {
+                format!(
+                    "host port {} is in use by another program and no free port was found for it",
+                    port.host
+                )
+            })?;
+        let mut entry = port.view(port.lan);
+        entry["from"] = json!(port.host);
+        entry["to"] = json!(to);
+        if let Some(fields) = entry.as_object_mut() {
+            fields.remove("host");
+        }
+        moved.push(entry);
+        forwards[i].host = to;
+    }
+    Ok(moved)
 }
 
 /// Waits for a Windows machine's OpenSSH Server to take its login.
@@ -2006,6 +2150,41 @@ mod tests {
             ssh_port: None,
             idle_pause_s: None,
         }
+    }
+
+    #[test]
+    fn a_taken_host_port_moves_to_a_free_one_and_the_others_stay() {
+        let holder = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let taken = holder.local_addr().unwrap().port();
+        let free = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let udp_holder = std::net::UdpSocket::bind(("0.0.0.0", 0)).unwrap();
+        let udp_taken = udp_holder.local_addr().unwrap().port();
+        let mut forwards = [
+            Forward::tcp(taken, 80),
+            Forward::tcp(free, 22),
+            Forward {
+                host: udp_taken,
+                guest: 53,
+                udp: true,
+                lan: true,
+            },
+        ];
+        let moved = move_taken(&mut forwards).unwrap();
+        assert_eq!(moved.len(), 2, "{moved:?}");
+        assert_eq!(moved[0]["guest"], 80);
+        assert_eq!(moved[0]["from"], taken);
+        assert_eq!(moved[0]["to"], forwards[0].host);
+        assert!(moved[0].get("host").is_none());
+        assert_ne!(forwards[0].host, taken);
+        assert_eq!(forwards[1].host, free);
+        assert_eq!(moved[1]["protocol"], "udp");
+        assert_eq!(moved[1]["address"], "0.0.0.0");
+        assert_ne!(forwards[2].host, udp_taken);
+        assert!(move_taken(&mut forwards).unwrap().is_empty());
     }
 
     #[test]

@@ -358,3 +358,46 @@ fn a_machine_whose_folder_is_gone_is_listed_invalid_and_can_be_removed() {
     );
     assert!(!crate::services::machines::running("invalid"));
 }
+
+#[test]
+fn a_host_port_another_program_took_moves_and_the_machine_keeps_the_new_one() {
+    let client = daemon();
+    let disk = image("portbase", 5 << 28);
+    let (created, _) = stream(
+        &client,
+        "machine.create",
+        json!({"name":"ports1","os":"linux","cpus":1,"memoryMiB":1024,"diskGiB":4,"disk":disk}),
+    );
+    created.unwrap();
+    let holder = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let taken = holder.local_addr().unwrap().port();
+    client
+        .call(
+            "machine.update",
+            json!({"name":"ports1","ports":[{"host":taken,"guest":80}]}),
+        )
+        .unwrap();
+    let ctx = crate::api_server::Ctx {
+        state_dir: PathBuf::new(),
+        runtime: Default::default(),
+        qemu_resources: None,
+        client: String::new(),
+    };
+    let mut machine = crate::services::machines::load("ports1").unwrap();
+    let moved = crate::services::machines::move_taken_ports(&ctx, &mut machine).unwrap();
+    assert_eq!(moved.len(), 1);
+    assert_eq!(moved[0]["from"], taken);
+    let to = moved[0]["to"].as_u64().unwrap();
+    // Kept: inspect shows the new port, and the next start moves nothing.
+    let shown = client
+        .call("machine.inspect", json!({"name":"ports1"}))
+        .unwrap();
+    assert_eq!(shown["ports"], json!([{"host":to,"guest":80}]));
+    let mut machine = crate::services::machines::load("ports1").unwrap();
+    assert!(
+        crate::services::machines::move_taken_ports(&ctx, &mut machine)
+            .unwrap()
+            .is_empty()
+    );
+    client.call("machine.rm", json!({"name":"ports1"})).unwrap();
+}
