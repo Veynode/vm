@@ -278,14 +278,14 @@ impl Ssh {
         mux: bool,
     ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
         let mut child = self
-            .command(&encoded(script), mux)
+            .command(LAUNCHER, mux)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .context("cannot run ssh")?;
         let mut input = child.stdin.take().unwrap();
-        let bytes = stdin.to_vec();
+        let bytes = framed(script, stdin);
         let writer = std::thread::spawn(move || input.write_all(&bytes));
         let mut stdout = child.stdout.take().unwrap();
         let mut stderr = child.stderr.take().unwrap();
@@ -327,22 +327,29 @@ fn wait_timeout(child: &mut Child, timeout: Duration) -> std::io::Result<Option<
     }
 }
 
-/// A command line for the SSH user's PowerShell that runs `script`, given as
-/// base64 so no quoting reaches PowerShell's parser, and gzipped: Windows
-/// OpenSSH refuses an exec request a little over 17 KB ("exec request failed
-/// on channel 0"), which cua.ps1 alone exceeded as UTF-16 base64.
-fn encoded(script: &str) -> String {
-    use std::io::Write as _;
-    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
-    gzip.write_all(script.as_bytes())
-        .and_then(|_| gzip.finish())
-        .map(|bytes| {
-            format!(
-                "$ProgressPreference='SilentlyContinue'; $veynodeScript=New-Object IO.Compression.GZipStream((New-Object IO.MemoryStream(,[Convert]::FromBase64String('{}'))),([IO.Compression.CompressionMode]::Decompress)); iex (New-Object IO.StreamReader($veynodeScript)).ReadToEnd()",
-                base64::engine::general_purpose::STANDARD.encode(bytes)
-            )
-        })
-        .expect("gzip into memory")
+/// The SSH user's PowerShell command line for every script: it reads the
+/// script from stdin ([`framed`]) and runs it. Scripts never travel on the
+/// command line: Windows OpenSSH refuses an exec request a little over 17 KB,
+/// and Microsoft Defender kills PowerShell whose command line decodes and
+/// runs a packed script (base64 and gzip into `iex` is detected as
+/// Behavior:Win32/PShellCobStager.A, and ssh then exits 0 with no output).
+/// It reads raw stdin, which reads nothing ahead, so the bytes after the
+/// script stay in the pipe for the script's own `[Console]::In` or
+/// `OpenStandardInput`.
+const LAUNCHER: &str = "$ProgressPreference='SilentlyContinue'; $veynodeIn=[Console]::OpenStandardInput(); \
+    $veynodeLine=New-Object Collections.Generic.List[byte]; \
+    while(($veynodeByte=$veynodeIn.ReadByte()) -ne -1 -and $veynodeByte -ne 10){$veynodeLine.Add([byte]$veynodeByte)}; \
+    $veynodeLength=[int][Text.Encoding]::ASCII.GetString($veynodeLine.ToArray()); $veynodeScript=New-Object byte[] $veynodeLength; $veynodeRead=0; \
+    while($veynodeRead -lt $veynodeLength){$veynodeCount=$veynodeIn.Read($veynodeScript,$veynodeRead,$veynodeLength-$veynodeRead); if($veynodeCount -le 0){break}; $veynodeRead+=$veynodeCount}; \
+    . ([scriptblock]::Create([Text.Encoding]::UTF8.GetString($veynodeScript,0,$veynodeRead)))";
+
+/// The launcher's stdin: the script's UTF-8 length on a line, the script,
+/// then the script's own input.
+fn framed(script: &str, stdin: &[u8]) -> Vec<u8> {
+    let mut bytes = format!("{}\n", script.len()).into_bytes();
+    bytes.extend_from_slice(script.as_bytes());
+    bytes.extend_from_slice(stdin);
+    bytes
 }
 
 /// The Windows command line for arguments, quoted so CommandLineToArgvW and
@@ -822,23 +829,21 @@ mod tests {
     }
 
     #[test]
-    fn scripts_travel_as_base64_powershell() {
-        use base64::Engine as _;
-        use std::io::Read as _;
-        let line = encoded("Write-Output 'x'");
-        assert!(line.starts_with("$ProgressPreference='SilentlyContinue'; $veynodeScript="));
-        assert!(!line.contains("Write-Output"));
-        let payload = line.split('\'').nth(3).unwrap();
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(payload)
-            .unwrap();
-        let mut script = String::new();
-        flate2::read::GzDecoder::new(&bytes[..])
-            .read_to_string(&mut script)
-            .unwrap();
-        assert_eq!(script, "Write-Output 'x'");
-        // cua.ps1 stays well under Windows OpenSSH's exec request limit.
-        assert!(encoded(include_str!("../../../guest/windows/cua.ps1")).len() < 8000);
+    fn scripts_travel_on_stdin_ahead_of_their_input() {
+        let bytes = framed("Write-Output 'ä'", b"{\"op\":1}\n");
+        assert_eq!(bytes, "17\nWrite-Output 'ä'{\"op\":1}\n".as_bytes());
+        // The command line carries no script and nothing packed.
+        for packed in [
+            "FromBase64String",
+            "GZip",
+            "Compression",
+            "iex",
+            "Invoke-Expression",
+        ] {
+            assert!(!LAUNCHER.contains(packed), "{packed}");
+        }
+        assert!(!LAUNCHER.contains('"') && !LAUNCHER.contains('\n'));
+        assert!(LAUNCHER.len() < 1000);
     }
 
     fn fixture() -> (tempfile::TempDir, PathBuf) {
