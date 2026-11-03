@@ -382,7 +382,7 @@ pub fn vm_state(ctx: &Ctx, name: &str) -> String {
 pub fn running(state: &str) -> bool {
     !matches!(
         state,
-        "stopped" | "crashed" | "error" | "missing" | "unknown"
+        "stopped" | "crashed" | "error" | "missing" | "unknown" | "invalid"
     )
 }
 
@@ -469,9 +469,72 @@ fn render(machine: &Machine, raw: &str, status: Option<Value>, used: u64) -> Val
         "icon": machine.icon,
         "idlePauseS": machine.idle_pause_s.unwrap_or(0),
         "vmState": raw,
+        "invalidReason": status.as_ref().map_or(Value::Null, |s| s["invalid_reason"].clone()),
         "record": machine,
         "vm": status,
     })
+}
+
+/// A daemon VM left by a machine whose `machine.json` is gone (its folder
+/// removed by hand, say): its configuration names files in the machine's
+/// folder. It can never start; `machine.ls` and `machine.inspect` show it as
+/// `invalid` with the reason, and `machine.rm` removes it.
+fn orphan(ctx: &Ctx, name: &str) -> Option<Value> {
+    let status = ctx.vm("status", json!({"id":name})).ok()?;
+    orphan_view(&home::machines_dir().ok()?, status)
+}
+
+fn orphans(ctx: &Ctx) -> Vec<Value> {
+    let (Ok(machines), Ok(Value::Array(vms))) = (home::machines_dir(), ctx.vm("list", json!({})))
+    else {
+        return Vec::new();
+    };
+    vms.into_iter()
+        .filter_map(|vm| orphan_view(&machines, vm))
+        .collect()
+}
+
+fn orphan_view(machines: &Path, status: Value) -> Option<Value> {
+    let config = &status["config"];
+    let name = config["id"].as_str()?;
+    let dir = machines.join(name);
+    if dir.join("machine.json").is_file()
+        || !["disk", "efi_vars", "serial_log"].iter().any(|field| {
+            config[field]
+                .as_str()
+                .is_some_and(|path| Path::new(path).parent() == Some(dir.as_path()))
+        })
+    {
+        return None;
+    }
+    let reason = if dir.exists() {
+        format!("its record {} is gone", dir.join("machine.json").display())
+    } else {
+        format!("its folder {} is gone", dir.display())
+    };
+    Some(json!({
+        "name": name,
+        "id": "",
+        "os": config["guest"],
+        "backend": config["backend"].as_str().unwrap_or("apple-virtualization"),
+        "state": "invalid",
+        "source": {},
+        "cpus": config["cpus"],
+        "memoryMiB": config["memory_mib"],
+        "diskGiB": 0,
+        "gpu": gpu_name(config),
+        "macAddress": config["mac_address"],
+        "shares": [],
+        "ports": [],
+        "createdAt": 0,
+        "diskUsedBytes": 0,
+        "icon": null,
+        "idlePauseS": 0,
+        "vmState": status["state"],
+        "invalidReason": format!("{name} cannot start: {reason}; remove it"),
+        "record": null,
+        "vm": status,
+    }))
 }
 
 /// The machine's published ports: an Apple Virtualization machine's from
@@ -541,15 +604,18 @@ fn name_arg(args: &Value) -> Result<String> {
 }
 
 pub fn ls(ctx: &Ctx, _: Value) -> Result<Value> {
-    let mut machines = records();
-    machines.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(Value::Array(
-        machines.iter().map(|m| view(ctx, m)).collect(),
-    ))
+    let mut rows: Vec<Value> = records().iter().map(|m| view(ctx, m)).collect();
+    rows.extend(orphans(ctx));
+    rows.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    Ok(Value::Array(rows))
 }
 
 pub fn inspect(ctx: &Ctx, args: Value) -> Result<Value> {
-    Ok(view(ctx, &load(&name_arg(&args)?)?))
+    let name = name_arg(&args)?;
+    match load(&name) {
+        Ok(machine) => Ok(view(ctx, &machine)),
+        Err(error) => orphan(ctx, &name).ok_or(error),
+    }
 }
 
 /// The `Spec` `machine.create` asks for, with the source it names.
@@ -1187,7 +1253,12 @@ fn wait_stopped(ctx: &Ctx, name: &str, timeout: Duration) -> bool {
 pub fn rm(ctx: &Ctx, args: Value) -> Result<Value> {
     let name = name_arg(&args)?;
     let dir = dir(&name)?;
-    load(&name)?;
+    if let Err(error) = load(&name) {
+        // A machine whose record is gone still has its daemon VM to remove.
+        if orphan(ctx, &name).is_none() {
+            return Err(error);
+        }
+    }
     let state = vm_state(ctx, &name);
     if running(&state) {
         if !flag(&args, "force")? {

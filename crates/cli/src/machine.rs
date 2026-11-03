@@ -415,15 +415,35 @@ pub fn command(rest: &[String], json_output: bool) -> Result<i32> {
         }
         "inspect" => {
             let machine = api_call("machine.inspect", json!({"name":name()?}))?;
-            print_json(&json!({"machine":machine["record"],"vm":machine["vm"]}))?;
+            let mut shown = json!({"machine":machine["record"],"vm":machine["vm"]});
+            if machine["state"] == "invalid" {
+                shown["invalid_reason"] = machine["invalidReason"].clone();
+            }
+            print_json(&shown)?;
         }
         "ls" | "list" => {
             let machines = api_call("machine.ls", json!({}))?;
             let rows = machines.as_array().cloned().unwrap_or_default();
+            // An `invalid` machine cannot start whatever its VM's state; the
+            // reason says why and `machine rm` removes it.
+            let state = |m: &Value| {
+                if m["state"] == "invalid" {
+                    m["state"].clone()
+                } else {
+                    m["vmState"].clone()
+                }
+            };
             if json_output {
                 print_json(&Value::Array(
                     rows.iter()
-                        .map(|m| json!({"machine":m["record"],"state":m["vmState"],"disk_used_bytes":m["diskUsedBytes"]}))
+                        .map(|m| {
+                            let mut row = json!({"machine":m["record"],"state":state(m),"disk_used_bytes":m["diskUsedBytes"]});
+                            if m["state"] == "invalid" {
+                                row["name"] = m["name"].clone();
+                                row["invalid_reason"] = m["invalidReason"].clone();
+                            }
+                            row
+                        })
                         .collect(),
                 ))?;
             } else {
@@ -431,18 +451,25 @@ pub fn command(rest: &[String], json_output: bool) -> Result<i32> {
                     "{:<20}{:<22}{:<12}{:<18}ISO",
                     "NAME", "BACKEND", "STATE", "DISK USED/SIZE"
                 );
-                for m in rows {
+                for m in &rows {
                     println!(
                         "{:<20}{:<22}{:<12}{:<18}{}",
                         m["name"].as_str().unwrap_or_default(),
                         m["backend"].as_str().unwrap_or_default(),
-                        m["vmState"].as_str().unwrap_or_default(),
+                        state(m).as_str().unwrap_or_default(),
                         format!(
                             "{:.1}/{}G",
                             m["diskUsedBytes"].as_u64().unwrap_or(0) as f64 / (1u64 << 30) as f64,
                             m["diskGiB"]
                         ),
                         m["source"]["iso"].as_str().unwrap_or("-")
+                    );
+                }
+                for m in rows.iter().filter(|m| m["state"] == "invalid") {
+                    eprintln!(
+                        "{}: {}",
+                        m["name"].as_str().unwrap_or_default(),
+                        m["invalidReason"].as_str().unwrap_or("cannot start")
                     );
                 }
             }

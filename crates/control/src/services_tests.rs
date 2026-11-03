@@ -304,3 +304,57 @@ fn a_create_owns_only_the_machine_it_registered() {
     client.call("machine.rm", json!({"name":"owned"})).unwrap();
     assert!(!crate::services::machines::created_by("owned", &id));
 }
+
+#[test]
+fn a_machine_whose_folder_is_gone_is_listed_invalid_and_can_be_removed() {
+    let client = daemon();
+    // A size of its own: the same bytes share one converted base disk with the other tests.
+    let disk = image("orphanbase", 3 << 29);
+    let (created, _) = stream(
+        &client,
+        "machine.create",
+        json!({"name":"orphan1","os":"linux","cpus":1,"memoryMiB":1024,"diskGiB":4,"disk":disk}),
+    );
+    created.unwrap();
+    // Removed by hand: the daemon's VM stays registered.
+    fs::remove_dir_all(home().join("machines/orphan1")).unwrap();
+    let row = |client: &Client| {
+        client
+            .call("machine.ls", json!({}))
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"] == "orphan1")
+            .cloned()
+    };
+    let listed = row(&client).expect("the orphan is listed");
+    assert_eq!(listed["state"], "invalid");
+    assert!(
+        listed["invalidReason"]
+            .as_str()
+            .unwrap()
+            .contains("is gone"),
+        "{listed}"
+    );
+    assert_eq!(
+        client
+            .call("machine.inspect", json!({"name":"orphan1"}))
+            .unwrap()["state"],
+        "invalid"
+    );
+    client
+        .call("machine.rm", json!({"name":"orphan1"}))
+        .unwrap();
+    assert!(row(&client).is_none());
+    assert!(client.call("status", json!({"id":"orphan1"})).is_err());
+    assert_eq!(
+        code(
+            client
+                .call("machine.rm", json!({"name":"orphan1"}))
+                .unwrap_err()
+        ),
+        ErrorCode::NotFound
+    );
+    assert!(!crate::services::machines::running("invalid"));
+}

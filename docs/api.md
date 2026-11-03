@@ -97,7 +97,8 @@ from an ISO (QEMU only).
 type Machine = {
   name: string; id: string; os: "linux" | "macos" | "windows";
   backend: "apple-virtualization" | "qemu-hvf";
-  state: "stopped" | "starting" | "running" | "paused" | "stopping" | "failed";
+  state: "stopped" | "starting" | "running" | "paused" | "stopping" | "failed" | "invalid";
+  invalidReason: string | null; // why an `invalid` machine cannot start
   source: { disk?: string; digest?: string; from?: string; iso?: string; driversIso?: string };
   cpus: number; memoryMiB: number; diskGiB: number;
   gpu: "virgl" | "venus" | "neptune" | null; macAddress: string | null;
@@ -134,6 +135,10 @@ type Machine = {
   disk and its GPT to `diskGiB`; `source.digest` is the image's sha256. A NoCloud seed (`seed.iso`) gives the guest
   the login `veynode` with the home's key, passwordless `sudo`, the hostname, the shares at `/mnt/TAG` and the
   guest agent. `machine.clone` writes a new seed, so the clone gets a new hostname and machine-id.
+- **Invalid machines.** A machine whose VM failed the daemon's checks when it started (its runtime is off, a file
+  it names is gone) is `invalid`, with `invalidReason`; it cannot start. So is a VM left by a machine whose folder or
+  `machine.json` is gone: `machine.ls` and `machine.inspect` list it under its name with `id: ""` and
+  `record: null`. `machine.rm` removes either.
 - **Ports.** Each is `{host, guest, protocol?, address?}`. On QEMU, `ports` are user-mode forwards on 127.0.0.1;
   `protocol: "udp"` makes a UDP one and `address: "0.0.0.0"` publishes it on every address of the Mac. On Apple
   Virtualization the daemon publishes TCP ones from 127.0.0.1 to the guest's lease address while the machine runs,
