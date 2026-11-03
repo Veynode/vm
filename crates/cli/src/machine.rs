@@ -20,6 +20,8 @@ pub const USAGE: &str =
                       [--os linux|windows]  (windows: QEMU/HVF, 64G disk default, --attach an
                                              Autounattend and the virtio-win image; --gpus neptune:
                                              UTM Neptune/DXMT, needs UTM's viogpu3d guest driver)
+                      [--unattended --drivers-iso PATH]  (windows: install unattended from --iso,
+                                             with the virtio-win ARM64 image; returns when installed)
                       [--disk-bus virtio|nvme]  (QEMU; nvme for disks installed without viostor)
                       [-p, --publish HOST:GUEST]...  (QEMU; TCP 127.0.0.1:HOST → guest, e.g. 2222:22)
                       [-v, --volume HOST_DIR:TAG[:ro]]... (virtiofs share)
@@ -105,6 +107,8 @@ fn create_args(rest: &[String]) -> Result<Value> {
             ("disk-bus", None, true),
             ("publish", Some('p'), true),
             ("volume", Some('v'), true),
+            ("unattended", None, false),
+            ("drivers-iso", None, true),
         ],
         false,
     )?;
@@ -123,7 +127,7 @@ fn create_args(rest: &[String]) -> Result<Value> {
             args.insert(field.into(), json!(value));
         }
     }
-    for (flag, field) in [("iso", "iso"), ("disk", "disk")] {
+    for (flag, field) in [("iso", "iso"), ("disk", "disk"), ("drivers-iso", "driversIso")] {
         if let Some(path) = p.value(flag) {
             args.insert(field.into(), json!(absolute(path)?));
         }
@@ -142,6 +146,9 @@ fn create_args(rest: &[String]) -> Result<Value> {
     }
     if p.has("monitor") {
         args.insert("monitor".into(), json!(true));
+    }
+    if p.has("unattended") {
+        args.insert("unattended".into(), json!(true));
     }
     if !p.values("attach").is_empty() {
         let attach = p
@@ -515,8 +522,19 @@ mod tests {
                    "gpu":"virgl","diskBus":"nvme","ports":[{"host":2222,"guest":22}]})
         );
         assert!(create_args(&args(&["u", "-p", "22"])).is_err());
-        assert!(create_args(&args(&["u", "--iso", "/no/such.iso"])).is_err());
         let dir = std::env::temp_dir();
+        let w = create_args(&args(&[
+            "w",
+            "--os",
+            "windows",
+            "--unattended",
+            "--drivers-iso",
+            &dir.display().to_string(),
+        ]))
+        .unwrap();
+        assert_eq!(w["unattended"], true);
+        assert!(w["driversIso"].as_str().is_some());
+        assert!(create_args(&args(&["u", "--iso", "/no/such.iso"])).is_err());
         let v = create_args(&args(&["u", "-v", &format!("{}:m0:ro", dir.display())])).unwrap();
         assert_eq!(v["shares"][0]["tag"], "m0");
         assert_eq!(v["shares"][0]["readOnly"], true);
