@@ -11,6 +11,10 @@ veynodevm daemon start                         # launchd user agent
 
 State lives in `~/Library/Application Support/VeynodeVM` (override with `VEYNODEVM_HOME`).
 
+`daemon start` replaces a daemon from another build (an older release, a development checkout), which stops every VM
+it runs. While any runs it refuses instead, says how many and exits 3 (`--json`: `{"error", "code": "busy", "running",
+"daemon"}`); `daemon start --force` replaces it anyway.
+
 ## Containers
 
 One micro-VM per container:

@@ -92,6 +92,25 @@ pub fn plist(label: &str, control: &str, log: &str, home_dir: Option<&str>) -> S
     )
 }
 
+/// `daemon start`'s exit code when it refuses to replace a daemon that has
+/// VMs running (without `--force`).
+pub const BUSY: i32 = 3;
+
+/// The VMs of a `list` answer that a daemon replacement would stop: every
+/// one but those stopped, hibernated (kept on disk), crashed or invalid.
+fn active(list: &serde_json::Value) -> usize {
+    list.as_array().map_or(0, |vms| {
+        vms.iter()
+            .filter(|vm| {
+                !matches!(
+                    vm["state"].as_str(),
+                    Some("stopped" | "hibernated" | "crashed" | "error" | "invalid")
+                )
+            })
+            .count()
+    })
+}
+
 pub fn running() -> bool {
     daemon_call("capabilities", json!({})).is_ok()
 }
@@ -126,19 +145,56 @@ pub fn command(rest: &[String], json_output: bool) -> Result<i32> {
             Err(err.into())
         }
         "start" => {
+            let mut force = false;
+            for option in &rest[1..] {
+                match option.as_str() {
+                    "--force" | "-f" => force = true,
+                    other => bail!("unknown daemon start option: {other}"),
+                }
+            }
             let control = sibling("vm-control")?;
             let path = plist_path(&label)?;
             // The agent names the daemon it runs; one from another build (an
             // older release, a development checkout) is replaced, which stops
-            // that daemon and the machines it runs.
+            // that daemon and the machines it runs: refused while any run,
+            // unless forced.
             let registered = std::fs::read_to_string(&path).ok();
             let current = registered.as_deref().and_then(program);
             let ours = current.as_deref() == Some(&*control.to_string_lossy());
-            if running() && (ours || registered.is_none()) {
+            let up = running();
+            if up && (ours || registered.is_none()) {
                 println!("daemon already running");
                 return Ok(0);
             }
             if let Some(previous) = current.filter(|_| !ours) {
+                if up && !force {
+                    let busy = daemon_call("list", json!({})).map(|list| active(&list));
+                    let refusal = match &busy {
+                        &Ok(0) => None,
+                        &Ok(n) => Some(format!(
+                            "the running daemon ({previous}) has {n} {} running; replacing it stops {}. Stop {} first, or run veynodevm daemon start --force",
+                            if n == 1 { "VM" } else { "VMs" },
+                            if n == 1 { "it" } else { "them" },
+                            if n == 1 { "it" } else { "them" },
+                        )),
+                        Err(e) => Some(format!(
+                            "cannot tell whether the running daemon ({previous}) has VMs running ({e:#}); replacing it stops them. Run veynodevm daemon start --force to replace it anyway"
+                        )),
+                    };
+                    if let Some(message) = refusal {
+                        if json_output {
+                            print_json(&json!({
+                                "error": message,
+                                "code": "busy",
+                                "running": busy.as_ref().ok(),
+                                "daemon": previous,
+                            }))?;
+                        } else {
+                            eprintln!("veynodevm: {message}");
+                        }
+                        return Ok(BUSY);
+                    }
+                }
                 println!("replacing the daemon at {previous}");
             }
             let root = home::private_dir(&home::root()?)?;
@@ -243,6 +299,21 @@ mod tests {
             Some("/v/0.1.0/a&b/vm-control")
         );
         assert_eq!(super::program("<plist/>"), None);
+    }
+
+    #[test]
+    fn only_vms_a_replacement_would_stop_count() {
+        let list = serde_json::json!([
+            {"state":"running"},
+            {"state":"paused"},
+            {"state":"starting"},
+            {"state":"stopped"},
+            {"state":"hibernated"},
+            {"state":"invalid"},
+            {"state":"crashed"}
+        ]);
+        assert_eq!(super::active(&list), 3);
+        assert_eq!(super::active(&serde_json::json!([])), 0);
     }
 
     #[test]

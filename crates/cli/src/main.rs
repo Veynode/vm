@@ -105,6 +105,7 @@ Virtual machines:
 
 Service:
   daemon run|start|stop|status      Per-user control daemon (launchd agent)
+      start --force                 Replace another build's daemon even with VMs running (exit 3 otherwise)
   mcp [--lifecycle] [--execute] [--files] [--input] [--browser] [--clipboard]
       [--tools GROUP,...] [--vm ID]
                                     MCP over stdio; --tools lists only those groups
