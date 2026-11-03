@@ -908,7 +908,7 @@ pub fn create(ctx: &Ctx, args: Value, io: &StreamIo) -> Result<Value> {
             eject(ctx, json!({"name":name}))?;
             write_login(
                 &dir,
-                super::windows_install::USER,
+                super::windows_install::ADMIN,
                 Some(&fs::read(&prepared.key)?),
             )?;
             let _ = fs::remove_dir_all(dir.join("install"));

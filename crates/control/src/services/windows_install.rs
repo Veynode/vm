@@ -33,9 +33,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// The login the answer file creates.
+/// The desktop user the answer file creates and Windows signs in by itself:
+/// a standard user once the install ends, so what runs on its desktop
+/// cannot read what only administrators can.
 pub const USER: &str = "veynode";
 const PASSWORD: &str = "veynode";
+/// The administrator the host reaches the machine as over SSH, by key only:
+/// its password is random, made in the guest and never kept, and it is
+/// hidden from the sign-in screen.
+pub const ADMIN: &str = "veynode-admin";
 const EDITION: &str = "Windows 11 Pro";
 /// Microsoft's generic key for the edition: it installs, it does not activate.
 const PRODUCT_KEY: &str = "VK7JG-NPHTM-C97JM-9MPGT-3V66T";
@@ -154,6 +160,25 @@ fn openssh_setup(authorized_key: &str) -> String {
     format!("powershell -NoProfile -ExecutionPolicy Bypass -Command \"{script}\"")
 }
 
+/// Makes [`ADMIN`] and leaves `user` a standard user. Run last, from the
+/// first sign-in, which still has the administrator's rights it gives up.
+fn accounts(user: &str) -> String {
+    let script = [
+        "$bytes = New-Object byte[] 24".to_owned(),
+        "[Security.Cryptography.RNGCryptoServiceProvider]::new().GetBytes($bytes)".to_owned(),
+        // Every character class, whatever the bytes were.
+        "$secret = ConvertTo-SecureString ([Convert]::ToBase64String($bytes) + 'aA1!') -AsPlainText -Force".to_owned(),
+        format!("New-LocalUser -Name {ADMIN} -Password $secret -PasswordNeverExpires -AccountNeverExpires | Out-Null"),
+        // SIDs: the group names are translated in other Windows languages.
+        format!("Add-LocalGroupMember -SID S-1-5-32-544 -Member {ADMIN}"),
+        format!("reg add 'HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\SpecialAccounts\\UserList' /v {ADMIN} /t REG_DWORD /d 0 /f | Out-Null"),
+        format!("Add-LocalGroupMember -SID S-1-5-32-545 -Member '{user}' -ErrorAction SilentlyContinue"),
+        format!("Remove-LocalGroupMember -SID S-1-5-32-544 -Member '{user}'"),
+    ]
+    .join("; ");
+    format!("powershell -NoProfile -ExecutionPolicy Bypass -Command \"{script}\"")
+}
+
 /// Autounattend.xml.
 pub fn answer(
     user: &str,
@@ -246,6 +271,7 @@ pub fn answer(
     first_logon.extend([
         openssh_install(),
         openssh_setup(authorized_key),
+        accounts(user),
         // Powering off tells the host the install is complete.
         "shutdown /s /t 20 /c \"VeynodeVM install complete\"".to_owned(),
     ]);
@@ -809,6 +835,18 @@ mod tests {
         // Windows PE gets the storage and network drivers on every CD letter.
         assert!(xml.contains("wcm:keyValue=\"24\"><Path>K:\\NetKVM\\w11\\ARM64</Path>"));
         assert!(!xml.contains("wcm:keyValue=\"25\"><Path>D:\\viostor"));
+        // The desktop user ends a standard user; the host's SSH login is a
+        // hidden administrator with a password nobody keeps.
+        assert!(xml.contains("New-LocalUser -Name veynode-admin -Password $secret"));
+        assert!(xml.contains("Add-LocalGroupMember -SID S-1-5-32-544 -Member veynode-admin"));
+        assert!(xml.contains("SpecialAccounts\\UserList' /v veynode-admin"));
+        assert!(xml.contains("Remove-LocalGroupMember -SID S-1-5-32-544 -Member 'a&lt;b'"));
+        assert!(
+            xml.find("administrators_authorized_keys").unwrap()
+                < xml.find("Remove-LocalGroupMember").unwrap()
+        );
+        assert!(!xml.contains("veynode-admin</Name>"));
+        assert!(accounts(USER).len() <= 1024);
         // The last first-logon command powers the machine off.
         let last = xml.rfind("<Order>").unwrap();
         assert!(xml[last..].contains("shutdown /s /t 20"));
