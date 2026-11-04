@@ -830,7 +830,10 @@ interleaved rounds per variant, medians; the full rows are in
     of a requested shutdown (2026-10-26, Neptune profile), after Windows had
     logged a clean shutdown (events 1074 and 6006, no 41/6008); the daemon
     reported `crashed`, the next boot was clean and the next shutdown stopped
-    normally.
+    normally. The unattended install meets it too, at the power-off that ends
+    the first logon (2026-11-04, 29 minutes in): the first logon now starts
+    sshd as its last step before that power-off, and a crash after SSH
+    answered counts as installed.
   - Uninstalling the active viogpu3d driver (`pnputil /delete-driver
     /uninstall`) hung the guest; restore a pre-driver clone instead. Plain
     `virtio-ramfb` is the same PCI device (1AF4:1050), so viogpu3d also binds

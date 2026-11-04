@@ -139,12 +139,12 @@ fn openssh_install() -> String {
     format!("powershell -NoProfile -ExecutionPolicy Bypass -Command \"{script}\"")
 }
 
-/// The service, the key for administrators, PowerShell as the shell.
+/// The service, the key for administrators, PowerShell as the shell. The
+/// service starts only in [`SSHD_START`], after every other step.
 fn openssh_setup(authorized_key: &str) -> String {
     let keys = "C:\\ProgramData\\ssh\\administrators_authorized_keys";
     let script = [
         "Set-Service sshd -StartupType Automatic".to_owned(),
-        "Start-Service sshd".to_owned(),
         "New-NetFirewallRule -Name veynode-sshd -DisplayName 'OpenSSH (VeynodeVM)' -Protocol TCP -LocalPort 22 -Action Allow".to_owned(),
         format!("Set-Content -Encoding ascii {keys} '{}'", authorized_key.trim()),
         // SIDs: the group names are translated in other Windows languages.
@@ -198,6 +198,11 @@ fn accounts(user: &str) -> String {
     .join("; ");
     format!("powershell -NoProfile -ExecutionPolicy Bypass -Command \"{script}\"")
 }
+
+/// The last first-logon step before the power-off: once SSH answers, every
+/// other step ran, so QEMU aborting in that power-off does not undo the
+/// install (see [`install_state`]).
+const SSHD_START: &str = "powershell -NoProfile -Command \"Start-Service sshd\"";
 
 /// Autounattend.xml.
 pub fn answer(
@@ -293,6 +298,7 @@ pub fn answer(
         openssh_setup(authorized_key),
         time_sync(),
         accounts(user),
+        SSHD_START.to_owned(),
         // Powering off tells the host the install is complete.
         "shutdown /s /t 20 /c \"VeynodeVM install complete\"".to_owned(),
     ]);
@@ -478,8 +484,11 @@ const MAX_GUEST_RESETS: u64 = 8;
 /// Where the install stands by the machine's `status`: `Ok(true)` once the
 /// Guest powered itself off, `Ok(false)` while it runs, else why it failed.
 /// Only the Guest's own power-off ends an install: a host stop, a removal,
-/// a crash or a Windows panic (QEMU exits with a failure) do not.
-fn install_state(name: &str, status: Option<&Value>) -> Result<bool> {
+/// a crash or a Windows panic (QEMU exits with a failure) do not. The one
+/// crash that does is QEMU's HVF `isv` abort in the final power-off once the
+/// Neptune driver is in: `finished` says SSH answered, so only that
+/// power-off was left. The first start after it still waits for the login.
+fn install_state(name: &str, status: Option<&Value>, finished: bool) -> Result<bool> {
     let Some(status) = status else {
         bail!("{name} was removed during the install")
     };
@@ -491,6 +500,7 @@ fn install_state(name: &str, status: Option<&Value>) -> Result<bool> {
     match status["state"].as_str().unwrap_or_default() {
         "stopped" if runtime["reason"] == "guest-shutdown" => Ok(true),
         "stopped" => bail!("{name} was stopped before Windows Setup finished"),
+        "crashed" if finished => Ok(true),
         "crashed" => bail!("{name} crashed during the install"),
         "paused" => match runtime["qmp_status"].as_str().unwrap_or_default() {
             "prelaunch" => Ok(false),
@@ -539,7 +549,7 @@ impl Serial {
                 return Ok(());
             }
             check()?;
-            if install_state(name, status(name).as_ref())? {
+            if install_state(name, status(name).as_ref(), false)? {
                 bail!("{name} stopped while waiting for {needle:?}")
             }
             thread::sleep(Duration::from_secs(1));
@@ -607,6 +617,22 @@ fn activity(name: &str) -> Result<Activity> {
     Ok(Activity { pcs, written })
 }
 
+/// Whether the Guest's SSH server greets on the machine's forward.
+fn ssh_answers(status: &Value) -> bool {
+    let Some(port) = super::machine_guest::ssh_forward(&status["config"]) else {
+        return false;
+    };
+    let Ok(mut stream) = std::net::TcpStream::connect_timeout(
+        &([127, 0, 0, 1], port).into(),
+        Duration::from_secs(2),
+    ) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+    let mut banner = [0; 4];
+    stream.read_exact(&mut banner).is_ok() && &banner == b"SSH-"
+}
+
 /// Waits for the Guest to power off, ending early when neither a vCPU
 /// program counter nor the bytes written to disk move across two samples
 /// two minutes apart (a firmware or kernel spin, as seen with a corrupt UEFI
@@ -616,10 +642,15 @@ fn wait_installed(name: &str, timeout: Duration, check: Check) -> Result<()> {
     let mut next_sample = Instant::now();
     let (mut last, mut still) = (None, 0);
     let started = Instant::now();
+    let mut finished = false;
     while Instant::now() < deadline {
         check()?;
         let status = status(name);
-        if install_state(name, status.as_ref())? {
+        if !finished && status.as_ref().is_some_and(ssh_answers) {
+            finished = true;
+            progress("the first logon is done; Windows powers off");
+        }
+        if install_state(name, status.as_ref(), finished)? {
             return Ok(());
         }
         if Instant::now() >= next_sample {
@@ -882,15 +913,18 @@ mod tests {
         assert!(xml.contains("@if exist %d:\\viogpudo\\w11\\ARM64 pnputil /add-driver"));
         // Installed from the seed, with Windows Update only as the fallback.
         assert!(xml.find("OpenSSH.msi").unwrap() < xml.find("Add-WindowsCapability").unwrap());
-        assert!(
-            xml.find("Add-WindowsCapability").unwrap() < xml.find("Start-Service sshd").unwrap()
-        );
+        // SSH starts last, so its answer means the other steps ran.
+        let start = xml.find("Start-Service sshd").unwrap();
+        assert!(xml.find("Add-WindowsCapability").unwrap() < start);
+        assert!(xml.find("Remove-LocalGroupMember").unwrap() < start);
+        assert!(start < xml.find("shutdown /s").unwrap());
+        assert_eq!(xml.matches("Start-Service sshd").count(), 1);
     }
 
     #[test]
     fn only_the_guest_s_own_power_off_ends_an_install() {
         let state = |state: &str, runtime: Value| {
-            install_state("w", Some(&json!({"state":state,"runtime":runtime})))
+            install_state("w", Some(&json!({"state":state,"runtime":runtime})), false)
         };
         let failure = |result: Result<bool>| result.unwrap_err().to_string();
         assert!(state("stopped", json!({"reason":"guest-shutdown"})).unwrap());
@@ -911,13 +945,38 @@ mod tests {
             failure(state("paused", json!({"qmp_status":"paused"}))).contains("stopped running")
         );
         assert!(failure(state("missing", json!({}))).contains("missing"));
-        assert!(failure(install_state("w", None)).contains("removed"));
+        assert!(failure(install_state("w", None, false)).contains("removed"));
+        // A crash once SSH answered is the power-off after the last step.
+        assert!(install_state("w", Some(&json!({"state":"crashed","runtime":{}})), true).unwrap());
         assert!(!state("running", json!({"guest_resets":MAX_GUEST_RESETS})).unwrap());
         assert!(failure(state(
             "running",
             json!({"guest_resets":MAX_GUEST_RESETS + 1})
         ))
         .contains("restarted 9 times"));
+    }
+
+    #[test]
+    fn only_an_ssh_greeting_says_the_first_logon_finished() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let status =
+            json!({"config":{"ports":[{"host_port":port,"guest_port":22,"protocol":"tcp"}]}});
+        let greet = |banner: &'static [u8]| {
+            let listener = listener.try_clone().unwrap();
+            thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.write_all(banner).unwrap();
+            })
+        };
+        let server = greet(b"SSH-2.0-OpenSSH_for_Windows\r\n");
+        assert!(ssh_answers(&status));
+        server.join().unwrap();
+        // A forward with nothing behind it closes at once.
+        let server = greet(b"");
+        assert!(!ssh_answers(&status));
+        server.join().unwrap();
+        assert!(!ssh_answers(&json!({"config":{"ports":[]}})));
     }
 
     #[test]
