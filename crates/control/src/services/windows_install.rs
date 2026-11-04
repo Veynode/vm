@@ -132,7 +132,11 @@ fn openssh_install() -> String {
         format!(
             "$msi = Get-PSDrive -PSProvider FileSystem | ForEach-Object {{ Join-Path $_.Root '{OPENSSH_MSI}' }} | Where-Object {{ Test-Path $_ }} | Select-Object -First 1"
         ),
-        "if ($msi) { Start-Process msiexec -Wait -ArgumentList '/i',$msi,'/qn','ADDLOCAL=Server' }".to_owned(),
+        // The package leaves its folder off PATH, where sshd looks for the
+        // sftp-server.exe its sshd_config names, and scp speaks SFTP.
+        "if ($msi) { Start-Process msiexec -Wait -ArgumentList '/i',$msi,'/qn','ADDLOCAL=Server'; \
+         [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + (Join-Path $env:ProgramFiles 'OpenSSH'), 'Machine') }"
+            .to_owned(),
         "if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) { Get-WindowsCapability -Online -Name 'OpenSSH.Server*' | Add-WindowsCapability -Online }".to_owned(),
     ]
     .join("; ");
@@ -965,6 +969,9 @@ mod tests {
         assert!(xml.contains("@if exist %d:\\viogpudo\\w11\\ARM64 pnputil /add-driver"));
         // Installed from the seed, with Windows Update only as the fallback.
         assert!(xml.find("OpenSSH.msi").unwrap() < xml.find("Add-WindowsCapability").unwrap());
+        // scp finds sftp-server.exe in the package's folder.
+        assert!(xml.contains("(Join-Path $env:ProgramFiles 'OpenSSH'), 'Machine')"));
+        assert!(openssh_install().len() <= 1024);
         // SSH starts last, so its answer means the other steps ran.
         let start = xml.find("Start-Service sshd").unwrap();
         assert!(xml.find("Add-WindowsCapability").unwrap() < start);
