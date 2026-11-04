@@ -23,10 +23,17 @@
   split DNS. `inspect` shows the servers in use, `--dns` replaces them, and
   a boot on a network with an IPv4 resolver goes back to `10.0.2.3`. A
   network change while the guest runs takes effect at its next boot.
-  Machines, Windows and the installed desktop distributions take DNS from
-  slirp's DHCP and still fail on such a network; fixing them needs a
-  patched libslirp (keep the IPv6 scope id, or forward to a host relay).
-  Apple Virtualization guests use vmnet's forwarder and resolve.
+  A QEMU Linux machine with the daemon's SSH login (a cloud image's seed)
+  gets the same servers when the daemon first logs in after a boot
+  (a `machine.start` with `wait`, `exec`, file copies): a runtime drop-in for
+  systemd-networkd, `nmcli device modify` for NetworkManager, or a plain
+  `/etc/resolv.conf`; all of it is gone at the next boot. Verified on
+  Debian 13 (networkd); the NetworkManager path is untested. Commands the
+  guest runs before that first login (cloud-init's own) still use
+  `10.0.2.3`. Windows machines and installed systems without that login
+  keep slirp's DHCP servers and still fail on such a network; a full fix
+  needs a patched libslirp. Apple Virtualization guests use vmnet's
+  forwarder and resolve.
 - **Path MTU on Apple NAT.** Inbound TCP segments larger than about 1300
   bytes are sometimes lost (TLS handshakes stall after connect; MTU 1280
   works, 1400 does not). First seen in the engine VM, later reproduced

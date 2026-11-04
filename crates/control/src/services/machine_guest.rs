@@ -212,6 +212,9 @@ pub fn ready(ctx: &Ctx, machine: &Machine, progress: &dyn Fn(&str)) -> Result<Ta
     loop {
         // cloud-init installs the key a little after sshd starts.
         if TcpStream::connect_timeout(&address, Duration::from_secs(2)).is_ok() && target.works()? {
+            if vm["config"]["backend"] == "qemu-hvf" {
+                boot_dns(&target, progress);
+            }
             return Ok(target);
         }
         if !said {
@@ -229,6 +232,38 @@ pub fn ready(ctx: &Ctx, machine: &Machine, progress: &dyn Fn(&str)) -> Result<Ta
             )
         }
         thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// DNS servers for a QEMU guest whose user network cannot reach the host's
+/// (`guest_dns`), set once per guest boot. On a host where slirp forwards
+/// DNS this costs nothing; elsewhere one SSH round trip per login check.
+fn boot_dns(target: &Target, progress: &dyn Fn(&str)) {
+    let Some(servers) = super::guest_dns::host_resolv_conf()
+        .as_deref()
+        .and_then(super::guest_dns::servers_for)
+    else {
+        return;
+    };
+    let script = super::guest_dns::machine_script(&servers);
+    let output = target
+        .ssh()
+        .arg(format!("sudo -n /bin/sh -c {}", quote(&script)))
+        .stdin(Stdio::null())
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            if String::from_utf8_lossy(&out.stdout).trim() == "set" {
+                progress(&format!(
+                    "host DNS unreachable from QEMU's user network; using {}",
+                    servers.join(", ")
+                ));
+            }
+        }
+        // The guest keeps slirp's servers; its commands still run.
+        _ => progress(
+            "host DNS unreachable from QEMU's user network; could not set the guest's DNS servers",
+        ),
     }
 }
 

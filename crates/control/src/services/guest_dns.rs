@@ -156,6 +156,54 @@ pub fn copy_auto(from: &Path, to: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// The shell script (run as root) that makes a Linux machine's network use
+/// `servers` until its next boot, through the first of these the guest has:
+/// systemd-networkd (a runtime drop-in for each Ethernet link's network
+/// file, replacing the servers DHCP and slirp's router advertisement gave),
+/// NetworkManager (`nmcli device modify`, which lasts until the device
+/// reconnects) or a plain `/etc/resolv.conf`. Everything it writes is under
+/// `/run` or rewritten by the guest's DHCP client, so the next boot decides
+/// again. It prints `set` when it changed the guest, nothing when this boot
+/// already uses `servers`.
+pub fn machine_script(servers: &[String]) -> String {
+    let all = servers.join(" ");
+    let (v4, v6): (Vec<&str>, Vec<&str>) = servers
+        .iter()
+        .map(String::as_str)
+        .partition(|s| !s.contains(':'));
+    let networkd = format!(
+        "[Network]\\nDNS={all}\\n[DHCPv4]\\nUseDNS=no\\n[DHCPv6]\\nUseDNS=no\\n[IPv6AcceptRA]\\nUseDNS=no\\n"
+    );
+    let nm = format!(
+        "ipv4.ignore-auto-dns yes ipv4.dns '{}' ipv6.ignore-auto-dns yes ipv6.dns '{}'",
+        v4.join(" "),
+        v6.join(" ")
+    );
+    format!(
+        r#"m=/run/veynode-dns; S='{all}'
+[ "$(cat $m 2>/dev/null)" = "$S" ] && exit 0
+done=
+if command -v networkctl >/dev/null && systemctl is-active -q systemd-networkd; then
+  for l in $(networkctl list --no-legend 2>/dev/null | awk '$3=="ether"{{print $2}}'); do
+    f=$(networkctl status "$l" 2>/dev/null | sed -n 's/^ *Network File: //p')
+    case "$f" in /*) d="/run/systemd/network/${{f##*/}}.d"; mkdir -p "$d" && printf '{networkd}' > "$d/90-veynode-dns.conf" && done=1;; esac
+  done
+  [ -n "$done" ] && networkctl reload
+fi
+if [ -z "$done" ] && command -v nmcli >/dev/null && systemctl is-active -q NetworkManager; then
+  for d in $(nmcli -t -f DEVICE,TYPE,STATE device 2>/dev/null | awk -F: '$2=="ethernet" && $3=="connected"{{print $1}}'); do
+    nmcli device modify "$d" {nm} >/dev/null && done=1
+  done
+fi
+if [ -z "$done" ] && [ -f /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ]; then
+  for s in $S; do echo "nameserver $s"; done > /etc/resolv.conf && done=1
+fi
+[ -n "$done" ] || exit 1
+echo "$S" > $m; echo set
+"#
+    )
+}
+
 /// The host's resolver configuration, if it can be read.
 pub fn host_resolv_conf() -> Option<String> {
     std::fs::read_to_string(RESOLV_CONF).ok()
@@ -259,6 +307,31 @@ mod tests {
         assert!(!apply_in(dir.path(), &mut guest, true, Some(LINK_LOCAL_ONLY)).unwrap());
         assert_eq!(guest, json!({"dns": ["9.9.9.9"]}));
         clear_auto(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn machine_script_replaces_dhcp_servers_until_the_next_boot() {
+        let script = machine_script(&["2001:db8::53".into(), "1.1.1.1".into()]);
+        assert!(script.starts_with("m=/run/veynode-dns; S='2001:db8::53 1.1.1.1'\n"));
+        // networkd: a runtime drop-in, DHCP and router-advertised servers off.
+        assert!(script.contains("DNS=2001:db8::53 1.1.1.1\\n[DHCPv4]\\nUseDNS=no"));
+        assert!(script.contains("[IPv6AcceptRA]\\nUseDNS=no"));
+        assert!(script.contains("d=\"/run/systemd/network/${f##*/}.d\""));
+        // NetworkManager takes each family's servers on its own.
+        assert!(
+            script.contains("ipv4.dns '1.1.1.1' ipv6.ignore-auto-dns yes ipv6.dns '2001:db8::53'")
+        );
+        assert!(script.contains("echo \"$S\" > $m; echo set"));
+    }
+
+    #[test]
+    fn machine_script_is_valid_shell() {
+        let script = machine_script(&["1.1.1.1".into(), "8.8.8.8".into()]);
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-n", "-c", &script])
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     #[test]
