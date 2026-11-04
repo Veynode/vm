@@ -591,6 +591,7 @@ pub fn fork(source: &Container, options: &ForkOptions) -> Result<Value> {
             config["hostname"] = json!(name.chars().take(63).collect::<String>());
             config["session_token"] = json!(session_token);
             container::write_config_disk(&dir.join("config.img"), &config)?;
+            super::guest_dns::copy_auto(&source_dir, &dir)?;
             let vm = fork_vm_config(&source_vm, &source_dir, &fork, &dir)?;
             daemon_call("create", vm)?;
             if options.start {

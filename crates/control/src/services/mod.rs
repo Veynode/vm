@@ -14,6 +14,7 @@ pub mod display;
 pub mod engine;
 pub mod files;
 pub mod gpt;
+pub mod guest_dns;
 pub mod images;
 pub mod machine_guest;
 pub mod machines;

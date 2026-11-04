@@ -8,6 +8,25 @@
   so lookups time out. Set explicit servers per container (`--dns 1.1.1.1`),
   for the engine (`veynodevm engine start --dns 1.1.1.1`), or as the default
   in runtime.json (`scripts/install-dev-runtime.py --dns 1.1.1.1`).
+- **DNS on QEMU when the host has no IPv4 resolver.** QEMU's user network
+  (libslirp 4.9) forwards the guest's `10.0.2.3` only to the first IPv4
+  `nameserver` in the host's `/etc/resolv.conf`, or to the first IPv6 one
+  without its scope id. On a network whose only resolver is link-local IPv6
+  (an IPv6-only Wi-Fi with `fe80::…%en0`), slirp drops IPv4 queries and
+  cannot reach the IPv6 server, so guests cannot resolve names while the
+  host can. A host relay can't fill the gap: slirp keeps port 53, which an
+  unprivileged process binds only on the wildcard address, where it takes
+  the queries of Apple Virtualization guests too. So a QEMU container or
+  engine given no `--dns` (and no runtime.json default) gets, at each boot,
+  the host's global IPv6 resolvers, or else `1.1.1.1` and `8.8.8.8` as the
+  last resort, and `run`/`start` say so; such a boot bypasses the host's
+  split DNS. `inspect` shows the servers in use, `--dns` replaces them, and
+  a boot on a network with an IPv4 resolver goes back to `10.0.2.3`. A
+  network change while the guest runs takes effect at its next boot.
+  Machines, Windows and the installed desktop distributions take DNS from
+  slirp's DHCP and still fail on such a network; fixing them needs a
+  patched libslirp (keep the IPv6 scope id, or forward to a host relay).
+  Apple Virtualization guests use vmnet's forwarder and resolve.
 - **Path MTU on Apple NAT.** Inbound TCP segments larger than about 1300
   bytes are sometimes lost (TLS handshakes stall after connect; MTU 1280
   works, 1400 does not). First seen in the engine VM, later reproduced

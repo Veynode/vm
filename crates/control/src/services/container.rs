@@ -732,6 +732,7 @@ pub fn create_and_start(options: &RunOptions) -> Result<Container> {
             guest_config["init"] = json!("systemd");
         }
         let config_disk = dir.join("config.img");
+        boot_dns(&dir, &mut guest_config, qemu)?;
         write_config_disk(&config_disk, &guest_config)?;
         let memory_mib = options.memory_mib.unwrap_or(default_memory_mib(
             qemu,
@@ -1220,6 +1221,7 @@ pub fn update(c: &Container, changes: &Changes, restart: bool) -> Result<Contain
     vm["memory_mib"] = json!(record.memory_mib);
     if let Some(dns) = dns {
         guest["dns"] = json!(dns);
+        super::guest_dns::clear_auto(&dir)?;
     }
     if let Some(mtu) = mtu {
         guest["mtu"] = json!(mtu);
@@ -1365,6 +1367,25 @@ pub fn wait_stopped(container: &Container, timeout: Duration) -> bool {
     false
 }
 
+/// The DNS servers a booting guest uses when QEMU's user network cannot
+/// reach the host's (`guest_dns`); the person's own servers stay.
+fn boot_dns(dir: &Path, guest: &mut Value, qemu: bool) -> Result<()> {
+    let resolv_conf = super::guest_dns::host_resolv_conf();
+    if super::guest_dns::apply_in(dir, guest, qemu, resolv_conf.as_deref())? {
+        let servers: Vec<&str> = guest["dns"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        super::progress(&format!(
+            "host DNS unreachable from QEMU's user network; using {}",
+            servers.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 /// Start a stopped container again. The previous run's console is kept as
 /// `console.prev.log` so markers (ip, exit) always describe the current run.
 pub fn start(container: &Container) -> Result<()> {
@@ -1389,9 +1410,12 @@ pub fn start_from(container: &Container, machine_state: Option<&Path>) -> Result
     }
     super::session::refresh_forward(container)?;
     if machine_state.is_none() && container.os != "darwin" {
-        // A booting guest gets a seed it has not seen before.
+        // A booting guest gets a seed it has not seen before, and DNS servers
+        // when QEMU's user network cannot reach the host's (`guest_dns`).
         let config_disk = dir.join("config.img");
-        replace_config_disk(&config_disk, &read_config_disk(&config_disk)?)?;
+        let mut guest = read_config_disk(&config_disk)?;
+        boot_dns(&dir, &mut guest, container.backend == "qemu-hvf")?;
+        replace_config_disk(&config_disk, &guest)?;
     }
     let mut request = start_request(container);
     if let Some(path) = machine_state {
