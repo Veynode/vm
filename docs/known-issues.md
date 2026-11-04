@@ -834,6 +834,13 @@ interleaved rounds per variant, medians; the full rows are in
     the first logon (2026-11-04, 29 minutes in): the first logon now starts
     sshd as its last step before that power-off, and a crash after SSH
     answered counts as installed.
+  - **Setup sometimes misses its answer file.** The seed CD (VEYNODEWIN) is a
+    USB CD-ROM like the installer and the driver CDs, and in Windows PE it can
+    show up last: Setup then starts without Autounattend.xml and waits on its
+    language page (vCPUs idle, nothing written). Seen in 2 of 4 installs on
+    2026-11-04; `diskpart` in that Windows PE listed the seed as the last
+    volume. A machine that looks hung before its first reboot with under
+    64 MiB written is booted again, up to three boots.
   - Uninstalling the active viogpu3d driver (`pnputil /delete-driver
     /uninstall`) hung the guest; restore a pre-driver clone instead. Plain
     `virtio-ramfb` is the same PCI device (1AF4:1050), so viogpu3d also binds

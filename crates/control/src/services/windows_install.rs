@@ -514,6 +514,20 @@ fn install_state(name: &str, status: Option<&Value>, finished: bool) -> Result<b
     }
 }
 
+/// Stops the machine at once and waits until the daemon says it stopped.
+fn power_off(name: &str) -> Result<()> {
+    call("force_stop", json!({"id":name,"confirm":name}))?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        let state = status(name).map(|s| s["state"].as_str().unwrap_or_default().to_owned());
+        if matches!(state.as_deref(), Some("stopped" | "crashed")) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    bail!("{name} did not stop to boot the installer again")
+}
+
 /// New bytes of the machine's serial log, from where it stood at `new`.
 struct Serial {
     path: PathBuf,
@@ -633,11 +647,35 @@ fn ssh_answers(status: &Value) -> bool {
     stream.read_exact(&mut banner).is_ok() && &banner == b"SSH-"
 }
 
+/// Less than Setup writes before its first reboot: below it, nothing was
+/// installed (the firmware's variables are written in any case).
+const NOTHING_WRITTEN: u64 = 64 << 20;
+
+/// Boots of the installer before an install that never starts fails.
+const INSTALLER_BOOTS: u32 = 3;
+
+/// How a wait for the install ended without an error.
+#[derive(Debug, PartialEq)]
+enum Waited {
+    Installed,
+    /// Setup sat still before its first reboot with nothing written: it
+    /// started before the seed CD's USB device showed up in Windows PE,
+    /// missed Autounattend.xml and waits on its language page for a click.
+    AnswerMissed,
+}
+
+/// Whether a machine that looks hung is Setup that never began: its first
+/// QEMU process (no reboot yet) and nearly nothing written.
+fn never_began(status: Option<&Value>, written: u64) -> bool {
+    status.is_some_and(|s| s["runtime"]["guest_resets"].as_u64().unwrap_or(0) == 0)
+        && written < NOTHING_WRITTEN
+}
+
 /// Waits for the Guest to power off, ending early when neither a vCPU
 /// program counter nor the bytes written to disk move across two samples
 /// two minutes apart (a firmware or kernel spin, as seen with a corrupt UEFI
 /// variable store; an idle vCPU waits at one PC, but Setup keeps writing).
-fn wait_installed(name: &str, timeout: Duration, check: Check) -> Result<()> {
+fn wait_installed(name: &str, timeout: Duration, check: Check) -> Result<Waited> {
     let deadline = Instant::now() + timeout;
     let mut next_sample = Instant::now();
     let (mut last, mut still) = (None, 0);
@@ -651,7 +689,7 @@ fn wait_installed(name: &str, timeout: Duration, check: Check) -> Result<()> {
             progress("the first logon is done; Windows powers off");
         }
         if install_state(name, status.as_ref(), finished)? {
-            return Ok(());
+            return Ok(Waited::Installed);
         }
         if Instant::now() >= next_sample {
             next_sample = Instant::now() + Duration::from_secs(120);
@@ -663,6 +701,9 @@ fn wait_installed(name: &str, timeout: Duration, check: Check) -> Result<()> {
                 0
             };
             last = now;
+            if still >= 2 && never_began(status.as_ref(), last.as_ref().map_or(0, |a| a.written)) {
+                return Ok(Waited::AnswerMissed);
+            }
             if still >= 2 {
                 bail!(
                     "{name} looks hung: vCPU program counters {:?} and disk writes unchanged for {} minutes",
@@ -839,16 +880,27 @@ pub fn prepare(name: &str, work: &Path, neptune: bool) -> Result<Prepared> {
 /// machine is left stopped. `check` runs between polls and ends the install
 /// with its error. The Mac does not idle-sleep meanwhile.
 pub fn install(name: &str, check: Check) -> Result<()> {
-    let serial = Serial::new(name)?;
     let _awake = Awake::new();
     let started = Instant::now();
-    progress("starting the Windows installer");
-    call("start", json!({"id":name}))?;
-    let installed = press_any_key(name, &serial, check).and_then(|()| {
-        progress("Windows Setup runs unattended; the first logon powers the machine off");
-        wait_installed(name, Duration::from_secs(180 * 60), check)
-    });
-    installed.map_err(|error| with_logs(error, name, &serial.path))?;
+    for boot in 1..=INSTALLER_BOOTS {
+        let serial = Serial::new(name)?;
+        progress("starting the Windows installer");
+        call("start", json!({"id":name}))?;
+        let waited = press_any_key(name, &serial, check).and_then(|()| {
+            progress("Windows Setup runs unattended; the first logon powers the machine off");
+            wait_installed(name, Duration::from_secs(180 * 60), check)
+        });
+        match waited.map_err(|error| with_logs(error, name, &serial.path))? {
+            Waited::Installed => break,
+            Waited::AnswerMissed if boot < INSTALLER_BOOTS => {
+                progress("Windows Setup missed its answer file; booting the installer again");
+                power_off(name)?;
+            }
+            Waited::AnswerMissed => bail!(
+                "Windows Setup did not find its answer file in {INSTALLER_BOOTS} boots of the installer"
+            ),
+        }
+    }
     progress(&format!(
         "installed in {} minutes",
         started.elapsed().as_secs() / 60
@@ -977,6 +1029,15 @@ mod tests {
         assert!(!ssh_answers(&status));
         server.join().unwrap();
         assert!(!ssh_answers(&json!({"config":{"ports":[]}})));
+    }
+
+    #[test]
+    fn only_setup_still_before_its_first_reboot_never_began() {
+        let status = |resets: u64| json!({"runtime":{"guest_resets":resets}});
+        assert!(never_began(Some(&status(0)), 128 << 10));
+        assert!(!never_began(Some(&status(0)), 2 << 30));
+        assert!(!never_began(Some(&status(1)), 0));
+        assert!(!never_began(None, 0));
     }
 
     #[test]
