@@ -522,6 +522,52 @@ def package(root, out, profile, identity, web, version, commit, dry=False, boot=
     return record
 
 
+def repackage(root, source, out, profile, identity, version, commit, dry=False):
+    """A release whose every piece but this checkout's Rust programs comes
+    from `source`, an earlier release directory as it was published: its
+    worker, helpers, boot files, guest agent, QEMU/GPU runtime and licences,
+    each checked against that release's MANIFEST.json first. For a version
+    that changed only `crates/`, on a Mac that no longer has the runtime's
+    build (which takes an hour and tens of gigabytes). The earlier release
+    must be signed by `identity`: the hardened loader takes one Team ID."""
+    earlier = json.loads((source / 'MANIFEST.json').read_text())
+    if earlier.get('product') != 'VeynodeVM' or earlier.get('includes', {}).get('web'):
+        raise SystemExit(f'{source} is not a VeynodeVM release without the web UI')
+    if earlier['signing'] != ('ad hoc' if identity == '-' else identity):
+        raise SystemExit(f'{source} is signed by {earlier["signing"]}, not {identity}')
+    missing = [str(root / 'target' / profile / name) for name in BINARIES
+               if not (root / 'target' / profile / name).exists()]
+    if missing:
+        raise SystemExit('missing built pieces (see docs/guides/building.md):\n  ' + '\n  '.join(missing))
+    changed = [entry['path'] for entry in earlier['files']
+               if not (source / entry['path']).is_file()
+               or digest(source / entry['path']) != entry['sha256']
+               or f'{(source / entry["path"]).stat().st_mode & 0o777:o}' != entry['mode']]
+    listed = {entry['path'] for entry in earlier['files']} | {'MANIFEST.json'}
+    changed += [str(path.relative_to(source)) for path in source.rglob('*')
+                if path.is_file() and not path.is_symlink() and str(path.relative_to(source)) not in listed]
+    if changed:
+        raise SystemExit(f'{source} is not as its MANIFEST.json says:\n  ' + '\n  '.join(sorted(changed)))
+    shutil.copytree(source, out, symlinks=True)
+    helpers = {key: f'libexec/{name}' for key, name in HELPERS.items() if (out / 'libexec' / name).exists()}
+    qemu = earlier['includes'].get('qemu_runtime')
+    for name in BINARIES:
+        (out / 'bin' / name).unlink()
+        copy(root / 'target' / profile / name, out / 'bin' / name)
+    (out / 'VeynodeVM.app/Contents/Info.plist').write_text(info_plist(version))
+    (out / 'install.py').write_text(INSTALL % {'layout': json.dumps(layout(helpers, False))})
+    os.chmod(out / 'install.py', 0o755)
+    (out / 'share/runtime.json').write_text(json.dumps(shipped_runtime(helpers, False, bool(qemu)), indent=2) + '\n')
+    for name in BINARIES:
+        run(signing_argv(identity, out / 'bin' / name), dry)
+    run(signing_argv(identity, out / 'VeynodeVM.app', root / 'native/entitlements.plist'), dry)
+    run(['codesign', '--verify', '--strict', '--deep', str(out / 'VeynodeVM.app')], dry)
+    record = manifest(out, version, commit, profile, identity, helpers, False, qemu)
+    record['runtime_from'] = {'version': earlier['version'], 'commit': earlier['commit']}
+    (out / 'MANIFEST.json').write_text(json.dumps(record, indent=2) + '\n')
+    return record
+
+
 def crate_version(root):
     for line in (root / 'crates/cli/Cargo.toml').read_text().splitlines():
         if line.startswith('version'):
@@ -563,6 +609,8 @@ def main():
                         help='the Venus host runtime and render server (runtime/linux-vulkan-build-host-runtime.py)')
     parser.add_argument('--gpu-drivers', type=Path, default=ROOT / '.local/runtime/gpu-drivers',
                         help='MoltenVK and DXMT built from source (runtime/build-gpu-drivers.sh)')
+    parser.add_argument('--from-release', type=Path, metavar='DIR',
+                        help='an earlier release directory: take everything but the Rust programs from it, checked against its MANIFEST.json')
     parser.add_argument('--archive', action='store_true', help='also write OUTPUT.tar.gz and OUTPUT.tar.gz.sha256')
     parser.add_argument('--dry-run', action='store_true', help='list the inputs and what is missing; copy and sign nothing')
     args = parser.parse_args()
@@ -570,7 +618,11 @@ def main():
                if args.qemu_runtime else None)
     if not args.output.is_absolute() or args.output.exists():
         raise SystemExit('--output must be an absolute path that does not exist yet')
-    if args.dry_run:
+    if args.from_release:
+        if args.dry_run or args.web or args.qemu_runtime:
+            raise SystemExit('--from-release takes the earlier release as it is: no --dry-run, --web or --qemu-runtime')
+        record = repackage(ROOT, args.from_release, args.output, args.profile, args.sign, crate_version(ROOT), git_commit(ROOT))
+    elif args.dry_run:
         files, helpers, missing = inputs(ROOT, args.profile, args.web, args.boot)
         if runtime:
             pieces, absent = runtime_inputs(*runtime)
@@ -581,8 +633,9 @@ def main():
         for path in missing:
             print(f'MISSING {path}')
         return 1 if missing else 0
-    record = package(ROOT, args.output, args.profile, args.sign, args.web, crate_version(ROOT), git_commit(ROOT),
-                     boot=args.boot, runtime=runtime)
+    else:
+        record = package(ROOT, args.output, args.profile, args.sign, args.web, crate_version(ROOT), git_commit(ROOT),
+                         boot=args.boot, runtime=runtime)
     print(f'{args.output}: VeynodeVM {record["version"]} ({record["commit"]}), {len(record["files"])} files, signing {record["signing"]}')
     if args.archive:
         path, checksum = archive(args.output)

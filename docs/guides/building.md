@@ -29,6 +29,11 @@ python3 scripts/package-release.py --output /tmp/VeynodeVM --web [--qemu-runtime
 /tmp/VeynodeVM/bin/veynodevm daemon start
 ```
 
+`--from-release DIR` makes the release of a version that changed only `crates/` on a Mac without the runtime's
+build: everything but the Rust programs (the worker, helpers, boot files, guest agent, QEMU/GPU runtime and
+licences) is copied from the earlier release directory `DIR`, after each file is checked against that release's
+`MANIFEST.json`; the new manifest names it in `runtime_from`. `DIR` must be signed by the same identity.
+
 With `--qemu-runtime` the release carries Venus and Neptune: `libexec/qemu/venus/` holds the render server, host
 library and loader with a `registration.json` relative to itself, and the drivers sit in `libexec/qemu/Frameworks/`.
 Signing changes their bytes, so the compiled Venus catalog cannot name them: a daemon admits the GPU runtime of the

@@ -52,6 +52,56 @@ class PackageReleaseTest(unittest.TestCase):
             record = release.package(self.root, self.out, 'release', identity, web, '0.1.0', 'abc', dry=True)
         return record, printed.getvalue()
 
+    def earlier(self):
+        """A release of an older checkout, with a runtime file and a symlink."""
+        old = pathlib.Path(self.temp.name) / 'old'
+        checkout(old, web=False)
+        source = pathlib.Path(self.temp.name) / 'Earlier'
+        with contextlib.redirect_stdout(io.StringIO()):
+            release.package(old, source, 'release', '-', False, '0.1.0', 'old', dry=True)
+        touch(source / 'libexec/qemu/Frameworks/a.framework/Versions/A/a')
+        os.symlink('Versions/A/a', source / 'libexec/qemu/Frameworks/a.framework/a')
+        record = release.manifest(source, '0.1.0', 'old', 'release', '-', ['vision'], False, ['a.framework'])
+        (source / 'MANIFEST.json').write_text(json.dumps(record))
+        return source
+
+    def test_a_release_from_an_earlier_one_takes_only_new_programs(self):
+        source = self.earlier()
+        checkout(self.root, web=False, helpers=())
+        (self.root / 'target/release/vm-control').write_text('new')
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            record = release.repackage(self.root, source, self.out, 'release', '-', '0.2.0', 'abc', dry=True)
+        self.assertEqual((self.out / 'bin/vm-control').read_text(), 'new')
+        self.assertEqual((self.out / 'libexec/vm-vision').read_text(), 'vm-vision')
+        self.assertTrue((self.out / 'libexec/qemu/Frameworks/a.framework/a').is_symlink())
+        self.assertIn('0.2.0', (self.out / 'VeynodeVM.app/Contents/Info.plist').read_text())
+        self.assertEqual(record['version'], '0.2.0')
+        self.assertEqual(record['includes'], {'web': False, 'helpers': ['vision'], 'qemu_runtime': ['a.framework']})
+        self.assertEqual(record['runtime_from'], {'version': '0.1.0', 'commit': 'old'})
+        self.assertIn('../libexec/qemu/probe-loader', (self.out / 'share/runtime.json').read_text())
+        signed = [line.split()[-1] for line in printed.getvalue().splitlines() if '--sign' in line]
+        self.assertEqual(len(signed), len(release.BINARIES) + 1)
+        self.assertFalse(any('libexec' in path for path in signed))
+
+    def test_an_earlier_release_that_changed_is_refused(self):
+        source = self.earlier()
+        checkout(self.root, web=False)
+        (source / 'libexec/vm-vision').write_text('other')
+        touch(source / 'libexec/qemu/extra')
+        with self.assertRaises(SystemExit) as refused:
+            release.repackage(self.root, source, self.out, 'release', '-', '0.2.0', 'abc', dry=True)
+        self.assertIn('libexec/vm-vision', str(refused.exception))
+        self.assertIn('libexec/qemu/extra', str(refused.exception))
+        self.assertFalse(self.out.exists())
+        with self.assertRaises(SystemExit) as refused:
+            release.repackage(self.root, self.earlier_signed_by(source), self.out, 'release', 'Developer ID', '0.2.0', 'abc', dry=True)
+        self.assertIn('signed by', str(refused.exception))
+
+    def earlier_signed_by(self, source):
+        (source / 'libexec/vm-vision').write_text('vm-vision')
+        (source / 'libexec/qemu/extra').unlink()
+        return source
+
     def test_missing_pieces_are_named_and_nothing_is_written(self):
         checkout(self.root)
         (self.root / '.local/boot/modloop').unlink()
