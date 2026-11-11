@@ -182,6 +182,10 @@ header of core's `apps/macos-runtime/native/screen-stream.swift`):
   width, height u16 BE, then RGBA rows with straight alpha; a hidden pointer is one clear pixel), and after input 6
   the Guest's copied text (3: UTF-8). A QEMU machine's come from SPICE (the Guest needs spice-vdagent for the
   text); an Apple Virtualization Linux machine sends copied text through the guest agent and no pointer shape.
+- Input 3 (a character, its Unicode scalar u32 BE, then 1 for the press) is typed with its key on a US layout. A
+  character with no key there is typed, on a Linux machine, on its press as Ctrl+Shift+U, the scalar's
+  hexadecimal digits and Space (the Unicode entry of IBus and GTK; a program with neither sees those keys); on
+  other machines it is dropped.
 - On QEMU the capabilities list inputs 17 and 18 (the viewer's width and height u16 BE): the size becomes the
   Guest's one monitor through its spice-vdagent (Linux on Xorg with `virtio-gpu-gl`). The capabilities always list
   19 (codec).

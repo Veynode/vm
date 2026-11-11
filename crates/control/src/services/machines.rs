@@ -578,6 +578,7 @@ pub fn display(ctx: &Ctx, args: Value) -> Result<Value> {
         &ctx.client,
         epoch,
         machine.backend == "qemu-hvf",
+        machine.os == "linux",
     )
 }
 

@@ -78,8 +78,9 @@ static ENDPOINTS: Mutex<Option<Endpoints>> = Mutex::new(None);
 
 /// `machine.display`: the endpoint of `epoch`, started if it is new.
 /// `spice`: a QEMU machine, whose SPICE console gives the pointer shape,
-/// copied text and the monitor size.
-pub fn display(name: &str, client: &str, epoch: u64, spice: bool) -> Result<Value> {
+/// copied text and the monitor size. `linux`: a Linux Guest, which takes a
+/// character that has no key as its desktop's Unicode entry (`unicode_entry`).
+pub fn display(name: &str, client: &str, epoch: u64, spice: bool, linux: bool) -> Result<Value> {
     // Held by the viewer whose encoder owns the desktop.
     let desktop = Arc::new(Mutex::new(()));
     endpoint(
@@ -88,7 +89,7 @@ pub fn display(name: &str, client: &str, epoch: u64, spice: bool) -> Result<Valu
         client,
         epoch,
         json!({"format":"stream"}),
-        Arc::new(move |name, stream| serve(name, stream, &desktop, spice)),
+        Arc::new(move |name, stream| serve(name, stream, &desktop, spice, linux)),
     )
 }
 
@@ -542,6 +543,32 @@ pub fn picture_size(au: &[u8], hevc: bool) -> Option<(u32, u32)> {
         })
 }
 
+/// The keys that type `c` where no key does, on a Linux desktop: Ctrl+Shift+U,
+/// the scalar's hexadecimal digits, then Space. That is the Unicode entry of
+/// IBus, which a GNOME session runs, and of GTK's own input method; a program
+/// with neither sees the keys as they are. The Guest has only a keyboard, and
+/// Wayland takes no key event for a character outside the layout.
+pub fn unicode_entry(c: char) -> Vec<Value> {
+    let key = |code: &str, down: bool| json!({"t":"key","code":code,"down":down});
+    let tap = |code: &str| [key(code, true), key(code, false)];
+    let mut events = vec![
+        key("ControlLeft", true),
+        key("ShiftLeft", true),
+        key("KeyU", true),
+        key("KeyU", false),
+        key("ShiftLeft", false),
+        key("ControlLeft", false),
+    ];
+    for digit in format!("{:x}", c as u32).chars() {
+        events.extend(tap(&match digit {
+            '0'..='9' => format!("Digit{digit}"),
+            _ => format!("Key{}", digit.to_ascii_uppercase()),
+        }));
+    }
+    events.extend(tap("Space"));
+    events
+}
+
 /// One endpoint message: kind, length (u32 BE), payload.
 pub fn message(kind: u8, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(5 + payload.len());
@@ -573,6 +600,8 @@ pub struct Input {
     buttons: u8,
     /// The picture's size, for pointer positions.
     pub size: Option<(u32, u32)>,
+    /// A character with no key is typed by `unicode_entry` (a Linux Guest).
+    pub unicode_entry: bool,
 }
 
 impl Input {
@@ -607,7 +636,8 @@ impl Input {
             3 => {
                 let scalar = u32::from_be_bytes([m[1], m[2], m[3], m[4]]);
                 let down = m[5] != 0;
-                match char::from_u32(scalar).and_then(us_key) {
+                let character = char::from_u32(scalar);
+                match character.and_then(us_key) {
                     Some((code, shift)) => {
                         let key = json!({"t":"key","code":code,"down":down});
                         let shift_key = json!({"t":"key","code":"ShiftLeft","down":down});
@@ -617,7 +647,13 @@ impl Input {
                             (true, false) => vec![key, shift_key],
                         })
                     }
-                    None => Action::None,
+                    // Typed whole on the press, as core types such a character.
+                    None => match character {
+                        Some(c) if self.unicode_entry && down && !c.is_control() => {
+                            Action::Events(unicode_entry(c))
+                        }
+                        _ => Action::None,
+                    },
                 }
             }
             4 => Action::KeyFrame,
@@ -802,7 +838,13 @@ pub fn guest_message(event: &Value) -> Option<Vec<u8>> {
 }
 
 /// Serves one authorized viewer until it disconnects or is replaced.
-fn serve(name: &str, stream: TcpStream, desktop: &Mutex<()>, spice: bool) -> Result<()> {
+fn serve(
+    name: &str,
+    stream: TcpStream,
+    desktop: &Mutex<()>,
+    spice: bool,
+    linux: bool,
+) -> Result<()> {
     let socket: Socket = Arc::new(Mutex::new(stream.try_clone()?));
     socket.lock().unwrap().write_all(&capabilities(spice))?;
     // What the viewer asked for, asked again of each new encoder.
@@ -819,7 +861,10 @@ fn serve(name: &str, stream: TcpStream, desktop: &Mutex<()>, spice: bool) -> Res
         size.clone(),
         sent_codec.clone(),
     )?);
-    let mut input = Input::default();
+    let mut input = Input {
+        unicode_entry: linux,
+        ..Input::default()
+    };
     let mut reader = BufReader::new(stream);
     let result = (|| -> Result<()> {
         loop {
@@ -1171,6 +1216,42 @@ mod tests {
                 json!({"t":"key","code":"Slash","down":true})
             ]
         );
+        // A character with no key: nothing, but on a Linux Guest its Unicode entry, on the press.
+        let zhong = [3, 0, 0, 0x4e, 0x2d, 1];
+        assert_eq!(input.act(&zhong), Action::None);
+        input.unicode_entry = true;
+        let Action::Events(e) = input.act(&zhong) else {
+            panic!()
+        };
+        let codes: Vec<(&str, bool)> = e
+            .iter()
+            .map(|k| (k["code"].as_str().unwrap(), k["down"].as_bool().unwrap()))
+            .collect();
+        assert_eq!(
+            codes,
+            [
+                ("ControlLeft", true),
+                ("ShiftLeft", true),
+                ("KeyU", true),
+                ("KeyU", false),
+                ("ShiftLeft", false),
+                ("ControlLeft", false),
+                ("Digit4", true),
+                ("Digit4", false),
+                ("KeyE", true),
+                ("KeyE", false),
+                ("Digit2", true),
+                ("Digit2", false),
+                ("KeyD", true),
+                ("KeyD", false),
+                ("Space", true),
+                ("Space", false),
+            ]
+        );
+        assert!(crate::desktop_input::parse(&json!(unicode_entry('\u{10ffff}'))).is_ok());
+        assert_eq!(input.act(&[3, 0, 0, 0x4e, 0x2d, 0]), Action::None);
+        assert_eq!(input.act(&[3, 0, 0, 0, 0x1b, 1]), Action::None);
+        assert!(matches!(input.act(&[3, 0, 0, 0, b'a', 1]), Action::Events(e) if e.len() == 1));
         assert_eq!(input.act(&[4]), Action::KeyFrame);
         assert_eq!(
             input.act(&[7, 0, 0, 0x1f, 0x40]),
